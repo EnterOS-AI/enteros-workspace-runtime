@@ -53,13 +53,33 @@ def get_adapter(runtime: str) -> type[BaseAdapter]:
     if adapter_module:
         try:
             mod = importlib.import_module(adapter_module)
-            cls = getattr(mod, "Adapter")
-            if cls and issubclass(cls, BaseAdapter):
-                return cls
         except Exception as e:
             raise KeyError(
-                f"ADAPTER_MODULE={adapter_module!r} could not be loaded: {e}"
+                f"ADAPTER_MODULE={adapter_module!r} could not be imported: {e}"
             ) from e
+
+        # Resolution order inside the imported module:
+        # 1. An explicit `Adapter = XxxAdapter` alias (most ergonomic).
+        # 2. Any attribute that is a BaseAdapter subclass — unblocks
+        #    standalone adapter repos whose author forgot to add the alias
+        #    (e.g. claude-code, langgraph, openclaw templates pre-2026-04-20).
+        #    Without this fallback, a perfectly valid ClaudeCodeAdapter
+        #    class in the module can't be loaded and provisioning fails at
+        #    runtime with "module 'adapter' has no attribute 'Adapter'".
+        cls = getattr(mod, "Adapter", None)
+        if cls is None:
+            for name in dir(mod):
+                if name.startswith("_"):
+                    continue
+                obj = getattr(mod, name, None)
+                if isinstance(obj, type) and obj is not BaseAdapter and issubclass(obj, BaseAdapter):
+                    cls = obj
+                    break
+        if cls is not None and issubclass(cls, BaseAdapter):
+            return cls
+        raise KeyError(
+            f"ADAPTER_MODULE={adapter_module!r} imported but no BaseAdapter subclass found"
+        )
 
     # Fall back to built-in discovery (for local dev / monorepo)
     adapters = discover_adapters()
