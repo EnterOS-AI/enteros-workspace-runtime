@@ -349,10 +349,11 @@ class CLIAgentExecutor(AgentExecutor):
                 stderr_text = stderr.decode().strip()
 
                 if proc.returncode != 0:
-                    logger.error("CLI agent [%s] exit=%d stdout=%s stderr=%s",
-                                 self.runtime, proc.returncode,
-                                 stdout_text[:200] if stdout_text else "(empty)",
-                                 stderr_text[:500] if stderr_text else "(empty)")
+                    # Classify once — used both for retry policy and sanitized logging.
+                    # Log ONLY the category, not raw stderr, to avoid leaking tokens/paths.
+                    category = classify_subprocess_error(stderr_text, proc.returncode)
+                    logger.error("CLI agent [%s] exit=%d category=%s",
+                                 self.runtime, proc.returncode, category)
 
                 if proc.returncode == 0 or stdout_text:
                     # Success, or non-zero exit but produced output (some CLIs exit 1 with valid output)

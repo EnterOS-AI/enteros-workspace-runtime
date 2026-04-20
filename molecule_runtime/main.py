@@ -232,7 +232,7 @@ async def main():  # pragma: no cover
                     if tok:
                         from platform_auth import save_token
                         save_token(tok)
-                        print(f"Saved workspace auth token (prefix={tok[:8]}…)")
+                        print("Workspace auth token saved to disk.")
                 except Exception as parse_exc:
                     print(f"Warning: couldn't parse register response for token: {parse_exc}")
         except Exception as e:
