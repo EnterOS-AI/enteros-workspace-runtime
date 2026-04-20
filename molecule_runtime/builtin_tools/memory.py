@@ -389,11 +389,7 @@ async def _record_memory_activity(scope: str, content: str, memory_id: str | Non
     }
 
     try:
-        try:
-            from platform_auth import auth_headers as _auth
-            _headers = _auth()
-        except Exception:
-            _headers = {}
+        _headers = await _auth_headers_for_platform()
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(
                 f"{platform_url}/workspaces/{workspace_id}/activity",
@@ -466,3 +462,12 @@ async def _maybe_log_skill_promotion(content: str, scope: str, memory_result: di
         # Best-effort observability only. Memory commits must never fail because
         # the promotion log could not be written.
         return
+
+
+async def _auth_headers_for_platform() -> dict[str, str]:
+    """Get auth headers for platform API calls, with graceful fallback."""
+    try:
+        from platform_auth import auth_headers as _auth
+        return _auth()
+    except Exception:
+        return {}
