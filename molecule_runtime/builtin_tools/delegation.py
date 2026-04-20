@@ -19,6 +19,7 @@ import httpx
 from langchain_core.tools import tool
 
 from builtin_tools.audit import check_permission, get_workspace_roles, log_event
+from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
 from builtin_tools.telemetry import (
     A2A_SOURCE_WORKSPACE,
     A2A_TARGET_WORKSPACE,
@@ -83,9 +84,14 @@ def _on_task_done(task: asyncio.Task):
 async def _notify_completion(task_id: str, target_workspace_id: str, status: str):
     """Push notification to platform when delegation completes/fails."""
     try:
+        ws_id = get_validated_workspace_id(caller="delegation._notify_completion")
+    except WorkspaceIdValidationError:
+        logger.debug("Delegation notify skipped: invalid WORKSPACE_ID")
+        return
+    try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/notify",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/notify",
                 json={
                     "type": "delegation_complete",
                     "task_id": task_id,
@@ -106,9 +112,14 @@ async def _record_delegation_on_platform(task_id: str, target_workspace_id: str,
     check_delegation_status sees.
     """
     try:
+        ws_id = get_validated_workspace_id(caller="delegation._record_delegation_on_platform")
+    except WorkspaceIdValidationError:
+        logger.debug("Delegation record skipped: invalid WORKSPACE_ID")
+        return
+    try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations/record",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/delegations/record",
                 json={
                     "target_id": target_workspace_id,
                     "task": task,
@@ -126,9 +137,14 @@ async def _update_delegation_on_platform(task_id: str, status: str, error: str =
     so the platform view stays in sync with the agent's local dict.
     """
     try:
+        ws_id = get_validated_workspace_id(caller="delegation._update_delegation_on_platform")
+    except WorkspaceIdValidationError:
+        logger.debug("Delegation update skipped: invalid WORKSPACE_ID")
+        return
+    try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations/{task_id}/update",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/delegations/{task_id}/update",
                 json={
                     "status": status,
                     "error": error,

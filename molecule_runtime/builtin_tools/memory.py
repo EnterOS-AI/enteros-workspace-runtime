@@ -33,6 +33,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 from builtin_tools.awareness_client import _normalise_namespace, build_awareness_client
+from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
 from builtin_tools.audit import check_permission, get_workspace_roles, log_event
 from builtin_tools.telemetry import MEMORY_QUERY, MEMORY_SCOPE, WORKSPACE_ID_ATTR, get_tracer
 
@@ -58,6 +59,12 @@ async def commit_memory(content: str, scope: str = "LOCAL", *, namespace: str | 
     scope = scope.upper()
     if scope not in ("LOCAL", "TEAM", "GLOBAL"):
         return {"error": "scope must be LOCAL, TEAM, or GLOBAL"}
+
+    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
+    try:
+        ws_id = get_validated_workspace_id(caller="memory.commit_memory")
+    except WorkspaceIdValidationError as e:
+        return {"success": False, "error": str(e)}
 
     # --- RBAC check -----------------------------------------------------------
     roles, custom_perms = get_workspace_roles()
@@ -129,7 +136,7 @@ async def commit_memory(content: str, scope: str = "LOCAL", *, namespace: str | 
             async with httpx.AsyncClient(timeout=10.0) as client:
                 try:
                     resp = await client.post(
-                        f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                        f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
                         json={"content": content, "scope": scope, "namespace": _normalise_namespace(namespace)},
                         headers=_headers,
                     )
@@ -199,6 +206,12 @@ async def search_memory(query: str = "", scope: str = "", *, namespace: str | No
     scope = scope.upper()
     if scope and scope not in ("LOCAL", "TEAM", "GLOBAL"):
         return {"error": "scope must be LOCAL, TEAM, GLOBAL, or empty"}
+
+    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
+    try:
+        ws_id = get_validated_workspace_id(caller="memory.search_memory")
+    except WorkspaceIdValidationError as e:
+        return {"success": False, "error": str(e)}
 
     # --- RBAC check -----------------------------------------------------------
     roles, custom_perms = get_workspace_roles()
@@ -292,7 +305,7 @@ async def search_memory(query: str = "", scope: str = "", *, namespace: str | No
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 resp = await client.get(
-                    f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                    f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
                     params=params,
                     headers=_headers,
                 )
