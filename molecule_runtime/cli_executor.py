@@ -206,13 +206,20 @@ class CLIAgentExecutor(AgentExecutor):
         return None
 
     def _create_auth_helper(self, token: str) -> str:
-        """Create a shell script that outputs the auth token (for apiKeyHelper pattern)."""
-        fd, helper_path = tempfile.mkstemp(suffix=".sh", prefix="agent-auth-")
-        self._temp_files.append(helper_path)  # Track immediately before any exception can leak
+        """Create a mode-0600 file holding the auth token (no shell script needed).
+
+        Fixes CWE-78: the old approach used a shell script with shlex.quote(),
+        which does NOT protect against command substitution ($(...), backticks)
+        embedded in a token value. This approach writes the raw token bytes to
+        a mode-0600 file and passes the path via AGENT_AUTH_TOKEN_FILE env
+        var — the token is never interpreted by a shell.
+        """
+        fd, helper_path = tempfile.mkstemp(suffix=".token", prefix="agent-auth-")
+        self._temp_files.append(helper_path)
         os.close(fd)
-        with open(helper_path, "w") as f:
-            f.write(f"#!/bin/sh\necho {shlex.quote(token)}\n")
-        os.chmod(helper_path, 0o700)
+        os.chmod(helper_path, 0o600)
+        with open(helper_path, "wb") as f:
+            f.write(token.encode())
         return helper_path
 
     def _build_command(self, message: str) -> list[str]:
@@ -244,8 +251,9 @@ class CLIAgentExecutor(AgentExecutor):
 
         # Auth (apiKeyHelper pattern — reserved for future CLI runtimes)
         if self._auth_helper_path and self.preset.get("auth_pattern") == "apiKeyHelper":
-            settings = json.dumps({"apiKeyHelper": self._auth_helper_path})
-            args.extend(["--settings", settings])
+            # Token path via env var — no shell interpretation (CWE-78 fix)
+            if "AGENT_AUTH_TOKEN_FILE" not in env:
+                env["AGENT_AUTH_TOKEN_FILE"] = self._auth_helper_path
 
         # A2A MCP server — inject for MCP-compatible runtimes (created once in __init__).
         # Runtimes that declare `mcp_via_settings: True` (e.g. gemini-cli) wire MCP
