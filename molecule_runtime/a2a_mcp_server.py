@@ -46,6 +46,42 @@ from molecule_runtime.a2a_tools import (
 
 logger = logging.getLogger(__name__)
 
+# --- RBAC gate ---
+# Lazy import avoids circular dep at startup (audit.py imports config.py, which
+# imports this module). _load_workspace_roles is cached inside audit.py.
+_PERMISSION_MAP: dict[str, str] = {
+    "delegate_task": "delegate",
+    "delegate_task_async": "delegate",
+    "check_task_status": "delegate",
+    "send_message_to_user": "approve",
+    "commit_memory": "memory.write",
+    # recall_memory, list_peers, get_workspace_info are always permitted
+}
+
+
+def _check_permission(action: str) -> None:
+    """Raise PermissionError if the caller lacks ``action`` permission."""
+    from molecule_runtime.builtin_tools.audit import (
+        check_permission,
+        get_workspace_roles,
+    )
+
+    roles, custom = get_workspace_roles()
+    if not check_permission(action, roles, custom):
+        raise PermissionError(f"RBAC: action '{action}' denied for roles {roles}")
+
+
+def _tool_permission_check(name: str, arguments: dict) -> str | None:
+    """Run RBAC check for ``name``; return error string or None if blocked."""
+    action = _PERMISSION_MAP.get(name)
+    if action is None:
+        return None  # No RBAC gate for this tool
+    try:
+        _check_permission(action)
+    except PermissionError as exc:
+        return str(exc)
+    return None
+
 # Re-export constants and client functions so existing imports
 # (e.g. tests that do `import a2a_mcp_server`) still work.
 from molecule_runtime.a2a_client import (  # noqa: F401, E402
@@ -185,6 +221,11 @@ TOOLS = [
 
 async def handle_tool_call(name: str, arguments: dict) -> str:
     """Handle a tool call and return the result as text."""
+    # RBAC gate — block tools that require elevated permissions
+    rbac_error = _tool_permission_check(name, arguments)
+    if rbac_error is not None:
+        return f"PERMISSION DENIED: {rbac_error}"
+
     if name == "delegate_task":
         return await tool_delegate_task(
             arguments.get("workspace_id", ""),
