@@ -39,6 +39,16 @@ SANDBOX_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "30"))
 SANDBOX_MEMORY_LIMIT = os.environ.get("SANDBOX_MEMORY_LIMIT", "256m")
 MAX_OUTPUT = 10_000
 
+# Log once at module load — subprocess is the default but has no isolation.
+# Tier 3+ deployments should set SANDBOX_BACKEND=docker or e2b.
+if SANDBOX_BACKEND == "subprocess":
+    logger.warning(
+        "Sandbox: using subprocess backend — no OS-level process isolation. "
+        "User code runs with the workspace container's full privilege (reads "
+        "os.environ, filesystem, network). Set SANDBOX_BACKEND=docker or e2b "
+        "for production isolation."
+    )
+
 # E2B kernel names differ from internal language names.
 _E2B_KERNEL_MAP = {
     "python": "python3",
