@@ -29,10 +29,15 @@ PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://platform:8080")
 
 async def discover(target_id: str) -> dict | None:
     """Discover a peer workspace's URL."""
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_cli.discover")
+    except WorkspaceIdValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return None
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             f"{PLATFORM_URL}/registry/discover/{target_id}",
-            headers={"X-Workspace-ID": WORKSPACE_ID},
+            headers={"X-Workspace-ID": ws_id},
         )
         if resp.status_code == 200:
             return resp.json()
