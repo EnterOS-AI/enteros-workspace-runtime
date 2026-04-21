@@ -17,6 +17,7 @@ import os
 
 import httpx
 from langchain_core.tools import tool
+from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
 from molecule_runtime.adapters.shared_runtime import build_peer_section
 from policies.routing import build_team_routing_payload
 
@@ -52,15 +53,20 @@ async def get_parent_context() -> list[dict]:
 async def get_children() -> list[dict]:
     """Fetch this workspace's children from the platform."""
     try:
+        ws_id = get_validated_workspace_id(caller="coordinator.get_children")
+    except WorkspaceIdValidationError:
+        logger.warning("get_children skipped: invalid WORKSPACE_ID")
+        return []
+    try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers",
-                headers={"X-Workspace-ID": WORKSPACE_ID},
+                f"{PLATFORM_URL}/registry/{ws_id}/peers",
+                headers={"X-Workspace-ID": ws_id},
             )
             if resp.status_code == 200:
                 peers = resp.json()
                 # Filter to only children (parent_id == our ID)
-                return [p for p in peers if p.get("parent_id") == WORKSPACE_ID]
+                return [p for p in peers if p.get("parent_id") == ws_id]
     except Exception as e:
         logger.warning("Failed to fetch children: %s", e)
     return []

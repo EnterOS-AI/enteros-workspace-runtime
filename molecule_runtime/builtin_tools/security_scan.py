@@ -184,8 +184,11 @@ def _parse_pip_audit(stdout: str) -> tuple[list[CVEFinding], Optional[str]]:
         if not isinstance(dep, dict):
             continue
         for vuln in dep.get("vulns", []):
-            sev_raw = vuln.get("fix_versions") and "high"  # pip-audit lacks severity
-            sev = (vuln.get("severity") or sev_raw or "high").lower()
+            # pip-audit doesn't provide a severity field in older versions.
+            # If fix_versions is present, the package has a patched version available,
+            # which indicates the vulnerability is real (not just a retracted advisory).
+            has_fix = bool(vuln.get("fix_versions"))
+            sev = (vuln.get("severity") or ("high" if has_fix else "medium")).lower()
             findings.append(
                 CVEFinding(
                     vuln_id=vuln.get("id", "UNKNOWN"),

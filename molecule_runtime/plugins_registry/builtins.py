@@ -48,6 +48,23 @@ from pathlib import Path
 
 from .protocol import SKILLS_SUBDIR, InstallContext, InstallResult
 
+# Keys scrubbed from plugin setup.sh env — matches skill_loader/loader.py's
+# _SCRUB_KEYS so a malicious plugin's setup.sh cannot exfiltrate credentials
+# that are available to the parent process. Fixes issue #19 (CWE-C-312).
+_SCRUB_KEYS = frozenset((
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "WORKSPACE_AUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+))
+
+
+def _scrubbed_env(extra: dict[str, str]) -> dict[str, str]:
+    """Return a copy of os.environ with sensitive keys stripped plus *extra* merged."""
+    return {k: v for k, v in os.environ.items() if k not in _SCRUB_KEYS} | extra
+
 # Files at the plugin root that are never treated as prompt fragments,
 # even if they're markdown. Module-level so tests and other adapters can
 # import the set rather than re-declaring it.
@@ -172,7 +189,7 @@ class AgentskillsAdaptor:
                     ["bash", str(setup_script)],
                     capture_output=True, text=True, timeout=120,
                     cwd=str(ctx.plugin_root),
-                    env={**os.environ, "CONFIGS_DIR": str(ctx.configs_dir)},
+                    env=_scrubbed_env({"CONFIGS_DIR": str(ctx.configs_dir)}),
                 )
                 if proc.returncode == 0:
                     ctx.logger.info("%s: setup.sh completed successfully", self.plugin_name)

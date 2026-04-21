@@ -22,14 +22,67 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Valid workspace ID: lowercase alphanumeric + hyphens (UUIDs and org-generated IDs).
+# Rejects /, \, .., #, ?, &, newlines — all chars that could break URL paths
+# or HTTP header values. This is the single validation gate for WORKSPACE_ID.
+_WORKSPACE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,127}$")
+
+# Cached result — validated once per process startup, not on every call.
+_validated_workspace_id: str | None = None
+
+
+def validate_workspace_id(workspace_id: str) -> str:
+    """Validate *workspace_id* and return it.
+
+    Raises ValueError if the ID is empty, contains unsafe characters, or
+    does not match the expected format. This function is the single validation
+    gate — call it once at startup and reuse the result.
+
+    Fixes issue #14 (CWE-20): prevents URL/header injection when WORKSPACE_ID
+    is used in platform API URLs and ``X-Workspace-ID`` headers.
+    """
+    global _validated_workspace_id
+    if _validated_workspace_id is not None:
+        return _validated_workspace_id  # pragma: no cover — cached fast path
+
+    if not workspace_id:
+        raise ValueError("WORKSPACE_ID is empty — set the WORKSPACE_ID env var")
+
+    # Strip and check again after strip
+    workspace_id = workspace_id.strip()
+
+    if not _WORKSPACE_ID_RE.match(workspace_id):
+        raise ValueError(
+            f"WORKSPACE_ID contains invalid characters: {workspace_id!r}. "
+            "Only lowercase letters, digits, and hyphens are allowed. "
+            "Ensure WORKSPACE_ID is a valid UUID or alphanumeric ID."
+        )
+
+    _validated_workspace_id = workspace_id
+    return workspace_id
 
 # In-process cache so we don't hit disk on every heartbeat. The heartbeat
 # loop fires on a short interval and reading a tiny file 10x per minute
 # is wasteful. The file is the durable copy; this var is the hot path.
 _cached_token: str | None = None
+
+# Validated WORKSPACE_ID — read once at import time so every caller gets the
+# same validated value without re-checking. Raises on bad input.
+WORKSPACE_ID: str = validate_workspace_id(os.environ.get("WORKSPACE_ID", ""))
+
+
+def get_workspace_id() -> str:
+    """Return the validated workspace ID.
+
+    Cached result from module-level WORKSPACE_ID constant. Call this instead
+    of reading WORKSPACE_ID directly — it guarantees the ID passed validation.
+    """
+    return WORKSPACE_ID
 
 
 def _token_file() -> Path:
@@ -88,14 +141,29 @@ def save_token(token: str) -> None:
 
 
 def auth_headers() -> dict[str, str]:
-    """Return a header dict to merge into httpx calls. Empty if no token
-    is available yet — callers send the request as-is and the platform's
-    heartbeat handler grandfathers pre-token workspaces through until
-    their next /registry/register issues one."""
+    """Return a header dict to merge into every outbound platform call.
+
+    Two headers, both optional:
+
+    - ``Authorization: Bearer <token>`` — the workspace-scoped auth
+      token issued on first /registry/register. Empty if not yet
+      issued; the platform grandfathers pre-token workspaces through.
+
+    - ``X-Molecule-Org-Id: <uuid>`` — the SaaS cross-org routing tag
+      the tenant platform's TenantGuard requires on every non-
+      allowlisted route. Read from the ``MOLECULE_ORG_ID`` env var
+      that the control plane exports into workspace user-data.
+      Unset on self-hosted / dev deployments where TenantGuard is a
+      no-op, so omitting the header keeps those paths working.
+    """
+    headers: dict[str, str] = {}
     tok = get_token()
-    if not tok:
-        return {}
-    return {"Authorization": f"Bearer {tok}"}
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    org_id = os.environ.get("MOLECULE_ORG_ID", "").strip()
+    if org_id:
+        headers["X-Molecule-Org-Id"] = org_id
+    return headers
 
 
 def clear_cache() -> None:

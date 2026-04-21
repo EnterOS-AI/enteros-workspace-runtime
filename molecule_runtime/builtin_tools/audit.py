@@ -102,12 +102,13 @@ def _load_workspace_config():
 def get_workspace_roles() -> tuple[list[str], dict[str, list[str]]]:
     """Return ``(roles, custom_permissions)`` from the workspace config.
 
-    Falls back to ``["operator"]`` / ``{}`` when the config is unavailable so
-    that agents remain functional in degraded environments.
+    Falls back to ``["read-only"]`` / ``{}`` when the config is unavailable so
+    that agents retain only memory-read access in degraded environments,
+    denying by default rather than granting elevated permissions (fail-secure).
     """
     cfg = _load_workspace_config()
     if cfg is None:
-        return ["operator"], {}
+        return ["read-only"], {}
     return list(cfg.rbac.roles), dict(cfg.rbac.allowed_actions)
 
 

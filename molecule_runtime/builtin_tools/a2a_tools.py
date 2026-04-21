@@ -9,15 +9,21 @@ import uuid
 
 import httpx
 
+from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
+
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://platform:8080")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")  # used only for tracing headers; URLs use validated version
 
 
 async def list_peers() -> list[dict]:
     """Get this workspace's peers from the platform registry."""
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_tools.list_peers")
+    except WorkspaceIdValidationError:
+        return []
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            resp = await client.get(f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers")
+            resp = await client.get(f"{PLATFORM_URL}/registry/{ws_id}/peers")
             if resp.status_code == 200:
                 return resp.json()
             return []
@@ -27,12 +33,17 @@ async def list_peers() -> list[dict]:
 
 async def delegate_task(workspace_id: str, task: str) -> str:
     """Send a task to a peer workspace via A2A and return the response text."""
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_tools.delegate_task")
+    except WorkspaceIdValidationError as e:
+        return f"Error: {e}"
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         # Discover target URL
         try:
             resp = await client.get(
                 f"{PLATFORM_URL}/registry/discover/{workspace_id}",
-                headers={"X-Workspace-ID": WORKSPACE_ID},
+                headers={"X-Workspace-ID": ws_id},
             )
             if resp.status_code != 200:
                 return f"Error: cannot reach workspace {workspace_id} (status {resp.status_code})"

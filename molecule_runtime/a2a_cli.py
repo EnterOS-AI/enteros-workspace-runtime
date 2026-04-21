@@ -21,16 +21,23 @@ import uuid
 
 import httpx
 
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
+
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")  # used for discover() headers only; URL uses validated version
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://platform:8080")
 
 
 async def discover(target_id: str) -> dict | None:
     """Discover a peer workspace's URL."""
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_cli.discover")
+    except WorkspaceIdValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return None
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             f"{PLATFORM_URL}/registry/discover/{target_id}",
-            headers={"X-Workspace-ID": WORKSPACE_ID},
+            headers={"X-Workspace-ID": ws_id},
         )
         if resp.status_code == 200:
             return resp.json()
@@ -182,8 +189,13 @@ async def check_status(target_id: str, task_id: str):
 
 async def peers():
     """List available peers."""
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_cli.peers")
+    except WorkspaceIdValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers")
+        resp = await client.get(f"{PLATFORM_URL}/registry/{ws_id}/peers")
         if resp.status_code != 200:
             print("Error: could not fetch peers", file=sys.stderr)
             sys.exit(1)
@@ -195,8 +207,13 @@ async def peers():
 
 async def info():
     """Get this workspace's info."""
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_cli.info")
+    except WorkspaceIdValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}")
+        resp = await client.get(f"{PLATFORM_URL}/workspaces/{ws_id}")
         if resp.status_code == 200:
             d = resp.json()
             print(f"ID:     {d['id']}")
