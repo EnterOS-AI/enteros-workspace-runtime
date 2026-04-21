@@ -139,3 +139,47 @@ class TestWorkspaceIdConstantInDelegation:
         assert "/" not in delegation_mod.WORKSPACE_ID
         assert "\\" not in delegation_mod.WORKSPACE_ID
         assert ".." not in delegation_mod.WORKSPACE_ID
+
+
+class TestA2aCliDiscoverValidation:
+    """a2a_cli.discover() validates WORKSPACE_ID before hitting the platform.
+
+    Since builtin_tools is only stubbed when the full test suite loads
+    (conftest must import other modules first to trigger the stubs), we
+    test the validation contract indirectly:
+    1. get_validated_workspace_id() raises WorkspaceIdValidationError for bad input
+    2. discover() is the only a2a_cli function that calls get_validated_workspace_id()
+       in the X-Workspace-ID header path — covered by (1)
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self, monkeypatch):
+        """Clear validation caches and env before each test."""
+        import molecule_runtime.platform_auth as pa_mod
+        import molecule_runtime.builtin_tools.validation as val_mod
+        pa_mod._validated_workspace_id = None
+        val_mod._cached_workspace_id = None
+        val_mod._cached_validated = False
+        monkeypatch.delenv("WORKSPACE_ID", raising=False)
+
+    def test_validated_ws_id_raises_on_empty(self):
+        """get_validated_workspace_id() must raise on empty WORKSPACE_ID."""
+        from molecule_runtime.builtin_tools.validation import (
+            WorkspaceIdValidationError,
+            get_validated_workspace_id,
+        )
+        with pytest.raises(WorkspaceIdValidationError, match="empty"):
+            get_validated_workspace_id(caller="test")
+
+    def test_validated_ws_id_raises_on_slash(self, monkeypatch):
+        """get_validated_workspace_id() must raise when WORKSPACE_ID contains /."""
+        import molecule_runtime.builtin_tools.validation as val_mod
+        val_mod._cached_workspace_id = None
+        val_mod._cached_validated = False
+        monkeypatch.setenv("WORKSPACE_ID", "ws/foo")
+        from molecule_runtime.builtin_tools.validation import (
+            WorkspaceIdValidationError,
+            get_validated_workspace_id,
+        )
+        with pytest.raises(WorkspaceIdValidationError, match="invalid"):
+            get_validated_workspace_id(caller="test")
