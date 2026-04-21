@@ -18,6 +18,10 @@ from molecule_runtime.a2a_client import (
     get_workspace_info,
     send_a2a_message,
 )
+from molecule_runtime.builtin_tools.validation import (
+    WorkspaceIdValidationError,
+    get_validated_workspace_id,
+)
 
 
 def _auth_headers_for_heartbeat() -> dict[str, str]:
@@ -35,11 +39,16 @@ async def report_activity(
     task_text: str = "", response_text: str = "",
 ):
     """Report activity to the platform for live progress tracking."""
+    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_tools.report_activity")
+    except WorkspaceIdValidationError:
+        return  # Best-effort — don't block delegation on activity reporting
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             payload: dict = {
                 "activity_type": activity_type,
-                "source_id": WORKSPACE_ID,
+                "source_id": ws_id,
                 "target_id": target_id,
                 "method": "message/send",
                 "summary": summary,
@@ -50,7 +59,7 @@ async def report_activity(
             if response_text:
                 payload["response_body"] = {"result": response_text}
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/activity",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/activity",
                 json=payload,
                 headers=_auth_headers_for_heartbeat(),
             )
@@ -59,7 +68,7 @@ async def report_activity(
                 await client.post(
                     f"{PLATFORM_URL}/registry/heartbeat",
                     json={
-                        "workspace_id": WORKSPACE_ID,
+                        "workspace_id": ws_id,
                         "current_task": summary,
                         "active_tasks": 1,
                         "error_rate": 0,
@@ -124,9 +133,13 @@ async def tool_delegate_task_async(workspace_id: str, task: str) -> str:
         return "Error: workspace_id and task are required"
 
     try:
+        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_delegate_task_async")
+    except WorkspaceIdValidationError as e:
+        return f"Error: {e}"
+    try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegate",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/delegate",
                 json={"target_id": workspace_id, "task": task},
                 headers=_auth_headers_for_heartbeat(),
             )
@@ -152,9 +165,13 @@ async def tool_check_task_status(workspace_id: str, task_id: str) -> str:
         task_id: Optional delegation_id to filter. If empty, returns all recent delegations.
     """
     try:
+        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_check_task_status")
+    except WorkspaceIdValidationError as e:
+        return f"Error: {e}"
+    try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/delegations",
                 headers=_auth_headers_for_heartbeat(),
             )
             if resp.status_code != 200:
@@ -186,9 +203,13 @@ async def tool_send_message_to_user(message: str) -> str:
     if not message:
         return "Error: message is required"
     try:
+        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_send_message_to_user")
+    except WorkspaceIdValidationError as e:
+        return f"Error: {e}"
+    try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/notify",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/notify",
                 json={"message": message},
                 headers=_auth_headers_for_heartbeat(),
             )
@@ -228,9 +249,13 @@ async def tool_commit_memory(content: str, scope: str = "LOCAL") -> str:
     if scope not in ("LOCAL", "TEAM", "GLOBAL"):
         scope = "LOCAL"
     try:
+        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_commit_memory")
+    except WorkspaceIdValidationError as e:
+        return f"Error: {e}"
+    try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
                 json={"content": content, "scope": scope},
                 headers=_auth_headers_for_heartbeat(),
             )
@@ -250,9 +275,13 @@ async def tool_recall_memory(query: str = "", scope: str = "") -> str:
     if scope:
         params["scope"] = scope.upper()
     try:
+        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_recall_memory")
+    except WorkspaceIdValidationError as e:
+        return f"Error: {e}"
+    try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
                 params=params,
                 headers=_auth_headers_for_heartbeat(),
             )
