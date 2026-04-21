@@ -8,6 +8,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Required by platform_auth.validate_workspace_id() (PR #29 / issue #14).
+      # Valid format: lowercase alphanumeric + hyphens (matches UUIDs and org IDs).
+      WORKSPACE_ID: ci-test-workspace
     steps:
       - uses: actions/checkout@v4
 
@@ -31,4 +35,4 @@ jobs:
       - name: Security linter (bandit)
         run: |
           pip install bandit
-          bandit -r molecule_runtime/ -ll --severity-level=high --exclude "."
+          bandit -r molecule_runtime/ --severity-level=high

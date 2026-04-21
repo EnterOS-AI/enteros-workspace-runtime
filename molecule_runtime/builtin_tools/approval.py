@@ -51,6 +51,7 @@ import httpx
 from langchain_core.tools import tool
 
 from builtin_tools.audit import check_permission, get_workspace_roles, log_event
+from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
 
 logger = logging.getLogger(__name__)
 
@@ -91,10 +92,16 @@ async def _create_approval_request(action: str, reason: str) -> dict:
 
     Returns {"approval_id": str} on success or {"error": str} on failure.
     """
+    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
+    try:
+        ws_id = get_validated_workspace_id(caller="approval._create_approval_request")
+    except WorkspaceIdValidationError as e:
+        return {"error": str(e)}
+
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/approvals",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/approvals",
                 json={"action": action, "reason": reason},
             )
             if resp.status_code != 201:
@@ -156,6 +163,13 @@ async def _wait_websocket(approval_id: str, timeout: float) -> dict:
 
 async def _wait_polling(approval_id: str, timeout: float) -> dict:
     """Legacy polling loop — checks platform REST endpoint every APPROVAL_POLL_INTERVAL seconds."""
+    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
+    try:
+        ws_id = get_validated_workspace_id(caller="approval._wait_polling")
+    except WorkspaceIdValidationError:
+        # Transient — propagate as timeout so the caller handles it gracefully
+        raise asyncio.TimeoutError("WORKSPACE_ID validation failed")
+
     elapsed = 0.0
     async with httpx.AsyncClient(timeout=10.0) as client:
         while elapsed < timeout:
@@ -163,7 +177,7 @@ async def _wait_polling(approval_id: str, timeout: float) -> dict:
             elapsed += APPROVAL_POLL_INTERVAL
             try:
                 resp = await client.get(
-                    f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/approvals",
+                    f"{PLATFORM_URL}/workspaces/{ws_id}/approvals",
                 )
                 if resp.status_code == 200:
                     for a in resp.json():

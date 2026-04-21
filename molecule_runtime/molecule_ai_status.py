@@ -22,6 +22,8 @@ import sys
 
 import httpx
 
+from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
+
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://platform:8080")
 
@@ -30,14 +32,22 @@ def set_status(task: str):
     """Push current_task to platform via heartbeat."""
     try:
         try:
-            from platform_auth import auth_headers as _auth
+            from builtin_tools.platform_auth import auth_headers as _auth
             _headers = _auth()
         except Exception:
             _headers = {}
+
+        # --- Workspace ID validation (CWE-20 / CWE-88) -----------------------
+        try:
+            ws_id = get_validated_workspace_id(caller="molecule_ai_status.set_status")
+        except WorkspaceIdValidationError as e:
+            sys.stderr.write(f"molecule_ai_status: {e}\n")
+            return
+
         httpx.post(
             f"{PLATFORM_URL}/registry/heartbeat",
             json={
-                "workspace_id": WORKSPACE_ID,
+                "workspace_id": ws_id,
                 "current_task": task,
                 "active_tasks": 1 if task else 0,
                 "error_rate": 0,
@@ -50,10 +60,10 @@ def set_status(task: str):
         if task:
             # Also log as activity for traceability
             httpx.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/activity",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/activity",
                 json={
                     "activity_type": "task_update",
-                    "source_id": WORKSPACE_ID,
+                    "source_id": ws_id,
                     "summary": task,
                     "status": "ok",
                 },

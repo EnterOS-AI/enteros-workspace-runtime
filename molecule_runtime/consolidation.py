@@ -14,7 +14,8 @@ import os
 
 import httpx
 
-from molecule_runtime.platform_auth import auth_headers
+from .builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
+from .platform_auth import auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +51,17 @@ class ConsolidationLoop:
 
     async def _consolidate(self):
         """Check if consolidation is needed and run it."""
+        # --- Workspace ID validation (CWE-20 / CWE-88) ------------------------
+        try:
+            ws_id = get_validated_workspace_id(caller="consolidation._consolidate")
+        except WorkspaceIdValidationError as e:
+            logger.warning("Consolidation skipped: %s", e)
+            return
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             # Fetch local memories
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
                 params={"scope": "LOCAL"},
                 headers=auth_headers(),
             )
@@ -96,7 +104,7 @@ class ConsolidationLoop:
                     if summary:
                         # Store consolidated summary as a TEAM memory — only delete originals if POST succeeds
                         resp = await client.post(
-                            f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                            f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
                             json={"content": f"[Consolidated] {summary}", "scope": "TEAM"},
                             headers=auth_headers(),
                         )
@@ -104,7 +112,7 @@ class ConsolidationLoop:
                             # Safe to delete originals — consolidated version is saved
                             for m in memories:
                                 await client.delete(
-                                    f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories/{m['id']}",
+                                    f"{PLATFORM_URL}/workspaces/{ws_id}/memories/{m['id']}",
                                     headers=auth_headers(),
                                 )
                             logger.info("Consolidated %d memories into team knowledge", len(memories))
@@ -121,7 +129,7 @@ class ConsolidationLoop:
             if not (self.agent and summary):
                 combined = " | ".join(contents[:20])
                 await client.post(
-                    f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                    f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
                     json={"content": f"[Consolidated] {combined}", "scope": "TEAM"},
                     headers=auth_headers(),
                 )

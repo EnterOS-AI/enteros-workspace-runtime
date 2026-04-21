@@ -10,7 +10,8 @@ import uuid
 
 import httpx
 
-from molecule_runtime.platform_auth import auth_headers
+from .builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
+from .platform_auth import auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +84,15 @@ async def send_a2a_message(target_url: str, message: str) -> str:
 
 async def get_peers() -> list[dict]:
     """Get this workspace's peers from the platform registry."""
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_client.get_peers")
+    except WorkspaceIdValidationError:
+        return []
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.get(
-                f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers",
-                headers={"X-Workspace-ID": WORKSPACE_ID, **auth_headers()},
+                f"{PLATFORM_URL}/registry/{ws_id}/peers",
+                headers={"X-Workspace-ID": ws_id, **auth_headers()},
             )
             if resp.status_code == 200:
                 return resp.json()
@@ -98,10 +103,14 @@ async def get_peers() -> list[dict]:
 
 async def get_workspace_info() -> dict:
     """Get this workspace's info from the platform."""
+    try:
+        ws_id = get_validated_workspace_id(caller="a2a_client.get_workspace_info")
+    except WorkspaceIdValidationError:
+        return {"error": "WORKSPACE_ID validation failed"}
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}",
+                f"{PLATFORM_URL}/workspaces/{ws_id}",
                 headers=auth_headers(),
             )
             if resp.status_code == 200:
