@@ -141,14 +141,29 @@ def save_token(token: str) -> None:
 
 
 def auth_headers() -> dict[str, str]:
-    """Return a header dict to merge into httpx calls. Empty if no token
-    is available yet — callers send the request as-is and the platform's
-    heartbeat handler grandfathers pre-token workspaces through until
-    their next /registry/register issues one."""
+    """Return a header dict to merge into every outbound platform call.
+
+    Two headers, both optional:
+
+    - ``Authorization: Bearer <token>`` — the workspace-scoped auth
+      token issued on first /registry/register. Empty if not yet
+      issued; the platform grandfathers pre-token workspaces through.
+
+    - ``X-Molecule-Org-Id: <uuid>`` — the SaaS cross-org routing tag
+      the tenant platform's TenantGuard requires on every non-
+      allowlisted route. Read from the ``MOLECULE_ORG_ID`` env var
+      that the control plane exports into workspace user-data.
+      Unset on self-hosted / dev deployments where TenantGuard is a
+      no-op, so omitting the header keeps those paths working.
+    """
+    headers: dict[str, str] = {}
     tok = get_token()
-    if not tok:
-        return {}
-    return {"Authorization": f"Bearer {tok}"}
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    org_id = os.environ.get("MOLECULE_ORG_ID", "").strip()
+    if org_id:
+        headers["X-Molecule-Org-Id"] = org_id
+    return headers
 
 
 def clear_cache() -> None:
