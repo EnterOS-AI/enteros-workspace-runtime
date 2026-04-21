@@ -8,6 +8,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Required by platform_auth.validate_workspace_id() (PR #29 / issue #14).
+      # Valid format: lowercase alphanumeric + hyphens (matches UUIDs and org IDs).
+      WORKSPACE_ID: ci-test-workspace
     steps:
       - uses: actions/checkout@v4
 
