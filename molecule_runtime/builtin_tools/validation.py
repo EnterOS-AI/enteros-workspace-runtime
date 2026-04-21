@@ -11,9 +11,9 @@ import re
 from typing import assert_never
 
 # Pattern: alphanumeric + hyphen + underscore + dot; no path-traversal chars.
-# This deliberately rejects `/`, `\`, `..`, `#`, `?`, `&` which could
-# manipulate URL path segments or query strings.
-_WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_\-.]{1,256}$")
+# Negative lookahead (?!.*\.\.) rejects ".." anywhere — ".." alone and embedded
+# (e.g. "ws../etc") are both security risks. Single dots (ws.example) are fine.
+_WORKSPACE_ID_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9_\-.]{1,256}$")
 
 # Error message prefix used by callers so callers can surface context.
 _WORKSPACE_ID_INVALID_MSG = (
