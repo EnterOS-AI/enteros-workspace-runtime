@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "molecule-ai-workspace-runtime"
-version = "0.1.4"
+version = "0.1.5"
 description = "Molecule AI workspace runtime — shared infrastructure for all agent adapters"
 requires-python = ">=3.11"
 license = {text = "BSL-1.1"}
