@@ -82,11 +82,15 @@ def test_refresh_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 # ---------- 401 retry pattern (replayed manually against MockTransport) ----------
 
 
-@pytest.mark.asyncio
-async def test_401_retry_pattern_uses_refreshed_token(
+def test_401_retry_pattern_uses_refreshed_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Models the #1877 fix path: 401 -> refresh_from_disk -> retry succeeds."""
+    """Models the #1877 fix path: 401 -> refresh_from_disk -> retry succeeds.
+
+    Uses httpx sync Client + MockTransport so the test doesn't require
+    pytest-asyncio in CI (the production code is async, but the retry
+    *logic* — refresh-on-401 — is identical sync or async).
+    """
     monkeypatch.setenv("CONFIGS_DIR", str(tmp_path))
     clear_cache()
 
@@ -102,27 +106,22 @@ async def test_401_retry_pattern_uses_refreshed_token(
             return httpx.Response(401, json={"error": "invalid token"})
         return httpx.Response(200, json={})
 
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport, timeout=5.0)
+    with httpx.Client(transport=httpx.MockTransport(handler), timeout=5.0) as client:
+        payload = {"workspace_id": "ws-test", "active_tasks": 0}
+        url = "http://platform:8080/registry/heartbeat"
 
-    payload = {"workspace_id": "ws-test", "active_tasks": 0}
-    url = "http://platform:8080/registry/heartbeat"
+        # Mirror exactly what heartbeat.py now does:
+        resp = client.post(url, json=payload, headers=auth_headers())
+        if resp.status_code == 401 and refresh_from_disk() is not None:
+            resp = client.post(url, json=payload, headers=auth_headers())
 
-    # Mirror exactly what heartbeat.py now does:
-    resp = await client.post(url, json=payload, headers=auth_headers())
-    if resp.status_code == 401 and refresh_from_disk() is not None:
-        resp = await client.post(url, json=payload, headers=auth_headers())
-
-    assert resp.status_code == 200
-    assert len(calls) == 2
-    assert calls[0]["auth"] == "Bearer token-v1"  # stale, rejected
-    assert calls[1]["auth"] == "Bearer token-v2"  # fresh, accepted
-
-    await client.aclose()
+        assert resp.status_code == 200
+        assert len(calls) == 2
+        assert calls[0]["auth"] == "Bearer token-v1"  # stale, rejected
+        assert calls[1]["auth"] == "Bearer token-v2"  # fresh, accepted
 
 
-@pytest.mark.asyncio
-async def test_401_retry_no_loop_when_disk_token_also_stale(
+def test_401_retry_no_loop_when_disk_token_also_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """If both cached AND disk tokens are stale, the retry uses the same value
@@ -139,18 +138,14 @@ async def test_401_retry_no_loop_when_disk_token_also_stale(
         calls.append(request.headers.get("authorization", ""))
         return httpx.Response(401, json={"error": "invalid token"})
 
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport, timeout=5.0)
+    with httpx.Client(transport=httpx.MockTransport(handler), timeout=5.0) as client:
+        payload = {"workspace_id": "ws-test"}
+        url = "http://platform:8080/registry/heartbeat"
 
-    payload = {"workspace_id": "ws-test"}
-    url = "http://platform:8080/registry/heartbeat"
+        resp = client.post(url, json=payload, headers=auth_headers())
+        if resp.status_code == 401 and refresh_from_disk() is not None:
+            resp = client.post(url, json=payload, headers=auth_headers())
 
-    resp = await client.post(url, json=payload, headers=auth_headers())
-    if resp.status_code == 401 and refresh_from_disk() is not None:
-        resp = await client.post(url, json=payload, headers=auth_headers())
-
-    # Both attempts 401, no third call — bounded retry budget
-    assert resp.status_code == 401
-    assert len(calls) == 2
-
-    await client.aclose()
+        # Both attempts 401, no third call — bounded retry budget
+        assert resp.status_code == 401
+        assert len(calls) == 2
