@@ -171,3 +171,22 @@ def clear_cache() -> None:
     files between cases."""
     global _cached_token
     _cached_token = None
+
+
+def refresh_from_disk() -> str | None:
+    """Force-reload the token from ``/configs/.auth_token``, bypassing the
+    in-memory cache. Used by callers (e.g. heartbeat loop) that got a 401
+    from the platform and suspect the on-disk token was rotated after boot.
+
+    Returns the fresh token on success, ``None`` if the file is missing or
+    unreadable. Updates the in-memory cache as a side-effect so subsequent
+    :func:`auth_headers` calls pick up the new value.
+
+    Context (#1877): on auto-restart, the platform revokes the old token
+    and writes a new ``.auth_token`` AFTER ``ContainerStart``, so the
+    runtime's first heartbeat can race the token write and send the stale
+    cached value. Re-reading from disk on 401 breaks the loop without
+    needing another full container restart.
+    """
+    clear_cache()
+    return get_token()
