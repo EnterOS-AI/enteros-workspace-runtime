@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 
-from molecule_runtime.platform_auth import auth_headers
+from molecule_runtime.platform_auth import auth_headers, refresh_from_disk
 
 logger = logging.getLogger(__name__)
 
@@ -85,18 +85,34 @@ class HeartbeatLoop:
                 while True:
                     # 1. Send heartbeat (Phase 30.1: include auth header if token known)
                     try:
-                        await client.post(
+                        hb_payload = {
+                            "workspace_id": self.workspace_id,
+                            "error_rate": self.error_rate,
+                            "sample_error": self.sample_error,
+                            "active_tasks": self.active_tasks,
+                            "current_task": self.current_task,
+                            "uptime_seconds": int(time.time() - self.start_time),
+                        }
+                        resp = await client.post(
                             f"{self.platform_url}/registry/heartbeat",
-                            json={
-                                "workspace_id": self.workspace_id,
-                                "error_rate": self.error_rate,
-                                "sample_error": self.sample_error,
-                                "active_tasks": self.active_tasks,
-                                "current_task": self.current_task,
-                                "uptime_seconds": int(time.time() - self.start_time),
-                            },
+                            json=hb_payload,
                             headers=auth_headers(),
                         )
+                        # #1877: auto-restart rotates the workspace token AFTER
+                        # container start, so the first heartbeat after a restart
+                        # can race the token write and send the stale cached
+                        # value → 401. Re-read /configs/.auth_token and retry ONCE
+                        # to break the 401 loop without needing another restart.
+                        if resp.status_code == 401:
+                            if refresh_from_disk() is not None:
+                                logger.info(
+                                    "Heartbeat: got 401, refreshed token from disk, retrying"
+                                )
+                                resp = await client.post(
+                                    f"{self.platform_url}/registry/heartbeat",
+                                    json=hb_payload,
+                                    headers=auth_headers(),
+                                )
                         self.error_count = 0
                         self.request_count = 0
                         self._consecutive_failures = 0
@@ -135,10 +151,12 @@ class HeartbeatLoop:
     async def _check_delegations(self, client: httpx.AsyncClient):
         """Check for completed delegations and store results for the agent."""
         try:
-            resp = await client.get(
-                f"{self.platform_url}/workspaces/{self.workspace_id}/delegations",
-                headers=auth_headers(),
-            )
+            url = f"{self.platform_url}/workspaces/{self.workspace_id}/delegations"
+            resp = await client.get(url, headers=auth_headers())
+            # #1877: refresh token on 401 and retry ONCE — same post-restart
+            # token-rotation race as the heartbeat path above.
+            if resp.status_code == 401 and refresh_from_disk() is not None:
+                resp = await client.get(url, headers=auth_headers())
             if resp.status_code != 200:
                 return
 
