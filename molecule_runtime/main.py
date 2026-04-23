@@ -65,7 +65,15 @@ async def main():  # pragma: no cover
     platform_url = os.environ.get("PLATFORM_URL", "http://platform:8080")
     awareness_config = get_awareness_config()
 
-    # 0. Initialise OpenTelemetry (no-op if packages not installed)
+    # 0. Normalise LLM auth env vars based on token type.
+    # Platform stores tokens as ANTHROPIC_AUTH_TOKEN, but the Claude SDK/CLI
+    # expects different env vars per token kind (OAuth vs API key vs proxy).
+    # Doing this early means every downstream adapter/executor sees a
+    # consistent, correct env — no per-adapter detection needed.
+    from molecule_runtime.llm_auth import normalise_llm_env
+    print(normalise_llm_env().summary())
+
+    # 0.5 Initialise OpenTelemetry (no-op if packages not installed)
     setup_telemetry(service_name=workspace_id)
 
     # 1. Load config
