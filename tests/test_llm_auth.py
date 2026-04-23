@@ -123,3 +123,70 @@ def test_uses_os_environ_by_default(monkeypatch):
     assert r.detected_kind == "oauth"
     assert os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-real"
     assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+
+
+def test_strips_whitespace_and_newlines_from_token():
+    env = {"ANTHROPIC_AUTH_TOKEN": "  sk-ant-oat01-abc\n"}
+    r = normalise_llm_env(env)
+    assert r.detected_kind == "oauth"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-abc"
+    # Trailing newline must not survive into the renamed var
+    assert "\n" not in env["CLAUDE_CODE_OAUTH_TOKEN"]
+    assert " " not in env["CLAUDE_CODE_OAUTH_TOKEN"]
+
+
+def test_unknown_prefix_does_not_leak_token_to_warning():
+    # Security: warning must not contain any bytes of the secret.
+    sensitive = "ghs_supersecrettoken123"
+    env = {"ANTHROPIC_AUTH_TOKEN": sensitive}
+    r = normalise_llm_env(env)
+    assert r.detected_kind == "unknown"
+    assert r.warning is not None
+    # No substring of the token — not even a prefix — is allowed in logs.
+    for i in range(4, len(sensitive)):
+        assert sensitive[:i] not in r.warning, (
+            f"token prefix leaked to warning: {sensitive[:i]!r} found in "
+            f"{r.warning!r}"
+        )
+
+
+def test_base_url_substring_false_positive_blocked():
+    # A hostile URL that contains 'anthropic.com' as a substring but is not
+    # actually Anthropic MUST still be cleared when switching to OAuth mode.
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-x",
+        "ANTHROPIC_BASE_URL": "https://proxy.anthropic.com.evil.example/",
+    }
+    r = normalise_llm_env(env)
+    assert r.detected_kind == "oauth"
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert "ANTHROPIC_BASE_URL" in r.cleared_vars
+
+
+def test_actual_anthropic_base_url_preserved():
+    for url in (
+        "https://api.anthropic.com",
+        "https://api.anthropic.com/v1",
+        "http://api.anthropic.com/",  # plain http unlikely but shouldn't crash
+    ):
+        env = {
+            "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-x",
+            "ANTHROPIC_BASE_URL": url,
+        }
+        normalise_llm_env(env)
+        assert env.get("ANTHROPIC_BASE_URL") == url, (
+            f"native Anthropic URL {url!r} should be preserved, got "
+            f"{env.get('ANTHROPIC_BASE_URL')!r}"
+        )
+
+
+def test_malformed_base_url_does_not_crash():
+    # If the URL is garbled, the normaliser shouldn't crash — fall through
+    # to clearing it, which is the safe choice for OAuth mode.
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-x",
+        "ANTHROPIC_BASE_URL": "not a url",
+    }
+    r = normalise_llm_env(env)
+    assert r.detected_kind == "oauth"
+    assert "ANTHROPIC_BASE_URL" not in env

@@ -55,6 +55,33 @@ class NormalisationResult:
         return line
 
 
+# Anthropic's native API hostnames. Treat as "direct Anthropic" for OAuth /
+# API-key mode. Anything else in ANTHROPIC_BASE_URL is assumed to be a proxy
+# and gets cleared when we switch to direct-Anthropic auth.
+_ANTHROPIC_NATIVE_HOSTS = frozenset({
+    "api.anthropic.com",
+    "anthropic.com",
+})
+
+
+def _is_native_anthropic_base_url(base_url: str) -> bool:
+    """Return True only if the base URL points at an Anthropic-native host.
+
+    Substring matching on ``"anthropic.com"`` would falsely accept
+    ``https://my-proxy.anthropic.com.evil.example/`` — parse the URL
+    properly and compare the exact hostname.
+    """
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(base_url).hostname or "").lower().strip()
+    except Exception:
+        return False
+    return host in _ANTHROPIC_NATIVE_HOSTS
+
+
 def _prefix_of(token: str) -> str:
     """Classify a token string by its well-known prefix."""
     if token.startswith("sk-ant-oat01-"):
@@ -100,15 +127,21 @@ def normalise_llm_env(env: Optional[dict[str, str]] = None) -> NormalisationResu
         # Base URL is irrelevant for OAuth mode; remove the proxy URL
         # so the SDK uses Claude defaults.
         base = env.get("ANTHROPIC_BASE_URL", "")
-        if base and "anthropic.com" not in base:
+        if base and not _is_native_anthropic_base_url(base):
             env.pop("ANTHROPIC_BASE_URL", None)
             result.cleared_vars.append("ANTHROPIC_BASE_URL")
         return result
 
-    # No explicit CLAUDE_CODE_OAUTH_TOKEN — detect from ANTHROPIC_AUTH_TOKEN
-    tok = env.get("ANTHROPIC_AUTH_TOKEN", "")
+    # No explicit CLAUDE_CODE_OAUTH_TOKEN — detect from ANTHROPIC_AUTH_TOKEN.
+    # Strip whitespace because operators frequently paste tokens with
+    # trailing newlines from terminals, and the SDK will reject those as
+    # malformed before auth is even attempted.
+    raw_tok = env.get("ANTHROPIC_AUTH_TOKEN", "")
+    tok = raw_tok.strip()
     if not tok:
         return result
+    if tok != raw_tok:
+        env["ANTHROPIC_AUTH_TOKEN"] = tok  # persist the cleaned value
 
     kind = _prefix_of(tok)
     result.detected_kind = kind
@@ -120,7 +153,7 @@ def normalise_llm_env(env: Optional[dict[str, str]] = None) -> NormalisationResu
         result.renamed_to = "CLAUDE_CODE_OAUTH_TOKEN"
         # Proxy base URL must go — OAuth flow uses Anthropic's own endpoint
         base = env.get("ANTHROPIC_BASE_URL", "")
-        if base and "anthropic.com" not in base:
+        if base and not _is_native_anthropic_base_url(base):
             env.pop("ANTHROPIC_BASE_URL", None)
             result.cleared_vars.append("ANTHROPIC_BASE_URL")
 
@@ -135,7 +168,7 @@ def normalise_llm_env(env: Optional[dict[str, str]] = None) -> NormalisationResu
         result.renamed_to = "ANTHROPIC_API_KEY"
         # Clear proxy base URL for direct Anthropic calls
         base = env.get("ANTHROPIC_BASE_URL", "")
-        if base and "anthropic.com" not in base:
+        if base and not _is_native_anthropic_base_url(base):
             env.pop("ANTHROPIC_BASE_URL", None)
             result.cleared_vars.append("ANTHROPIC_BASE_URL")
 
@@ -152,12 +185,14 @@ def normalise_llm_env(env: Optional[dict[str, str]] = None) -> NormalisationResu
             )
 
     else:
-        # unknown — be conservative, leave env untouched but warn
+        # unknown — be conservative, leave env untouched but warn.
+        # Do NOT include the token value in the warning. Even a prefix
+        # leaks bytes of a secret into logs (which get shipped to
+        # Langfuse / CloudWatch / sentry / slack-firehose).
         result.warning = (
-            "ANTHROPIC_AUTH_TOKEN has an unrecognised prefix "
-            f"{tok[:12] + '…' if len(tok) > 12 else tok!r}; "
-            "not normalising. If this is a proxy token, prefix convention "
-            "is sk-cp-*; OAuth is sk-ant-oat01-*; API key is sk-ant-api03-*."
+            "ANTHROPIC_AUTH_TOKEN has an unrecognised prefix; not "
+            "normalising. Known prefixes: sk-ant-oat01-* (OAuth), "
+            "sk-ant-api03-* (API key), sk-cp-* (proxy)."
         )
 
     return result
