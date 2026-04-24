@@ -84,6 +84,15 @@ async def main():  # pragma: no cover
     from molecule_runtime.credential_helper import install_credential_helper
     install_credential_helper()
 
+    # 0.2 Pre-commit hook installer — refuse commits that add internal-flavored
+    # paths to the public monorepo. Runs at the agent's local git, so leaks
+    # get instant feedback with the redirect command in the same response
+    # cycle the agent ran `git commit` in. Hook is a no-op in non-public
+    # repos (internal, plugins, templates, third-party). See precommit_hook.py
+    # for the full rationale.
+    from molecule_runtime.precommit_hook import install_pre_commit_hook
+    install_pre_commit_hook()
+
     # 0.5 Initialise OpenTelemetry (no-op if packages not installed)
     setup_telemetry(service_name=workspace_id)
 
