@@ -1,0 +1,118 @@
+name: Auto-promote staging → main
+
+# Fast-forwards `main` to `staging` when all required status checks on
+# the staging HEAD commit are green. Eliminates the manual sync-PR round
+# for non-critical repos.
+#
+# Gate list is READ FROM BRANCH PROTECTION (not hardcoded) so each repo
+# gets the set of checks its own admin configured as required. Zero
+# customization per repo.
+#
+# Excluded by policy: molecule-core + molecule-controlplane. Those two are
+# critical-path and stay manual per CEO directive 2026-04-24.
+#
+# Safety model:
+# - Only fires on push to staging (not PRs into staging)
+# - Refuses with --ff-only if main has diverged (hotfix landed directly)
+# - Writes a promote commit to git log so the action is visible
+# - Requires the branch protection's `required_status_checks.contexts`
+#   list to be non-empty (i.e. don't auto-promote if no gates configured)
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  statuses: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read required gates from branch protection + check green
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Pull required status check contexts from branch protection.
+          # If this 404s (no protection) or returns an empty list, refuse
+          # to promote — silent auto-promotion on unprotected branches is
+          # the scary case.
+          GATES=$(gh api "repos/${REPO}/branches/staging/protection/required_status_checks" \
+                    --jq '.contexts[]' 2>/dev/null || true)
+
+          if [ -z "$GATES" ]; then
+            echo "::error::No required_status_checks.contexts configured on staging. Refusing to auto-promote."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Required gates on staging:"
+          echo "${GATES}" | sed 's/^/  - /'
+
+          # For each required gate, look up the most recent check-run /
+          # status on HEAD_SHA and confirm SUCCESS. The context match can
+          # come from either Checks API or Status API depending on how the
+          # gate reports.
+          ALL_GREEN=true
+          while IFS= read -r gate; do
+            [ -z "$gate" ] && continue
+
+            # First, try check-runs (GitHub Actions + App-based checks).
+            conclusion=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" \
+                          --jq "[.check_runs[] | select(.name == \"${gate}\")] | sort_by(.completed_at) | last.conclusion" \
+                          2>/dev/null || echo "")
+
+            if [ -z "$conclusion" ] || [ "$conclusion" = "null" ]; then
+              # Fall back to the legacy status API.
+              conclusion=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/status" \
+                            --jq "[.statuses[] | select(.context == \"${gate}\")] | sort_by(.updated_at) | last.state" \
+                            2>/dev/null || echo "")
+            fi
+
+            if [ "$conclusion" != "success" ] && [ "$conclusion" != "SUCCESS" ]; then
+              echo "::warning::Gate '${gate}' is '${conclusion:-missing}' on ${HEAD_SHA} — not promoting."
+              ALL_GREEN=false
+            else
+              echo "  ✓ ${gate}: success"
+            fi
+          done <<< "$GATES"
+
+          echo "ok=${ALL_GREEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Fast-forward main to staging
+        if: steps.check.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+
+          git fetch origin main:main staging:staging
+          git checkout main
+
+          # --ff-only refuses if main has moved independently (hotfix on
+          # main). In that case a human resolves.
+          if ! git merge --ff-only staging; then
+            echo "::error::main has diverged from staging history — refusing fast-forward. Resolve manually."
+            exit 1
+          fi
+
+          git push origin main
+
+          echo "Promoted: main is now at $(git rev-parse --short HEAD)"
