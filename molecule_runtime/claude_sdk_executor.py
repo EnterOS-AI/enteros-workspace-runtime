@@ -65,10 +65,11 @@ _NO_TEXT_MSG = "Error: message contained no text content."
 _NO_RESPONSE_MSG = "(no response generated)"
 _MAX_RETRIES = 3
 _BASE_RETRY_DELAY_S = 5
-# Cap for stderr captured from the CLI subprocess in the executor log. Keeps
-# log lines bounded while still surfacing enough context to diagnose crashes.
-# Fixes #66 (previously the executor logged nothing beyond the generic
-# "Check stderr output for details" message).
+# Cap for stderr captured from the CLI subprocess in the executor log and
+# surfaced in A2A error responses. 1 KB keeps log lines bounded while still
+# surfacing enough context to diagnose crashes. Fixes #66 (previously the
+# executor logged nothing beyond the generic "Check stderr output for
+# details" message).
 _PROCESS_ERROR_STDERR_MAX_CHARS = 4096
 
 # Substrings in error messages that indicate a transient failure worth retrying.
@@ -453,10 +454,14 @@ class ClaudeSDKExecutor(AgentExecutor):
                     # Non-retryable or exhausted retries. Log exit_code +
                     # stderr explicitly (fixes #66) so operators don't have
                     # to reproduce the crash manually to find out why the
-                    # subprocess died.
+                    # subprocess died. Surface the first ~1 KB of stderr in
+                    # the A2A response so clients can show actionable context.
                     logger.error("SDK agent error [claude-code]: %s", formatted)
                     logger.exception("SDK agent error [claude-code] — full traceback follows")
-                    response_text = sanitize_agent_error(exc)
+                    exc_stderr = getattr(exc, "stderr", None)
+                    if exc_stderr:
+                        exc_stderr = exc_stderr[:1024]
+                    response_text = sanitize_agent_error(exc, stderr=exc_stderr)
                     break
         finally:
             await set_current_task(self.heartbeat, "")
