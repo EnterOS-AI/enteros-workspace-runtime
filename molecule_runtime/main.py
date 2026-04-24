@@ -74,6 +74,16 @@ async def main():  # pragma: no cover
     from molecule_runtime.llm_auth import normalise_llm_env
     print(normalise_llm_env().summary())
 
+    # 0.1 GitHub credential helper installer — extracts bundled .sh scripts,
+    # configures git, starts refresh daemon, primes gh CLI. Eliminates the
+    # per-template wiring that caused #1933 (claude-code-default template
+    # shipped without the wiring; 39 workspaces lost their tokens after the
+    # ~60min installation-token TTL). Fails-soft so a missing git/gh binary
+    # doesn't block runtime startup. See credential_helper.py for the full
+    # rationale.
+    from molecule_runtime.credential_helper import install_credential_helper
+    install_credential_helper()
+
     # 0.5 Initialise OpenTelemetry (no-op if packages not installed)
     setup_telemetry(service_name=workspace_id)
 
