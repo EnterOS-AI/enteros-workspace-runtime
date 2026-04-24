@@ -76,10 +76,20 @@ async def send_a2a_message(target_url: str, message: str) -> str:
                     return f"{_A2A_ERROR_PREFIX}{text}"
                 return text
             elif "error" in data:
-                return f"{_A2A_ERROR_PREFIX}{data['error'].get('message', 'unknown')}"
+                err = data["error"]
+                msg = err.get("message") or "unknown"
+                code = err.get("code")
+                if code is not None:
+                    return f"{_A2A_ERROR_PREFIX}[code={code}] {msg}"
+                return f"{_A2A_ERROR_PREFIX}{msg}"
             return str(data)
         except Exception as e:
-            return f"{_A2A_ERROR_PREFIX}{e}"
+            # #51: str(e) is empty for bare TimeoutError(), BrokenPipeError(),
+            # and several httpx transport errors — leaving "[A2A_ERROR] " with
+            # no diagnostic. Fall back to the exception class name so logs
+            # always carry at least one actionable breadcrumb.
+            detail = str(e) or type(e).__name__
+            return f"{_A2A_ERROR_PREFIX}{detail}"
 
 
 async def get_peers() -> list[dict]:
