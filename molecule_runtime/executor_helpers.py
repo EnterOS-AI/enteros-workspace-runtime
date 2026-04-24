@@ -409,6 +409,7 @@ def classify_subprocess_error(stderr_text: str, exit_code: int | None) -> str:
 def sanitize_agent_error(
     exc: BaseException | None = None,
     category: str | None = None,
+    stderr: str | None = None,
 ) -> str:
     """Render an agent-side failure into a user-safe error message.
 
@@ -416,7 +417,12 @@ def sanitize_agent_error(
     category string (e.g. from `classify_subprocess_error`). If both are
     given, `category` wins. If neither, the tag defaults to "unknown".
 
-    The message body is deliberately dropped — exception messages and
+    `stderr` is the first ~1 KB of captured subprocess stderr — it is
+    included verbatim in the returned message so callers can surface it in
+    A2A error responses. The caller is responsible for the cap; this
+    function does not truncate.
+
+    The message body is deliberately simple — exception messages and
     subprocess stderr frequently leak stack traces, paths, tokens, and
     API keys. Full detail is available in the workspace logs via
     `logger.exception()` / `logger.error()`.
@@ -427,4 +433,7 @@ def sanitize_agent_error(
         tag = type(exc).__name__
     else:
         tag = "unknown"
-    return f"Agent error ({tag}) — see workspace logs for details."
+    msg = f"Agent error ({tag})"
+    if stderr:
+        msg += f": {stderr}"
+    return msg
