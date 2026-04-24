@@ -225,9 +225,14 @@ async def main():  # pragma: no cover
     # anywhere else produces 404 on every inbound A2A and silent fleet-
     # wide productivity loss (baseline restart 2026-04-24: 0 delegations
     # for 2 cycles until this was traced to `/api/v1/jsonrpc/`).
+    # enable_v0_3_compat=True because the platform sends v0.3-shaped
+    # JSON-RPC requests (`message/send`, `tasks/get`, etc.) that the
+    # 1.x dispatcher rejects as "Method not found" without the compat
+    # shim. The v0.3 adapter recognizes those names and routes them to
+    # the handler's on_message_send / on_get_task / etc.
     routes = []
     routes.extend(create_agent_card_routes(agent_card))
-    routes.extend(create_jsonrpc_routes(handler, "/"))
+    routes.extend(create_jsonrpc_routes(handler, "/", enable_v0_3_compat=True))
     app = Starlette(routes=routes)
 
     # 8. Register with platform
