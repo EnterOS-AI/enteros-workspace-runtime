@@ -39,8 +39,9 @@ import uuid
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
-from a2a.types import Part, TextPart
-from a2a.utils import new_agent_text_message
+# a2a.utils and TextPart removed in a2a-sdk 1.x; use a2a.helpers + flat Part
+from a2a.types import Part
+from a2a.helpers import new_text_message
 from molecule_runtime.adapters.shared_runtime import (
     extract_history as _extract_history,
     extract_message_text,
@@ -214,7 +215,7 @@ class LangGraphA2AExecutor(AgentExecutor):
             parts = getattr(getattr(context, "message", None), "parts", None)
             logger.warning("A2A execute: no text content in message parts: %s", parts)
             await event_queue.enqueue_event(
-                new_agent_text_message("Error: message contained no text content.")
+                new_text_message("Error: message contained no text content.")
             )
             return ""
 
@@ -229,7 +230,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                 )
             except PromptInjectionError as exc:
                 await event_queue.enqueue_event(
-                    new_agent_text_message(f"Request blocked: {exc}")
+                    new_text_message(f"Request blocked: {exc}")
                 )
                 return ""
 
@@ -324,7 +325,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                                 texts = _extract_chunk_text(chunk.content)
                                 for text in texts:
                                     await updater.add_artifact(
-                                        parts=[Part(root=TextPart(text=text))],
+                                        parts=[Part(text=text)],
                                         artifact_id=artifact_id,
                                         append=has_streamed,  # False=first, True=append
                                         last_chunk=False,
@@ -384,7 +385,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                 #   immediately as the response (a2a_client.py reads .parts[0].text).
                 # Streaming: yielded as the last SSE event in the stream.
                 await event_queue.enqueue_event(
-                    new_agent_text_message(final_text, task_id=task_id, context_id=context_id)
+                    new_text_message(final_text, task_id=task_id, context_id=context_id)
                 )
                 _result = final_text
 
@@ -399,7 +400,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                 # Emit a Message so both streaming and non-streaming clients
                 # receive an error response rather than hanging.
                 await event_queue.enqueue_event(
-                    new_agent_text_message(
+                    new_text_message(
                         f"Agent error: {e}", task_id=task_id, context_id=context_id
                     )
                 )

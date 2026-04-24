@@ -10,6 +10,12 @@ Every known submodule + symbol used anywhere in `molecule_runtime/` is
 stubbed here, so test_imports.py (walking every module) + test_session_
 resume_gate.py (ClaudeSDKExecutor methods) + future tests all share one
 consistent stub set.
+
+NOTE: a2a-sdk 1.x (KI-009 migration) changed the module layout:
+- REMOVED: a2a.server.apps (A2AStarletteApplication)
+- REMOVED: a2a.utils
+- ADDED: a2a.server.routes (create_agent_card_routes, create_jsonrpc_routes)
+- ADDED: AgentInterface in a2a.types
 """
 from __future__ import annotations
 
@@ -60,19 +66,32 @@ if "claude_agent_sdk" not in sys.modules:
     sys.modules["claude_agent_sdk"] = sdk_stub
 
 # a2a + submodules — every import path in the package gets stubbed.
+# NOTE: a2a-sdk 1.x (KI-009 migration) removed a2a.server.apps and
+# a2a.utils; added a2a.server.routes. Update stubs accordingly.
 _A2A_MODULES: dict[str, list[str]] = {
     "a2a": [],
     "a2a.server": [],
-    "a2a.server.agent_execution": ["AgentExecutor", "RequestContext"],
+    "a2a.server.agent_execution": ["AgentExecutor", "RequestContext", "RequestContextBuilder"],
     "a2a.server.events": ["EventQueue"],
     "a2a.server.tasks": ["TaskUpdater", "InMemoryTaskStore"],
-    "a2a.server.apps": ["A2AStarletteApplication"],
+    "a2a.server.routes": [
+        "create_agent_card_routes",
+        "create_jsonrpc_routes",
+        "create_rest_routes",
+        "DefaultServerCallContextBuilder",
+    ],
     "a2a.server.request_handlers": ["DefaultRequestHandler"],
     "a2a.types": [
-        "Part", "TextPart", "AgentCard", "AgentCapabilities", "AgentSkill",
+        # TextPart removed in 1.x; Part is now flat (Part(text="...") instead of Part(root=TextPart(...)))
+        "Part", "AgentCard", "AgentCapabilities", "AgentSkill",
+        "AgentInterface",  # added in a2a-sdk 1.x
         "TaskStatus", "TaskState", "TaskStatusUpdateEvent",
     ],
-    "a2a.utils": ["new_agent_text_message"],
+    "a2a.helpers": [
+        # Added in 1.x; replaces a2a.utils
+        "new_text_message", "new_task", "new_artifact",
+        "get_message_text", "get_text_parts",
+    ],
 }
 for dotted, attrs in _A2A_MODULES.items():
     mod = _ensure_package(dotted)

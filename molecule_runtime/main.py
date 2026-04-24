@@ -19,10 +19,11 @@ if _PKG_DIR not in sys.path:
 
 import httpx
 import uvicorn
-from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore
-from a2a.types import AgentCard, AgentCapabilities, AgentSkill
+from a2a.types import AgentCard, AgentCapabilities, AgentSkill, AgentInterface
+from starlette.applications import Starlette
 
 from molecule_runtime.adapters import get_adapter, AdapterConfig
 from molecule_runtime.config import load_config
@@ -155,11 +156,16 @@ async def main():  # pragma: no cover
         name=config.name,
         description=config.description or config.name,
         version=config.version,
-        url=workspace_url,
+        supported_interfaces=[
+            AgentInterface(
+                protocol_binding="JSONRPC",
+                url=f"{workspace_url}/",
+                protocol_version="1.0",
+            ),
+        ],
         capabilities=AgentCapabilities(
             streaming=config.a2a.streaming,
-            pushNotifications=config.a2a.push_notifications,
-            stateTransitionHistory=True,
+            push_notifications=config.a2a.push_notifications,
         ),
         skills=[
             AgentSkill(
@@ -171,8 +177,8 @@ async def main():  # pragma: no cover
             )
             for skill in loaded_skills
         ],
-        defaultInputModes=["text/plain", "application/json"],
-        defaultOutputModes=["text/plain", "application/json"],
+        default_input_modes=["text/plain", "application/json"],
+        default_output_modes=["text/plain", "application/json"],
     )
 
     # 7. Wrap in A2A.
@@ -189,12 +195,14 @@ async def main():  # pragma: no cover
     handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
+        agent_card=agent_card,
     )
 
-    app = A2AStarletteApplication(
-        agent_card=agent_card,
-        http_handler=handler,
-    )
+    # Build Starlette app from route factory functions (a2a-sdk 1.x API)
+    routes = []
+    routes.extend(create_agent_card_routes(agent_card))
+    routes.extend(create_jsonrpc_routes(handler, "/api/v1/jsonrpc/"))
+    app = Starlette(routes=routes)
 
     # 8. Register with platform
     agent_card_dict = {
@@ -303,7 +311,7 @@ async def main():  # pragma: no cover
     print(f"Workspace {workspace_id} starting on port {port}")
     # Wrap the ASGI app with W3C TraceContext extraction middleware so incoming
     # A2A HTTP requests propagate their trace context into _incoming_trace_context.
-    starlette_app = app.build()
+    starlette_app = app
 
     # Add /transcript route — exposes the most-recent agent session log
     # (claude-code reads ~/.claude/projects/<cwd>/<session>.jsonl). Other

@@ -13,9 +13,9 @@ license = {text = "BSL-1.1"}
 readme = "README.md"
 # Don't pin heavy deps — each adapter adds its own
 dependencies = [
-    # Upper bound: a2a-sdk 1.0.0 dropped the a2a.server.apps module we import
-    # in main.py. Keep on the 0.3.x line until we migrate to the 1.x API.
-    "a2a-sdk[http-server]>=0.3.25,<1.0",
+    # Migrated to a2a-sdk 1.x (KI-009). A2AStarletteApplication replaced by
+    # Starlette route factory functions (create_agent_card_routes, create_jsonrpc_routes).
+    "a2a-sdk[http-server]>=0.3.25",
     "httpx>=0.27.0",
     "uvicorn>=0.30.0",
     "starlette>=0.38.0",
