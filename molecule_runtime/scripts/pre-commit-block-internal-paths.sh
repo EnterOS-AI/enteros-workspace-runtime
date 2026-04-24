@@ -27,6 +27,22 @@ if [ -z "${GIT_AUTHOR_NAME:-}${GIT_COMMITTER_NAME:-}" ]; then
     exit 0
 fi
 
+# Skip during rebase / cherry-pick / merge / revert — these REPLAY existing
+# commits and the staged file set is whatever was already committed
+# upstream. Blocking those forces the agent to manually rewrite history
+# (interactive rebase + manual file deletion + commit amend) which most
+# agents won't do — net effect was 15+ DIRTY PRs sitting unmergeable on
+# molecule-core after the hook landed (cycle 107 trace, 2026-04-24).
+#
+# Detection via .git state directories. These exist only during the
+# corresponding operation and get cleaned up at the end.
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null || echo .git)
+for state_dir in rebase-merge rebase-apply CHERRY_PICK_HEAD MERGE_HEAD REVERT_HEAD; do
+    if [ -e "${GIT_DIR}/${state_dir}" ]; then
+        exit 0
+    fi
+done
+
 # Determine if we're in a public Molecule-AI repo. `git remote get-url`
 # returns nothing in repos without a remote (fine — exit clean).
 REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
