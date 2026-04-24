@@ -217,10 +217,17 @@ async def main():  # pragma: no cover
         agent_card=agent_card,
     )
 
-    # Build Starlette app from route factory functions (a2a-sdk 1.x API)
+    # Build Starlette app from route factory functions (a2a-sdk 1.x API).
+    # JSON-RPC mounts at root because the platform's ProxyA2A (the only
+    # caller in this deployment) POSTs to `http://ws-<id>:8000/` — no
+    # path suffix. See workspace-server/internal/provisioner.InternalURL
+    # which returns the Docker-DNS form without a path. Mounting
+    # anywhere else produces 404 on every inbound A2A and silent fleet-
+    # wide productivity loss (baseline restart 2026-04-24: 0 delegations
+    # for 2 cycles until this was traced to `/api/v1/jsonrpc/`).
     routes = []
     routes.extend(create_agent_card_routes(agent_card))
-    routes.extend(create_jsonrpc_routes(handler, "/api/v1/jsonrpc/"))
+    routes.extend(create_jsonrpc_routes(handler, "/"))
     app = Starlette(routes=routes)
 
     # 8. Register with platform
