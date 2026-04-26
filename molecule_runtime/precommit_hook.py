@@ -1,35 +1,40 @@
-"""Pre-commit hook installer — block internal-flavored paths in public monorepo.
+"""Pre-commit hook installer — secret scan + internal-paths block.
 
 Companion to ``credential_helper`` (#1933). Lifts the per-template wiring
 that would otherwise need to live in each Dockerfile + entrypoint.sh:
 copy the hook script to a known location, set ``core.hooksPath`` so git
-finds it, and now every ``git commit`` inside the public monorepo gets a
-local refusal with the redirect command in the same error.
+finds it, and now every ``git commit`` runs through two defense-in-depth
+gates with the recovery command printed in the same error.
+
+Two gates, single hook file
+===========================
+
+The bundled ``pre-commit-checks.sh`` runs:
+
+1. **Secret scan** — ALL repos. Refuses any commit whose staged
+   additions contain a recognisable credential (GitHub PAT/installation
+   tokens, Anthropic / OpenAI / Slack / AWS keys). Catches the leak
+   regardless of how the secret arrived in the working tree (npm
+   copying ``_authToken`` into ``package.json``, an agent persisting
+   its own ``GITHUB_TOKEN`` to a config file, etc.).
+
+2. **Internal-paths block** — ``Molecule-AI/molecule-monorepo`` and
+   ``Molecule-AI/molecule-core`` only. Refuses commits that add
+   ``research/``, ``marketing/``, etc. to the public monorepo with a
+   redirect to ``Molecule-AI/internal``.
+
+Both gates skip during rebase / cherry-pick / merge / revert (they
+replay existing commits and blocking would force interactive history
+rewriting).
 
 Why a local hook is the right layer
 ===================================
 
-Agents try to ``git add /research/foo.md`` despite SHARED_RULES, the
-``.gitignore`` patterns, and the CI gate. Each leak attempt costs ~5
-cycles: PR opens, CI fails (now that ``Block forbidden paths`` is
-required), agent retries with workaround. Pollutes git history with
-reverts.
-
-A pre-commit hook converts the failure from "PR opens then fails 5
-minutes later" to "commit refused immediately, with the recovery
-command printed in the same response cycle the agent ran ``git commit``
-in." Agents act on what's in the current response context — putting the
-redirect command literally in the error message they see is the highest
-density of feedback we can provide.
-
-Scoped to public monorepo only
-==============================
-
-The hook checks ``git remote get-url origin`` and only enforces when the
-repo is ``Molecule-AI/molecule-monorepo`` or ``Molecule-AI/molecule-core``.
-Inside ``Molecule-AI/internal`` (where ``research/``, ``marketing/``
-etc. legitimately belong) the hook is a no-op. Same for plugin /
-template / third-party repos.
+Agents act on what's in the current response context. A pre-commit hook
+converts "PR opens then fails 5 minutes later" into "commit refused
+immediately, with the recovery command printed in the same response
+cycle the agent ran ``git commit`` in." That's the highest density of
+feedback we can provide.
 
 Idempotence + non-clobber
 =========================
@@ -53,7 +58,7 @@ log = logging.getLogger(__name__)
 
 _HOOKS_DIR = Path(os.environ.get("HOME", "/home/agent")) / ".molecule-runtime" / "git-hooks"
 _HOOK_SCRIPT_NAME = "pre-commit"
-_BUNDLED_SCRIPT = "pre-commit-block-internal-paths.sh"
+_BUNDLED_SCRIPT = "pre-commit-checks.sh"
 
 
 def _existing_hooks_path() -> str | None:
