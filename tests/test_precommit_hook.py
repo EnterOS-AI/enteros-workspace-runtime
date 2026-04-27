@@ -139,3 +139,25 @@ def test_secret_scan_runs_on_third_party_repos(repo: Path) -> None:
     )
     assert result.returncode != 0, "secret scan must fire even without a Molecule-AI remote"
     assert "sk-ant-" in result.stderr
+
+
+@pytest.mark.skipif(_BASH is None, reason="bash not on PATH")
+def test_secret_scan_catches_minimax_sk_cp_token(repo: Path) -> None:
+    """Lock for the F1088 incident — a MiniMax sk-cp-* token leaked in
+    plaintext, undetected by the original pattern set because sk-cp- was
+    never in it. Pattern added retroactively; this test guards against
+    accidental removal."""
+    leaky = repo / "config.yml"
+    # Fake-but-pattern-matching token: 65 chars after the sk-cp- prefix.
+    leaky.write_text(
+        "minimax_key: sk-cp-FAKE_DO_NOT_USE_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+    )
+    _run(["git", "add", "config.yml"], cwd=repo).check_returncode()
+
+    result = _run(
+        ["git", "commit", "-m", "config: minimax", "--no-gpg-sign"],
+        cwd=repo,
+        env={"GIT_AUTHOR_NAME": "test-agent", "GIT_COMMITTER_NAME": "test-agent"},
+    )
+    assert result.returncode != 0, "secret scan must catch sk-cp- MiniMax tokens"
+    assert "sk-cp-" in result.stderr
