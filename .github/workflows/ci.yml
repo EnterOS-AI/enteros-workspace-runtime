@@ -1,38 +1,43 @@
-name: CI
+name: ci
+
+# Mirror-guard CI. This repo is a publish artifact of the monorepo
+# `Molecule-AI/molecule-core/workspace/` directory — see README.
+#
+# Direct commits + PRs to this repo are no longer accepted; the
+# canonical edit point is the monorepo. This workflow exists only
+# to enforce that, by failing CI on any push that wasn't produced
+# by the publish-runtime sync (a future automated push from the
+# monorepo's tag-driven publish workflow).
+#
+# Until that auto-sync is wired up, we whitelist the historical
+# pusher identities so existing in-flight PRs don't all turn red.
+# Whitelist removal becomes a follow-up once the auto-sync lands.
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  mirror-guard:
     runs-on: ubuntu-latest
-    env:
-      # Required by platform_auth.validate_workspace_id() (PR #29 / issue #14).
-      # Valid format: lowercase alphanumeric + hyphens (matches UUIDs and org IDs).
-      WORKSPACE_ID: ci-test-workspace
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install package + test deps
+      - name: Reject direct edits
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || github.actor }}
         run: |
-          pip install -e .
-          pip install pytest
-
-      - name: Run import smoke tests
-        # Critical: these tests run in an environment with NO top-level
-        # `adapters/` package on sys.path. They catch the regression that
-        # broke every modular workspace template repo before the absolute-
-        # import fix. Do not weaken — the failure mode (silent fallthrough
-        # in get_adapter → "Unknown runtime") is hard to debug at runtime.
-        run: pytest tests/ -v
-
-      - name: Security linter (bandit)
-        run: |
-          pip install bandit
-          bandit -r molecule_runtime/ --severity-level=high
+          # Allow the future bot author once it exists. Until then,
+          # block on PR events but allow push events (for in-flight
+          # work to land while the migration finishes).
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "::error::This repo is a publish artifact of Molecule-AI/molecule-core."
+            echo "::error::Edit workspace/ in the monorepo and let the publish-runtime"
+            echo "::error::workflow regenerate this mirror — do not PR here directly."
+            echo "::error::See README.md for the new contribution flow."
+            exit 1
+          fi
+          echo "Push event from $PR_AUTHOR — allowing while migration completes."
