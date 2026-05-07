@@ -2,7 +2,7 @@
 
 > **⚠️ This repo is a publish artifact, not the source of truth.**
 >
-> Runtime code lives in **[`Molecule-AI/molecule-core` → `workspace/`](https://github.com/Molecule-AI/molecule-core/tree/main/workspace)**. This repo is regenerated and republished from there by the [`publish-runtime`](https://github.com/Molecule-AI/molecule-core/blob/main/.github/workflows/publish-runtime.yml) workflow on every `runtime-v*` tag.
+> Runtime code lives in **[`Molecule-AI/molecule-core` → `workspace/`](https://git.moleculesai.app/molecule-ai/molecule-core/tree/main/workspace)**. This repo is regenerated and republished from there by the [`publish-runtime`](https://git.moleculesai.app/molecule-ai/molecule-core/blob/main/.github/workflows/publish-runtime.yml) workflow on every `runtime-v*` tag.
 >
 > **Don't edit files here directly.** PRs against this repo will not be merged. Open them against `molecule-core` instead.
 
@@ -42,12 +42,12 @@ The runtime discovers adapters in two ways:
 ## Contributing
 
 **Don't open PRs here.** Send your change to
-[`Molecule-AI/molecule-core`](https://github.com/Molecule-AI/molecule-core)
+[`Molecule-AI/molecule-core`](https://git.moleculesai.app/molecule-ai/molecule-core)
 under the `workspace/` directory. After your PR merges to main and a
-`runtime-v*` tag is pushed, the [`publish-runtime`](https://github.com/Molecule-AI/molecule-core/blob/main/.github/workflows/publish-runtime.yml)
+`runtime-v*` tag is pushed, the [`publish-runtime`](https://git.moleculesai.app/molecule-ai/molecule-core/blob/main/.github/workflows/publish-runtime.yml)
 workflow rebuilds this mirror + uploads the new wheel to PyPI.
 
-See [`docs/workspace-runtime-package.md`](https://github.com/Molecule-AI/molecule-core/blob/main/docs/workspace-runtime-package.md)
+See [`docs/workspace-runtime-package.md`](https://git.moleculesai.app/molecule-ai/molecule-core/blob/main/docs/workspace-runtime-package.md)
 for the full publishing flow.
 
 ## Why this split
@@ -59,4 +59,4 @@ payloads). A monorepo edit + auto-publish pipeline gives both: atomic
 cross-cutting changes, plus a clean PyPI release on every tag.
 
 For the back-history of why this repo previously was the source of truth
-and the drift that caused: see issue [`Molecule-AI/molecule-core#2103`](https://github.com/Molecule-AI/molecule-core/pull/2103).
+and the drift that caused: see issue [`Molecule-AI/molecule-core#2103`](https://git.moleculesai.app/molecule-ai/molecule-core/pull/2103).
