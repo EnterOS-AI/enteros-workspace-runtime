@@ -1,7 +1,7 @@
 name: ci
 
 # Mirror-guard CI. This repo is a publish artifact of the monorepo
-# `Molecule-AI/molecule-core/workspace/` directory — see README.
+# `molecule-ai/molecule-core/workspace/` directory — see README.
 #
 # Direct commits + PRs to this repo are no longer accepted; the
 # canonical edit point is the monorepo. This workflow exists only
@@ -34,7 +34,7 @@ jobs:
           # block on PR events but allow push events (for in-flight
           # work to land while the migration finishes).
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "::error::This repo is a publish artifact of Molecule-AI/molecule-core."
+            echo "::error::This repo is a publish artifact of molecule-ai/molecule-core."
             echo "::error::Edit workspace/ in the monorepo and let the publish-runtime"
             echo "::error::workflow regenerate this mirror — do not PR here directly."
             echo "::error::See README.md for the new contribution flow."
