@@ -4,18 +4,25 @@
 Exposes A2A delegation, peer discovery, and workspace info as MCP tools
 so CLI-based runtimes (Claude Code, Codex) can communicate with other workspaces.
 
-Launched automatically by main.py for CLI runtimes. Runs on stdio transport
-and is configured as a local MCP server for the claude --print invocation.
+Two transports:
+  stdio  — default; JSON-RPC over stdin/stdout. Used by Claude Code CLI.
+  http   — MCP over HTTP/SSE. Used by Hermes runtime which is MCP-native.
+
+Launched automatically by main.py for CLI runtimes (stdio) or by the Hermes
+template's start.sh (http on :9100). Configured as a local MCP server for
+the claude --print invocation.
 
 Environment variables (set by the workspace container):
   WORKSPACE_ID  — this workspace's ID
   PLATFORM_URL  — platform API base URL (e.g. http://platform:8080)
 """
 
+import argparse
 import asyncio
 import json
 import logging
 import sys
+import uuid
 
 # Absolute imports so the installed-package location works too. Previously
 # the script relied on `/app` being on sys.path (legacy template layout),
@@ -262,7 +269,7 @@ async def handle_tool_call(name: str, arguments: dict) -> str:
 
 # --- MCP Server (JSON-RPC over stdio) ---
 
-async def main():  # pragma: no cover
+async def _handle_stdio():
     """Run MCP server on stdio — reads JSON-RPC requests, writes responses."""
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
@@ -344,6 +351,163 @@ async def main():  # pragma: no cover
         except Exception as e:
             logger.error(f"MCP server error: {e}")
             break
+
+
+# --- HTTP/SSE Transport (for Hermes runtime) ---
+
+# Per-connection pending request queue.
+# Maps (connection-id) → asyncio.Queue of JSON-RPC responses.
+_connection_queues: dict[str, asyncio.Queue] = {}
+_connection_lock = asyncio.Lock()
+
+
+async def _sse_broadcaster(request_id: str, response: dict, conn_id: str):
+    """Send a JSON-RPC response to a specific SSE connection."""
+    async with _connection_lock:
+        queue = _connection_queues.get(conn_id)
+    if queue is not None:
+        await queue.put(response)
+
+
+async def _handle_http_mcp(request) -> dict:
+    """Handle an incoming JSON-RPC request over HTTP. Returns the JSON-RPC response."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+
+    req_id = body.get("id")
+    method = body.get("method", "")
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "a2a-delegation", "version": "1.0.0"},
+            },
+        }
+
+    elif method == "notifications/initialized":
+        return None  # No response needed
+
+    elif method == "tools/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+
+    elif method == "tools/call":
+        params = body.get("params", {})
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+        result_text = await handle_tool_call(tool_name, tool_args)
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": result_text}]},
+        }
+
+    else:
+        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+
+
+async def _run_http_server(port: int):
+    """Run MCP server over HTTP/SSE — compatible with Hermes MCP-native agents."""
+    try:
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        from starlette.responses import JSONResponse, Response
+    except ImportError:
+        logger.error("HTTP transport requires starlette — already in molecule-runtime deps")
+        return
+
+    _connection_queues.clear()
+
+    async def mcp_handler(request):
+        """POST endpoint — receive and process JSON-RPC requests."""
+        conn_id = request.headers.get("x-mcp-conn-id", "default")
+        response = await _handle_http_mcp(request)
+        if response is None:
+            return Response(status_code=202)
+        # Try to push via SSE; fall back to direct JSON response
+        async with _connection_lock:
+            queue = _connection_queues.get(conn_id)
+        if queue is not None and not queue.full():
+            await queue.put(response)
+            return Response(status_code=202)
+        # No SSE connection — return JSON directly (simpler clients)
+        return JSONResponse(response)
+
+    async def sse_handler(request):
+        """GET endpoint — SSE stream for push-based responses."""
+        conn_id = str(uuid.uuid4())[:8]
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+        async with _connection_lock:
+            _connection_queues[conn_id] = queue
+
+        async def event_stream():
+            yield "event: connected\ndata: {}\n\n".format(json.dumps({"conn_id": conn_id}))
+            try:
+                while True:
+                    response = await asyncio.wait_for(queue.get(), timeout=300)
+                    yield f"event: message\ndata: {json.dumps(response)}\n\n"
+                    if queue.empty():
+                        yield "event: heartbeat\ndata: {}\n\n"
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                async with _connection_lock:
+                    _connection_queues.pop(conn_id, None)
+
+        return Response(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    async def health_handler(_request):
+        return JSONResponse({"ok": True, "transport": "http+sse", "port": port})
+
+    app = Starlette(
+        routes=[
+            Route("/mcp", mcp_handler, methods=["POST"]),
+            Route("/mcp/stream", sse_handler, methods=["GET"]),
+            Route("/health", health_handler),
+        ]
+    )
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    logger.info(f"A2A MCP HTTP server listening on http://127.0.0.1:{port}/mcp")
+    await server.serve()
+
+
+async def main():  # pragma: no cover
+    """Entry point — select transport from CLI args or default to stdio."""
+    parser = argparse.ArgumentParser(description="A2A MCP Server")
+    parser.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio", "http"],
+        help="Transport mode: stdio (default) or http (HTTP+SSE for Hermes)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=9100,
+        help="TCP port for HTTP transport (default 9100)",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "http":
+        await _run_http_server(args.port)
+    else:
+        await _handle_stdio()
 
 
 if __name__ == "__main__":  # pragma: no cover
