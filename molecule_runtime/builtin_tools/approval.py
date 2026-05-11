@@ -32,7 +32,7 @@ RBAC denials emit an ``rbac / rbac.deny / denied`` event instead.
 
 Environment variables
 ---------------------
-PLATFORM_URL            Platform base URL            (default: http://platform:8080)
+PLATFORM_URL            Platform base URL            (default: http://host.docker.internal:8080)
 WORKSPACE_ID            This workspace's ID (validated at startup by platform_auth)
 APPROVAL_TIMEOUT        Max wait in seconds          (default: 300)
 APPROVAL_POLL_INTERVAL  Polling interval in seconds  (default: 5, polling path only)
@@ -55,7 +55,7 @@ from builtin_tools.validation import WorkspaceIdValidationError, get_validated_w
 
 logger = logging.getLogger(__name__)
 
-PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://platform:8080")
+PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
 from molecule_runtime.platform_auth import WORKSPACE_ID
 APPROVAL_POLL_INTERVAL = float(os.environ.get("APPROVAL_POLL_INTERVAL", "5"))
 APPROVAL_TIMEOUT = float(os.environ.get("APPROVAL_TIMEOUT", "300"))
