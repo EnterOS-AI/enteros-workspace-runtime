@@ -11,7 +11,7 @@ import httpx
 
 from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
 
-PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://platform:8080")
+PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")  # used only for tracing headers; URLs use validated version
 
 

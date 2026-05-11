@@ -14,7 +14,7 @@ the claude --print invocation.
 
 Environment variables (set by the workspace container):
   WORKSPACE_ID  — this workspace's ID
-  PLATFORM_URL  — platform API base URL (e.g. http://platform:8080)
+  PLATFORM_URL  — platform API base URL (default: http://host.docker.internal:8080)
 """
 
 import argparse

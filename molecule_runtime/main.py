@@ -63,7 +63,7 @@ from transcript_auth import transcript_authorized as _transcript_authorized
 async def main():  # pragma: no cover
     workspace_id = os.environ.get("WORKSPACE_ID", "workspace-default")
     config_path = os.environ.get("WORKSPACE_CONFIG_PATH", "/configs")
-    platform_url = os.environ.get("PLATFORM_URL", "http://platform:8080")
+    platform_url = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
     awareness_config = get_awareness_config()
 
     # 0. Normalise LLM auth env vars based on token type.
