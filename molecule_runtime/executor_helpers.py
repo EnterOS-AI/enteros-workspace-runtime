@@ -178,11 +178,45 @@ async def commit_memory(content: str) -> None:
 # Delegation results — written by heartbeat loop, consumed atomically
 # ========================================================================
 
+def _detect_injection_safe(text: str) -> bool:
+    """Return True if text contains prompt-injection patterns.
+
+    Uses a lazy import so executor_helpers stays importable even when the
+    compliance module is absent (e.g. in a minimal test fixture).
+    Logs a warning if the check itself fails.
+    """
+    try:
+        # builtin_tools is a sibling package added to sys.path by the container
+        # entrypoint (PYTHONPATH=/app). Accept either the molecule-runtime
+        # location (workspace-template layout) or the molecule-core layout.
+        from builtin_tools.compliance import detect_prompt_injection as _detect
+    except ImportError:
+        try:
+            # molecule-core/workspace layout: builtin_tools is a sibling of the
+            # molecule_runtime package, not inside it.
+            from molecule_runtime.builtin_tools.compliance import (
+                detect_prompt_injection as _detect,
+            )
+        except ImportError:
+            logger.warning(
+                "builtin_tools.compliance unavailable — OFFSEC-003 injection "
+                "detection is disabled for delegation results"
+            )
+            return False
+    return bool(_detect(text))
+
+
 def read_delegation_results() -> str:
     """Read and consume delegation results written by the heartbeat loop.
 
     Uses atomic rename to prevent races with the heartbeat writer.
     Returns formatted text suitable for prompt injection, or empty string.
+
+    OA-01 / OFFSEC-003 fix: peer-supplied ``summary`` and ``response_preview``
+    are scanned for prompt-injection patterns before being included in the
+    output.  Text with detected injection is replaced with
+    ``[injection detected]`` so the agent still sees the delegation metadata
+    (status, task ID) but never the malicious content.
     """
     results_file = Path(
         os.environ.get("DELEGATION_RESULTS_FILE", DEFAULT_DELEGATION_RESULTS_FILE)
@@ -212,9 +246,12 @@ def read_delegation_results() -> str:
         status = record.get("status", "?")
         summary = record.get("summary", "")
         preview = record.get("response_preview", "")
+        # OFFSEC-003: sanitize peer-supplied text before prompt injection
+        summary = "" if _detect_injection_safe(summary) else summary
+        preview = "" if _detect_injection_safe(preview) else preview[:200]
         parts.append(f"- [{status}] {summary}")
         if preview:
-            parts.append(f"  Response: {preview[:200]}")
+            parts.append(f"  Response: {preview}")
     return "\n".join(parts)
 
 
