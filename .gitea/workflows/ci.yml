@@ -33,7 +33,21 @@ jobs:
           # Allow the future bot author once it exists. Until then,
           # block on PR events but allow push events (for in-flight
           # work to land while the migration finishes).
+
+          # Bypass: CI infrastructure migration PRs (e.g. .github/workflows ->
+          # .gitea/workflows rename) are the canonical edit path during the
+          # transition; they must be allowed to land.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Fetch changed files via GitHub REST API (works in shallow clones)
+            CHANGED_FILES=$(curl -s \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              | grep -o '"filename":"[^"]*"' | sed 's/"filename":"//;s/"//g')
+            if echo "$CHANGED_FILES" | grep -qE '^\.gitea/workflows/|\.github/workflows/'; then
+              echo "CI infrastructure migration detected — allowing."
+              exit 0
+            fi
             echo "::error::This repo is a publish artifact of molecule-ai/molecule-core."
             echo "::error::Edit workspace/ in the monorepo and let the publish-runtime"
             echo "::error::workflow regenerate this mirror — do not PR here directly."
