@@ -2,7 +2,7 @@
 
 Delegations are non-blocking: the tool fires the A2A request in the background
 and returns immediately with a task_id. The agent can check status anytime via
-check_delegation_status, or just continue working and check later.
+check_task_status, or just continue working and check later.
 
 When the delegate responds, the result is stored and the agent is notified
 via a status update.
@@ -18,9 +18,8 @@ from typing import Optional
 import httpx
 from langchain_core.tools import tool
 
-from builtin_tools.audit import check_permission, get_workspace_roles, log_event
-from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
-from builtin_tools.telemetry import (
+from molecule_runtime.builtin_tools.audit import check_permission, get_workspace_roles, log_event
+from molecule_runtime.builtin_tools.telemetry import (
     A2A_SOURCE_WORKSPACE,
     A2A_TARGET_WORKSPACE,
     A2A_TASK_ID,
@@ -31,7 +30,7 @@ from builtin_tools.telemetry import (
 )
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
-from molecule_runtime.platform_auth import WORKSPACE_ID
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
 DELEGATION_RETRY_ATTEMPTS = int(os.environ.get("DELEGATION_RETRY_ATTEMPTS", "3"))
 DELEGATION_RETRY_DELAY = float(os.environ.get("DELEGATION_RETRY_DELAY", "5.0"))
 DELEGATION_TIMEOUT = float(os.environ.get("DELEGATION_TIMEOUT", "300.0"))
@@ -40,6 +39,13 @@ DELEGATION_TIMEOUT = float(os.environ.get("DELEGATION_TIMEOUT", "300.0"))
 class DelegationStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
+    # QUEUED: peer's a2a-proxy returned HTTP 202 + {queued: true}, meaning
+    # the peer is mid-task and the request was placed in a drain queue.
+    # The reply will arrive via the platform's stitch path when the
+    # peer finishes its current work. The LLM should WAIT, not retry,
+    # and definitely not fall back to doing the work itself — see the
+    # check_task_status docstring for the prompt-side guidance.
+    QUEUED = "queued"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -84,14 +90,9 @@ def _on_task_done(task: asyncio.Task):
 async def _notify_completion(task_id: str, target_workspace_id: str, status: str):
     """Push notification to platform when delegation completes/fails."""
     try:
-        ws_id = get_validated_workspace_id(caller="delegation._notify_completion")
-    except WorkspaceIdValidationError:
-        logger.debug("Delegation notify skipped: invalid WORKSPACE_ID")
-        return
-    try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/notify",
+                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/notify",
                 json={
                     "type": "delegation_complete",
                     "task_id": task_id,
@@ -109,17 +110,12 @@ async def _record_delegation_on_platform(task_id: str, target_workspace_id: str,
     Best-effort POST to /workspaces/<self>/delegations/record. The agent still
     fires A2A directly for speed + OTEL propagation, but the platform's
     GET /delegations endpoint now mirrors the same set an agent's local
-    check_delegation_status sees.
+    check_task_status sees.
     """
-    try:
-        ws_id = get_validated_workspace_id(caller="delegation._record_delegation_on_platform")
-    except WorkspaceIdValidationError:
-        logger.debug("Delegation record skipped: invalid WORKSPACE_ID")
-        return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/delegations/record",
+                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations/record",
                 json={
                     "target_id": target_workspace_id,
                     "task": task,
@@ -130,6 +126,69 @@ async def _record_delegation_on_platform(task_id: str, target_workspace_id: str,
         logger.debug("Delegation record failed (best-effort): %s", e)
 
 
+async def _refresh_queued_from_platform(task_id: str) -> bool:
+    """Lazy-refresh a QUEUED delegation's local state from the platform.
+
+    Called by check_task_status when local status is QUEUED. The
+    platform's drain stitch (a2a_queue.go) updates the delegate_result
+    activity_logs row when a queued delegation eventually completes,
+    but it has no callback to this runtime — without this lazy refresh,
+    the LLM polling check_task_status would see "queued" forever
+    even after the platform has the result.
+
+    Returns True if the local delegation was updated to a terminal state
+    (completed/failed), False otherwise. Best-effort — network/parse
+    errors leave the local state untouched and let the next call retry.
+    """
+    delegation = _delegations.get(task_id)
+    if not delegation:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations",
+                headers={},
+            )
+            if resp.status_code != 200:
+                return False
+            entries = resp.json()
+            if not isinstance(entries, list):
+                return False
+    except Exception as e:
+        logger.debug("refresh queued delegation %s: %s", task_id, e)
+        return False
+    # Find the latest delegate_result row matching our task_id.
+    # Platform list is newest-first; the first match is the freshest.
+    for entry in entries:
+        if entry.get("delegation_id") != task_id:
+            continue
+        if entry.get("type") != "delegation":
+            continue
+        # Only delegate_result rows carry the eventual outcome; the
+        # initial 'delegate' row stays at status='pending' even after
+        # the result lands. Filtering on summary text is brittle, but
+        # the rows from the LIST endpoint don't include `method`. The
+        # `delegate_result` rows are the ones with `error` (failure)
+        # or `response_preview` (success) populated — pick those.
+        status = entry.get("status", "")
+        if status == "completed":
+            delegation.status = DelegationStatus.COMPLETED
+            delegation.result = entry.get("response_preview", "")
+            await _notify_completion(task_id, delegation.workspace_id, "completed")
+            return True
+        if status == "failed":
+            delegation.status = DelegationStatus.FAILED
+            delegation.error = entry.get("error", "")
+            await _notify_completion(task_id, delegation.workspace_id, "failed")
+            return True
+        # status == "queued" / "pending" / "dispatched": platform hasn't
+        # resolved yet; leave local state unchanged so the next poll
+        # retries. Don't break — keep scanning in case there's a newer
+        # entry for the same task_id (possible if the same delegation
+        # was retried).
+    return False
+
+
 async def _update_delegation_on_platform(task_id: str, status: str, error: str = "", response_preview: str = ""):
     """Mirror status changes to the platform's activity_logs (#64 fix).
 
@@ -137,14 +196,9 @@ async def _update_delegation_on_platform(task_id: str, status: str, error: str =
     so the platform view stays in sync with the agent's local dict.
     """
     try:
-        ws_id = get_validated_workspace_id(caller="delegation._update_delegation_on_platform")
-    except WorkspaceIdValidationError:
-        logger.debug("Delegation update skipped: invalid WORKSPACE_ID")
-        return
-    try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/delegations/{task_id}/update",
+                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations/{task_id}/update",
                 json={
                     "status": status,
                     "error": error,
@@ -161,7 +215,7 @@ async def _execute_delegation(task_id: str, workspace_id: str, task: str):
     delegation.status = DelegationStatus.IN_PROGRESS
 
     # #64: register on the platform so GET /workspaces/<self>/delegations
-    # sees the same set as check_delegation_status. Best-effort — platform
+    # sees the same set as check_task_status. Best-effort — platform
     # unreachability must not block the actual A2A delegation.
     await _record_delegation_on_platform(task_id, workspace_id, task)
 
@@ -228,6 +282,39 @@ async def _execute_delegation(task_id: str, workspace_id: str, task: str):
                         },
                     )
 
+                    # HTTP 202 + {queued: true} = peer's a2a-proxy
+                    # accepted the request but the peer's runtime is
+                    # mid-task. Platform-side drain will deliver the
+                    # reply asynchronously. Mark QUEUED locally so
+                    # check_task_status can surface that state
+                    # to the LLM with explicit "wait, don't bypass"
+                    # guidance. Do NOT mark FAILED — the request is
+                    # alive in the platform's queue, not lost.
+                    #
+                    # Without this branch, the loop falls through, the
+                    # `if "error" in result` line below references an
+                    # unbound `result`, and the eventual FAILED status
+                    # leads the LLM to conclude the peer is permanently
+                    # unavailable — at which point it does the delegated
+                    # work itself, defeating the whole orchestration.
+                    if a2a_resp.status_code == 202:
+                        try:
+                            queued_body = a2a_resp.json()
+                        except Exception:
+                            queued_body = {}
+                        if queued_body.get("queued") is True:
+                            delegation.status = DelegationStatus.QUEUED
+                            log_event(
+                                event_type="delegation", action="delegate",
+                                resource=workspace_id, outcome="queued",
+                                trace_id=task_id, attempt=attempt + 1,
+                            )
+                            await _notify_completion(task_id, workspace_id, "queued")
+                            await _update_delegation_on_platform(
+                                task_id, "queued", "", "",
+                            )
+                            return
+
                     if a2a_resp.status_code == 200:
                         try:
                             result = a2a_resp.json()
@@ -284,14 +371,36 @@ async def _execute_delegation(task_id: str, workspace_id: str, task: str):
 
 
 @tool
-async def delegate_to_workspace(
+async def delegate_task(
+    workspace_id: str,
+    task: str,
+) -> str:
+    """Delegate a task to a peer workspace via A2A and WAIT for the response.
+
+    Synchronous variant — blocks until the peer replies (or the platform's
+    A2A round-trip times out). Use this for QUICK questions and small
+    sub-tasks where you can afford to wait inline.
+
+    For longer-running work (research, multi-minute jobs) use
+    delegate_task_async + check_task_status instead so you don't hold
+    this workspace busy waiting.
+
+    Tool name + description are sourced from the platform_tools registry —
+    a single ToolSpec drives MCP, LangChain, and system-prompt docs.
+    """
+    from molecule_runtime.a2a_tools import tool_delegate_task
+    return await tool_delegate_task(workspace_id, task)
+
+
+@tool
+async def delegate_task_async(
     workspace_id: str,
     task: str,
 ) -> dict:
     """Delegate a task to a peer workspace via A2A protocol (non-blocking).
 
     Sends the task in the background and returns immediately with a task_id.
-    Use check_delegation_status to poll for the result, or continue working
+    Use check_task_status to poll for the result, or continue working
     and check later. The delegate works independently.
 
     Args:
@@ -299,9 +408,31 @@ async def delegate_to_workspace(
         task: The task description to send to the peer.
 
     Returns:
-        A dict with task_id and status="delegated". Use check_delegation_status(task_id) to get results.
+        A dict with task_id and status="delegated". Use check_task_status(task_id) to get results.
     """
     task_id = str(uuid.uuid4())
+
+    # Task #190 / #193 — Self-delegation guard (async path). Even on the
+    # async path that returns a task_id immediately, _execute_delegation
+    # eventually fires the A2A POST back to our own URL, which times out
+    # against our own held run lock, gets recorded with source_id=our
+    # workspace UUID, and surfaces in the inbox as a peer_agent message
+    # from ourselves (#190). Reject before scheduling the background task
+    # so no peer_agent echo can be generated. Sibling guards:
+    #   - workspace-server/internal/handlers/delegation.go (Go API gate)
+    #   - workspace/a2a_tools_delegation.py (MCP sync + async paths)
+    #   - workspace/builtin_tools/a2a_tools.py (framework-agnostic sync)
+    if WORKSPACE_ID and workspace_id == WORKSPACE_ID:
+        log_event(event_type="delegation", action="delegate", resource=workspace_id,
+                  outcome="rejected_self_delegation", trace_id=task_id)
+        return {
+            "success": False,
+            "error": (
+                "self-delegation rejected: cannot delegate_task_async to your "
+                "own workspace (would time out and echo back as a peer_agent "
+                "message from yourself — #190)"
+            ),
+        }
 
     # RBAC check
     roles, custom_perms = get_workspace_roles()
@@ -330,18 +461,35 @@ async def delegate_to_workspace(
         "success": True,
         "task_id": task_id,
         "status": "delegated",
-        "message": f"Task delegated to {workspace_id}. Use check_delegation_status('{task_id}') to get the result when ready.",
+        "message": f"Task delegated to {workspace_id}. Use check_task_status('{task_id}') to get the result when ready.",
     }
 
 
 @tool
-async def check_delegation_status(
+async def check_task_status(
     task_id: str = "",
 ) -> dict:
     """Check the status of a delegated task, or list all active delegations.
 
+    Status semantics — IMPORTANT:
+
+    - "pending" / "in_progress" → peer is actively working. Wait and check again.
+    - "queued" → peer's a2a-proxy accepted the call but the peer is
+      processing a prior task. The reply WILL arrive — the platform's
+      drain re-dispatches when the peer is free. This tool transparently
+      polls the platform for the eventual outcome on each call, so
+      keep polling check_task_status periodically and you'll see
+      the status flip to "completed" / "failed" automatically.
+      Do NOT retry the delegation. Do NOT do the work yourself.
+      Acknowledge to the user that the peer is busy and will reply,
+      then continue with other delegations or check back later.
+    - "completed" → result is in the `result` field.
+    - "failed" → real failure (network, peer crashed, etc.). The
+      `error` field has the cause. Only fall back to doing the work
+      yourself if status is "failed", never if status is "queued".
+
     Args:
-        task_id: The task_id returned by delegate_to_workspace. If empty, lists all delegations.
+        task_id: The task_id returned by delegate_task_async. If empty, lists all delegations.
 
     Returns:
         Status and result (if completed) of the delegation.
@@ -367,6 +515,16 @@ async def check_delegation_status(
     if not delegation:
         return {"error": f"No delegation found with task_id {task_id}"}
 
+    # Lazy refresh for QUEUED entries: the platform's drain stitch
+    # updates its activity_logs row when the queued delegation
+    # eventually completes, but doesn't push back to this runtime.
+    # Without this refresh, the LLM polling here would see "queued"
+    # forever even after the result is available — exactly the bug
+    # the upstream director-bypass docstring guidance warned against.
+    if delegation.status == DelegationStatus.QUEUED:
+        await _refresh_queued_from_platform(task_id)
+        # delegation is the same dict entry — _refresh mutates in-place.
+
     result = {
         "task_id": task_id,
         "workspace_id": delegation.workspace_id,
@@ -379,4 +537,14 @@ async def check_delegation_status(
     elif delegation.status == DelegationStatus.FAILED:
         result["error"] = delegation.error
 
+    # RFC #2251 V1.0 reproduction-harness instrumentation. Every poll of
+    # check_task_status emits a phase=check_status line so the harness
+    # operator can tell whether a coordinator stuck for 8 minutes was
+    # polling-children-the-whole-time vs synthesizing-after-children-done.
+    # `grep rfc2251_phase=check_status` in the workspace's container log
+    # gives the polling pattern. Strip when V1.0 ships.
+    logger.info(
+        "rfc2251_phase=check_status task_id=%s peer=%s status=%s",
+        task_id, delegation.workspace_id, delegation.status.value,
+    )
     return result

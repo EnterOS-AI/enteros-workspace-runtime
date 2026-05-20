@@ -28,23 +28,23 @@ Attribute constants for ``gen_ai.*`` follow OpenTelemetry GenAI SemConv 1.26.
 Usage example
 -------------
     # main.py — call once at startup
-    from builtin_tools.telemetry import setup_telemetry, make_trace_middleware
+    from molecule_runtime.builtin_tools.telemetry import setup_telemetry, make_trace_middleware
     setup_telemetry(service_name=workspace_id)
     instrumented = make_trace_middleware(app.build())
 
     # Any module
-    from builtin_tools.telemetry import get_tracer
+    from molecule_runtime.builtin_tools.telemetry import get_tracer
     tracer = get_tracer()
     with tracer.start_as_current_span("my_span") as span:
         span.set_attribute("key", "value")
 
     # Outgoing HTTP — inject W3C headers
-    from builtin_tools.telemetry import inject_trace_headers
+    from molecule_runtime.builtin_tools.telemetry import inject_trace_headers
     headers = inject_trace_headers({"Content-Type": "application/json"})
     await client.post(url, headers=headers, ...)
 
     # Incoming HTTP — extract context (done automatically by middleware)
-    from builtin_tools.telemetry import extract_trace_context
+    from molecule_runtime.builtin_tools.telemetry import extract_trace_context
     ctx = extract_trace_context(dict(request.headers))
 """
 

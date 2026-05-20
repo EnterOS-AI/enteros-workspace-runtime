@@ -7,40 +7,33 @@ import asyncio
 import json
 import os
 import socket
-import sys
-
-# When running as the installed `molecule-runtime` console script, the flat
-# module names (config, heartbeat, adapters, etc.) need to resolve to this
-# package's submodules. We inject the package directory onto sys.path so that
-# `from config import ...` resolves to `molecule_runtime/config.py`.
-_PKG_DIR = os.path.dirname(__file__)
-if _PKG_DIR not in sys.path:
-    sys.path.insert(0, _PKG_DIR)
 
 import httpx
 import uvicorn
-from a2a.server.request_handlers import DefaultRequestHandler
+# KI-009 a2a-sdk v1 migration: A2AStarletteApplication removed; use Starlette route factory
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCard, AgentCapabilities, AgentSkill, AgentInterface
 from starlette.applications import Starlette
 
 from molecule_runtime.adapters import get_adapter, AdapterConfig
+from molecule_runtime.agents_md import generate_agents_md
 from molecule_runtime.config import load_config
 from molecule_runtime.heartbeat import HeartbeatLoop
 from molecule_runtime.preflight import run_preflight, render_preflight_report
-from builtin_tools.awareness_client import get_awareness_config
+from molecule_runtime.builtin_tools.awareness_client import get_awareness_config
 import uuid as _uuid
 
-from builtin_tools.telemetry import setup_telemetry, make_trace_middleware
-from policies.namespaces import resolve_awareness_namespace
+from molecule_runtime.builtin_tools.telemetry import setup_telemetry, make_trace_middleware
+from molecule_runtime.policies.namespaces import resolve_awareness_namespace
 
 
-from initial_prompt import (
+from molecule_runtime.initial_prompt import (
     mark_initial_prompt_attempted,
     resolve_initial_prompt_marker,
 )
-from molecule_runtime.platform_auth import auth_headers
+from molecule_runtime.platform_auth import auth_headers, self_source_headers
 
 
 def get_machine_ip() -> str:  # pragma: no cover
@@ -55,18 +48,49 @@ def get_machine_ip() -> str:  # pragma: no cover
         return "127.0.0.1"
 
 
+def _check_delegation_results_pending() -> bool:
+    """Check if there are unconsumed delegation results waiting.
+
+    Reads ``DELEGATION_RESULTS_FILE``.  Returns ``True`` if the file
+    exists and contains non-whitespace content (after stripping) — meaning
+    the idle loop should skip this tick.  Returns ``False`` if the file is
+    absent, empty, or contains only whitespace.
+
+    The extracted form lets unit tests call this directly rather than mirroring
+    the logic (anti-pattern flagged as #401).
+    """
+    from molecule_runtime.heartbeat import DELEGATION_RESULTS_FILE
+
+    try:
+        with open(DELEGATION_RESULTS_FILE) as rf:
+            rf.seek(0)
+            return bool(rf.read().strip())
+    except FileNotFoundError:
+        return False
+
+
 # Re-exported from transcript_auth for the inline /transcript handler.
 # Separate module keeps the security-critical gate import-light + unit-testable.
-from transcript_auth import transcript_authorized as _transcript_authorized
+from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
 
 
 async def main():  # pragma: no cover
-    workspace_id = os.environ.get("WORKSPACE_ID", "workspace-default")
+    workspace_id = os.environ.get("WORKSPACE_ID", "")
+    if not workspace_id:
+        raise SystemExit("FATAL: WORKSPACE_ID env var is not set. Aborting.")
     config_path = os.environ.get("WORKSPACE_CONFIG_PATH", "/configs")
-    platform_url = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
+    # Docker-aware default — host.docker.internal resolves the platform service
+    # from inside the Docker network mesh; falls back to localhost for local dev.
+    if os.path.exists("/.dockerenv") or os.environ.get("DOCKER_VERSION"):
+        platform_url = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
+    else:
+        platform_url = os.environ.get("PLATFORM_URL", "http://localhost:8080")
     awareness_config = get_awareness_config()
 
-    # 0. Normalise LLM auth env vars based on token type.
+    # 0. Initialise OpenTelemetry (no-op if packages not installed)
+    setup_telemetry(service_name=workspace_id)
+
+    # 0.1 Normalise LLM auth env vars based on token type.
     # Platform stores tokens as ANTHROPIC_AUTH_TOKEN, but the Claude SDK/CLI
     # expects different env vars per token kind (OAuth vs API key vs proxy).
     # Doing this early means every downstream adapter/executor sees a
@@ -74,7 +98,7 @@ async def main():  # pragma: no cover
     from molecule_runtime.llm_auth import normalise_llm_env
     print(normalise_llm_env().summary())
 
-    # 0.1 GitHub credential helper installer — extracts bundled .sh scripts,
+    # 0.2 GitHub credential helper installer — extracts bundled .sh scripts,
     # configures git, starts refresh daemon, primes gh CLI. Eliminates the
     # per-template wiring that caused #1933 (claude-code-default template
     # shipped without the wiring; 39 workspaces lost their tokens after the
@@ -84,23 +108,35 @@ async def main():  # pragma: no cover
     from molecule_runtime.credential_helper import install_credential_helper
     install_credential_helper()
 
-    # 0.2 Pre-commit hook installer — refuse commits that add internal-flavored
-    # paths to the public monorepo. Runs at the agent's local git, so leaks
-    # get instant feedback with the redirect command in the same response
-    # cycle the agent ran `git commit` in. Hook is a no-op in non-public
-    # repos (internal, plugins, templates, third-party). See precommit_hook.py
-    # for the full rationale.
+    # 0.3 Pre-commit hook installer — refuses commits that add internal-flavored
+    # paths or known secret shapes to any git repo the workspace touches. Lifted
+    # into runtime so all templates get the gate without per-Dockerfile wiring.
+    # Companion to credential_helper (#1933) + defense-in-depth for #2090-class
+    # credential leaks. See precommit_hook.py for the full hook contract.
     from molecule_runtime.precommit_hook import install_pre_commit_hook
     install_pre_commit_hook()
 
-    # 0.5 Initialise OpenTelemetry (no-op if packages not installed)
-    setup_telemetry(service_name=workspace_id)
+    # 0a. Fix /workspace perms before any agent code runs. Docker ships
+    # named volumes as root:root 755 — without this the non-root agent
+    # user can't write files the user asked it to produce, and the
+    # "agent → file → user downloads" flow dead-ends at a bash "permission
+    # denied". Best-effort: no-ops silently if molecule-runtime itself
+    # isn't root (template's own start.sh should have handled it there).
+    from molecule_runtime.executor_helpers import ensure_workspace_writable
+    ensure_workspace_writable()
 
     # 1. Load config
     config = load_config(config_path)
     port = config.a2a.port
     preflight = run_preflight(config, config_path)
     render_preflight_report(preflight)
+
+    # 1a. Generate AGENTS.md so peer agents and discovery tools can see this
+    # workspace's identity, role, endpoint, and capabilities immediately.
+    try:
+        generate_agents_md(config_path, "/workspace/AGENTS.md")
+    except Exception as _agents_md_err:  # pragma: no cover
+        print(f"Warning: AGENTS.md generation failed (non-fatal): {_agents_md_err}")
     if not preflight.ok:
         raise SystemExit(1)
     if awareness_config:
@@ -111,15 +147,23 @@ async def main():  # pragma: no cover
         print(f"Awareness enabled for namespace: {awareness_namespace}")
 
     # 1.5  Initialise governance adapter (no-op if disabled or package absent)
-    from builtin_tools.governance import initialize_governance
+    from molecule_runtime.builtin_tools.governance import initialize_governance
     if config.governance.enabled:
         await initialize_governance(config.governance)
         print(f"Governance: Microsoft Agent Governance Toolkit enabled (mode={config.governance.policy_mode})")
     else:
         print("Governance: disabled (set governance.enabled: true in config.yaml to activate)")
 
-    # 2. Create heartbeat (passed to adapter for task tracking)
-    heartbeat = HeartbeatLoop(platform_url, workspace_id)
+    # 2. Create heartbeat (passed to adapter for task tracking).
+    # interval is sourced from observability.heartbeat_interval_seconds
+    # in config.yaml — clamped to [5, 300] at parse time. Operators
+    # who want a faster crash-detection signal lower it; ones who want
+    # to reduce platform write load raise it.
+    heartbeat = HeartbeatLoop(
+        platform_url,
+        workspace_id,
+        interval_seconds=config.observability.heartbeat_interval_seconds,
+    )
 
     # 3. Get adapter for this runtime
     runtime = config.runtime or "langgraph"
@@ -127,6 +171,16 @@ async def main():  # pragma: no cover
 
     adapter = adapter_cls()
     print(f"Runtime: {runtime} ({adapter.display_name()})")
+
+    # 3a. Wire pluggable event-log backend from config.observability.event_log.
+    # Default config.yaml sets backend=memory; operators set "disabled" to
+    # opt out without removing append-call sites from adapter code.
+    from molecule_runtime.event_log import create_event_log
+    adapter.event_log = create_event_log(
+        backend=config.observability.event_log.backend,
+        ttl_seconds=config.observability.event_log.ttl_seconds,
+        max_entries=config.observability.event_log.max_entries,
+    )
 
     # 4. Build adapter config
     adapter_config = AdapterConfig(
@@ -141,101 +195,151 @@ async def main():  # pragma: no cover
         heartbeat=heartbeat,
     )
 
-    # 5. Setup adapter and create executor
-    # If setup fails, ensure heartbeat is stopped to prevent resource leak
-    try:
-        await adapter.setup(adapter_config)
-        executor = await adapter.create_executor(adapter_config)
-    except Exception:
-        # heartbeat hasn't started yet but may have async tasks pending
-        if hasattr(heartbeat, "stop"):
-            try:
-                await heartbeat.stop()
-            except Exception:
-                pass
-        raise
-
-    # 5.5. Initialise Temporal durable execution wrapper (optional)
-    # Connects to TEMPORAL_HOST (default: localhost:7233) and starts a
-    # co-located Temporal worker as a background asyncio task.
-    # No-op with a warning log if Temporal is unreachable or temporalio
-    # is not installed — all tasks fall back to direct execution transparently.
-    from builtin_tools.temporal_workflow import create_wrapper as _create_temporal_wrapper
-    temporal_wrapper = _create_temporal_wrapper()
-    await temporal_wrapper.start()
-
-    # Get loaded skills for agent card (adapter may have populated them)
-    loaded_skills = getattr(adapter, "loaded_skills", [])
-
-    # 6. Build Agent Card
+    # 5. Build the AgentCard *before* adapter.setup() so /.well-known/agent-card.json
+    # is reachable as soon as uvicorn binds, regardless of whether the adapter
+    # has working LLM credentials. Decoupling readiness ("is the workspace up?")
+    # from configuration ("can it actually answer?") means a workspace with a
+    # missing/rotated key stays REACHABLE — canvas can render a clear
+    # "agent not configured" error instead of "stuck booting forever," and
+    # operators can deprovision/redeploy normally. Skills built from
+    # config.skills (static names from config.yaml) up front; richer metadata
+    # from the adapter's loaded_skills swaps in below if setup() succeeds.
     machine_ip = os.environ.get("HOSTNAME", get_machine_ip())
     workspace_url = f"http://{machine_ip}:{port}"
 
+    # v1: AgentCard.url removed; put url+protocol in supported_interfaces instead.
+    # v1: AgentCapabilities.inputModes/outputModes removed; move to AgentCard.default_*.
+    # v1: pushNotifications → push_notifications (Pydantic field name)
+    #
+    # AgentCard's protocol message uses `supported_interfaces` (plural,
+    # interfaces — see a2a-sdk types/a2a_pb2.pyi:189). The 0.3.x→1.0
+    # migration in #1974 originally used `supported_protocols`, which
+    # the protobuf doesn't expose at all — every workspace boot since
+    # then crashed with `ValueError: Protocol message AgentCard has no
+    # "supported_protocols" field`. The crash didn't surface in the
+    # publish-runtime smoke because the smoke only IMPORTS
+    # molecule_runtime.main, never CALLS the AgentCard constructor.
+    # Don't rename back.
     agent_card = AgentCard(
         name=config.name,
         description=config.description or config.name,
         version=config.version,
         supported_interfaces=[
-            AgentInterface(
-                protocol_binding="JSONRPC",
-                url=f"{workspace_url}/",
-                protocol_version="1.0",
-            ),
+            AgentInterface(protocol_binding="https://a2a.g/v1", url=workspace_url)
         ],
         capabilities=AgentCapabilities(
             streaming=config.a2a.streaming,
             push_notifications=config.a2a.push_notifications,
+            # Note: state_transition_history (a 0.x capability flag) was
+            # removed in a2a-sdk 1.0. Per the SDK's own
+            # a2a/compat/v0_3/conversions.py: "No longer supported in
+            # v1.0". The capability is now universal — Task.history is
+            # always available and tasks/get accepts historyLength via
+            # apply_history_length(). Don't add this kwarg back.
         ),
+        # Static skill stubs from config.yaml; replaced with rich metadata
+        # below if adapter.setup() loads skills successfully.
         skills=[
-            AgentSkill(
-                id=skill.metadata.id,
-                name=skill.metadata.name,
-                description=skill.metadata.description,
-                tags=skill.metadata.tags,
-                examples=skill.metadata.examples,
-            )
-            for skill in loaded_skills
+            AgentSkill(id=name, name=name, description=name, tags=[], examples=[])
+            for name in (config.skills or [])
         ],
         default_input_modes=["text/plain", "application/json"],
         default_output_modes=["text/plain", "application/json"],
     )
 
+    # 6. Setup adapter and create executor
+    # On failure: log + continue. The card route stays mounted (above);
+    # the JSON-RPC route below returns -32603 "agent not configured" until
+    # the operator fixes credentials and redeploys. Heartbeat keeps running
+    # so the platform sees the workspace as reachable-but-misconfigured
+    # rather than crash-looping.
+    adapter_ready = False
+    adapter_error: str | None = None
+    executor = None
+    try:
+        await adapter.setup(adapter_config)
+        executor = await adapter.create_executor(adapter_config)
+
+        # 6a. Boot-smoke short-circuit (issue #2275): if MOLECULE_SMOKE_MODE
+        # is set, exercise the executor's full import tree by calling
+        # execute() once with stub deps + a short timeout. Skips platform
+        # registration + uvicorn entirely. Returns process exit code.
+        from molecule_runtime.smoke_mode import is_smoke_mode, run_executor_smoke
+        if is_smoke_mode():
+            exit_code = await run_executor_smoke(executor)
+            if hasattr(heartbeat, "stop"):
+                try:
+                    await heartbeat.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise SystemExit(exit_code)
+
+        # 6b. Restore from pre-stop snapshot if one exists (GH#1391).
+        # The snapshot is scrubbed before being written, so secrets are
+        # already redacted — restore_state must not re-expose them.
+        from molecule_runtime.lib.pre_stop import read_snapshot
+        snapshot = read_snapshot()
+        if snapshot:
+            try:
+                adapter.restore_state(snapshot)
+                print(
+                    f"Pre-stop snapshot restored: task={snapshot.get('current_task', '')!r}, "
+                    f"uptime={snapshot.get('uptime_seconds', 0)}s"
+                )
+            except Exception as restore_err:
+                print(f"Warning: snapshot restore failed (continuing): {restore_err}")
+
+        # 6c. Swap rich skill metadata into the card now that setup() loaded
+        # them. In-place mutation: a2a-sdk's create_agent_card_routes serialises
+        # the card on each request, so the route mounted below sees the update.
+        # Isolated via card_helpers.enrich_card_skills — a malformed
+        # loaded_skills shape (e.g., a future adapter that doesn't follow
+        # the .metadata convention) is logged + swallowed instead of
+        # propagating up to the outer except, where it would silently
+        # degrade an OK boot to the not-configured state.
+        from molecule_runtime.card_helpers import enrich_card_skills
+        enrich_card_skills(agent_card, getattr(adapter, "loaded_skills", None))
+        adapter_ready = True
+    except SystemExit:
+        # Smoke-mode exit signal — propagate untouched.
+        raise
+    except Exception as setup_err:  # noqa: BLE001
+        adapter_error = f"{type(setup_err).__name__}: {setup_err}"
+        print(
+            f"WARNING: adapter.setup() failed — workspace will serve agent-card "
+            f"but JSON-RPC will return -32603 until configuration is fixed. "
+            f"Reason: {adapter_error}",
+            flush=True,
+        )
+        # Heartbeat keeps running so the platform marks the workspace as
+        # reachable-but-misconfigured. Operators can then redeploy with the
+        # correct env vars without having to chase a crash-loop.
+
+    # 6.5. Initialise Temporal durable execution wrapper (optional). Only
+    # meaningful when an executor exists; skipped on misconfigured boots.
+    if adapter_ready:
+        from molecule_runtime.builtin_tools.temporal_workflow import create_wrapper as _create_temporal_wrapper
+        temporal_wrapper = _create_temporal_wrapper()
+        await temporal_wrapper.start()
+
     # 7. Wrap in A2A.
     #
-    # Regression fix (#204): PR #198 tried to wire push_config_store +
-    # push_sender to satisfy #175 (push notification capability), but
-    # PushNotificationSender is an abstract base class in the a2a-sdk and
-    # can't be instantiated directly. Passing it crashed main.py on startup
-    # with `TypeError: Can't instantiate abstract class`. Dropped back to
-    # DefaultRequestHandler's own defaults — pushNotifications capability
-    # in the AgentCard below is still advertised via AgentCapabilities so
-    # clients know we COULD do pushes; actually implementing them requires
-    # a concrete sender subclass, tracked as a Phase-H follow-up to #175.
-    handler = DefaultRequestHandler(
-        agent_executor=executor,
-        task_store=InMemoryTaskStore(),
-        agent_card=agent_card,
-    )
-
-    # Build Starlette app from route factory functions (a2a-sdk 1.x API).
-    # JSON-RPC mounts at root because the platform's ProxyA2A (the only
-    # caller in this deployment) POSTs to `http://ws-<id>:8000/` — no
-    # path suffix. See workspace-server/internal/provisioner.InternalURL
-    # which returns the Docker-DNS form without a path. Mounting
-    # anywhere else produces 404 on every inbound A2A and silent fleet-
-    # wide productivity loss (baseline restart 2026-04-24: 0 delegations
-    # for 2 cycles until this was traced to `/api/v1/jsonrpc/`).
-    # enable_v0_3_compat=True because the platform sends v0.3-shaped
-    # JSON-RPC requests (`message/send`, `tasks/get`, etc.) that the
-    # 1.x dispatcher rejects as "Method not found" without the compat
-    # shim. The v0.3 adapter recognizes those names and routes them to
-    # the handler's on_message_send / on_get_task / etc.
-    routes = []
-    routes.extend(create_agent_card_routes(agent_card))
-    routes.extend(create_jsonrpc_routes(handler, "/", enable_v0_3_compat=True))
-    app = Starlette(routes=routes)
+    # Route assembly is in workspace/boot_routes.py so the contract —
+    # card always mounted, JSON-RPC route swaps based on adapter state
+    # (DefaultRequestHandler when executor is non-None, not_configured
+    # handler returning -32603 otherwise) — is unit-testable with
+    # Starlette's TestClient. main.py is `# pragma: no cover` so without
+    # this extraction a future refactor that re-coupled card + setup()
+    # would silently bypass PR #2756. tests/test_boot_routes.py pins
+    # the four-branch contract.
+    from molecule_runtime.boot_routes import build_routes
+    app = Starlette(routes=build_routes(agent_card, executor, adapter_error))
 
     # 8. Register with platform
+    # When adapter.setup() failed, advertise via configuration_status so
+    # the platform/canvas can render "configured: false, reason: …" instead
+    # of a confused "ready but silent" state.
+    loaded_skills = getattr(adapter, "loaded_skills", None) or []
     agent_card_dict = {
         "name": config.name,
         "description": config.description,
@@ -249,11 +353,16 @@ async def main():  # pragma: no cover
                 "tags": s.metadata.tags,
             }
             for s in loaded_skills
+        ] if adapter_ready else [
+            {"id": n, "name": n, "description": n, "tags": []}
+            for n in (config.skills or [])
         ],
         "capabilities": {
             "streaming": config.a2a.streaming,
             "pushNotifications": config.a2a.push_notifications,
         },
+        "configuration_status": "ready" if adapter_ready else "not_configured",
+        **({"configuration_error": adapter_error} if adapter_error else {}),
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -277,9 +386,20 @@ async def main():  # pragma: no cover
                     body = resp.json()
                     tok = body.get("auth_token")
                     if tok:
-                        from platform_auth import save_token
+                        from molecule_runtime.platform_auth import save_token
                         save_token(tok)
-                        print("Workspace auth token saved to disk.")
+                        print(f"Saved workspace auth token (prefix={tok[:8]}…)")
+                    # RFC #2312 PR-F: persist platform_inbound_secret if the
+                    # platform supplied one. Idempotent — writing the same
+                    # value over an existing file is harmless. Required for
+                    # SaaS where there's no persistent /configs volume; on
+                    # Docker mode it overwrites the value the provisioner
+                    # already wrote at workspace creation.
+                    inbound = body.get("platform_inbound_secret")
+                    if inbound:
+                        from molecule_runtime.platform_inbound_auth import save_inbound_secret
+                        save_inbound_secret(inbound)
+                        print(f"Saved platform_inbound_secret (prefix={inbound[:8]}…)")
                 except Exception as parse_exc:
                     print(f"Warning: couldn't parse register response for token: {parse_exc}")
         except Exception as e:
@@ -291,9 +411,11 @@ async def main():  # pragma: no cover
     # 9b. Start skills hot-reload watcher (background task)
     # When a skill file changes the watcher reloads the skill module and calls
     # back into the adapter so the next A2A request uses the updated tools.
-    if config.skills:
+    # Skipped on misconfigured boots — adapter has no executor / tool registry
+    # to swap into, so reloading skills would NPE on the agent rebuild path.
+    if adapter_ready and config.skills:
         try:
-            from skill_loader.watcher import SkillsWatcher
+            from molecule_runtime.skill_loader.watcher import SkillsWatcher
 
             def _on_skill_reload(updated_skill):
                 """Rebuild the LangGraph agent when a skill changes in-place."""
@@ -306,19 +428,24 @@ async def main():  # pragma: no cover
                 ]
                 # Rebuild the agent's tool list from updated skills
                 if hasattr(adapter, "all_tools") and hasattr(adapter, "system_prompt"):
-                    from builtin_tools.approval import request_approval
-                    from builtin_tools.delegation import delegate_to_workspace
-                    from builtin_tools.memory import commit_memory, search_memory
-                    from builtin_tools.sandbox import run_code
-                    base_tools = [delegate_to_workspace, request_approval,
-                                  commit_memory, search_memory, run_code]
+                    from molecule_runtime.builtin_tools.approval import request_approval
+                    from molecule_runtime.builtin_tools.delegation import delegate_task, delegate_task_async, check_task_status
+                    from molecule_runtime.builtin_tools.memory import commit_memory, recall_memory
+                    from molecule_runtime.builtin_tools.sandbox import run_code
+                    # Core platform tools mirror adapter_base.all_tools — must
+                    # match the platform_tools registry names so docs and tools
+                    # never drift.
+                    base_tools = [
+                        delegate_task, delegate_task_async, check_task_status,
+                        request_approval, commit_memory, recall_memory, run_code,
+                    ]
                     skill_tools = []
                     for sk in adapter.loaded_skills:
                         skill_tools.extend(sk.tools)
                     adapter.all_tools = base_tools + skill_tools
                     # Rebuild compiled agent so next ainvoke picks up new tools
                     try:
-                        from agent import create_agent
+                        from molecule_runtime.agent import create_agent
                         new_agent = create_agent(
                             config.model, adapter.all_tools, adapter.system_prompt
                         )
@@ -332,6 +459,7 @@ async def main():  # pragma: no cover
                 config_path=config_path,
                 skill_names=config.skills,
                 on_reload=_on_skill_reload,
+                current_runtime=runtime,
             )
             asyncio.create_task(skills_watcher.start())
             print(f"Skills hot-reload enabled for: {config.skills}")
@@ -342,6 +470,7 @@ async def main():  # pragma: no cover
     print(f"Workspace {workspace_id} starting on port {port}")
     # Wrap the ASGI app with W3C TraceContext extraction middleware so incoming
     # A2A HTTP requests propagate their trace context into _incoming_trace_context.
+    # v1: Starlette app is constructed directly; no build() step needed
     starlette_app = app
 
     # Add /transcript route — exposes the most-recent agent session log
@@ -352,7 +481,7 @@ async def main():  # pragma: no cover
 
     async def _transcript_handler(request):
         # Require workspace bearer token — the same token issued at registration
-        # and stored in /configs/.auth_token. Any container on molecule-monorepo-net
+        # and stored in /configs/.auth_token. Any container on molecule-core-net
         # could otherwise read the full session log. Closes #287.
         #
         # #328: fail CLOSED when the token file is unavailable. get_token()
@@ -364,7 +493,7 @@ async def main():  # pragma: no cover
         # instead. The platform's TranscriptHandler acquires the token
         # during registration, so once the bootstrap completes it always
         # has a valid credential to present.
-        from platform_auth import get_token
+        from molecule_runtime.platform_auth import get_token
         if not _transcript_authorized(get_token(), request.headers.get("Authorization", "")):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         try:
@@ -372,26 +501,73 @@ async def main():  # pragma: no cover
             limit = int(request.query_params.get("limit", "100"))
         except (TypeError, ValueError):
             return JSONResponse({"error": "since and limit must be integers"}, status_code=400)
-        result = await adapter.transcript_lines(since=since, limit=limit)
+        # Isolate adapter call: misconfigured boots leave the adapter
+        # partially-initialised, and a future adapter override of
+        # transcript_lines might assume setup() ran. Surface a 503 with
+        # a clear reason instead of letting the exception propagate to
+        # Starlette's 500 handler — same pattern as the not-configured
+        # JSON-RPC route (PR #2756). BaseAdapter.transcript_lines's
+        # default returns {"supported": false} so today's 4 adapters
+        # never trigger this branch; this is the safety net.
+        try:
+            result = await adapter.transcript_lines(since=since, limit=limit)
+        except Exception as transcript_err:  # noqa: BLE001
+            return JSONResponse(
+                {
+                    "error": "transcript unavailable",
+                    "detail": f"{type(transcript_err).__name__}: {transcript_err}",
+                },
+                status_code=503,
+            )
         return JSONResponse(result)
 
     starlette_app.add_route("/transcript", _transcript_handler, methods=["GET"])
 
+    # /internal/* — platform→workspace forward calls (RFC #2312). Auth
+    # is the per-workspace platform_inbound_secret in
+    # /configs/.platform_inbound_secret, distinct from the outbound
+    # workspace_auth_token used by /transcript above.
+    from molecule_runtime.internal_chat_uploads import ingest_handler as _internal_chat_uploads_ingest
+    starlette_app.add_route(
+        "/internal/chat/uploads/ingest",
+        _internal_chat_uploads_ingest,
+        methods=["POST"],
+    )
+    from molecule_runtime.internal_file_read import file_read_handler as _internal_file_read
+    starlette_app.add_route(
+        "/internal/file/read",
+        _internal_file_read,
+        methods=["GET"],
+    )
+
     built_app = make_trace_middleware(starlette_app)
 
+    # uvicorn expects the level name in lowercase ("debug" / "info" /
+    # "warning" / "error" / "critical"). config.observability.log_level
+    # is uppercased at parse time (config.py.load_config) for the
+    # Python ``logging`` module's convention; lower it here so both
+    # consumers get the form they expect from one source of truth.
+    # An ``LOG_LEVEL`` env var still wins as an ops-side debugging
+    # override — set it on the workspace process to bypass YAML
+    # without a config edit + restart cycle.
+    uvicorn_log_level = os.environ.get("LOG_LEVEL", config.observability.log_level).lower()
     server_config = uvicorn.Config(
         built_app,
         host="0.0.0.0",
         port=port,
-        log_level="info",
+        log_level=uvicorn_log_level,
     )
     server = uvicorn.Server(server_config)
 
     # 10b. Schedule initial_prompt self-message after server is ready.
     # Only runs on first boot — creates a marker file to prevent re-execution on restart.
+    # Skipped on misconfigured boots: the self-message would route through the
+    # platform back to /, hit the -32603 not-configured handler, and consume
+    # the marker for a fire that can't actually run. Wait until the operator
+    # fixes credentials and the workspace redeploys with adapter_ready=True.
     initial_prompt_task = None
     initial_prompt_marker = resolve_initial_prompt_marker(config_path)
-    if config.initial_prompt and not os.path.exists(initial_prompt_marker):
+    if adapter_ready and config.initial_prompt and not os.path.exists(initial_prompt_marker):
         # Write the marker UP FRONT (#71): if the prompt later crashes or
         # times out, we do NOT replay on next boot — that created a
         # ProcessError cascade where every message kept crashing. Operators
@@ -405,13 +581,23 @@ async def main():  # pragma: no cover
             )
         async def _send_initial_prompt():
             """Wait for server to be ready, then send initial_prompt as self-message."""
-            # Wait for the A2A server to accept connections
+            # Wait for the A2A server to accept connections.
+            # Use the SDK's own constant for the well-known path so this
+            # probe and the route mounted by create_agent_card_routes()
+            # never drift apart. Pre-fix this hardcoded the pre-1.x
+            # well-known path string; a2a-sdk 1.x renamed it (the
+            # canonical value lives in a2a.utils.constants now), so
+            # the probe got 404 every attempt and fell through to
+            # "server not ready after 30s, skipping" even though the
+            # server was actually serving fine. Net effect: every
+            # workspace silently dropped its `initial_prompt`.
+            from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
             ready = False
             for attempt in range(30):
                 await asyncio.sleep(1)
                 try:
                     async with httpx.AsyncClient(timeout=5.0) as client:
-                        resp = await client.get(f"http://127.0.0.1:{port}/.well-known/agent.json")
+                        resp = await client.get(f"http://127.0.0.1:{port}{AGENT_CARD_WELL_KNOWN_PATH}")
                         if resp.status_code == 200:
                             ready = True
                             break
@@ -447,7 +633,15 @@ async def main():  # pragma: no cover
                 # silently rejected once any workspace has a live token on
                 # file. Without this, initial_prompt 401s in multi-tenant
                 # mode exactly like /registry/register did in #215.
-                headers = {"Content-Type": "application/json", **auth_headers()}
+                # X-Workspace-ID via self_source_headers() so the platform
+                # tags the row source=agent — without it the canvas's
+                # My Chat tab renders the initial_prompt as if the user
+                # had typed it. See platform_auth.py for the full
+                # explanation.
+                headers = {
+                    "Content-Type": "application/json",
+                    **self_source_headers(workspace_id),
+                }
 
                 # Retry with backoff — the platform proxy may not be able to
                 # reach us yet (container networking takes a moment to settle).
@@ -491,7 +685,9 @@ async def main():  # pragma: no cover
     # workspaces upgrade opt-in — set idle_prompt in org.yaml defaults or
     # per-workspace to enable.
     idle_loop_task = None
-    if config.idle_prompt:
+    # Skipped on misconfigured boots — the self-fire would route to the
+    # -32603 handler in a tight loop and consume cycles for no useful work.
+    if adapter_ready and config.idle_prompt:
         # Idle-fire HTTP timeout. Kept tight relative to the fire cadence so a
         # hung platform doesn't accumulate dangling requests — a fire that
         # takes longer than the idle interval itself is almost certainly stuck.
@@ -519,6 +715,26 @@ async def main():  # pragma: no cover
                 if heartbeat.active_tasks > 0:
                     continue
 
+                # Issue #381 fix: skip the idle prompt if there are unconsumed
+                # delegation results waiting. The heartbeat sends a self-message
+                # for every new result batch, so sending the idle prompt here would
+                # race: the agent would compose a stale tick BEFORE processing the
+                # results notification, producing repeated identical asks (peer sends
+                # correction, we respond with stale state, peer asks again).
+                # By skipping the idle prompt when results are pending, we let the
+                # heartbeat's own self-message wake the agent after results are
+                # written. The agent then sees the results in _prepare_prompt()
+                # and processes them before composing.
+                # Guard logic extracted to _check_delegation_results_pending() for
+                # direct unit-testing (#401 follow-up).
+                if _check_delegation_results_pending():
+                    print(
+                        "Idle loop: skipping — unconsumed delegation results pending "
+                        "(heartbeat will notify agent)",
+                        flush=True,
+                    )
+                    continue
+
                 # Self-post the idle prompt via the platform A2A proxy (same
                 # path as initial_prompt). The agent's own concurrency control
                 # rejects if the workspace becomes busy between this check and
@@ -539,7 +755,13 @@ async def main():  # pragma: no cover
                     # actual outcome instead of a bare "post failed" line.
                     # #220: include auth_headers() on every idle fire. Without
                     # this, the idle loop 401s in multi-tenant mode.
-                    headers = {"Content-Type": "application/json", **auth_headers()}
+                    # self_source_headers() adds X-Workspace-ID so the
+                    # platform classifies the idle fire as source=agent
+                    # rather than user-typed canvas input.
+                    headers = {
+                        "Content-Type": "application/json",
+                        **self_source_headers(workspace_id),
+                    }
                     try:
                         req = _urlreq.Request(
                             f"{platform_url}/workspaces/{workspace_id}/a2a",
@@ -584,6 +806,18 @@ async def main():  # pragma: no cover
     try:
         await server.serve()
     finally:
+        # 10d. Pre-stop serialization — GH#1391.
+        # Capture in-memory state before the container exits so it survives
+        # intentional pause and unplanned restart. All content is scrubbed
+        # via lib.snapshot_scrub before being written to the config volume.
+        try:
+            from molecule_runtime.lib.pre_stop import build_snapshot, write_snapshot
+            adapter_state = adapter.pre_stop_state() if adapter else {}
+            snapshot = build_snapshot(heartbeat, adapter_state)
+            write_snapshot(snapshot)
+        except Exception as pre_stop_err:
+            print(f"Warning: pre-stop serialization failed (continuing): {pre_stop_err}")
+
         # Cancel initial prompt if still running
         if initial_prompt_task and not initial_prompt_task.done():
             initial_prompt_task.cancel()
@@ -595,7 +829,15 @@ async def main():  # pragma: no cover
 
 
 def main_sync():  # pragma: no cover
-    """Synchronous entry point for the molecule-runtime console script."""
+    """Synchronous entry point for the `molecule-runtime` console script.
+
+    Declared in scripts/build_runtime_package.py as the wheel's entry-point
+    target (`molecule-runtime = "molecule_runtime.main:main_sync"`). Removed
+    silently during the pre-monorepo consolidation, which broke every
+    workspace startup against 0.1.16/0.1.17/0.1.18 with `ImportError:
+    cannot import name 'main_sync'`. The .github/workflows/runtime-pin-compat.yml
+    smoke step is the regression gate.
+    """
     asyncio.run(main())
 
 

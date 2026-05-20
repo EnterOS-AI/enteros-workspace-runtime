@@ -161,7 +161,7 @@ class GovernanceAdapter:
             ``(allowed, reason)`` — reason is a short human-readable string
             explaining the decision.
         """
-        from builtin_tools import audit  # inline import to avoid circular dependencies
+        from molecule_runtime.builtin_tools import audit  # inline import to avoid circular dependencies
 
         context = context or {}
 
@@ -282,8 +282,8 @@ class GovernanceAdapter:
         str
             The ``trace_id`` produced by ``audit.log_event``.
         """
-        from builtin_tools import audit  # inline import to avoid circular dependencies
-        from builtin_tools.telemetry import get_current_traceparent  # inline import
+        from molecule_runtime.builtin_tools import audit  # inline import to avoid circular dependencies
+        from molecule_runtime.builtin_tools.telemetry import get_current_traceparent  # inline import
 
         traceparent: str | None = get_current_traceparent()
 
@@ -364,7 +364,7 @@ def check_permission_with_governance(
         ``(allowed, reason)``
     """
     if _adapter is None:
-        from builtin_tools import audit  # inline import to avoid circular dependencies
+        from molecule_runtime.builtin_tools import audit  # inline import to avoid circular dependencies
 
         result: bool = audit.check_permission(action, roles, custom_permissions)
         return result, "rbac_only"

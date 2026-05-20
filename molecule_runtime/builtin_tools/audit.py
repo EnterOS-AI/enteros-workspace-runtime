@@ -92,7 +92,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
 def _load_workspace_config():
     """Return the WorkspaceConfig or None if it cannot be loaded."""
     try:
-        from config import load_config  # local import avoids circular deps
+        from molecule_runtime.config import load_config  # local import avoids circular deps
         return load_config()
     except Exception as exc:
         logger.warning("audit: could not load workspace config for RBAC: %s", exc)
@@ -105,6 +105,10 @@ def get_workspace_roles() -> tuple[list[str], dict[str, list[str]]]:
     Falls back to ``["read-only"]`` / ``{}`` when the config is unavailable so
     that agents retain only memory-read access in degraded environments,
     denying by default rather than granting elevated permissions (fail-secure).
+
+    Fix originally landed in standalone c72fbfc (closes #11, CWE-285);
+    re-applied during standalone-as-SSOT migration. Pinned by
+    tests/test_audit.py::TestGetWorkspaceRolesFailSecure.
     """
     cfg = _load_workspace_config()
     if cfg is None:

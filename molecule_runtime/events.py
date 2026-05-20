@@ -67,7 +67,7 @@ class PlatformEventSubscriber:
         # Graceful fallback for workspaces that have no token yet.
         headers = {"X-Workspace-ID": self.workspace_id}
         try:
-            from platform_auth import auth_headers as _auth_headers
+            from molecule_runtime.platform_auth import auth_headers as _auth_headers
             headers.update(_auth_headers())
         except Exception:
             pass  # No token available — connect unauthenticated (grandfathered)

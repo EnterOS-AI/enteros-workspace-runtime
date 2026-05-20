@@ -1,62 +1,125 @@
 # molecule-ai-workspace-runtime
 
-> **⚠️ This repo is a publish artifact, not the source of truth.**
->
-> Runtime code lives in **[`Molecule-AI/molecule-core` → `workspace/`](https://git.moleculesai.app/molecule-ai/molecule-core/tree/main/workspace)**. This repo is regenerated and republished from there by the [`publish-runtime`](https://git.moleculesai.app/molecule-ai/molecule-core/blob/main/.github/workflows/publish-runtime.yml) workflow on every `runtime-v*` tag.
->
-> **Don't edit files here directly.** PRs against this repo will not be merged. Open them against `molecule-core` instead.
+Shared Python runtime infrastructure for all [Molecule AI](https://git.moleculesai.app/molecule-ai/molecule-core)
+agent adapters and workspace template images.
 
----
+> **This repo is the canonical source of truth as of 2026-05-20.**
+> Direct PRs are the editable path. The monorepo `molecule-core/workspace-server`
+> pins this wheel by version (`molecule-ai-workspace-runtime==X.Y.Z`).
+>
+> Previously the monorepo `workspace/` directory was the source and this
+> repo was a publish-time mirror. That arrangement is reversed by the
+> standalone-as-SSOT migration ([CTO-GO 2026-05-20](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime)).
 
-Shared Python runtime infrastructure for all Molecule AI agent adapters.
+## What lives here
 
 This package provides the core machinery every Molecule AI workspace container needs:
 
 - **A2A server** — registers with the platform, heartbeats, serves A2A JSON-RPC
 - **Adapter interface** — `BaseAdapter` / `AdapterConfig` / `SetupResult`
-- **Built-in tools** — delegation, memory, approvals, sandbox, telemetry
+- **Built-in tools** — delegation, memory, approvals, sandbox, audit, telemetry
 - **Skill loader** — loads and hot-reloads skill modules from `/configs/skills/`
 - **Plugin system** — per-workspace + shared plugin discovery and install
 - **Config / preflight** — YAML config loading with validation
+- **External-runtime MCP** (`molecule-mcp`) — universal MCP stdio server for
+  external agents (Claude Code, hermes, codex, etc.) running outside the
+  platform's container fleet
+- **Multi-workspace support** — `MOLECULE_WORKSPACES` env var lets one MCP
+  process serve N workspaces concurrently (introduced in the multi-WS PR
+  series, finalised in 0.2.0)
 
 ## Installation
 
 ```bash
 pip install molecule-ai-workspace-runtime
+# Or, recommended for the external MCP server:
+pipx install molecule-ai-workspace-runtime
 ```
-
-## Adapter discovery
-
-The runtime discovers adapters in two ways:
-
-1. **`ADAPTER_MODULE` env var** (standalone adapter repos):
-   ```bash
-   ADAPTER_MODULE=adapter molecule-runtime
-   ```
-   The runtime imports `adapter` and calls `adapter.Adapter`.
-
-2. **Subdirectory scan** (monorepo local dev): falls back to scanning
-   `molecule_runtime/adapters/<runtime>/` and importing the matching
-   subdir's `Adapter` class.
 
 ## Contributing
 
-**Don't open PRs here.** Send your change to
-[`Molecule-AI/molecule-core`](https://git.moleculesai.app/molecule-ai/molecule-core)
-under the `workspace/` directory. After your PR merges to main and a
-`runtime-v*` tag is pushed, the [`publish-runtime`](https://git.moleculesai.app/molecule-ai/molecule-core/blob/main/.github/workflows/publish-runtime.yml)
-workflow rebuilds this mirror + uploads the new wheel to PyPI.
+This repo is the editable source. Open PRs directly here.
 
-See [`docs/workspace-runtime-package.md`](https://git.moleculesai.app/molecule-ai/molecule-core/blob/main/docs/workspace-runtime-package.md)
-for the full publishing flow.
+### Branch protection contract
 
-## Why this split
+- 2 non-author approvals required (typically `core-qa` + `core-devops` persona tokens)
+- All CI contexts must pass: `ci / unit-tests`, `ci / lint`, `ci / build`,
+  `ci / smoke-install`, `Secret scan / Scan diff for credential-shaped strings`
+- No admin-bypass; no force-push to `main`
+- Use the per-agent persona-token pattern (see
+  [`feedback_per_agent_gitea_identity_default`](https://git.moleculesai.app/molecule-ai/molecule-core/)
+  in the ops handbook) — not the founder PAT for CI
+
+### Local development
+
+```bash
+# Run the unit tests
+python -m venv .venv && source .venv/bin/activate
+pip install pytest pytest-asyncio
+pip install httpx uvicorn starlette websockets pyyaml langchain-core \
+            opentelemetry-api opentelemetry-sdk \
+            opentelemetry-exporter-otlp-proto-http \
+            temporalio python-multipart
+pytest tests/
+```
+
+```bash
+# Build a local wheel + smoke-install
+pip install build
+python -m build
+pip install dist/*.whl
+molecule-mcp --help
+```
+
+## Release process
+
+1. Land changes via reviewed PR (2 non-author approvals + CI green)
+2. Bump `version =` in `pyproject.toml` (semver — patch for fixes, minor for
+   additive features, major for breaking API)
+3. Tag `runtime-vX.Y.Z` on `main` post-merge
+4. `publish-runtime.yml` (Gitea Actions) fires on the tag → builds wheel +
+   sdist → publishes to PyPI → cascades the version pin to template repos
+
+## Consumer pinning
+
+Monorepo `workspace-server` (and the 8 workspace template Dockerfiles) pin
+this package by exact version:
+
+```dockerfile
+RUN pip install --no-cache-dir molecule-ai-workspace-runtime==0.2.0
+```
+
+The version bump in this repo is the gating event; consumers pick up the
+new version via the publish cascade (or by editing the Dockerfile pin
+directly).
+
+## Architecture: why a separate repo
 
 The runtime needs to ship as a PyPI artifact (so the 8 workspace template
-images can `pip install` it), but it also needs to evolve in lock-step
-with the platform's wire protocol (queue shape, A2A metadata, event
-payloads). A monorepo edit + auto-publish pipeline gives both: atomic
-cross-cutting changes, plus a clean PyPI release on every tag.
+images can `pip install` it AND so operators can run `molecule-mcp` outside
+our container fleet) while still evolving fast.
 
-For the back-history of why this repo previously was the source of truth
-and the drift that caused: see issue [`Molecule-AI/molecule-core#2103`](https://git.moleculesai.app/molecule-ai/molecule-core/pull/2103).
+A standalone editable repo with independent CI cadence avoids two problems
+the previous mirror arrangement had:
+
+1. **CI saturation** — runtime-only changes had to go through the monorepo's
+   full PR-CI lane (Go build, Docker layers, integration tests). Now Python
+   unit tests + lint + wheel build + smoke install run independently in
+   ~2-3 minutes.
+2. **Bidirectional drift** — when standalone was a publish artifact but also
+   accepted ad-hoc PRs (mirror-guard CI gave inconsistent enforcement),
+   security fixes landed in standalone never reached the monorepo and
+   monorepo features (multi-WS code) never reached standalone. The
+   standalone-as-SSOT migration audited and reconciled this drift.
+
+## Back-history
+
+- [#87](https://git.moleculesai.app/molecule-ai/molecule-core/issues/87) — original
+  workspace executor split (template repos host their own `executor.py`,
+  runtime hosts the shared helpers)
+- [#2103](https://git.moleculesai.app/molecule-ai/molecule-core/pull/2103) — first
+  attempt at "standalone is the source" (predated mirror-guard CI); reverted
+  because direct edits caused drift
+- Standalone-as-SSOT migration (CTO-GO 2026-05-20) — this is the canonical
+  flip, with the audit + drift reconciliation baked into the initial 0.2.0
+  release.

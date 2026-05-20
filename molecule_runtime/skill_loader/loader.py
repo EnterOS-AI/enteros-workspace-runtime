@@ -13,7 +13,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 try:
-    from builtin_tools.security_scan import SkillSecurityError, scan_skill_dependencies
+    from molecule_runtime.builtin_tools.security_scan import SkillSecurityError, scan_skill_dependencies
     _SECURITY_SCAN_AVAILABLE = True
 except ImportError:  # lightweight test environments without tools/ on sys.path
     _SECURITY_SCAN_AVAILABLE = False
@@ -26,6 +26,12 @@ class SkillMetadata:
     description: str
     tags: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
+    # Runtime compatibility — list of adapter `name()` values this skill
+    # supports, or ["*"] for universal. Borrowed from hermes' declarative
+    # skill-compat pattern: a skill that depends on claude-code-only tools
+    # should declare `runtime: [claude-code]` so hermes (or any other
+    # adapter) skips it at load time instead of failing at first invocation.
+    runtime: list[str] = field(default_factory=lambda: ["*"])
 
 
 @dataclass
@@ -133,8 +139,39 @@ def load_skill_tools(scripts_dir: Path) -> list[Any]:
     return tools
 
 
-def load_skills(config_path: str, skill_names: list[str]) -> list[LoadedSkill]:
-    """Load all skills specified in the config."""
+def _normalize_runtime_field(raw: Any, skill_name: str) -> list[str]:
+    """Normalize the optional `runtime` frontmatter field to a list[str].
+
+    Accepts: ["*"] (default), ["claude-code"], "claude-code" (string sugar),
+    or absent (-> ["*"]). Anything else logs a warning and falls back to
+    universal so a malformed manifest doesn't silently filter the skill.
+    """
+    if raw is None:
+        return ["*"]
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list) and all(isinstance(x, str) for x in raw):
+        return raw or ["*"]
+    logger.warning(
+        "SKILL.md for '%s' has invalid `runtime` field %r; treating as universal",
+        skill_name, raw,
+    )
+    return ["*"]
+
+
+def load_skills(
+    config_path: str,
+    skill_names: list[str],
+    current_runtime: str | None = None,
+) -> list[LoadedSkill]:
+    """Load all skills specified in the config.
+
+    If ``current_runtime`` is provided, skills whose ``runtime`` frontmatter
+    list does not include ``"*"`` or ``current_runtime`` are skipped (with a
+    log line) instead of being loaded — matches hermes' declarative compat
+    model so adapter-specific skills don't get force-loaded into runtimes
+    that can't actually execute their tools.
+    """
     skills_dir = Path(config_path) / "skills"
     loaded = []
 
@@ -143,7 +180,7 @@ def load_skills(config_path: str, skill_names: list[str]) -> list[LoadedSkill]:
     fail_open_if_no_scanner = True  # safe default matches security_scan.py default
     if _SECURITY_SCAN_AVAILABLE:
         try:
-            from config import load_config
+            from molecule_runtime.config import load_config
             _cfg = load_config(config_path)
             scan_mode = _cfg.security_scan.mode
             fail_open_if_no_scanner = _cfg.security_scan.fail_open_if_no_scanner
@@ -171,12 +208,21 @@ def load_skills(config_path: str, skill_names: list[str]) -> list[LoadedSkill]:
 
         frontmatter, instructions = parse_skill_frontmatter(skill_md)
 
+        runtime_compat = _normalize_runtime_field(frontmatter.get("runtime"), skill_name)
+        if current_runtime is not None and "*" not in runtime_compat and current_runtime not in runtime_compat:
+            logger.info(
+                "Skipping skill '%s': runtime=%s not compatible with current=%s",
+                skill_name, runtime_compat, current_runtime,
+            )
+            continue
+
         metadata = SkillMetadata(
             id=skill_name,
             name=frontmatter.get("name", skill_name),
             description=frontmatter.get("description", ""),
             tags=frontmatter.get("tags", []),
             examples=frontmatter.get("examples", []),
+            runtime=runtime_compat,
         )
 
         # Executables live under scripts/ per the agentskills.io spec.

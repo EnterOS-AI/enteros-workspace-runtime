@@ -32,13 +32,17 @@ MODULES = [
 
 
 @pytest.mark.parametrize("module_name", MODULES)
-def test_module_imports_without_top_level_adapters_pkg(module_name):
+def test_module_imports_without_top_level_adapters_pkg(module_name, monkeypatch):
     # Sanity: no top-level `adapters` package shadowing molecule_runtime.adapters.
     assert "adapters" not in sys.modules or sys.modules["adapters"].__name__ != "adapters", (
         "test environment must not have a top-level `adapters` package — "
         "this test catches the regression of importing `from adapters import …` "
         "instead of `from molecule_runtime.adapters import …`"
     )
+    # main + coordinator require WORKSPACE_ID at import time (production-strict
+    # gate added monorepo-side); set a sentinel so the import smoke test
+    # exercises the import path without triggering the runtime side-effect.
+    monkeypatch.setenv("WORKSPACE_ID", "test-import-smoke")
     mod = importlib.import_module(module_name)
     assert mod is not None
     # Re-import via importlib should be idempotent.

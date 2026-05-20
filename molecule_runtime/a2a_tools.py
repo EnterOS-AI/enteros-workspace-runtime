@@ -3,7 +3,10 @@
 Imports shared client functions and constants from a2a_client.
 """
 
+import hashlib
 import json
+import mimetypes
+import os
 import uuid
 
 import httpx
@@ -13,42 +16,66 @@ from molecule_runtime.a2a_client import (
     WORKSPACE_ID,
     _A2A_ERROR_PREFIX,
     _peer_names,
+    _peer_to_source,
     discover_peer,
     get_peers,
+    get_peers_with_diagnostic,
     get_workspace_info,
     send_a2a_message,
 )
-from molecule_runtime.builtin_tools.validation import (
-    WorkspaceIdValidationError,
-    get_validated_workspace_id,
+from molecule_runtime.builtin_tools.security import _redact_secrets
+from molecule_runtime.platform_auth import list_registered_workspaces
+
+
+# ---------------------------------------------------------------------------
+# RBAC + auth helpers — extracted to a2a_tools_rbac (RFC #2873 iter 4a).
+# Re-exported here under the legacy underscore names so existing tests'
+# patch("a2a_tools._check_memory_write_permission", …) and call sites
+# inside this module that resolve bare names against the module-level
+# namespace continue to work unchanged.
+# ---------------------------------------------------------------------------
+from molecule_runtime.a2a_tools_rbac import (  # noqa: E402  (import after the from-a2a_client block)
+    _auth_headers_for_heartbeat,
+    _check_memory_read_permission,
+    _check_memory_write_permission,
+    _get_workspace_tier,
+    _is_root_workspace,
+    _ROLE_PERMISSIONS,
 )
 
 
-def _auth_headers_for_heartbeat() -> dict[str, str]:
-    """Return Phase 30.1 auth headers; tolerate platform_auth being absent
-    in older installs (e.g. during rolling upgrade)."""
-    try:
-        from molecule_runtime.platform_auth import auth_headers
-        return auth_headers()
-    except Exception:
-        return {}
+# Per-field caps on the heartbeat / activity payload. Borrowed from
+# hermes-agent's design discipline: cap ONCE in the helper, not at every
+# call site, so a future caller adding error_detail can't accidentally
+# DoS activity_logs by pasting a 4MB stack trace + base64 image.
+#
+# Why these specific limits:
+#   - error_detail (4096): hermes' value. Long enough for a multi-frame
+#     stack trace, short enough that 100 errors in 5min is < 500KB total.
+#   - summary (256): summary is a one-liner shown in the canvas card +
+#     activity row. 256 covers UTF-8 emoji + a sentence.
+#   - response_text (NOT capped): this is the agent's actual reply
+#     content. Capping would silently truncate user-visible output.
+_MAX_ERROR_DETAIL_CHARS = 4096
+_MAX_SUMMARY_CHARS = 256
 
 
 async def report_activity(
     activity_type: str, target_id: str = "", summary: str = "", status: str = "ok",
-    task_text: str = "", response_text: str = "",
+    task_text: str = "", response_text: str = "", error_detail: str = "",
 ):
     """Report activity to the platform for live progress tracking."""
-    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
-    try:
-        ws_id = get_validated_workspace_id(caller="a2a_tools.report_activity")
-    except WorkspaceIdValidationError:
-        return  # Best-effort — don't block delegation on activity reporting
+    # Defensive caps in the helper itself so every caller benefits — see
+    # _MAX_ERROR_DETAIL_CHARS / _MAX_SUMMARY_CHARS comments above.
+    if error_detail and len(error_detail) > _MAX_ERROR_DETAIL_CHARS:
+        error_detail = error_detail[:_MAX_ERROR_DETAIL_CHARS]
+    if summary and len(summary) > _MAX_SUMMARY_CHARS:
+        summary = summary[:_MAX_SUMMARY_CHARS]
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             payload: dict = {
                 "activity_type": activity_type,
-                "source_id": ws_id,
+                "source_id": WORKSPACE_ID,
                 "target_id": target_id,
                 "method": "message/send",
                 "summary": summary,
@@ -58,8 +85,15 @@ async def report_activity(
                 payload["request_body"] = {"task": task_text}
             if response_text:
                 payload["response_body"] = {"result": response_text}
+            if error_detail:
+                # error_detail is a top-level activity row column on the
+                # platform (handlers/activity.go). Surfacing the cleaned
+                # exception string here lets the Activity tab render a
+                # red error chip + the cause without forcing the user
+                # to scroll into the raw response_body JSON.
+                payload["error_detail"] = error_detail
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/activity",
+                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/activity",
                 json=payload,
                 headers=_auth_headers_for_heartbeat(),
             )
@@ -68,7 +102,7 @@ async def report_activity(
                 await client.post(
                     f"{PLATFORM_URL}/registry/heartbeat",
                     json={
-                        "workspace_id": ws_id,
+                        "workspace_id": WORKSPACE_ID,
                         "current_task": summary,
                         "active_tasks": 1,
                         "error_rate": 0,
@@ -81,218 +115,67 @@ async def report_activity(
         pass  # Best-effort — don't block delegation on activity reporting
 
 
-async def tool_delegate_task(workspace_id: str, task: str) -> str:
-    """Delegate a task to another workspace via A2A (synchronous — waits for response)."""
-    if not workspace_id or not task:
-        return "Error: workspace_id and task are required"
-
-    # Discover the target
-    peer = await discover_peer(workspace_id)
-    if not peer:
-        return f"Error: workspace {workspace_id} not found or not accessible (check access control)"
-
-    target_url = peer.get("url", "")
-    if not target_url:
-        return f"Error: workspace {workspace_id} has no URL (may be offline)"
-
-    # Report delegation start — include the task text for traceability
-    peer_name = peer.get("name") or _peer_names.get(workspace_id) or workspace_id[:8]
-    _peer_names[workspace_id] = peer_name  # cache for future use
-    # Brief summary for canvas display — just the delegation target
-    await report_activity("a2a_send", workspace_id, f"Delegating to {peer_name}", task_text=task)
-
-    # Send A2A message and log the full round-trip
-    result = await send_a2a_message(target_url, task)
-
-    # Detect delegation failures — wrap them clearly so the calling agent
-    # can decide to retry, use another peer, or handle the task itself.
-    is_error = result.startswith(_A2A_ERROR_PREFIX)
-    await report_activity(
-        "a2a_receive", workspace_id,
-        f"{peer_name} responded ({len(result)} chars)" if not is_error else f"{peer_name} failed",
-        task_text=task, response_text=result,
-        status="error" if is_error else "ok",
-    )
-    if is_error:
-        return (
-            f"DELEGATION FAILED to {peer_name}: {result}\n"
-            f"You should either: (1) try a different peer, (2) handle this task yourself, "
-            f"or (3) inform the user that {peer_name} is unavailable and provide your best answer."
-        )
-    return result
+# Delegation tool handlers — extracted to a2a_tools_delegation
+# (RFC #2873 iter 4b). Re-imported here so call sites + tests that
+# reference ``a2a_tools.tool_delegate_task`` /
+# ``a2a_tools._delegate_sync_via_polling`` keep resolving identically.
+from molecule_runtime.a2a_tools_delegation import (  # noqa: E402  (import after the from-a2a_client block)
+    _SYNC_POLL_BUDGET_S,
+    _SYNC_POLL_INTERVAL_S,
+    _delegate_sync_via_polling,
+    tool_check_task_status,
+    tool_delegate_task,
+    tool_delegate_task_async,
+)
 
 
-async def tool_delegate_task_async(workspace_id: str, task: str) -> str:
-    """Delegate a task via the platform's async delegation API (fire-and-forget).
-
-    Uses POST /workspaces/:id/delegate which runs the A2A request in the background.
-    Results are tracked in the platform DB and broadcast via WebSocket.
-    Use check_task_status to poll for results.
-    """
-    if not workspace_id or not task:
-        return "Error: workspace_id and task are required"
-
-    try:
-        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_delegate_task_async")
-    except WorkspaceIdValidationError as e:
-        return f"Error: {e}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/delegate",
-                json={"target_id": workspace_id, "task": task},
-                headers=_auth_headers_for_heartbeat(),
-            )
-            if resp.status_code == 202:
-                data = resp.json()
-                return json.dumps({
-                    "delegation_id": data.get("delegation_id", ""),
-                    "workspace_id": workspace_id,
-                    "status": "delegated",
-                    "note": "Task delegated. The platform runs it in the background. Use check_task_status to poll for results.",
-                })
-            else:
-                return f"Error: delegation failed with status {resp.status_code}: {resp.text[:200]}"
-    except Exception as e:
-        return f"Error: delegation failed — {e}"
+# Messaging tool handlers — extracted to a2a_tools_messaging
+# (RFC #2873 iter 4d). Re-imported here so call sites + tests that
+# reference ``a2a_tools.tool_send_message_to_user`` /
+# ``tool_list_peers`` / ``tool_get_workspace_info`` /
+# ``tool_chat_history`` / ``_upload_chat_files`` keep resolving
+# identically.
+from molecule_runtime.a2a_tools_messaging import (  # noqa: E402  (import after the top-of-module imports)
+    _upload_chat_files,
+    tool_broadcast_message,
+    tool_chat_history,
+    tool_get_workspace_info,
+    tool_list_peers,
+    tool_send_message_to_user,
+)
 
 
-async def tool_check_task_status(workspace_id: str, task_id: str) -> str:
-    """Check delegations for this workspace via the platform API.
-
-    Args:
-        workspace_id: Ignored (kept for backward compat). Checks this workspace's delegations.
-        task_id: Optional delegation_id to filter. If empty, returns all recent delegations.
-    """
-    try:
-        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_check_task_status")
-    except WorkspaceIdValidationError as e:
-        return f"Error: {e}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/delegations",
-                headers=_auth_headers_for_heartbeat(),
-            )
-            if resp.status_code != 200:
-                return f"Error: failed to check delegations ({resp.status_code})"
-            delegations = resp.json()
-            if task_id:
-                # Filter by delegation_id
-                matching = [d for d in delegations if d.get("delegation_id") == task_id]
-                if matching:
-                    return json.dumps(matching[0])
-                return json.dumps({"status": "not_found", "delegation_id": task_id})
-            # Return all recent delegations
-            summary = []
-            for d in delegations[:10]:
-                summary.append({
-                    "delegation_id": d.get("delegation_id", ""),
-                    "target_id": d.get("target_id", ""),
-                    "status": d.get("status", ""),
-                    "summary": d.get("summary", ""),
-                    "response_preview": d.get("response_preview", ""),
-                })
-            return json.dumps({"delegations": summary, "count": len(delegations)})
-    except Exception as e:
-        return f"Error checking delegations: {e}"
+# Memory tool handlers — extracted to a2a_tools_memory (RFC #2873 iter 4c).
+# Re-imported here so call sites + tests that reference
+# ``a2a_tools.tool_commit_memory`` / ``tool_recall_memory`` keep
+# resolving identically.
+from molecule_runtime.a2a_tools_memory import (  # noqa: E402  (import after the top-of-module imports)
+    tool_commit_memory,
+    tool_recall_memory,
+)
 
 
-async def tool_send_message_to_user(message: str) -> str:
-    """Send a message directly to the user's canvas chat via WebSocket."""
-    if not message:
-        return "Error: message is required"
-    try:
-        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_send_message_to_user")
-    except WorkspaceIdValidationError as e:
-        return f"Error: {e}"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/notify",
-                json={"message": message},
-                headers=_auth_headers_for_heartbeat(),
-            )
-            if resp.status_code == 200:
-                return "Message sent to user"
-            return f"Error: platform returned {resp.status_code}"
-    except Exception as e:
-        return f"Error sending message: {e}"
+# Inbox tool handlers — extracted to a2a_tools_inbox (RFC #2873 iter 4e).
+# Re-imported here so call sites + tests that reference
+# ``a2a_tools.tool_inbox_peek`` / ``tool_inbox_pop`` / ``tool_wait_for_message``
+# / ``_enrich_inbound_for_agent`` / ``_INBOX_NOT_ENABLED_MSG`` keep
+# resolving identically.
+from molecule_runtime.a2a_tools_inbox import (  # noqa: E402  (import after the top-of-module imports)
+    _INBOX_NOT_ENABLED_MSG,
+    _enrich_inbound_for_agent,
+    tool_inbox_peek,
+    tool_inbox_pop,
+    tool_wait_for_message,
+)
 
 
-async def tool_list_peers() -> str:
-    """List all workspaces this agent can communicate with."""
-    peers = await get_peers()
-    if not peers:
-        return "No peers available (this workspace may be isolated)"
-    lines = []
-    for p in peers:
-        status = p.get("status", "unknown")
-        role = p.get("role", "")
-        # Cache name for use in delegate_task
-        _peer_names[p["id"]] = p["name"]
-        lines.append(f"- {p['name']} (ID: {p['id']}, status: {status}, role: {role})")
-    return "\n".join(lines)
-
-
-async def tool_get_workspace_info() -> str:
-    """Get this workspace's own info."""
-    info = await get_workspace_info()
-    return json.dumps(info, indent=2)
-
-
-async def tool_commit_memory(content: str, scope: str = "LOCAL") -> str:
-    """Save important information to persistent memory."""
-    if not content:
-        return "Error: content is required"
-    scope = scope.upper()
-    if scope not in ("LOCAL", "TEAM", "GLOBAL"):
-        scope = "LOCAL"
-    try:
-        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_commit_memory")
-    except WorkspaceIdValidationError as e:
-        return f"Error: {e}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
-                json={"content": content, "scope": scope},
-                headers=_auth_headers_for_heartbeat(),
-            )
-            data = resp.json()
-            if resp.status_code in (200, 201):
-                return json.dumps({"success": True, "id": data.get("id"), "scope": scope})
-            return f"Error: {data.get('error', resp.text)}"
-    except Exception as e:
-        return f"Error saving memory: {e}"
-
-
-async def tool_recall_memory(query: str = "", scope: str = "") -> str:
-    """Search persistent memory for previously saved information."""
-    params = {}
-    if query:
-        params["q"] = query
-    if scope:
-        params["scope"] = scope.upper()
-    try:
-        ws_id = get_validated_workspace_id(caller="a2a_tools.tool_recall_memory")
-    except WorkspaceIdValidationError as e:
-        return f"Error: {e}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
-                params=params,
-                headers=_auth_headers_for_heartbeat(),
-            )
-            data = resp.json()
-            if isinstance(data, list):
-                if not data:
-                    return "No memories found."
-                lines = []
-                for m in data:
-                    lines.append(f"[{m.get('scope', '?')}] {m.get('content', '')}")
-                return "\n".join(lines)
-            return json.dumps(data)
-    except Exception as e:
-        return f"Error recalling memory: {e}"
+# Identity tool handlers — extracted to a2a_tools_identity. Ports the
+# two T4-tier MCP tools (``tool_get_runtime_identity`` +
+# ``tool_update_agent_card``) from molecule-ai-workspace-runtime PR#17.
+# That repo is mirror-only (reference_runtime_repo_is_mirror_only);
+# this is the canonical edit point, and the wheel mirror is
+# regenerated by publish-runtime.yml on merge.
+from molecule_runtime.a2a_tools_identity import (  # noqa: E402  (import after the top-of-module imports)
+    tool_get_runtime_identity,
+    tool_update_agent_card,
+)

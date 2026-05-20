@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from policies.namespaces import resolve_awareness_namespace
+from molecule_runtime.policies.namespaces import resolve_awareness_namespace
 
 try:  # pragma: no cover - optional runtime dependency in lightweight test envs
     import httpx  # type: ignore
@@ -51,24 +51,21 @@ class AwarenessClient:
         # be adjusted later without touching the agent-facing tools.
         return f"{self.base_url}/api/v1/namespaces/{self.namespace}/memories"
 
-    async def commit(self, content: str, scope: str, *, namespace: str | None = None) -> dict[str, Any]:
-        _ns = _normalise_namespace(namespace)
+    async def commit(self, content: str, scope: str) -> dict[str, Any]:
         client_cls = _resolve_async_client()
         async with client_cls(timeout=self.timeout) as client:
             resp = await client.post(
                 self._memories_url(),
-                json={"content": content, "scope": scope, "namespace": _ns},
+                json={"content": content, "scope": scope},
             )
         return _parse_commit_response(resp, scope)
 
-    async def search(self, query: str = "", scope: str = "", *, namespace: str | None = None) -> dict[str, Any]:
+    async def search(self, query: str = "", scope: str = "") -> dict[str, Any]:
         params: dict[str, str] = {}
         if query:
             params["q"] = query
         if scope:
             params["scope"] = scope
-        if namespace is not None:
-            params["namespace"] = namespace.strip()
 
         client_cls = _resolve_async_client()
         async with client_cls(timeout=self.timeout) as client:
@@ -123,17 +120,3 @@ def _resolve_async_client():
             return client_cls
 
     raise RuntimeError("httpx.AsyncClient is unavailable")
-
-
-def _normalise_namespace(namespace: str | None) -> str:
-    """Normalise a namespace value to 'general' when None or empty.
-
-    Whitespace is stripped before the empty check so that strings
-    containing only spaces are also treated as 'general'.
-    """
-    if namespace is None:
-        return "general"
-    stripped = namespace.strip()
-    if not stripped:
-        return "general"
-    return stripped
