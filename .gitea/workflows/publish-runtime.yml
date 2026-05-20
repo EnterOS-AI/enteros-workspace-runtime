@@ -1,0 +1,175 @@
+name: publish-runtime
+
+on:
+  push:
+    tags:
+      - "runtime-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-runtime
+  cancel-in-progress: false
+
+env:
+  GITEA_URL: https://git.moleculesai.app
+  GITEA_PYPI_SIMPLE_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+  GITEA_PYPI_UPLOAD_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/
+
+jobs:
+  publish:
+    runs-on: publish
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      wheel_sha256: ${{ steps.wheel_hash.outputs.wheel_sha256 }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Derive version from tag or pyproject
+        id: version
+        run: |
+          set -eu
+          if echo "$GITHUB_REF" | grep -q "^refs/tags/runtime-v"; then
+            VERSION="${GITHUB_REF#refs/tags/runtime-v}"
+          else
+            VERSION=$(python - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              print(tomllib.load(f)["project"]["version"])
+          PY
+          )
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([a-z0-9.+-]+)?$'; then
+            echo "::error::version $VERSION does not look like a PEP 440 release"
+            exit 1
+          fi
+          PYPROJECT_VERSION=$(python - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              print(tomllib.load(f)["project"]["version"])
+          PY
+          )
+          if [ "$VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::tag version $VERSION does not match pyproject.toml version $PYPROJECT_VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing molecule-ai-workspace-runtime $VERSION to Gitea package registry"
+
+      - name: Build wheel + sdist
+        run: |
+          pip install build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Capture wheel SHA256
+        id: wheel_hash
+        run: |
+          set -eu
+          WHEEL=$(ls dist/*.whl | head -1)
+          HASH=$(sha256sum "$WHEEL" | awk '{print $1}')
+          echo "wheel_sha256=$HASH" >> "$GITHUB_OUTPUT"
+          echo "Wheel: $(basename "$WHEEL")"
+          echo "SHA256: $HASH"
+
+      - name: Publish to Gitea package registry
+        env:
+          MOLECULE_PYPI_GITEA_PUBLISHER_USER: ${{ secrets.MOLECULE_PYPI_GITEA_PUBLISHER_USER }}
+          MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN: ${{ secrets.MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${MOLECULE_PYPI_GITEA_PUBLISHER_USER:-}" ] || [ -z "${MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN:-}" ]; then
+            echo "::error::Gitea package registry publisher secrets are not set"
+            exit 1
+          fi
+          python -m twine upload \
+            --repository-url "$GITEA_PYPI_UPLOAD_URL" \
+            --username "$MOLECULE_PYPI_GITEA_PUBLISHER_USER" \
+            --password "$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" \
+            dist/*
+
+      - name: Verify install from Gitea registry
+        env:
+          RUNTIME_VERSION: ${{ steps.version.outputs.version }}
+          EXPECTED_SHA256: ${{ steps.wheel_hash.outputs.wheel_sha256 }}
+        run: |
+          set -eu
+          python -m venv /tmp/runtime-registry-smoke
+          PIP=/tmp/runtime-registry-smoke/bin/pip
+          PY=/tmp/runtime-registry-smoke/bin/python
+          $PIP install --upgrade --quiet pip
+          $PIP install \
+            --index-url "$GITEA_PYPI_SIMPLE_URL" \
+            --no-cache-dir \
+            "molecule-ai-workspace-runtime==$RUNTIME_VERSION"
+          INSTALLED=$($PIP show molecule-ai-workspace-runtime | awk -F': ' '/^Version:/{print $2}')
+          if [ "$INSTALLED" != "$RUNTIME_VERSION" ]; then
+            echo "::error::installed $INSTALLED, want $RUNTIME_VERSION"
+            exit 1
+          fi
+          $PY -c "from molecule_runtime.main import main_sync; from molecule_runtime.mcp_cli import main; print('runtime registry smoke OK')"
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## publish-runtime $(date -u +%FT%TZ)"
+            echo
+            echo "**Version:** \`${{ steps.version.outputs.version }}\`"
+            echo "**Registry:** \`$GITEA_PYPI_SIMPLE_URL\`"
+            echo "**Wheel SHA256:** \`${{ steps.wheel_hash.outputs.wheel_sha256 }}\`"
+            echo
+            echo "PyPI is intentionally not part of this release path."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cascade:
+    runs-on: publish
+    needs: publish
+    steps:
+      - name: Fan out .runtime-version to template repos
+        env:
+          DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          RUNTIME_VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          set +e
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "::error::DISPATCH_TOKEN secret missing; cannot update template runtime pins"
+            exit 1
+          fi
+          TEMPLATES="claude-code hermes openclaw codex langgraph autogen"
+          FAILED=""
+          WORKDIR="$(mktemp -d)"
+          git config --global user.name "publish-runtime cascade"
+          git config --global user.email "publish-runtime@moleculesai.app"
+          for tpl in $TEMPLATES; do
+            REPO="molecule-ai/molecule-ai-workspace-template-$tpl"
+            CLONE="$WORKDIR/$tpl"
+            git clone "https://x-access-token:${DISPATCH_TOKEN}@${GITEA_URL#https://}/$REPO.git" "$CLONE"
+            if [ $? -ne 0 ]; then
+              FAILED="$FAILED $tpl:clone"
+              continue
+            fi
+            printf '%s\n' "$RUNTIME_VERSION" > "$CLONE/.runtime-version"
+            cd "$CLONE"
+            if git diff --quiet -- .runtime-version; then
+              echo "$tpl already pinned to $RUNTIME_VERSION"
+              cd - >/dev/null
+              continue
+            fi
+            git add .runtime-version
+            git commit -m "chore(runtime): bump runtime to $RUNTIME_VERSION"
+            git push origin HEAD:main
+            [ $? -ne 0 ] && FAILED="$FAILED $tpl:push"
+            cd - >/dev/null
+          done
+          if [ -n "$FAILED" ]; then
+            echo "::error::cascade failures:$FAILED"
+            exit 1
+          fi

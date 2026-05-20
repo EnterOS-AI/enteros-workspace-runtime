@@ -68,6 +68,11 @@ def _scrubbed_env(extra: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k not in _SCRUB_KEYS} | extra
 
 
+def _setup_shell() -> str:
+    """Resolve bash before env scrubbing changes PATH for setup.sh."""
+    return shutil.which("bash") or "/bin/bash"
+
+
 # Files at the plugin root that are never treated as prompt fragments,
 # even if they're markdown. Module-level so tests and other adapters can
 # import the set rather than re-declaring it.
@@ -189,7 +194,7 @@ class AgentskillsAdaptor:
             ctx.logger.info("%s: running setup.sh", self.plugin_name)
             try:
                 proc = subprocess.run(
-                    ["bash", str(setup_script)],
+                    [_setup_shell(), str(setup_script)],
                     capture_output=True, text=True, timeout=120,
                     cwd=str(ctx.plugin_root),
                     env=_scrubbed_env({"CONFIGS_DIR": str(ctx.configs_dir)}),
