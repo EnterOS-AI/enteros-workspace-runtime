@@ -388,7 +388,10 @@ async def main():  # pragma: no cover
                     if tok:
                         from molecule_runtime.platform_auth import save_token
                         save_token(tok)
-                        print(f"Saved workspace auth token (prefix={tok[:8]}…)")
+                        # CWE-532 (task #344): redacted — never log token
+                        # prefix. Even 8 chars narrows the guess space for
+                        # logs scraped from container stdout / journald.
+                        print("Saved workspace auth token (value=[REDACTED])")
                     # RFC #2312 PR-F: persist platform_inbound_secret if the
                     # platform supplied one. Idempotent — writing the same
                     # value over an existing file is harmless. Required for
@@ -399,7 +402,9 @@ async def main():  # pragma: no cover
                     if inbound:
                         from molecule_runtime.platform_inbound_auth import save_inbound_secret
                         save_inbound_secret(inbound)
-                        print(f"Saved platform_inbound_secret (prefix={inbound[:8]}…)")
+                        # CWE-532 (task #344): redacted — never log secret
+                        # prefix.
+                        print("Saved platform_inbound_secret (value=[REDACTED])")
                 except Exception as parse_exc:
                     print(f"Warning: couldn't parse register response for token: {parse_exc}")
         except Exception as e:
