@@ -1,5 +1,15 @@
 """Bridge between LangGraph agent and A2A protocol, with SSE streaming support.
 
+Non-blocking inbound (task #378)
+--------------------------------
+When ``MOLECULE_A2A_NONBLOCKING=true``, ``_core_execute`` cooperates with
+``molecule_runtime.runtime_inbox`` so a second POST sharing the running
+turn's ``context_id`` returns within ~50 ms instead of queuing behind the
+in-flight LangGraph turn. The in-flight turn polls the inbox between
+``astream_events`` iterations and re-runs with the merged message history
+when an interrupt fires. See ``runtime_inbox.py`` for the full design and
+upstream a2a-protocol spec citation ("Task Execution and Interruption" §3).
+
 SSE streaming architecture
 --------------------------
 The A2A SDK (``DefaultRequestHandler`` + ``EventQueue``) owns the SSE transport
@@ -53,6 +63,10 @@ from molecule_runtime.executor_helpers import (
     extract_attached_files,
     read_delegation_results,
     sanitize_agent_error,
+)
+from molecule_runtime.runtime_inbox import (
+    get_inbox as _get_runtime_inbox,
+    is_nonblocking_enabled as _nonblocking_enabled,
 )
 from molecule_runtime.builtin_tools.telemetry import (
     A2A_TASK_ID,
@@ -310,6 +324,39 @@ class LangGraphA2AExecutor(AgentExecutor):
 
             updater = TaskUpdater(event_queue, task_id, context_id)
 
+            # ── Task #378: non-blocking fast-path ────────────────────────
+            # When the feature flag is on, register this context's inbox
+            # entry. If a turn is already running for this context_id,
+            # request an interrupt + return immediately so the POST handler
+            # acks within ~50 ms instead of blocking behind the live turn.
+            _inbox_entry = None
+            _nonblocking = _nonblocking_enabled()
+            if _nonblocking:
+                _inbox_entry = await _get_runtime_inbox().get_or_create(context_id)
+                if _inbox_entry.turn_in_flight:
+                    logger.info(
+                        "A2A execute: turn already in flight for context_id=%s — "
+                        "requesting interrupt + acking new message",
+                        context_id,
+                    )
+                    _inbox_entry.request_interrupt(user_input)
+                    # Fast-ack the new POST: complete() with a stub Message
+                    # so the platform proxy gets a prompt 200 response. The
+                    # in-flight turn will deliver the real reply (which it
+                    # composes with the merged history) via its own
+                    # updater.complete() — the canvas already polls for
+                    # subsequent A2A_RESPONSE WebSocket events.
+                    await updater.complete(
+                        message=new_text_message(
+                            "[Acknowledged — interrupting current turn to "
+                            "process your new message.]",
+                            task_id=task_id,
+                            context_id=context_id,
+                        )
+                    )
+                    return ""
+                _inbox_entry.turn_in_flight = True
+
             try:
                 # set_current_task INSIDE the try so active_tasks is always
                 # decremented by the finally block even if CancelledError hits
@@ -375,68 +422,133 @@ class LangGraphA2AExecutor(AgentExecutor):
                     tool_trace: list[dict] = []
                     tool_trace_by_run: dict[str, dict] = {}
 
-                    async for event in self.agent.astream_events(
-                        {"messages": messages},
-                        config=run_config,
-                        version="v2",
-                    ):
-                        kind = event.get("event", "")
-
-                        if kind == "on_chat_model_stream":
-                            run_id = event.get("run_id", "")
-                            if run_id and run_id != current_run_id:
-                                # New LLM run started — fresh artifact slot
-                                current_run_id = run_id
-                                artifact_id = str(uuid.uuid4())
-                                has_streamed = False
-
-                            chunk = event.get("data", {}).get("chunk")
-                            if chunk is not None:
-                                texts = _extract_chunk_text(chunk.content)
-                                for text in texts:
-                                    await updater.add_artifact(
-                                        parts=[Part(text=text)],  # v1: TextPart removed, Part takes text= directly
-                                        artifact_id=artifact_id,
-                                        append=has_streamed,  # False=first, True=append
-                                        last_chunk=False,
-                                    )
-                                    has_streamed = True
-                                    accumulated.append(text)
-
-                        elif kind == "on_tool_start":
-                            tool_name = event.get("name", "?")
-                            tool_input = event.get("data", {}).get("input", "")
-                            tool_run_id = event.get("run_id", "")
-                            logger.debug("SSE: tool start — %s", tool_name)
-                            if len(tool_trace) < MAX_TOOL_TRACE:
-                                entry = {
-                                    "tool": tool_name,
-                                    "input": str(tool_input)[:500] if tool_input else "",
-                                }
-                                tool_trace.append(entry)
-                                if tool_run_id:
-                                    tool_trace_by_run[tool_run_id] = entry
-                            if _agency is not None:
-                                _agency.on_tool_call(
-                                    tool_name=tool_name,
-                                    context_id=context_id,
+                    # Task #378: the astream loop is wrapped in a
+                    # while-True so an interrupt (new POST for the same
+                    # context_id) can abort the in-flight turn, drain
+                    # the inbox, append the queued messages to history,
+                    # and re-enter astream with the merged context. The
+                    # subprocess registered in the inbox entry — if any
+                    # — is terminated so a `bash -c "sleep 600"` doesn't
+                    # block the new turn.
+                    while True:
+                        _astream_iter = self.agent.astream_events(
+                            {"messages": messages},
+                            config=run_config,
+                            version="v2",
+                        )
+                        _was_interrupted = False
+                        async for event in _astream_iter:
+                            # Cooperative interrupt check — runs between
+                            # every LangGraph event so even a long
+                            # tool-call iteration can be aborted by an
+                            # inbound message. The check is O(1)
+                            # (asyncio.Event.is_set) so this stays
+                            # zero-cost when no interrupt is pending.
+                            if _inbox_entry is not None and _inbox_entry.interrupt_event.is_set():
+                                logger.info(
+                                    "A2A execute: interrupt detected for context_id=%s — "
+                                    "draining inbox and restarting astream",
+                                    context_id,
                                 )
+                                _inbox_entry.kill_subprocess()
+                                _was_interrupted = True
+                                # Close the iterator promptly so any
+                                # pending LangGraph coroutines see the
+                                # cancellation and clean up.
+                                try:
+                                    await _astream_iter.aclose()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                break
 
-                        elif kind == "on_tool_end":
-                            tool_end_name = event.get("name", "?")
-                            tool_output = event.get("data", {}).get("output", "")
-                            tool_run_id = event.get("run_id", "")
-                            logger.debug("SSE: tool end — %s", tool_end_name)
-                            # Pair via run_id so parallel tool calls don't clobber each other.
-                            entry = tool_trace_by_run.get(tool_run_id) if tool_run_id else None
-                            if entry is not None:
-                                entry["output_preview"] = str(tool_output)[:300] if tool_output else ""
+                            kind = event.get("event", "")
 
-                        elif kind == "on_chat_model_end":
-                            # Capture the last completed AIMessage for token telemetry
-                            output = event.get("data", {}).get("output")
-                            if output is not None:
-                                last_ai_message = output
+                            if kind == "on_chat_model_stream":
+                                run_id = event.get("run_id", "")
+                                if run_id and run_id != current_run_id:
+                                    # New LLM run started — fresh artifact slot
+                                    current_run_id = run_id
+                                    artifact_id = str(uuid.uuid4())
+                                    has_streamed = False
+
+                                chunk = event.get("data", {}).get("chunk")
+                                if chunk is not None:
+                                    texts = _extract_chunk_text(chunk.content)
+                                    for text in texts:
+                                        await updater.add_artifact(
+                                            parts=[Part(text=text)],  # v1: TextPart removed, Part takes text= directly
+                                            artifact_id=artifact_id,
+                                            append=has_streamed,  # False=first, True=append
+                                            last_chunk=False,
+                                        )
+                                        has_streamed = True
+                                        accumulated.append(text)
+
+                            elif kind == "on_tool_start":
+                                tool_name = event.get("name", "?")
+                                tool_input = event.get("data", {}).get("input", "")
+                                tool_run_id = event.get("run_id", "")
+                                logger.debug("SSE: tool start — %s", tool_name)
+                                if len(tool_trace) < MAX_TOOL_TRACE:
+                                    entry = {
+                                        "tool": tool_name,
+                                        "input": str(tool_input)[:500] if tool_input else "",
+                                    }
+                                    tool_trace.append(entry)
+                                    if tool_run_id:
+                                        tool_trace_by_run[tool_run_id] = entry
+                                if _agency is not None:
+                                    _agency.on_tool_call(
+                                        tool_name=tool_name,
+                                        context_id=context_id,
+                                    )
+
+                            elif kind == "on_tool_end":
+                                tool_end_name = event.get("name", "?")
+                                tool_output = event.get("data", {}).get("output", "")
+                                tool_run_id = event.get("run_id", "")
+                                logger.debug("SSE: tool end — %s", tool_end_name)
+                                # Pair via run_id so parallel tool calls don't clobber each other.
+                                entry = tool_trace_by_run.get(tool_run_id) if tool_run_id else None
+                                if entry is not None:
+                                    entry["output_preview"] = str(tool_output)[:300] if tool_output else ""
+
+                            elif kind == "on_chat_model_end":
+                                # Capture the last completed AIMessage for token telemetry
+                                output = event.get("data", {}).get("output")
+                                if output is not None:
+                                    last_ai_message = output
+
+                        if not _was_interrupted:
+                            # Natural completion — exit the outer loop
+                            break
+
+                        # Interrupt path: drain the inbox, snapshot
+                        # accumulated text as an AI message (so the
+                        # new turn knows what was said before being
+                        # cut off), append all queued user messages,
+                        # and re-run astream with the merged history.
+                        _pending = _inbox_entry.consume_pending()
+                        if not _pending:
+                            # Spurious wakeup (interrupt set with no
+                            # queued message — shouldn't happen but
+                            # defend against the race). Exit cleanly.
+                            break
+                        _partial = "".join(accumulated).strip()
+                        if _partial:
+                            messages.append(("ai", _partial))
+                            _inbox_entry.last_accumulated = _partial
+                        # Each queued message becomes a fresh human turn
+                        # in arrival order. The LangGraph agent treats
+                        # them as a normal multi-turn continuation.
+                        for _m in _pending:
+                            messages.append(("human", _m))
+                        # Reset stream state for the restart so artifact
+                        # IDs and token accumulators don't bleed across.
+                        accumulated.clear()
+                        current_run_id = None
+                        artifact_id = str(uuid.uuid4())
+                        has_streamed = False
 
                     # Record token usage from the last completed LLM call
                     if last_ai_message is not None:
@@ -560,6 +672,13 @@ class LangGraphA2AExecutor(AgentExecutor):
                 )
             finally:
                 await set_current_task(self._heartbeat, "")
+                # Task #378: release the inbox slot so the next POST
+                # for this context_id starts a fresh turn. Done in the
+                # finally so a mid-turn exception can't leak
+                # ``turn_in_flight=True`` and dead-end the workspace.
+                if _inbox_entry is not None:
+                    _inbox_entry.turn_in_flight = False
+                    _inbox_entry.interrupt_event.clear()
 
         return _result
 
