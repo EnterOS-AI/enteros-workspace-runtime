@@ -51,7 +51,12 @@ import os
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
-WORKSPACE_ID: str = os.environ.get("WORKSPACE_ID", "")
+# CWE-20 (issue #14): WORKSPACE_ID flows into governance event records.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID: str = _get_workspace_id()
+except ValueError:
+    WORKSPACE_ID = ""
 
 # Module-level singleton — set by initialize_governance() at startup
 _adapter: Optional["GovernanceAdapter"] = None
@@ -161,7 +166,7 @@ class GovernanceAdapter:
             ``(allowed, reason)`` — reason is a short human-readable string
             explaining the decision.
         """
-        from builtin_tools import audit  # inline import to avoid circular dependencies
+        from molecule_runtime.builtin_tools import audit  # inline import to avoid circular dependencies
 
         context = context or {}
 
@@ -282,8 +287,8 @@ class GovernanceAdapter:
         str
             The ``trace_id`` produced by ``audit.log_event``.
         """
-        from builtin_tools import audit  # inline import to avoid circular dependencies
-        from builtin_tools.telemetry import get_current_traceparent  # inline import
+        from molecule_runtime.builtin_tools import audit  # inline import to avoid circular dependencies
+        from molecule_runtime.builtin_tools.telemetry import get_current_traceparent  # inline import
 
         traceparent: str | None = get_current_traceparent()
 
@@ -364,7 +369,7 @@ def check_permission_with_governance(
         ``(allowed, reason)``
     """
     if _adapter is None:
-        from builtin_tools import audit  # inline import to avoid circular dependencies
+        from molecule_runtime.builtin_tools import audit  # inline import to avoid circular dependencies
 
         result: bool = audit.check_permission(action, roles, custom_permissions)
         return result, "rbac_only"

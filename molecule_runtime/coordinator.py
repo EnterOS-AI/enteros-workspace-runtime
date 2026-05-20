@@ -17,56 +17,41 @@ import os
 
 import httpx
 from langchain_core.tools import tool
-from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
-from molecule_runtime.adapters.shared_runtime import build_peer_section
-from policies.routing import build_team_routing_payload
+from molecule_runtime.shared_runtime import build_peer_section
+from molecule_runtime.policies.routing import build_team_routing_payload
 
 logger = logging.getLogger(__name__)
 
-PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
-
-
-async def get_parent_context() -> list[dict]:
-    """Fetch shared context files from this workspace's parent.
-
-    Returns a list of {"path": str, "content": str} dicts.
-    Returns empty list if no parent, parent unreachable, or no shared context.
-    """
-    parent_id = os.environ.get("PARENT_ID", "")
-    if not parent_id:
-        return []
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{parent_id}/shared-context",
-                headers={"X-Workspace-ID": WORKSPACE_ID},
-            )
-            if resp.status_code == 200:
-                return resp.json()
-    except Exception as e:
-        logger.warning("Failed to fetch parent context: %s", e)
-    return []
+if os.path.exists("/.dockerenv") or os.environ.get("DOCKER_VERSION"):
+    PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
+else:
+    PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://localhost:8080")
+# Validate WORKSPACE_ID before it lands in
+# /registry/{WORKSPACE_ID}/peers URL paths (CWE-20, issue #14).
+# Raises RuntimeError on either empty OR malformed input so the existing
+# "required but not set" contract is preserved.
+from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
+_WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
+if not _WORKSPACE_ID_raw:
+    raise RuntimeError("WORKSPACE_ID environment variable is required but not set")
+try:
+    WORKSPACE_ID = _validate_workspace_id(_WORKSPACE_ID_raw)
+except ValueError as _exc:
+    raise RuntimeError(f"WORKSPACE_ID failed validation: {_exc}") from _exc
 
 
 async def get_children() -> list[dict]:
     """Fetch this workspace's children from the platform."""
     try:
-        ws_id = get_validated_workspace_id(caller="coordinator.get_children")
-    except WorkspaceIdValidationError:
-        logger.warning("get_children skipped: invalid WORKSPACE_ID")
-        return []
-    try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{PLATFORM_URL}/registry/{ws_id}/peers",
-                headers={"X-Workspace-ID": ws_id},
+                f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers",
+                headers={"X-Workspace-ID": WORKSPACE_ID},
             )
             if resp.status_code == 200:
                 peers = resp.json()
                 # Filter to only children (parent_id == our ID)
-                return [p for p in peers if p.get("parent_id") == ws_id]
+                return [p for p in peers if p.get("parent_id") == WORKSPACE_ID]
     except Exception as e:
         logger.warning("Failed to fetch children: %s", e)
     return []
@@ -81,7 +66,7 @@ def build_children_description(children: list[dict]) -> str:
         children,
         heading="## Your Team (sub-workspaces you coordinate)",
         instruction=(
-            "Use the `delegate_to_workspace` tool to send tasks to the chosen member. "
+            "Use the `delegate_task_async` tool to send tasks to the chosen member. "
             "Only delegate to members listed above."
         ),
     )
@@ -92,7 +77,7 @@ def build_children_description(children: list[dict]) -> str:
             "",
             "### Coordination Rules — MANDATORY",
             "1. You are a COORDINATOR. Your ONLY job is to delegate and synthesize. NEVER do the work yourself.",
-            "2. For EVERY task, use `delegate_to_workspace` to send it to the appropriate team member(s). "
+            "2. For EVERY task, use `delegate_task_async` to send it to the appropriate team member(s). "
             "Do this BEFORE writing any analysis, code, or research yourself.",
             "3. If a task spans multiple members, delegate to ALL of them in parallel and aggregate results.",
             "4. If ALL members are offline/paused, tell the caller which members are unavailable. "
@@ -120,23 +105,56 @@ async def route_task_to_team(
         task: The task description to route.
         preferred_member_id: Optional — directly delegate to this member.
     """
-    from builtin_tools.delegation import delegate_to_workspace as delegate
+    import time
+    from molecule_runtime.builtin_tools.delegation import delegate_task_async as delegate
+
+    # RFC #2251 V1.0 reproduction-harness instrumentation. Phase-tagged log
+    # lines correlate with scripts/measure-coordinator-task-bounds.sh's
+    # external timing trace, so an operator running the harness against
+    # staging can answer "what phase was the coordinator in at minute 7?".
+    # `grep rfc2251_phase` on the workspace's container logs is the query.
+    # Strip when V1.0 ships and the phase data lands in the structured
+    # heartbeat payload instead.
+    _phase_t0 = time.monotonic()
+    logger.info(
+        "rfc2251_phase=route_start task_chars=%d preferred_member_id=%s",
+        len(task), preferred_member_id or "none",
+    )
 
     children = await get_children()
+    logger.info(
+        "rfc2251_phase=children_fetched count=%d elapsed_ms=%d",
+        len(children), int((time.monotonic() - _phase_t0) * 1000),
+    )
+
     decision = build_team_routing_payload(
         children,
         task=task,
         preferred_member_id=preferred_member_id,
     )
+    logger.info(
+        "rfc2251_phase=routing_decided action=%s elapsed_ms=%d",
+        decision.get("action", "unknown"), int((time.monotonic() - _phase_t0) * 1000),
+    )
 
     if decision.get("action") == "delegate_to_preferred_member":
         # Async delegation — returns immediately with task_id
+        target = decision["preferred_member_id"]
+        logger.info(
+            "rfc2251_phase=delegate_invoked target=%s elapsed_ms=%d",
+            target, int((time.monotonic() - _phase_t0) * 1000),
+        )
         result = await delegate.ainvoke(
-            {
-                "workspace_id": decision["preferred_member_id"],
-                "task": task,
-            }
+            {"workspace_id": target, "task": task}
+        )
+        logger.info(
+            "rfc2251_phase=delegate_returned target=%s task_id=%s elapsed_ms=%d",
+            target, result.get("task_id", "n/a"), int((time.monotonic() - _phase_t0) * 1000),
         )
         return result
 
+    logger.info(
+        "rfc2251_phase=route_returning_decision_only elapsed_ms=%d",
+        int((time.monotonic() - _phase_t0) * 1000),
+    )
     return decision

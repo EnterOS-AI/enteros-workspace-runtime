@@ -70,7 +70,7 @@ class HITLConfig:
 def _load_hitl_config() -> HITLConfig:
     """Load HITL config from workspace config; fall back to safe defaults."""
     try:
-        from config import load_config
+        from molecule_runtime.config import load_config
         cfg = load_config()
         raw = getattr(cfg, "hitl", None)
         if raw is None:
@@ -346,7 +346,7 @@ def requires_approval(
             active_bypass = bypass_roles if bypass_roles is not None else hitl_cfg.bypass_roles
             if active_bypass:
                 try:
-                    from builtin_tools.audit import get_workspace_roles
+                    from molecule_runtime.builtin_tools.audit import get_workspace_roles
                     roles, _ = get_workspace_roles()
                     if any(r in active_bypass for r in roles):
                         logger.info(
@@ -373,7 +373,7 @@ def requires_approval(
 
             # --- Request approval via approval tool --------------------------
             try:
-                from builtin_tools.approval import request_approval
+                from molecule_runtime.builtin_tools.approval import request_approval
                 approval_result = await request_approval.ainvoke(
                     {"action": action, "reason": reason}
                 )
@@ -385,6 +385,21 @@ def requires_approval(
                 }
 
             if not approval_result.get("approved"):
+                # Art. 14 audit: log the denial outcome so the activity log
+                # contains evidence that the human oversight gate was exercised.
+                try:
+                    from molecule_runtime.builtin_tools.audit import log_event
+                    log_event(
+                        event_type="hitl",
+                        action="approve",
+                        resource=action,
+                        outcome="denied",
+                        actor=approval_result.get("decided_by"),
+                        approval_id=approval_result.get("approval_id"),
+                        reason=reason,
+                    )
+                except Exception:
+                    pass
                 return {
                     "success": False,
                     "error": (
@@ -393,6 +408,21 @@ def requires_approval(
                     ),
                     "approval_id": approval_result.get("approval_id"),
                 }
+
+            # Art. 14 audit: log the approval grant before running the function.
+            try:
+                from molecule_runtime.builtin_tools.audit import log_event
+                log_event(
+                    event_type="hitl",
+                    action="approve",
+                    resource=action,
+                    outcome="granted",
+                    actor=approval_result.get("decided_by"),
+                    approval_id=approval_result.get("approval_id"),
+                    reason=reason,
+                )
+            except Exception:
+                pass
 
             # --- Approved — run the original function ------------------------
             return await fn(*args, **kwargs)
@@ -426,7 +456,7 @@ async def pause_task(task_id: str, reason: str = "") -> dict:
     _ws = os.environ.get("WORKSPACE_ID", "")
 
     try:
-        from builtin_tools.audit import log_event
+        from molecule_runtime.builtin_tools.audit import log_event
         log_event(
             event_type="hitl",
             action="pause",
@@ -447,7 +477,7 @@ async def pause_task(task_id: str, reason: str = "") -> dict:
         result = pause_registry.pop_result(task_id)
         logger.info("HITL: task %s resumed", task_id)
         try:
-            from builtin_tools.audit import log_event
+            from molecule_runtime.builtin_tools.audit import log_event
             log_event(
                 event_type="hitl",
                 action="resume",
@@ -462,7 +492,7 @@ async def pause_task(task_id: str, reason: str = "") -> dict:
     except asyncio.TimeoutError:
         logger.warning("HITL: task %s timed out after %.0fs", task_id, timeout)
         try:
-            from builtin_tools.audit import log_event
+            from molecule_runtime.builtin_tools.audit import log_event
             log_event(
                 event_type="hitl",
                 action="pause",
@@ -504,7 +534,7 @@ async def resume_task(task_id: str, message: str = "") -> dict:
     if success:
         logger.info("HITL: resume signal sent for task %s", task_id)
         try:
-            from builtin_tools.audit import log_event
+            from molecule_runtime.builtin_tools.audit import log_event
             log_event(
                 event_type="hitl",
                 action="resume",

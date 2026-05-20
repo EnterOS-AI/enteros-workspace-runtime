@@ -39,16 +39,22 @@ import uuid
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
-# a2a.utils and TextPart removed in a2a-sdk 1.x; use a2a.helpers + flat Part
 from a2a.types import Part
+# KI-009: a2a-sdk v1 renames a2a.utils → a2a.helpers; TextPart removed (Part takes text= directly)
 from a2a.helpers import new_text_message
-from molecule_runtime.adapters.shared_runtime import (
+from molecule_runtime.shared_runtime import (
     extract_history as _extract_history,
     extract_message_text,
     brief_task,
     set_current_task,
 )
-from builtin_tools.telemetry import (
+from molecule_runtime.executor_helpers import (
+    collect_outbound_files,
+    extract_attached_files,
+    read_delegation_results,
+    sanitize_agent_error,
+)
+from molecule_runtime.builtin_tools.telemetry import (
     A2A_TASK_ID,
     GEN_AI_OPERATION_NAME,
     GEN_AI_REQUEST_MODEL,
@@ -62,7 +68,14 @@ from builtin_tools.telemetry import (
 
 logger = logging.getLogger(__name__)
 
-_WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "unknown")
+# CWE-20 (issue #14): _WORKSPACE_ID becomes an OpenTelemetry span
+# attribute; "unknown" sentinel preserved for the no-env fallback so the
+# tracer keeps working before the workspace ID is provisioned.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    _WORKSPACE_ID = _get_workspace_id()
+except ValueError:
+    _WORKSPACE_ID = "unknown"
 
 # LangGraph ReAct cycle budget per turn. Library default is 25; 500 covers
 # PM fan-outs (plan → 6 delegations → 6 awaits → 6 results → synthesize ≈
@@ -97,7 +110,7 @@ def _parse_recursion_limit() -> int:
 # ---------------------------------------------------------------------------
 
 try:
-    from builtin_tools.compliance import (
+    from molecule_runtime.builtin_tools.compliance import (
         AgencyTracker,
         ExcessiveAgencyError,
         PromptInjectionError,
@@ -113,7 +126,7 @@ except ImportError:  # pragma: no cover
 def _get_compliance_cfg():
     """Return ComplianceConfig or None (cached for process lifetime)."""
     try:
-        from config import load_config
+        from molecule_runtime.config import load_config
         return load_config().compliance
     except Exception:
         return None
@@ -186,7 +199,7 @@ class LangGraphA2AExecutor(AgentExecutor):
         # Falls back silently to _core_execute() on any error or if Temporal
         # is unavailable, so the client always receives a response.
         try:
-            from builtin_tools.temporal_workflow import get_wrapper as _get_temporal_wrapper
+            from molecule_runtime.builtin_tools.temporal_workflow import get_wrapper as _get_temporal_wrapper
 
             _tw = _get_temporal_wrapper()
             if _tw is not None and _tw.is_available():
@@ -211,6 +224,29 @@ class LangGraphA2AExecutor(AgentExecutor):
           3. Message(final_text)                      — terminal event
         """
         user_input = extract_message_text(context)
+        # Inject delegation results from prior turns. Heartbeat writes
+        # completed delegation rows to DELEGATION_RESULTS_FILE and sends
+        # a self-message to wake the agent; this consumes the file and
+        # surfaces the results as context so the agent can act on them
+        # without needing an explicit check_task_status call.
+        # Results are prepended so they are visible even when the
+        # self-message text is overwritten by a subsequent user message.
+        pending_results = read_delegation_results()
+        if pending_results:
+            logger.info("A2A execute: injecting %d delegation result(s)", pending_results.count("\n") + 1)
+            user_input = f"[Delegation results available]\n{pending_results}\n\n{user_input}"
+        # Pull attached files from A2A message parts (kind: "file") and
+        # append a manifest to the prompt so the agent knows they exist.
+        # LangGraph tools (filesystem, bash, skills) can then open the
+        # files by path — without this the agent silently ignores the
+        # attachments and replies "I'm not sure what you're referring to".
+        _attached_files = extract_attached_files(getattr(context, "message", None))
+        if _attached_files:
+            _manifest = "\n\nAttached files:\n" + "\n".join(
+                f"- {f['name']} ({f['mime_type'] or 'unknown type'}) at {f['path']}"
+                for f in _attached_files
+            )
+            user_input = (user_input + _manifest) if user_input else _manifest.lstrip()
         if not user_input:
             parts = getattr(getattr(context, "message", None), "parts", None)
             logger.warning("A2A execute: no text content in message parts: %s", parts)
@@ -247,16 +283,40 @@ class LangGraphA2AExecutor(AgentExecutor):
             task_span.set_attribute(A2A_TASK_ID, context.context_id or "")
             task_span.set_attribute("a2a.input_preview", user_input[:256])
 
-            await set_current_task(self._heartbeat, brief_task(user_input))
-
             # Resolve IDs — the RequestContextBuilder always sets them, but
             # we generate fallbacks for safety (e.g. in unit tests).
             task_id = context.task_id or str(uuid.uuid4())
             context_id = context.context_id or str(uuid.uuid4())
 
+            # A2A v1 contract (a2a-sdk ≥ 1.0): enqueue a Task event before any
+            # TaskStatusUpdateEvent. The framework only auto-creates the Task
+            # on continuation messages (existing task_id resolves via
+            # task_manager.get_task()). For fresh requests get_task() returns
+            # None and the SDK rejects the first status update with
+            # InvalidAgentResponseError("Agent should enqueue Task before
+            # TaskStatusUpdateEvent event") — see a2a/server/agent_execution/
+            # active_task.py for the validation site. PR #2170 migrated the
+            # surface to v1 but missed this contract; the synth-E2E gate
+            # surfaced it on every run after staging deploy.
+            if getattr(context, "current_task", None) is None:
+                from a2a.types import Task, TaskState, TaskStatus
+                await event_queue.enqueue_event(
+                    Task(
+                        id=task_id,
+                        context_id=context_id,
+                        status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
+                    )
+                )
+
             updater = TaskUpdater(event_queue, task_id, context_id)
 
             try:
+                # set_current_task INSIDE the try so active_tasks is always
+                # decremented by the finally block even if CancelledError hits
+                # during the heartbeat HTTP push. Moving it outside the try
+                # created a window where cancellation left active_tasks stuck
+                # at 1, permanently blocking queue drain. (#2026)
+                await set_current_task(self._heartbeat, brief_task(user_input))
                 messages = _extract_history(context)
                 if messages:
                     logger.info("A2A execute: injecting %d history messages", len(messages))
@@ -305,6 +365,16 @@ class LangGraphA2AExecutor(AgentExecutor):
                         else None
                     )
 
+                    # ── Tool trace: collect every tool invocation for
+                    # platform-level observability ────────────────────
+                    # Keyed by run_id so parallel tool calls (LangGraph
+                    # supports them) pair start→end correctly. Capped at
+                    # MAX_TOOL_TRACE entries to prevent runaway loops from
+                    # ballooning the JSONB payload.
+                    MAX_TOOL_TRACE = 200
+                    tool_trace: list[dict] = []
+                    tool_trace_by_run: dict[str, dict] = {}
+
                     async for event in self.agent.astream_events(
                         {"messages": messages},
                         config=run_config,
@@ -325,7 +395,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                                 texts = _extract_chunk_text(chunk.content)
                                 for text in texts:
                                     await updater.add_artifact(
-                                        parts=[Part(text=text)],
+                                        parts=[Part(text=text)],  # v1: TextPart removed, Part takes text= directly
                                         artifact_id=artifact_id,
                                         append=has_streamed,  # False=first, True=append
                                         last_chunk=False,
@@ -335,7 +405,17 @@ class LangGraphA2AExecutor(AgentExecutor):
 
                         elif kind == "on_tool_start":
                             tool_name = event.get("name", "?")
+                            tool_input = event.get("data", {}).get("input", "")
+                            tool_run_id = event.get("run_id", "")
                             logger.debug("SSE: tool start — %s", tool_name)
+                            if len(tool_trace) < MAX_TOOL_TRACE:
+                                entry = {
+                                    "tool": tool_name,
+                                    "input": str(tool_input)[:500] if tool_input else "",
+                                }
+                                tool_trace.append(entry)
+                                if tool_run_id:
+                                    tool_trace_by_run[tool_run_id] = entry
                             if _agency is not None:
                                 _agency.on_tool_call(
                                     tool_name=tool_name,
@@ -343,7 +423,14 @@ class LangGraphA2AExecutor(AgentExecutor):
                                 )
 
                         elif kind == "on_tool_end":
-                            logger.debug("SSE: tool end — %s", event.get("name", "?"))
+                            tool_end_name = event.get("name", "?")
+                            tool_output = event.get("data", {}).get("output", "")
+                            tool_run_id = event.get("run_id", "")
+                            logger.debug("SSE: tool end — %s", tool_end_name)
+                            # Pair via run_id so parallel tool calls don't clobber each other.
+                            entry = tool_trace_by_run.get(tool_run_id) if tool_run_id else None
+                            if entry is not None:
+                                entry["output_preview"] = str(tool_output)[:300] if tool_output else ""
 
                         elif kind == "on_chat_model_end":
                             # Capture the last completed AIMessage for token telemetry
@@ -363,7 +450,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                 if _COMPLIANCE_AVAILABLE and _compliance_cfg and _compliance_cfg.mode == "owasp_agentic":
                     final_text, _pii_types = _redact_pii(final_text)
                     if _pii_types:
-                        from builtin_tools.audit import log_event as _audit_log
+                        from molecule_runtime.builtin_tools.audit import log_event as _audit_log
                         _audit_log(
                             event_type="compliance",
                             action="pii.redact",
@@ -384,9 +471,73 @@ class LangGraphA2AExecutor(AgentExecutor):
                 # Non-streaming: ResultAggregator.consume_all() returns this
                 #   immediately as the response (a2a_client.py reads .parts[0].text).
                 # Streaming: yielded as the last SSE event in the stream.
-                await event_queue.enqueue_event(
-                    new_text_message(final_text, task_id=task_id, context_id=context_id)
-                )
+                #
+                # If the reply mentions /workspace/... paths, stage each one
+                # and emit as FileParts alongside the text so the canvas can
+                # render a download button. Same contract the hermes executor
+                # uses — every runtime going through this code path (langgraph,
+                # deepagents, future ReAct variants) inherits it.
+                _outbound = collect_outbound_files(final_text)
+                if _outbound:
+                    # NOTE: do NOT re-import `Part` here. It is already imported
+                    # at module scope (line 42). A function-scope `from a2a.types
+                    # import ... Part ...` would mark `Part` as a local name
+                    # throughout this function under Python's scoping rules,
+                    # making the earlier `Part(text=text)` call (line ~358, inside
+                    # the astream_events loop) raise UnboundLocalError because
+                    # the local binding is not yet in scope at that point.
+                    #
+                    # a2a-sdk 1.x flattened the Part shape: 0.x used
+                    # `Part(root=TextPart(text=...))` / `Part(root=FilePart(file=
+                    # FileWithUri(uri=..., name=..., mimeType=...)))` (Pydantic
+                    # discriminated-union style). 1.x's Part is a single proto
+                    # message with flat fields: text, url, filename, media_type,
+                    # raw, data, metadata. TextPart/FilePart/FileWithUri were
+                    # removed. Same for Message: messageId/taskId/contextId
+                    # camelCase became message_id/task_id/context_id.
+                    from a2a.types import Message, Role
+                    _parts: list[Part] = [Part(text=final_text)] if final_text else []
+                    for f in _outbound:
+                        _parts.append(Part(
+                            url="workspace:" + f["path"],
+                            filename=f["name"],
+                            media_type=f["mime_type"],
+                        ))
+                    msg = Message(
+                        message_id=uuid.uuid4().hex,
+                        # 1.x Role is a protobuf enum: ROLE_UNSPECIFIED,
+                        # ROLE_USER, ROLE_AGENT. Old `Role.agent` (Pydantic
+                        # lowercase enum) doesn't exist anymore.
+                        role=Role.ROLE_AGENT,
+                        parts=_parts,
+                        task_id=task_id,
+                        context_id=context_id,
+                    )
+                else:
+                    msg = new_text_message(final_text, task_id=task_id, context_id=context_id)
+                # Attach tool_trace via metadata when supported. Guarded with
+                # hasattr because some test mocks return a plain string here.
+                if tool_trace and hasattr(msg, "metadata"):
+                    try:
+                        msg.metadata = {"tool_trace": tool_trace}
+                    except (AttributeError, TypeError):
+                        # `new_text_message()` returns a plain string in
+                        # MagicMock paths in tests, where assignment to
+                        # .metadata raises despite hasattr being true (the
+                        # mock has the attribute as a property). Suppression
+                        # is intentional — production Message objects always
+                        # accept the assignment. See #1787 + commit dcbcf19
+                        # for the original test-mock motivation.
+                        logger.debug("metadata attach skipped (non-Message return from new_text_message)")
+                # A2A v1 (a2a-sdk ≥ 1.0): once Task is enqueued (above, PR #2558),
+                # the executor is in task mode and raw Message enqueues are
+                # rejected with InvalidAgentResponseError("Received Message
+                # object in task mode. Use TaskStatusUpdateEvent or
+                # TaskArtifactUpdateEvent instead."). updater.complete()
+                # wraps the Message in a terminal TaskStatusUpdateEvent
+                # (state=COMPLETED, final=True) which both streaming and
+                # non-streaming clients accept.
+                await updater.complete(message=msg)
                 _result = final_text
 
             except Exception as e:
@@ -397,11 +548,14 @@ class LangGraphA2AExecutor(AgentExecutor):
                     task_span.set_status(StatusCode.ERROR, str(e))
                 except Exception:
                     pass
-                # Emit a Message so both streaming and non-streaming clients
-                # receive an error response rather than hanging.
-                await event_queue.enqueue_event(
-                    new_text_message(
-                        f"Agent error: {e}", task_id=task_id, context_id=context_id
+                # A2A v1: in task mode, terminal errors must publish a
+                # FAILED TaskStatusUpdateEvent (carrying the error Message)
+                # rather than a raw Message enqueue. updater.failed() does
+                # exactly this — both streaming and non-streaming clients
+                # receive the error and stop polling.
+                await updater.failed(
+                    message=new_text_message(
+                        sanitize_agent_error(exc=e), task_id=task_id, context_id=context_id
                     )
                 )
             finally:
@@ -414,7 +568,7 @@ class LangGraphA2AExecutor(AgentExecutor):
         from a2a.types import TaskStatus, TaskState, TaskStatusUpdateEvent
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
-                status=TaskStatus(state=TaskState.canceled),
+                status=TaskStatus(state=TaskState.TASK_STATE_CANCELED),  # v1: TaskState uses SCREAMING_SNAKE_CASE
                 final=True,
             )
         )

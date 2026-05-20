@@ -1,17 +1,14 @@
 name: ci
 
-# Mirror-guard CI. This repo is a publish artifact of the monorepo
-# `molecule-ai/molecule-core/workspace/` directory — see README.
+# Standalone-as-SSOT CI (post-migration 2026-05-20).
 #
-# Direct commits + PRs to this repo are no longer accepted; the
-# canonical edit point is the monorepo. This workflow exists only
-# to enforce that, by failing CI on any push that wasn't produced
-# by the publish-runtime sync (a future automated push from the
-# monorepo's tag-driven publish workflow).
+# This repo became the single source of truth for the molecule-runtime
+# Python package as of the standalone-as-SSOT migration (issue #87
+# follow-on, CTO-GO 2026-05-20). Edit Python under molecule_runtime/
+# directly here; the monorepo workspace-server pins this wheel by
+# version.
 #
-# Until that auto-sync is wired up, we whitelist the historical
-# pusher identities so existing in-flight PRs don't all turn red.
-# Whitelist removal becomes a follow-up once the auto-sync lands.
+# Old mirror-guard CI removed — direct PRs are the canonical edit path.
 
 on:
   push:
@@ -22,36 +19,115 @@ permissions:
   contents: read
 
 jobs:
-  mirror-guard:
+  unit-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Reject direct edits
-        env:
-          PR_AUTHOR: ${{ github.event.pull_request.user.login || github.actor }}
-        run: |
-          # Allow the future bot author once it exists. Until then,
-          # block on PR events but allow push events (for in-flight
-          # work to land while the migration finishes).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-          # Bypass: CI infrastructure migration PRs (e.g. .github/workflows ->
-          # .gitea/workflows rename) are the canonical edit path during the
-          # transition; they must be allowed to land.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # Fetch changed files via GitHub REST API (works in shallow clones)
-            CHANGED_FILES=$(curl -s \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-              | grep -o '"filename":"[^"]*"' | sed 's/"filename":"//;s/"//g')
-            if echo "$CHANGED_FILES" | grep -qE '^\.gitea/workflows/|\.github/workflows/'; then
-              echo "CI infrastructure migration detected — allowing."
-              exit 0
-            fi
-            echo "::error::This repo is a publish artifact of molecule-ai/molecule-core."
-            echo "::error::Edit workspace/ in the monorepo and let the publish-runtime"
-            echo "::error::workflow regenerate this mirror — do not PR here directly."
-            echo "::error::See README.md for the new contribution flow."
-            exit 1
-          fi
-          echo "Push event from $PR_AUTHOR — allowing while migration completes."
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Runtime deps (mirrors pyproject.toml — installed once for tests
+          # so import-smoke + multi-WS routing tests can resolve them).
+          pip install \
+            "httpx>=0.27.0" \
+            "uvicorn>=0.30.0" \
+            "starlette>=0.38.0" \
+            "websockets>=12.0" \
+            "pyyaml>=6.0" \
+            "langchain-core>=0.3.0" \
+            "opentelemetry-api>=1.24.0" \
+            "opentelemetry-sdk>=1.24.0" \
+            "opentelemetry-exporter-otlp-proto-http>=1.24.0" \
+            "temporalio>=1.7.0" \
+            "python-multipart>=0.0.27"
+          # Test runner + plugins
+          pip install pytest pytest-asyncio
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint with ruff (syntax + obvious errors only)
+        # Initial lint scope is intentionally narrow — E9 (syntax), F (pyflakes
+        # errors only, not warnings). Broadening to full ruff rules is a
+        # follow-up task once the SSOT settles.
+        run: ruff check --select=E9,F63,F7,F82 molecule_runtime/
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build tooling
+        run: pip install build twine
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      - name: Verify package metadata
+        run: python -m twine check dist/*
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: wheel
+          path: dist/*.whl
+          retention-days: 7
+
+  smoke-install:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: wheel
+          path: dist/
+
+      - name: Install wheel in clean venv + smoke-import
+        run: |
+          set -eu
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/pip install --quiet dist/*.whl
+          # Verify the package + the canonical multi-WS / runtime imports.
+          /tmp/smoke-venv/bin/python -c "
+          from molecule_runtime import executor_helpers
+          from molecule_runtime.mcp_workspace_resolver import resolve_workspaces
+          from molecule_runtime import mcp_cli
+          from molecule_runtime.executor_helpers import extract_attached_files
+          from molecule_runtime.llm_auth import normalise_llm_env
+          from molecule_runtime.credential_helper import install_credential_helper
+          from molecule_runtime.precommit_hook import install_pre_commit_hook
+          print('smoke-import: all canonical surfaces import cleanly')
+          "
+          # CLI entry-point — molecule-mcp must be installed + show help.
+          /tmp/smoke-venv/bin/molecule-mcp --help | head -5

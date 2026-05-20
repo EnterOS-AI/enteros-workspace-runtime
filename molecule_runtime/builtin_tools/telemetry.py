@@ -28,23 +28,23 @@ Attribute constants for ``gen_ai.*`` follow OpenTelemetry GenAI SemConv 1.26.
 Usage example
 -------------
     # main.py — call once at startup
-    from builtin_tools.telemetry import setup_telemetry, make_trace_middleware
+    from molecule_runtime.builtin_tools.telemetry import setup_telemetry, make_trace_middleware
     setup_telemetry(service_name=workspace_id)
     instrumented = make_trace_middleware(app.build())
 
     # Any module
-    from builtin_tools.telemetry import get_tracer
+    from molecule_runtime.builtin_tools.telemetry import get_tracer
     tracer = get_tracer()
     with tracer.start_as_current_span("my_span") as span:
         span.set_attribute("key", "value")
 
     # Outgoing HTTP — inject W3C headers
-    from builtin_tools.telemetry import inject_trace_headers
+    from molecule_runtime.builtin_tools.telemetry import inject_trace_headers
     headers = inject_trace_headers({"Content-Type": "application/json"})
     await client.post(url, headers=headers, ...)
 
     # Incoming HTTP — extract context (done automatically by middleware)
-    from builtin_tools.telemetry import extract_trace_context
+    from molecule_runtime.builtin_tools.telemetry import extract_trace_context
     ctx = extract_trace_context(dict(request.headers))
 """
 
@@ -82,7 +82,17 @@ MEMORY_QUERY = "memory.query"
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-WORKSPACE_ID: str = os.environ.get("WORKSPACE_ID", "unknown")
+# CWE-20 (issue #14): WORKSPACE_ID becomes the service-name suffix
+# (f"molecule-{WORKSPACE_ID}") and an OpenTelemetry resource attribute;
+# unsanitized input could break OTLP exporters' service-name conventions
+# or appear in span attributes verbatim. Validate at module load —
+# "unknown" sentinel kept for the no-env fallback (multi-workspace mode
+# or pre-provision boot).
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID: str = _get_workspace_id()
+except ValueError:
+    WORKSPACE_ID = "unknown"
 
 _initialized: bool = False
 _tracer: Any = None  # opentelemetry.trace.Tracer | _NoopTracer

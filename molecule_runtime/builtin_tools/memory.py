@@ -8,7 +8,7 @@ Hierarchical Memory Architecture:
 RBAC enforcement
 ----------------
 ``commit_memory`` requires the ``"memory.write"`` action.
-``search_memory`` requires the ``"memory.read"`` action.
+``recall_memory`` requires the ``"memory.read"`` action.
 Roles are read from ``config.yaml`` under ``rbac.roles`` (default: operator).
 
 Audit trail
@@ -32,10 +32,10 @@ from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.tools import tool
-from builtin_tools.awareness_client import _normalise_namespace, build_awareness_client
-from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
-from builtin_tools.audit import check_permission, get_workspace_roles, log_event
-from builtin_tools.telemetry import MEMORY_QUERY, MEMORY_SCOPE, WORKSPACE_ID_ATTR, get_tracer
+from molecule_runtime.builtin_tools.awareness_client import build_awareness_client
+from molecule_runtime.builtin_tools.audit import check_permission, get_workspace_roles, log_event
+from molecule_runtime.builtin_tools.security import _redact_secrets
+from molecule_runtime.builtin_tools.telemetry import MEMORY_QUERY, MEMORY_SCOPE, WORKSPACE_ID_ATTR, get_tracer
 
 try:  # pragma: no cover - optional runtime dependency in lightweight test envs
     import httpx  # type: ignore
@@ -43,28 +43,32 @@ except ImportError:  # pragma: no cover
     httpx = SimpleNamespace(AsyncClient=None)
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+# CWE-20 (issue #14): validate WORKSPACE_ID before it lands in
+# /workspaces/{WORKSPACE_ID}/memories URL paths used by commit_memory /
+# recall_memory below.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID = _get_workspace_id()
+except ValueError:
+    # Multi-workspace external-runtime — env-level WORKSPACE_ID unset;
+    # the helpers below are unreachable in that mode, fail soft to keep
+    # the package importable.
+    WORKSPACE_ID = ""
 
 
 @tool
-async def commit_memory(content: str, scope: str = "LOCAL", *, namespace: str | None = None) -> dict:
+async def commit_memory(content: str, scope: str = "LOCAL") -> dict:
     """Store a fact in memory with a specific scope.
 
     Args:
         content: The fact or knowledge to remember.
         scope: Memory scope — LOCAL (private), TEAM (shared with team), or GLOBAL (company-wide, root only).
-        namespace: Optional namespace bucket (e.g. "facts", "procedures", "blockers"). Defaults to "general".
     """
+    content = _redact_secrets(content)
     trace_id = str(uuid.uuid4())
     scope = scope.upper()
     if scope not in ("LOCAL", "TEAM", "GLOBAL"):
         return {"error": "scope must be LOCAL, TEAM, or GLOBAL"}
-
-    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
-    try:
-        ws_id = get_validated_workspace_id(caller="memory.commit_memory")
-    except WorkspaceIdValidationError as e:
-        return {"success": False, "error": str(e)}
 
     # --- RBAC check -----------------------------------------------------------
     roles, custom_perms = get_workspace_roles()
@@ -107,7 +111,7 @@ async def commit_memory(content: str, scope: str = "LOCAL", *, namespace: str | 
         awareness_client = build_awareness_client()
         if awareness_client is not None:
             try:
-                result = await awareness_client.commit(content, scope, namespace=namespace)
+                result = await awareness_client.commit(content, scope)
             except Exception as e:
                 log_event(
                     event_type="memory",
@@ -129,15 +133,15 @@ async def commit_memory(content: str, scope: str = "LOCAL", *, namespace: str | 
             # activity-log path below) so test environments that don't ship
             # platform_auth still work.
             try:
-                from platform_auth import auth_headers as _auth
+                from molecule_runtime.platform_auth import auth_headers as _auth
                 _headers = _auth()
             except Exception:
                 _headers = {}
             async with httpx.AsyncClient(timeout=10.0) as client:
                 try:
                     resp = await client.post(
-                        f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
-                        json={"content": content, "scope": scope, "namespace": _normalise_namespace(namespace)},
+                        f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                        json={"content": content, "scope": scope},
                         headers=_headers,
                     )
                     if resp.status_code == 201:
@@ -194,24 +198,17 @@ async def commit_memory(content: str, scope: str = "LOCAL", *, namespace: str | 
 
 
 @tool
-async def search_memory(query: str = "", scope: str = "", *, namespace: str | None = None) -> dict:
+async def recall_memory(query: str = "", scope: str = "") -> dict:
     """Search stored memories.
 
     Args:
         query: Text to search for (empty returns all).
         scope: Filter by scope — LOCAL, TEAM, GLOBAL, or empty for all accessible.
-        namespace: Optional namespace bucket to search within. When None, searches all namespaces.
     """
     trace_id = str(uuid.uuid4())
     scope = scope.upper()
     if scope and scope not in ("LOCAL", "TEAM", "GLOBAL"):
         return {"error": "scope must be LOCAL, TEAM, GLOBAL, or empty"}
-
-    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
-    try:
-        ws_id = get_validated_workspace_id(caller="memory.search_memory")
-    except WorkspaceIdValidationError as e:
-        return {"success": False, "error": str(e)}
 
     # --- RBAC check -----------------------------------------------------------
     roles, custom_perms = get_workspace_roles()
@@ -254,7 +251,7 @@ async def search_memory(query: str = "", scope: str = "", *, namespace: str | No
         awareness_client = build_awareness_client()
         if awareness_client is not None:
             try:
-                result = await awareness_client.search(query, scope, namespace=namespace)
+                result = await awareness_client.search(query, scope)
                 mem_span.set_attribute("memory.result_count", result.get("count", 0))
                 mem_span.set_attribute("memory.success", result.get("success", False))
                 log_event(
@@ -288,8 +285,6 @@ async def search_memory(query: str = "", scope: str = "", *, namespace: str | No
             params["q"] = query
         if scope:
             params["scope"] = scope.upper()
-        if namespace is not None:
-            params["namespace"] = namespace.strip()
 
         # #215-class bug (search path): same fix as commit_memory above —
         # the platform gates GET /workspaces/:id/memories behind workspace
@@ -297,7 +292,7 @@ async def search_memory(query: str = "", scope: str = "", *, namespace: str | No
         # agent thinks its backlog is empty (observed on Technical Researcher
         # idle-loop pilot 2026-04-15).
         try:
-            from platform_auth import auth_headers as _auth
+            from molecule_runtime.platform_auth import auth_headers as _auth
             _headers = _auth()
         except Exception:
             _headers = {}
@@ -305,7 +300,7 @@ async def search_memory(query: str = "", scope: str = "", *, namespace: str | No
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 resp = await client.get(
-                    f"{PLATFORM_URL}/workspaces/{ws_id}/memories",
+                    f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
                     params=params,
                     headers=_headers,
                 )
@@ -406,7 +401,11 @@ async def _record_memory_activity(scope: str, content: str, memory_id: str | Non
     }
 
     try:
-        _headers = await _auth_headers_for_platform()
+        try:
+            from molecule_runtime.platform_auth import auth_headers as _auth
+            _headers = _auth()
+        except Exception:
+            _headers = {}
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(
                 f"{platform_url}/workspaces/{workspace_id}/activity",
@@ -479,12 +478,3 @@ async def _maybe_log_skill_promotion(content: str, scope: str, memory_result: di
         # Best-effort observability only. Memory commits must never fail because
         # the promotion log could not be written.
         return
-
-
-async def _auth_headers_for_platform() -> dict[str, str]:
-    """Get auth headers for platform API calls, with graceful fallback."""
-    try:
-        from platform_auth import auth_headers as _auth
-        return _auth()
-    except Exception:
-        return {}

@@ -1,4 +1,10 @@
-"""Regression tests for A2A MCP server RBAC gate (issue #12)."""
+"""Regression tests for A2A MCP server RBAC gate (issue #12 / task #343, CWE-862).
+
+Originally landed in standalone repo (#12 c72fbfc area) and skipped during the
+standalone-as-SSOT migration because the monorepo-base import lacked the gate.
+Re-restored by task #343 atop the migration: ``_tool_permission_check`` is back
+in ``a2a_mcp_server.py`` and wired into ``handle_tool_call``.
+"""
 
 import pytest
 from unittest import mock

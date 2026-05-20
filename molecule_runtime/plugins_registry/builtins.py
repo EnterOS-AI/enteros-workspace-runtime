@@ -8,7 +8,7 @@ per-runtime file:
 .. code-block:: python
 
     # plugins/<name>/adapters/claude_code.py
-    from plugins_registry.builtins import AgentskillsAdaptor as Adaptor
+    from molecule_runtime.plugins_registry.builtins import AgentskillsAdaptor as Adaptor
 
 Shape taxonomy (one class per shape; add more as the ecosystem evolves):
 
@@ -24,7 +24,7 @@ Planned as the ecosystem matures (none are implemented yet — rule of
 three: promote a class here only after 3+ plugins ship the same custom
 shape via their own ``adapters/<runtime>.py``):
 
-* ``MCPServerAdaptor`` — install a plugin as an MCP server *(TODO)*
+* :class:`MCPServerAdaptor` — install a plugin as an MCP server ✅ (issue #847)
 * ``DeepAgentsSubagentAdaptor`` — register a DeepAgents sub-agent
   (runtime-locked to deepagents) *(TODO)*
 * ``LangGraphSubgraphAdaptor`` — install a LangGraph sub-graph *(TODO)*
@@ -51,6 +51,8 @@ from .protocol import SKILLS_SUBDIR, InstallContext, InstallResult
 # Keys scrubbed from plugin setup.sh env — matches skill_loader/loader.py's
 # _SCRUB_KEYS so a malicious plugin's setup.sh cannot exfiltrate credentials
 # that are available to the parent process. Fixes issue #19 (CWE-C-312).
+# Re-applied during standalone-as-SSOT migration; originally landed in
+# standalone commit d694408.
 _SCRUB_KEYS = frozenset((
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -64,6 +66,7 @@ _SCRUB_KEYS = frozenset((
 def _scrubbed_env(extra: dict[str, str]) -> dict[str, str]:
     """Return a copy of os.environ with sensitive keys stripped plus *extra* merged."""
     return {k: v for k, v in os.environ.items() if k not in _SCRUB_KEYS} | extra
+
 
 # Files at the plugin root that are never treated as prompt fragments,
 # even if they're markdown. Module-level so tests and other adapters can
@@ -284,16 +287,7 @@ def _copy_dir_files(
             if not (executable_suffix and f.suffix == ".py"):
                 continue
         target = dst / f.name
-        # Strip CRLF from .sh and .py files. Windows git checkout introduces
-        # \r\n even with .gitattributes eol=lf; Linux containers choke on \r
-        # in shebangs and Python path args. This single fix point covers ALL
-        # plugin hooks that enter a workspace container (#507 permanent fix).
-        if f.suffix in (".sh", ".py"):
-            data = f.read_bytes().replace(b"\r\n", b"\n")
-            target.write_bytes(data)
-            shutil.copystat(f, target)
-        else:
-            shutil.copy2(f, target)
+        shutil.copy2(f, target)
         if executable_suffix and f.suffix == executable_suffix:
             target.chmod(0o755)
         result.files_written.append(str(target.relative_to(target.parents[2])))
@@ -345,9 +339,115 @@ def _deep_merge_hooks(existing: dict, fragment: dict) -> dict:
     out.setdefault("hooks", {})
     for event, handlers in fragment.get("hooks", {}).items():
         out["hooks"].setdefault(event, [])
-        out["hooks"][event].extend(handlers)
-    for key, val in fragment.items():
-        if key == "hooks":
+        # Build a set of already-present handler fingerprints so that
+        # re-installing the same plugin fragment does not append duplicates.
+        # Key: (matcher, frozenset-of-commands) — same logic the issue spec
+        # describes. Two handlers are considered identical when they watch the
+        # same matcher pattern and invoke exactly the same set of commands.
+        seen: set[tuple[str, frozenset[str]]] = {
+            (h.get("matcher", ""), frozenset(c.get("command", "") for c in h.get("hooks", [])))
+            for h in out["hooks"][event]
+        }
+        for handler in handlers:
+            hkey = (
+                handler.get("matcher", ""),
+                frozenset(c.get("command", "") for c in handler.get("hooks", [])),
+            )
+            if hkey not in seen:
+                seen.add(hkey)
+                out["hooks"][event].append(handler)
+    for top_key, val in fragment.items():
+        if top_key == "hooks":
             continue
-        out.setdefault(key, val)
+        # mcpServers must be deep-merged: plugin A ships "firecrawl" and
+        # plugin B ships "github" → both entries land in settings.json.
+        # Using setdefault would skip the fragment's value when the key
+        # already exists, so we explicitly handle the dict case.
+        if top_key in out and isinstance(out[top_key], dict) and isinstance(val, dict):
+            out[top_key] = {**out[top_key], **val}
+        else:
+            out.setdefault(top_key, val)
     return out
+
+
+# ----------------------------------------------------------------------
+# MCPServerAdaptor — issue #847.
+# Promoted from custom adapters after 4 plugin proposals (molecule-firecrawl
+# #512, molecule-github-mcp #520, molecule-browser-use #553, mcp-connector
+# #573) all shipped the same pattern independently.
+# ----------------------------------------------------------------------
+
+
+class MCPServerAdaptor:
+    """Sub-type adaptor for plugins that wrap an MCP server.
+
+    The plugin ships:
+
+    * ``settings-fragment.json`` with an ``mcpServers`` block — standard
+      Claude Code ``claude_desktop_config`` format, e.g.:
+
+      .. code-block:: json
+
+          {
+            "mcpServers": {
+              "my-server": {
+                "command": "npx",
+                "args": ["-y", "@org/my-mcp-server"]
+              }
+            }
+          }
+
+    * ``skills/<name>/SKILL.md`` (optional) — agentskills.io skill docs;
+      ``AgentskillsAdaptor`` logic handles these.
+    * ``rules/*.md`` (optional) — always-on prose appended to CLAUDE.md;
+      ``AgentskillsAdaptor`` logic handles these.
+    * ``setup.sh`` (optional) — install npm packages, build binaries, etc.;
+      ``AgentskillsAdaptor`` logic handles these.
+
+    On ``install()``:
+
+      1. ``settings-fragment.json`` → ``_install_claude_layer()`` merges the
+         ``mcpServers`` block into ``<configs>/.claude/settings.json``.
+         Hooks are also merged via the same path (so MCP-server plugins
+         can also ship hooks if they need them).
+      2. Skills + rules + setup.sh → delegated to ``AgentskillsAdaptor``.
+
+    On ``uninstall()``:
+
+      1. Skills + rules → delegated to ``AgentskillsAdaptor.uninstall()``.
+      2. ``mcpServers`` entries are intentionally **not** removed from
+         ``settings.json`` on uninstall. MCP server configurations are
+         often shared with other tools or manually curated, so removing
+         them could break a user's setup. The user must remove them
+         manually if desired.
+
+    Usage — in the plugin's per-runtime adapter file:
+
+    .. code-block:: python
+
+        # plugins/<name>/adapters/claude_code.py
+        from molecule_runtime.plugins_registry.builtins import MCPServerAdaptor as Adaptor
+    """
+
+    def __init__(self, plugin_name: str, runtime: str) -> None:
+        self.plugin_name = plugin_name
+        self.runtime = runtime
+
+    async def install(self, ctx: InstallContext) -> InstallResult:
+        result = InstallResult(
+            plugin_name=self.plugin_name,
+            runtime=self.runtime,
+            source="plugin",
+        )
+        # 1. Merge mcpServers (and any hooks) from settings-fragment.json.
+        _install_claude_layer(ctx, result, self.plugin_name)
+        # 2. Skills + rules + setup.sh — reuse AgentskillsAdaptor logic.
+        sub = await AgentskillsAdaptor(self.plugin_name, self.runtime).install(ctx)
+        result.files_written.extend(sub.files_written)
+        result.warnings.extend(sub.warnings)
+        return result
+
+    async def uninstall(self, ctx: InstallContext) -> None:
+        # Delegate to AgentskillsAdaptor for skills + rules cleanup.
+        # NOTE: mcpServers entries are intentionally NOT removed (see class docstring).
+        await AgentskillsAdaptor(self.plugin_name, self.runtime).uninstall(ctx)

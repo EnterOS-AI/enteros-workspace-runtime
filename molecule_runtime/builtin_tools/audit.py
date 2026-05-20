@@ -55,7 +55,15 @@ logger = logging.getLogger(__name__)
 AUDIT_LOG_PATH: str = os.environ.get(
     "AUDIT_LOG_PATH", "/var/log/molecule/audit.jsonl"
 )
-WORKSPACE_ID: str = os.environ.get("WORKSPACE_ID", "")
+# CWE-20 (issue #14): WORKSPACE_ID lands in audit-log records — even
+# though audit.jsonl is local-only (no URL/header surface), validating
+# at module load keeps an injection-bearing env from being persisted
+# into long-term audit storage.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID: str = _get_workspace_id()
+except ValueError:
+    WORKSPACE_ID = ""
 
 # Protects the open() + write() sequence; prevents interleaved JSON lines
 # when multiple async tasks run in the same event-loop thread.
@@ -92,7 +100,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
 def _load_workspace_config():
     """Return the WorkspaceConfig or None if it cannot be loaded."""
     try:
-        from config import load_config  # local import avoids circular deps
+        from molecule_runtime.config import load_config  # local import avoids circular deps
         return load_config()
     except Exception as exc:
         logger.warning("audit: could not load workspace config for RBAC: %s", exc)
@@ -105,6 +113,10 @@ def get_workspace_roles() -> tuple[list[str], dict[str, list[str]]]:
     Falls back to ``["read-only"]`` / ``{}`` when the config is unavailable so
     that agents retain only memory-read access in degraded environments,
     denying by default rather than granting elevated permissions (fail-secure).
+
+    Fix originally landed in standalone c72fbfc (closes #11, CWE-285);
+    re-applied during standalone-as-SSOT migration. Pinned by
+    tests/test_audit.py::TestGetWorkspaceRolesFailSecure.
     """
     cfg = _load_workspace_config()
     if cfg is None:

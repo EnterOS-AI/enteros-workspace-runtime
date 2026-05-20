@@ -19,8 +19,15 @@ NOTE: a2a-sdk 1.x (KI-009 migration) changed the module layout:
 """
 from __future__ import annotations
 
+import os
 import sys
 import types
+
+# Test sentinel for modules that read WORKSPACE_ID at import time
+# (a2a_client.py, coordinator.py — added by monorepo dev surface).
+# Setting before any test-side import keeps the smoke surface importable
+# without forcing every individual test to monkeypatch.
+os.environ.setdefault("WORKSPACE_ID", "test-conftest-sentinel")
 
 
 def _ensure_package(dotted: str) -> types.ModuleType:
@@ -54,6 +61,38 @@ def _set_attrs(mod: types.ModuleType, attrs: list[str]) -> None:
             continue
         if attr in ("AgentExecutor",):
             setattr(mod, attr, type(attr, (), {}))
+        elif attr == "Part":
+            # a2a-sdk 1.x Part stub — flat protobuf with optional fields.
+            # Tests inspect part.text / part.url / part.filename.
+            class Part:
+                def __init__(self, text=None, root=None, **kwargs):
+                    self.text = text
+                    self.root = root
+                    for k, v in kwargs.items():
+                        setattr(self, k, v)
+            setattr(mod, attr, Part)
+        elif attr == "Role":
+            # a2a-sdk 1.x: Role is an IntEnum. Tests set Message(role=Role.ROLE_AGENT)
+            # so the stub needs the canonical values as class attributes.
+            class Role:
+                ROLE_UNSPECIFIED = 0
+                ROLE_USER = 1
+                ROLE_AGENT = 2
+            setattr(mod, attr, Role)
+        elif attr == "Message":
+            # a2a-sdk 1.x Message stub — kwargs-preserving so tests can assert on
+            # message_id / role / parts / task_id / context_id.
+            class Message:
+                def __init__(self, message_id="", role=0, parts=None,
+                             task_id="", context_id="", **kwargs):
+                    self.message_id = message_id
+                    self.role = role
+                    self.parts = list(parts) if parts is not None else []
+                    self.task_id = task_id
+                    self.context_id = context_id
+                    for k, v in kwargs.items():
+                        setattr(self, k, v)
+            setattr(mod, attr, Message)
         else:
             setattr(mod, attr, lambda *a, **kw: None)
 
@@ -86,6 +125,12 @@ _A2A_MODULES: dict[str, list[str]] = {
         "Part", "AgentCard", "AgentCapabilities", "AgentSkill",
         "AgentInterface",  # added in a2a-sdk 1.x
         "TaskStatus", "TaskState", "TaskStatusUpdateEvent",
+        # Role enum — exposed in a2a-sdk 1.x at module level for callers
+        # that need to set Message(role=Role.ROLE_AGENT). Tests in
+        # test_executor_helpers::test_new_response_message_* import this
+        # symbol directly. Real SDK has a Role IntEnum; stub provides a
+        # simple class with the canonical values so equality checks work.
+        "Role", "Message",
     ],
     "a2a.helpers": [
         # Added in 1.x; replaces a2a.utils

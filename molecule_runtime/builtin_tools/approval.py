@@ -32,8 +32,8 @@ RBAC denials emit an ``rbac / rbac.deny / denied`` event instead.
 
 Environment variables
 ---------------------
-PLATFORM_URL            Platform base URL            (default: http://host.docker.internal:8080)
-WORKSPACE_ID            This workspace's ID (validated at startup by platform_auth)
+PLATFORM_URL            Platform base URL            (default: http://platform:8080)
+WORKSPACE_ID            This workspace's ID          (default: "")
 APPROVAL_TIMEOUT        Max wait in seconds          (default: 300)
 APPROVAL_POLL_INTERVAL  Polling interval in seconds  (default: 5, polling path only)
 APPROVAL_USE_WEBSOCKET  "true" to force WS, "false"
@@ -50,13 +50,26 @@ import uuid
 import httpx
 from langchain_core.tools import tool
 
-from builtin_tools.audit import check_permission, get_workspace_roles, log_event
-from builtin_tools.validation import WorkspaceIdValidationError, get_validated_workspace_id
+from molecule_runtime.builtin_tools.audit import check_permission, get_workspace_roles, log_event
 
 logger = logging.getLogger(__name__)
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
-from molecule_runtime.platform_auth import WORKSPACE_ID
+# WORKSPACE_ID is interpolated into platform URL paths and the
+# X-Workspace-ID header below; pass through the central validator so a
+# crafted env var (containing /, .., #, newlines, etc.) fails fast at
+# import instead of opening a URL/header injection surface
+# (CWE-20, issue #14).
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID = _get_workspace_id()
+except ValueError:
+    # Single-workspace WORKSPACE_ID env var unset — this module's tools
+    # are unusable in that mode (every URL needs the ID), but importing
+    # it from the multi-workspace external-runtime path must not crash
+    # the whole package. Set to empty string so the existing in-module
+    # guards (truthy-WORKSPACE_ID checks below) still gate behaviour.
+    WORKSPACE_ID = ""
 APPROVAL_POLL_INTERVAL = float(os.environ.get("APPROVAL_POLL_INTERVAL", "5"))
 APPROVAL_TIMEOUT = float(os.environ.get("APPROVAL_TIMEOUT", "300"))
 
@@ -92,16 +105,10 @@ async def _create_approval_request(action: str, reason: str) -> dict:
 
     Returns {"approval_id": str} on success or {"error": str} on failure.
     """
-    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
-    try:
-        ws_id = get_validated_workspace_id(caller="approval._create_approval_request")
-    except WorkspaceIdValidationError as e:
-        return {"error": str(e)}
-
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{ws_id}/approvals",
+                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/approvals",
                 json={"action": action, "reason": reason},
             )
             if resp.status_code != 201:
@@ -163,13 +170,6 @@ async def _wait_websocket(approval_id: str, timeout: float) -> dict:
 
 async def _wait_polling(approval_id: str, timeout: float) -> dict:
     """Legacy polling loop — checks platform REST endpoint every APPROVAL_POLL_INTERVAL seconds."""
-    # --- Workspace ID validation (CWE-20 / CWE-88) ----------------------------
-    try:
-        ws_id = get_validated_workspace_id(caller="approval._wait_polling")
-    except WorkspaceIdValidationError:
-        # Transient — propagate as timeout so the caller handles it gracefully
-        raise asyncio.TimeoutError("WORKSPACE_ID validation failed")
-
     elapsed = 0.0
     async with httpx.AsyncClient(timeout=10.0) as client:
         while elapsed < timeout:
@@ -177,7 +177,7 @@ async def _wait_polling(approval_id: str, timeout: float) -> dict:
             elapsed += APPROVAL_POLL_INTERVAL
             try:
                 resp = await client.get(
-                    f"{PLATFORM_URL}/workspaces/{ws_id}/approvals",
+                    f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/approvals",
                 )
                 if resp.status_code == 200:
                     for a in resp.json():

@@ -1,185 +1,222 @@
-"""Regression tests for WORKSPACE_ID validation (issue #14, CWE-20)."""
+"""Regression tests for WORKSPACE_ID validation (CWE-20, issue #14).
 
-import os
-import re
+Originally landed as ``tests/test_workspace_id_validation.py`` alongside
+standalone PR #29 in the 0.1.x line. Dropped during the standalone-SSOT
+0.2.0 restructure (PR #19) and restored here so 0.2.0 doesn't ship with
+a known security regression.
+
+Key differences from the original 0.1.x test:
+
+  - The original validated WORKSPACE_ID at module import time
+    (``WORKSPACE_ID: str = validate_workspace_id(os.environ.get(...))``).
+    The SSOT 0.2.0 codebase supports multi-workspace external-runtime
+    mode where the legacy WORKSPACE_ID env var is unset, so eager
+    import-time validation would crash the universal MCP server.
+    Validation is now lazy: ``get_workspace_id()`` validates on first
+    call and caches the result.
+  - ``register_workspace_token()`` validates each per-workspace ID in
+    the multi-workspace registry, so the CWE-20 surface is closed for
+    both the single- and multi-workspace paths.
+"""
 
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_cache(monkeypatch):
+    """Clear the per-process cache before each test and ensure the
+    test does not leak a real WORKSPACE_ID into the validator."""
+    import molecule_runtime.platform_auth as pa_mod
+    pa_mod._reset_workspace_id_cache()
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
+    yield
+    pa_mod._reset_workspace_id_cache()
+
+
 class TestValidateWorkspaceId:
-    """validate_workspace_id() must reject injection characters."""
+    """validate_workspace_id() must reject injection characters and
+    accept the lowercase-alphanumeric-plus-hyphens shape used by
+    platform-generated UUIDs and org-generated alphanumeric IDs."""
 
-    @pytest.fixture(autouse=True)
-    def _reset_cache(self, monkeypatch):
-        """Clear module-level caches and env before each test."""
-        import molecule_runtime.platform_auth as pa_mod
-        pa_mod._validated_workspace_id = None
-        monkeypatch.delenv("WORKSPACE_ID", raising=False)
-
-    def test_rejects_empty_string(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "")
-
+    def test_rejects_empty_string(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="empty"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("")
 
-    def test_rejects_whitespace_only(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "   ")
-
+    def test_rejects_whitespace_only(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("   ")
 
-    def test_rejects_slash(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "ws/foo")
-
+    def test_rejects_slash(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("ws/foo")
 
-    def test_rejects_double_dot(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "ws..foo")
-
+    def test_rejects_double_dot(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("ws..foo")
 
-    def test_rejects_hash_fragment(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "ws#foo")
-
+    def test_rejects_hash_fragment(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("ws#foo")
 
-    def test_rejects_question_mark(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "ws?foo")
-
+    def test_rejects_question_mark(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("ws?foo")
 
-    def test_rejects_backslash(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "ws\\foo")
-
+    def test_rejects_ampersand(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("ws&foo")
 
-    def test_rejects_newline(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "ws\nfoo")
-
+    def test_rejects_backslash(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("ws\\foo")
 
-    def test_accepts_valid_uuid(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "53255246-1f34-432c-87e5-ae07f888f905")
-
-        assert pa_mod.validate_workspace_id("53255246-1f34-432c-87e5-ae07f888f905") == "53255246-1f34-432c-87e5-ae07f888f905"
-
-    def test_accepts_simple_alphanumeric(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "test-workspace")
-
-        assert pa_mod.validate_workspace_id("test-workspace") == "test-workspace"
-
-    def test_rejects_uppercase(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "Test-Workspace")
-
+    def test_rejects_newline(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("ws\nfoo")
 
-    def test_rejects_starts_with_hyphen(self, monkeypatch):
-        import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "-test-workspace")
-
+    def test_rejects_carriage_return(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
         with pytest.raises(ValueError, match="invalid characters"):
-            pa_mod.validate_workspace_id(os.environ["WORKSPACE_ID"])
+            validate_workspace_id("ws\rfoo")
 
-    def test_cache_returns_same_result(self, monkeypatch):
-        """Second call returns cached result without re-validation."""
+    def test_rejects_null_byte(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        with pytest.raises(ValueError, match="invalid characters"):
+            validate_workspace_id("ws\x00foo")
+
+    def test_rejects_uppercase(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        with pytest.raises(ValueError, match="invalid characters"):
+            validate_workspace_id("Test-Workspace")
+
+    def test_rejects_starts_with_hyphen(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        with pytest.raises(ValueError, match="invalid characters"):
+            validate_workspace_id("-test-workspace")
+
+    def test_rejects_underscore(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        with pytest.raises(ValueError, match="invalid characters"):
+            validate_workspace_id("test_workspace")
+
+    def test_rejects_space(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        with pytest.raises(ValueError, match="invalid characters"):
+            validate_workspace_id("test workspace")
+
+    def test_rejects_over_max_length(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        # Regex caps the post-leading-char part at 127 chars, so 129 total fails.
+        too_long = "a" + ("b" * 128)
+        with pytest.raises(ValueError, match="invalid characters"):
+            validate_workspace_id(too_long)
+
+    def test_accepts_valid_uuid(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        wsid = "53255246-1f34-432c-87e5-ae07f888f905"
+        assert validate_workspace_id(wsid) == wsid
+
+    def test_accepts_simple_alphanumeric(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        assert validate_workspace_id("test-workspace") == "test-workspace"
+
+    def test_accepts_numeric_start(self):
+        from molecule_runtime.platform_auth import validate_workspace_id
+        assert validate_workspace_id("0a1b2c3d-ef") == "0a1b2c3d-ef"
+
+    def test_strips_surrounding_whitespace(self):
+        """Whitespace around an otherwise-valid ID is stripped before
+        regex check (matches the original PR #29 contract)."""
+        from molecule_runtime.platform_auth import validate_workspace_id
+        assert validate_workspace_id("  test-ws  ") == "test-ws"
+
+
+class TestGetWorkspaceId:
+    """get_workspace_id() reads WORKSPACE_ID env var, validates, caches."""
+
+    def test_raises_on_unset_env(self):
+        from molecule_runtime.platform_auth import get_workspace_id
+        with pytest.raises(ValueError, match="empty"):
+            get_workspace_id()
+
+    def test_raises_on_malformed_env(self, monkeypatch):
+        from molecule_runtime.platform_auth import get_workspace_id
+        monkeypatch.setenv("WORKSPACE_ID", "bad/ws")
+        with pytest.raises(ValueError, match="invalid characters"):
+            get_workspace_id()
+
+    def test_returns_validated_value_on_good_env(self, monkeypatch):
+        from molecule_runtime.platform_auth import get_workspace_id
+        monkeypatch.setenv("WORKSPACE_ID", "good-ws-123")
+        assert get_workspace_id() == "good-ws-123"
+
+    def test_caches_result(self, monkeypatch):
+        """Second call returns the same validated value without
+        re-reading the environment — workspace IDs are immutable per
+        container lifetime."""
         import molecule_runtime.platform_auth as pa_mod
-        monkeypatch.setenv("WORKSPACE_ID", "my-workspace-123")
-
-        first = pa_mod.validate_workspace_id("my-workspace-123")
-        second = pa_mod.validate_workspace_id("my-workspace-123")
-        assert first == second == "my-workspace-123"
-
-
-class TestWorkspaceIdConstantInApproval:
-    """approval.py imports WORKSPACE_ID from platform_auth."""
-
-    def test_approval_imports_validated_id(self, monkeypatch):
-        """approval.py uses platform_auth's validated WORKSPACE_ID constant."""
-        import molecule_runtime.builtin_tools.approval as approval_mod
-        from molecule_runtime.platform_auth import WORKSPACE_ID
-
-        # Verify it's the same object
-        assert approval_mod.WORKSPACE_ID is WORKSPACE_ID
-
-        # Verify the value contains no injection chars
-        assert "\n" not in approval_mod.WORKSPACE_ID
-        assert "/" not in approval_mod.WORKSPACE_ID
-        assert "\\" not in approval_mod.WORKSPACE_ID
-        assert ".." not in approval_mod.WORKSPACE_ID
+        monkeypatch.setenv("WORKSPACE_ID", "first-ws")
+        first = pa_mod.get_workspace_id()
+        # Mutating the env after the first call MUST NOT change the
+        # returned value (the validator is intentionally one-shot).
+        monkeypatch.setenv("WORKSPACE_ID", "different-ws")
+        second = pa_mod.get_workspace_id()
+        assert first == second == "first-ws"
 
 
-class TestWorkspaceIdConstantInDelegation:
-    """delegation.py imports WORKSPACE_ID from platform_auth."""
+class TestRegisterWorkspaceTokenValidation:
+    """register_workspace_token() must reject malformed workspace IDs
+    so the multi-workspace registry can't store an injection-bearing
+    ID that get_workspace_token() returns verbatim."""
 
-    def test_delegation_imports_validated_id(self, monkeypatch):
-        """delegation.py uses platform_auth's validated WORKSPACE_ID constant."""
-        import molecule_runtime.builtin_tools.delegation as delegation_mod
-        from molecule_runtime.platform_auth import WORKSPACE_ID
-
-        assert delegation_mod.WORKSPACE_ID is WORKSPACE_ID
-        assert "\n" not in delegation_mod.WORKSPACE_ID
-        assert "/" not in delegation_mod.WORKSPACE_ID
-        assert "\\" not in delegation_mod.WORKSPACE_ID
-        assert ".." not in delegation_mod.WORKSPACE_ID
-
-
-class TestA2aCliDiscoverValidation:
-    """a2a_cli.discover() validates WORKSPACE_ID before hitting the platform.
-
-    Since builtin_tools is only stubbed when the full test suite loads
-    (conftest must import other modules first to trigger the stubs), we
-    test the validation contract indirectly:
-    1. get_validated_workspace_id() raises WorkspaceIdValidationError for bad input
-    2. discover() is the only a2a_cli function that calls get_validated_workspace_id()
-       in the X-Workspace-ID header path — covered by (1)
-    """
-
-    @pytest.fixture(autouse=True)
-    def _reset_cache(self, monkeypatch):
-        """Clear validation caches and env before each test."""
-        import molecule_runtime.platform_auth as pa_mod
-        import molecule_runtime.builtin_tools.validation as val_mod
-        pa_mod._validated_workspace_id = None
-        val_mod._cached_workspace_id = None
-        val_mod._cached_validated = False
-        monkeypatch.delenv("WORKSPACE_ID", raising=False)
-
-    def test_validated_ws_id_raises_on_empty(self):
-        """get_validated_workspace_id() must raise on empty WORKSPACE_ID."""
-        from molecule_runtime.builtin_tools.validation import (
-            WorkspaceIdValidationError,
-            get_validated_workspace_id,
+    def test_rejects_malformed_id_silently(self, caplog):
+        """Invalid IDs are dropped with a warning — operator's mcp_cli
+        loop must not crash on a single bad entry in MOLECULE_WORKSPACES."""
+        from molecule_runtime.platform_auth import (
+            register_workspace_token,
+            get_workspace_token,
         )
-        with pytest.raises(WorkspaceIdValidationError, match="empty"):
-            get_validated_workspace_id(caller="test")
+        register_workspace_token("bad/ws/id", "some-token")
+        assert get_workspace_token("bad/ws/id") is None
 
-    def test_validated_ws_id_raises_on_slash(self, monkeypatch):
-        """get_validated_workspace_id() must raise when WORKSPACE_ID contains /."""
-        import molecule_runtime.builtin_tools.validation as val_mod
-        val_mod._cached_workspace_id = None
-        val_mod._cached_validated = False
-        monkeypatch.setenv("WORKSPACE_ID", "ws/foo")
-        from molecule_runtime.builtin_tools.validation import (
-            WorkspaceIdValidationError,
-            get_validated_workspace_id,
+    def test_accepts_valid_id(self):
+        import molecule_runtime.platform_auth as pa_mod
+        from molecule_runtime.platform_auth import (
+            register_workspace_token,
+            get_workspace_token,
         )
-        with pytest.raises(WorkspaceIdValidationError, match="invalid"):
-            get_validated_workspace_id(caller="test")
+        try:
+            register_workspace_token("good-ws-1", "t1")
+            assert get_workspace_token("good-ws-1") == "t1"
+        finally:
+            pa_mod.clear_cache()
+
+    def test_strips_whitespace_then_validates(self):
+        import molecule_runtime.platform_auth as pa_mod
+        from molecule_runtime.platform_auth import (
+            register_workspace_token,
+            get_workspace_token,
+        )
+        try:
+            register_workspace_token("  good-ws-2  ", "t2")
+            assert get_workspace_token("good-ws-2") == "t2"
+        finally:
+            pa_mod.clear_cache()
+
+
+class TestRefreshFromDiskAlias:
+    """refresh_from_disk is preserved as a back-compat alias for
+    callers/tests that imported the original PR #1877 symbol."""
+
+    def test_refresh_from_disk_is_refresh_cache(self):
+        from molecule_runtime import platform_auth
+        assert platform_auth.refresh_from_disk is platform_auth.refresh_cache
