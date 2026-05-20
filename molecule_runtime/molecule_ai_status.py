@@ -18,10 +18,16 @@ import sys
 
 import httpx
 
+# Validate WORKSPACE_ID (CWE-20, issue #14) — interpolated into
+# /workspaces/{WORKSPACE_ID}/activity URL below.
+from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
 _WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
 if not _WORKSPACE_ID_raw:
     raise RuntimeError("WORKSPACE_ID environment variable is required but not set")
-WORKSPACE_ID = _WORKSPACE_ID_raw
+try:
+    WORKSPACE_ID = _validate_workspace_id(_WORKSPACE_ID_raw)
+except ValueError as _exc:
+    raise RuntimeError(f"WORKSPACE_ID failed validation: {_exc}") from _exc
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
 
 

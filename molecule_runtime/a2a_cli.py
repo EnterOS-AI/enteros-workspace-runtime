@@ -21,10 +21,17 @@ import uuid
 
 import httpx
 
+# Validate WORKSPACE_ID (CWE-20, issue #14) — interpolated into
+# /registry/{WORKSPACE_ID}/peers + /workspaces/{WORKSPACE_ID} URL paths
+# and the X-Workspace-ID header below.
+from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
 _WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
 if not _WORKSPACE_ID_raw:
     raise RuntimeError("WORKSPACE_ID environment variable is required but not set")
-WORKSPACE_ID = _WORKSPACE_ID_raw
+try:
+    WORKSPACE_ID = _validate_workspace_id(_WORKSPACE_ID_raw)
+except ValueError as _exc:
+    raise RuntimeError(f"WORKSPACE_ID failed validation: {_exc}") from _exc
 # Platform URL: always host.docker.internal inside containers. The platform API
 # is only reachable via the Docker network mesh from inside a workspace
 # container regardless of the runtime environment (Docker/host).

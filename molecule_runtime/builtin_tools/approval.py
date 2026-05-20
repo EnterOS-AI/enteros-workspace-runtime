@@ -55,7 +55,21 @@ from molecule_runtime.builtin_tools.audit import check_permission, get_workspace
 logger = logging.getLogger(__name__)
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+# WORKSPACE_ID is interpolated into platform URL paths and the
+# X-Workspace-ID header below; pass through the central validator so a
+# crafted env var (containing /, .., #, newlines, etc.) fails fast at
+# import instead of opening a URL/header injection surface
+# (CWE-20, issue #14).
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID = _get_workspace_id()
+except ValueError:
+    # Single-workspace WORKSPACE_ID env var unset — this module's tools
+    # are unusable in that mode (every URL needs the ID), but importing
+    # it from the multi-workspace external-runtime path must not crash
+    # the whole package. Set to empty string so the existing in-module
+    # guards (truthy-WORKSPACE_ID checks below) still gate behaviour.
+    WORKSPACE_ID = ""
 APPROVAL_POLL_INTERVAL = float(os.environ.get("APPROVAL_POLL_INTERVAL", "5"))
 APPROVAL_TIMEOUT = float(os.environ.get("APPROVAL_TIMEOUT", "300"))
 

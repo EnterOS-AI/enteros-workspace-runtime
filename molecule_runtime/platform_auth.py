@@ -22,12 +22,112 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
 import molecule_runtime.configs_dir as configs_dir
 
 logger = logging.getLogger(__name__)
+
+# Valid workspace ID: lowercase alphanumeric + hyphens (UUIDs and
+# org-generated IDs). Rejects /, \, .., #, ?, &, newlines — all
+# characters that could break URL paths or HTTP header values when
+# WORKSPACE_ID is interpolated into platform API URLs or the
+# ``X-Workspace-ID`` header. This is the single validation gate for the
+# legacy single-workspace WORKSPACE_ID env var AND for each entry in the
+# multi-workspace ``MOLECULE_WORKSPACES`` registry (see
+# :func:`register_workspace_token`).
+#
+# Fixes issue #14 (CWE-20, Improper Input Validation). Originally landed
+# as standalone PR #29 in 0.1.x, dropped accidentally in the
+# standalone-SSOT 0.2.0 restructure, restored here so 0.2.0 doesn't ship
+# with a known security regression.
+_WORKSPACE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,127}$")
+
+# In-process cache for the validated single-workspace ID. Validated once
+# on first call to :func:`get_workspace_id` and reused thereafter — the
+# regex check is cheap but pointless to repeat on every heartbeat.
+_validated_workspace_id: str | None = None
+
+
+def validate_workspace_id(workspace_id: str) -> str:
+    """Validate *workspace_id* and return the canonical (stripped) form.
+
+    Raises :class:`ValueError` if the ID is empty, contains unsafe
+    characters, or does not match the expected lowercase-alphanumeric-
+    plus-hyphen format. Callers that hand-construct a workspace ID for
+    a platform request should pass it through here first; callers that
+    only need the env-var workspace ID should use :func:`get_workspace_id`,
+    which caches the result.
+
+    Fixes issue #14 (CWE-20): prevents URL/header injection when the
+    workspace ID is interpolated into platform API URLs or the
+    ``X-Workspace-ID`` header. The regex deliberately matches the
+    smallest set of characters platform-generated IDs are known to use,
+    so unexpected encodings (uppercase, underscores, dots, slashes,
+    fragment/query/space chars, control chars) fail closed.
+    """
+    if not workspace_id:
+        raise ValueError(
+            "WORKSPACE_ID is empty — set the WORKSPACE_ID env var "
+            "(single-workspace) or MOLECULE_WORKSPACES "
+            "(multi-workspace external runtime)"
+        )
+
+    # Strip whitespace before regex match. Whitespace-only IDs fail the
+    # regex (which requires a leading [a-z0-9]) with the "invalid
+    # characters" message — same behaviour as PR #29's original
+    # validator.
+    workspace_id = workspace_id.strip()
+
+    if not _WORKSPACE_ID_RE.match(workspace_id):
+        raise ValueError(
+            f"WORKSPACE_ID contains invalid characters: {workspace_id!r}. "
+            "Only lowercase letters, digits, and hyphens are allowed "
+            "(starting with an alphanumeric, max 128 chars). "
+            "Ensure the ID is a valid UUID or platform-generated alphanumeric."
+        )
+
+    return workspace_id
+
+
+def get_workspace_id() -> str:
+    """Return the validated single-workspace WORKSPACE_ID.
+
+    Reads ``os.environ['WORKSPACE_ID']`` on first call, validates it via
+    :func:`validate_workspace_id`, caches the result, and returns it.
+    Subsequent calls return the cached value without re-reading the
+    environment — workspace IDs are immutable per container lifetime, so
+    refreshing on every call would just burn CPU.
+
+    Use this in any module that needs to interpolate the workspace ID
+    into a platform URL or ``X-Workspace-ID`` header. Multi-workspace
+    callers (mcp_cli external-runtime path) should look up per-workspace
+    IDs from the ``MOLECULE_WORKSPACES`` JSON via
+    :func:`get_workspace_token`, not from this function.
+
+    Raises :class:`ValueError` if ``WORKSPACE_ID`` is unset or malformed.
+    Callers that want to gracefully handle the missing-env case
+    (multi-workspace mode, doctor tools, tests) should catch the
+    ValueError; the alternative — returning empty/None — re-introduces
+    the CWE-20 surface this validator exists to close.
+    """
+    global _validated_workspace_id
+    if _validated_workspace_id is not None:
+        return _validated_workspace_id
+
+    raw = os.environ.get("WORKSPACE_ID", "")
+    _validated_workspace_id = validate_workspace_id(raw)
+    return _validated_workspace_id
+
+
+def _reset_workspace_id_cache() -> None:
+    """Clear the cached single-workspace ID. Test-only — production
+    workspaces never change WORKSPACE_ID after boot."""
+    global _validated_workspace_id
+    _validated_workspace_id = None
+
 
 # In-process cache so we don't hit disk on every heartbeat. The heartbeat
 # loop fires on a short interval and reading a tiny file 10x per minute
@@ -141,6 +241,19 @@ def register_workspace_token(workspace_id: str, token: str) -> None:
     workspace_id = (workspace_id or "").strip()
     token = (token or "").strip()
     if not workspace_id or not token:
+        return
+    # Validate the workspace_id format before it lands in the registry —
+    # otherwise a crafted MOLECULE_WORKSPACES JSON entry could store an
+    # injection-bearing ID that get_workspace_token(...) returns
+    # unchanged, re-introducing the CWE-20 surface. Single validation
+    # gate here means every legitimate caller (mcp_cli) gets uniform
+    # protection without each call-site duplicating the regex.
+    try:
+        workspace_id = validate_workspace_id(workspace_id)
+    except ValueError as exc:
+        logger.warning(
+            "platform_auth: refusing to register invalid workspace_id: %s", exc,
+        )
         return
     with _WORKSPACE_TOKENS_LOCK:
         prior = _WORKSPACE_TOKENS.get(workspace_id)
@@ -263,3 +376,11 @@ def refresh_cache() -> str | None:
     global _cached_token
     _cached_token = None
     return get_token()
+
+
+# Back-compat alias for callers + tests that imported the original
+# ``refresh_from_disk`` symbol introduced alongside the CWE-20 fix
+# (standalone PR #1877). The standalone-SSOT restructure renamed it to
+# ``refresh_cache`` — both names point at the same implementation so
+# pre-0.2.0 callers keep working without behaviour change.
+refresh_from_disk = refresh_cache

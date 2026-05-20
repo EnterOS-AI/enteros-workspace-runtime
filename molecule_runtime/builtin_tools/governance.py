@@ -51,7 +51,12 @@ import os
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
-WORKSPACE_ID: str = os.environ.get("WORKSPACE_ID", "")
+# CWE-20 (issue #14): WORKSPACE_ID flows into governance event records.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID: str = _get_workspace_id()
+except ValueError:
+    WORKSPACE_ID = ""
 
 # Module-level singleton — set by initialize_governance() at startup
 _adapter: Optional["GovernanceAdapter"] = None

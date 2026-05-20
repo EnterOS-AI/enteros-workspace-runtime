@@ -18,14 +18,23 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 
 import molecule_runtime.a2a_response as a2a_response
-from molecule_runtime.platform_auth import auth_headers, self_source_headers
+from molecule_runtime.platform_auth import (
+    auth_headers,
+    self_source_headers,
+    validate_workspace_id as _validate_workspace_id,
+)
 
 logger = logging.getLogger(__name__)
 
+# Validate WORKSPACE_ID (CWE-20, issue #14) — flows into X-Workspace-ID
+# headers on every outbound A2A call below.
 _WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
 if not _WORKSPACE_ID_raw:
     raise RuntimeError("WORKSPACE_ID environment variable is required but not set")
-WORKSPACE_ID = _WORKSPACE_ID_raw
+try:
+    WORKSPACE_ID = _validate_workspace_id(_WORKSPACE_ID_raw)
+except ValueError as _exc:
+    raise RuntimeError(f"WORKSPACE_ID failed validation: {_exc}") from _exc
 # Platform URL: always host.docker.internal inside containers. The platform API
 # is only reachable via the Docker network mesh from inside a workspace
 # container regardless of the runtime environment (Docker/host).

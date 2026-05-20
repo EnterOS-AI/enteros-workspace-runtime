@@ -30,7 +30,18 @@ from molecule_runtime.builtin_tools.telemetry import (
 )
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+# CWE-20 (issue #14): validate WORKSPACE_ID before it lands in
+# /workspaces/{WORKSPACE_ID}/... URL paths or the X-Workspace-ID header.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID = _get_workspace_id()
+except ValueError:
+    # Multi-workspace external runtime — WORKSPACE_ID env not set; the
+    # module's delegate() helper is unreachable in that mode (it
+    # references the module constant), and that's fine because
+    # multi-workspace callers go through a2a_tools_delegation.py with
+    # an explicit workspace_id parameter.
+    WORKSPACE_ID = ""
 DELEGATION_RETRY_ATTEMPTS = int(os.environ.get("DELEGATION_RETRY_ATTEMPTS", "3"))
 DELEGATION_RETRY_DELAY = float(os.environ.get("DELEGATION_RETRY_DELAY", "5.0"))
 DELEGATION_TIMEOUT = float(os.environ.get("DELEGATION_TIMEOUT", "300.0"))

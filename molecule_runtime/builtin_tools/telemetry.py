@@ -82,7 +82,17 @@ MEMORY_QUERY = "memory.query"
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-WORKSPACE_ID: str = os.environ.get("WORKSPACE_ID", "unknown")
+# CWE-20 (issue #14): WORKSPACE_ID becomes the service-name suffix
+# (f"molecule-{WORKSPACE_ID}") and an OpenTelemetry resource attribute;
+# unsanitized input could break OTLP exporters' service-name conventions
+# or appear in span attributes verbatim. Validate at module load —
+# "unknown" sentinel kept for the no-env fallback (multi-workspace mode
+# or pre-provision boot).
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID: str = _get_workspace_id()
+except ValueError:
+    WORKSPACE_ID = "unknown"
 
 _initialized: bool = False
 _tracer: Any = None  # opentelemetry.trace.Tracer | _NoopTracer

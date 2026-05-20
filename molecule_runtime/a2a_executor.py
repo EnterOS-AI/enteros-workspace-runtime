@@ -68,7 +68,14 @@ from molecule_runtime.builtin_tools.telemetry import (
 
 logger = logging.getLogger(__name__)
 
-_WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "unknown")
+# CWE-20 (issue #14): _WORKSPACE_ID becomes an OpenTelemetry span
+# attribute; "unknown" sentinel preserved for the no-env fallback so the
+# tracer keeps working before the workspace ID is provisioned.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    _WORKSPACE_ID = _get_workspace_id()
+except ValueError:
+    _WORKSPACE_ID = "unknown"
 
 # LangGraph ReAct cycle budget per turn. Library default is 25; 500 covers
 # PM fan-outs (plan → 6 delegations → 6 awaits → 6 results → synthesize ≈

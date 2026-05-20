@@ -55,7 +55,15 @@ logger = logging.getLogger(__name__)
 AUDIT_LOG_PATH: str = os.environ.get(
     "AUDIT_LOG_PATH", "/var/log/molecule/audit.jsonl"
 )
-WORKSPACE_ID: str = os.environ.get("WORKSPACE_ID", "")
+# CWE-20 (issue #14): WORKSPACE_ID lands in audit-log records — even
+# though audit.jsonl is local-only (no URL/header surface), validating
+# at module load keeps an injection-bearing env from being persisted
+# into long-term audit storage.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID: str = _get_workspace_id()
+except ValueError:
+    WORKSPACE_ID = ""
 
 # Protects the open() + write() sequence; prevents interleaved JSON lines
 # when multiple async tasks run in the same event-loop thread.

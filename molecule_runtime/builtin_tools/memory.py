@@ -43,7 +43,17 @@ except ImportError:  # pragma: no cover
     httpx = SimpleNamespace(AsyncClient=None)
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+# CWE-20 (issue #14): validate WORKSPACE_ID before it lands in
+# /workspaces/{WORKSPACE_ID}/memories URL paths used by commit_memory /
+# recall_memory below.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID = _get_workspace_id()
+except ValueError:
+    # Multi-workspace external-runtime — env-level WORKSPACE_ID unset;
+    # the helpers below are unreachable in that mode, fail soft to keep
+    # the package importable.
+    WORKSPACE_ID = ""
 
 
 @tool

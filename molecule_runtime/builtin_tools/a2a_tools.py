@@ -17,7 +17,18 @@ import httpx
 from molecule_runtime._sanitize_a2a import sanitize_a2a_result
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+# Validate WORKSPACE_ID (CWE-20, issue #14) — interpolated into
+# /registry/{WORKSPACE_ID}/peers URL path below.
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+try:
+    WORKSPACE_ID = _get_workspace_id()
+except ValueError:
+    # Multi-workspace external-runtime import — single WORKSPACE_ID env
+    # not set; the in-container list_peers() helper is unreachable in
+    # that mode (the multi-WS path uses a2a_tools_delegation.py with an
+    # explicit workspace_id parameter), so failing soft here keeps the
+    # external runtime importable without exposing the CWE-20 surface.
+    WORKSPACE_ID = ""
 
 
 async def list_peers() -> list[dict]:
