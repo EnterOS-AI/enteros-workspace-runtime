@@ -49,6 +49,64 @@ from molecule_runtime.platform_tools.registry import TOOLS as _PLATFORM_TOOL_SPE
 
 logger = logging.getLogger(__name__)
 
+# --- RBAC gate (task #343, CWE-862) ---
+#
+# Maps MCP tool name → action capability that must be granted by the
+# workspace's configured roles. Tools omitted from this map are always
+# allowed (read-only / env-only surface — list_peers, recall_memory,
+# get_workspace_info, get_runtime_identity, inbox_peek/pop, wait_for_message,
+# chat_history, broadcast_message).
+#
+# Originally landed standalone (#12 era, c72fbfc-adjacent), dropped during
+# the standalone-as-SSOT migration (6988bec) because monorepo lacked it.
+# Re-ported here.
+_PERMISSION_MAP: dict[str, str] = {
+    "delegate_task": "delegate",
+    "delegate_task_async": "delegate",
+    "check_task_status": "delegate",
+    "send_message_to_user": "approve",
+    "commit_memory": "memory.write",
+    # update_agent_card mutates the workspace's own platform-side card —
+    # gate it behind the same memory.write capability the agent already
+    # needs to persist anything outbound. Read-only roles can still call
+    # get_runtime_identity / get_workspace_info to read their identity.
+    "update_agent_card": "memory.write",
+}
+
+
+def _check_permission(action: str) -> None:
+    """Raise PermissionError if the caller lacks ``action`` permission.
+
+    Lazy import of builtin_tools.audit avoids a circular dep at startup
+    (audit.py → config.py → eventually back to this module's siblings).
+    """
+    from molecule_runtime.builtin_tools.audit import (
+        check_permission,
+        get_workspace_roles,
+    )
+
+    roles, custom = get_workspace_roles()
+    if not check_permission(action, roles, custom):
+        raise PermissionError(f"RBAC: action '{action}' denied for roles {roles}")
+
+
+def _tool_permission_check(name: str, arguments: dict) -> str | None:
+    """Run RBAC check for ``name``; return error string, or None if allowed.
+
+    ``arguments`` is accepted (and currently unused) so future per-arg
+    gating (e.g. memory scope-aware checks) can land without changing
+    every call site.
+    """
+    action = _PERMISSION_MAP.get(name)
+    if action is None:
+        return None  # No RBAC gate for this tool
+    try:
+        _check_permission(action)
+    except PermissionError as exc:
+        return str(exc)
+    return None
+
+
 # Re-export constants and client functions so existing imports
 # (e.g. tests that do `import a2a_mcp_server`) still work.
 from molecule_runtime.a2a_client import (  # noqa: F401, E402
@@ -93,6 +151,14 @@ TOOLS = [
 
 async def handle_tool_call(name: str, arguments: dict) -> str:
     """Handle a tool call and return the result as text."""
+    # RBAC gate (task #343, CWE-862) — block tools the workspace's
+    # configured roles do not grant. Returns a tool-result string so
+    # the caller surfaces an actionable reason without leaking which
+    # role / config knob would lift the denial.
+    rbac_error = _tool_permission_check(name, arguments)
+    if rbac_error is not None:
+        return f"PERMISSION DENIED: {rbac_error}"
+
     if name == "delegate_task":
         return await tool_delegate_task(
             arguments.get("workspace_id", ""),
