@@ -46,7 +46,11 @@ def _import_mcp_cli():
 
 
 class TestResolveWorkspaces:
-    def test_multi_workspace_json_returns_pairs(self, monkeypatch):
+    def test_multi_workspace_json_returns_triples(self, monkeypatch):
+        # Entries without a per-entry ``platform_url`` resolve to a
+        # 3-tuple whose third element is the empty string — caller
+        # falls through to the module-level PLATFORM_URL (back-compat
+        # default).
         monkeypatch.setenv(
             "MOLECULE_WORKSPACES",
             json.dumps([
@@ -57,7 +61,7 @@ class TestResolveWorkspaces:
         mcp_cli = _import_mcp_cli()
         out, errors = mcp_cli._resolve_workspaces()
         assert errors == []
-        assert out == [("ws-a", "tok-a"), ("ws-b", "tok-b")]
+        assert out == [("ws-a", "tok-a", ""), ("ws-b", "tok-b", "")]
 
     def test_multi_workspace_ignores_legacy_env_vars(self, monkeypatch):
         # When MOLECULE_WORKSPACES is set, WORKSPACE_ID + token env are
@@ -72,7 +76,7 @@ class TestResolveWorkspaces:
         mcp_cli = _import_mcp_cli()
         out, errors = mcp_cli._resolve_workspaces()
         assert errors == []
-        assert out == [("ws-only", "tok-only")]
+        assert out == [("ws-only", "tok-only", "")]
 
     def test_invalid_json_returns_error(self, monkeypatch):
         monkeypatch.setenv("MOLECULE_WORKSPACES", "{not valid json")
@@ -129,7 +133,10 @@ class TestResolveWorkspaces:
         mcp_cli = _import_mcp_cli()
         out, errors = mcp_cli._resolve_workspaces()
         assert errors == []
-        assert out == [("legacy-ws", "legacy-tok")]
+        # Single-workspace path never carries a per-entry platform_url —
+        # third tuple element is "" so the caller falls through to the
+        # module-level PLATFORM_URL env var.
+        assert out == [("legacy-ws", "legacy-tok", "")]
 
     def test_legacy_no_workspace_id_returns_error(self, monkeypatch):
         monkeypatch.setenv("MOLECULE_WORKSPACE_TOKEN", "tok")

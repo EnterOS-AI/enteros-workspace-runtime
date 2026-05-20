@@ -148,6 +148,21 @@ _cached_token: str | None = None
 _WORKSPACE_TOKENS: dict[str, str] = {}
 _WORKSPACE_TOKENS_LOCK = threading.Lock()
 
+# Per-workspace platform_url registry — populated by mcp_cli when the
+# operator's MOLECULE_WORKSPACES JSON carries a per-entry ``platform_url``
+# field (RFC#601, task #296 Phase B0). Mirrors ``_WORKSPACE_TOKENS`` so
+# the wiring stays uniform: each registered workspace optionally owns
+# BOTH a bearer token AND a platform URL.
+#
+# Distinct from the module-level ``PLATFORM_URL`` env var (which still
+# wins for entries without a per-workspace override AND for the entire
+# single-workspace path). Reads happen on every outbound HTTP construct
+# in the A2A client + messaging tool layer, so the lookup must stay
+# lock-free in the hot path — the dict is populated synchronously from
+# main() before any thread starts, then read-only thereafter.
+_WORKSPACE_PLATFORM_URLS: dict[str, str] = {}
+_WORKSPACE_PLATFORM_URLS_LOCK = threading.Lock()
+
 
 def _token_file() -> Path:
     """Path to the on-disk token file. Resolved via configs_dir so
@@ -275,6 +290,69 @@ def get_workspace_token(workspace_id: str) -> str | None:
     return _WORKSPACE_TOKENS.get((workspace_id or "").strip())
 
 
+def register_workspace_platform_url(workspace_id: str, platform_url: str) -> None:
+    """Register a per-workspace platform URL in the multi-tenant registry.
+
+    Called by ``mcp_cli`` once per MOLECULE_WORKSPACES entry whose JSON
+    carried a ``platform_url`` field (RFC#601, task #296 Phase B0). Lets
+    a single external-agent process register into workspaces that live
+    on different platform tenants — each workspace's outbound HTTP
+    target / Origin header is derived from its own URL rather than the
+    process-wide ``PLATFORM_URL`` env var.
+
+    Pre-validates ``workspace_id`` through ``validate_workspace_id`` for
+    symmetry with the token-registry path — an invalid id stored here
+    could later flow into a URL/header injection through
+    ``get_workspace_platform_url``. Empty / blank ``platform_url`` is
+    treated as "operator declined the per-entry override" — we silently
+    drop the registration so the caller falls through to the
+    module-level env var (back-compat default).
+
+    Idempotent: re-registering the same workspace_id with the same URL
+    is a no-op; with a different URL it overwrites and logs at INFO so
+    operator-side tenant moves leave a trail in the runtime log.
+    """
+    workspace_id = (workspace_id or "").strip()
+    platform_url = (platform_url or "").strip().rstrip("/")
+    if not workspace_id or not platform_url:
+        return
+    try:
+        workspace_id = validate_workspace_id(workspace_id)
+    except ValueError as exc:
+        logger.warning(
+            "platform_auth: refusing to register platform_url for invalid "
+            "workspace_id: %s", exc,
+        )
+        return
+    with _WORKSPACE_PLATFORM_URLS_LOCK:
+        prior = _WORKSPACE_PLATFORM_URLS.get(workspace_id)
+        if prior == platform_url:
+            return
+        if prior is not None:
+            logger.info(
+                "platform_auth: workspace_id %s platform_url changed "
+                "(%s → %s)",
+                workspace_id, prior, platform_url,
+            )
+        _WORKSPACE_PLATFORM_URLS[workspace_id] = platform_url
+
+
+def get_workspace_platform_url(workspace_id: str | None) -> str | None:
+    """Return the per-workspace platform URL from the registry, or None.
+
+    None means "no per-workspace override registered" — callers should
+    fall through to the module-level ``PLATFORM_URL`` env var (the
+    pre-RFC#601 behavior, unchanged for single-tenant operators).
+
+    Lookup is lock-free: writes happen in main() before any thread
+    starts, reads are stable thereafter — same hot-path contract as
+    ``get_workspace_token``.
+    """
+    if not workspace_id:
+        return None
+    return _WORKSPACE_PLATFORM_URLS.get(workspace_id.strip())
+
+
 def list_registered_workspaces() -> list[str]:
     """Return the workspace IDs currently in the per-workspace registry.
 
@@ -318,11 +396,26 @@ def auth_headers(workspace_id: str | None = None) -> dict[str, str]:
     before. Multi-workspace operators pass ``workspace_id`` so each
     thread (heartbeat, poller, send_message_to_user) authenticates
     against the correct workspace.
+
+    Origin-header resolution order (RFC#601, task #296 Phase B0):
+        1. Per-workspace platform_url registry — set by mcp_cli when
+           the MOLECULE_WORKSPACES JSON carried a per-entry
+           ``platform_url`` field. Used only when ``workspace_id`` was
+           passed AND that workspace has a URL registered.
+        2. Module-level ``PLATFORM_URL`` env var — the pre-RFC#601
+           default, still wins for entries without a per-workspace
+           override AND for the entire single-workspace path.
     """
     headers: dict[str, str] = {}
-    platform_url = os.environ.get("PLATFORM_URL", "").strip()
-    if platform_url:
-        headers["Origin"] = platform_url
+    ws_url: str | None = None
+    if workspace_id:
+        ws_url = get_workspace_platform_url(workspace_id)
+    if ws_url:
+        headers["Origin"] = ws_url
+    else:
+        platform_url = os.environ.get("PLATFORM_URL", "").strip()
+        if platform_url:
+            headers["Origin"] = platform_url
     tok: str | None = None
     if workspace_id:
         tok = get_workspace_token(workspace_id)
@@ -365,6 +458,8 @@ def clear_cache() -> None:
     _cached_token = None
     with _WORKSPACE_TOKENS_LOCK:
         _WORKSPACE_TOKENS.clear()
+    with _WORKSPACE_PLATFORM_URLS_LOCK:
+        _WORKSPACE_PLATFORM_URLS.clear()
 
 
 def refresh_cache() -> str | None:

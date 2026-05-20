@@ -155,7 +155,7 @@ def main() -> None:
     # outbound-tool behavior unchanged for single-workspace operators
     # AND for the multi-workspace operator's first registered
     # workspace.
-    primary_workspace_id, _primary_token = workspaces[0]
+    primary_workspace_id, _primary_token, _primary_platform_url = workspaces[0]
     os.environ["WORKSPACE_ID"] = primary_workspace_id
 
     # Configure logging so the operator sees register/heartbeat status
@@ -174,10 +174,24 @@ def main() -> None:
     # token for each workspace via ``platform_auth.auth_headers(wsid)``.
     # Done BEFORE register/heartbeat thread spawn so a thread that
     # races to fire its first request always sees its token.
+    #
+    # Same window also wires the per-workspace platform_url registry
+    # (RFC#601, task #296 Phase B0). When a MOLECULE_WORKSPACES entry
+    # carried a per-entry ``platform_url`` field, register it now so
+    # subsequent outbound HTTP from that workspace's threads resolves
+    # via ``_resolve_platform_url(src)`` to the correct tenant. Entries
+    # without a per-entry URL (empty third tuple element) are silently
+    # skipped — those workspaces fall through to the module-level
+    # PLATFORM_URL env var (back-compat default).
     try:
-        from molecule_runtime.platform_auth import register_workspace_token
-        for wsid, tok in workspaces:
+        from molecule_runtime.platform_auth import (
+            register_workspace_platform_url,
+            register_workspace_token,
+        )
+        for wsid, tok, ws_platform_url in workspaces:
             register_workspace_token(wsid, tok)
+            if ws_platform_url:
+                register_workspace_platform_url(wsid, ws_platform_url)
     except ImportError:
         # Older installs that don't yet ship register_workspace_token —
         # multi-workspace resolution silently degrades to the legacy
@@ -191,7 +205,7 @@ def main() -> None:
     # MOLECULE_MCP_DISABLE_HEARTBEAT escape hatch exists for tests +
     # the rare embedded use-case.
     if not os.environ.get("MOLECULE_MCP_DISABLE_HEARTBEAT", "").strip():
-        for wsid, tok in workspaces:
+        for wsid, tok, _ws_platform_url in workspaces:
             _platform_register(platform_url, wsid, tok)
             _start_heartbeat_thread(platform_url, wsid, tok)
 

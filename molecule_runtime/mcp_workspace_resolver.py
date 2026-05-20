@@ -24,16 +24,20 @@ import sys
 import molecule_runtime.configs_dir as configs_dir
 
 
-def resolve_workspaces() -> tuple[list[tuple[str, str]], list[str]]:
-    """Return the list of ``(workspace_id, token)`` pairs to register.
+def resolve_workspaces() -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Return the list of ``(workspace_id, token, platform_url)`` triples
+    to register.
 
     Resolution order:
 
     1. ``MOLECULE_WORKSPACES`` env var — JSON array of
-       ``{"id": "...", "token": "..."}`` objects. Activates the
-       multi-workspace external-agent path (one process registered into
-       N workspaces). When set, ``WORKSPACE_ID`` / ``MOLECULE_WORKSPACE_TOKEN``
-       are IGNORED — the JSON is the source of truth.
+       ``{"id": "...", "token": "...", "platform_url": "..."}`` objects.
+       Activates the multi-workspace external-agent path (one process
+       registered into N workspaces). When set, ``WORKSPACE_ID`` /
+       ``MOLECULE_WORKSPACE_TOKEN`` are IGNORED — the JSON is the source
+       of truth. The ``platform_url`` field is OPTIONAL — if omitted it
+       falls back to the module-level ``PLATFORM_URL`` env var so
+       same-tenant multi-workspace operators keep the simpler config.
 
     2. Single-workspace fallback — ``WORKSPACE_ID`` env var + token
        resolved in this order:
@@ -46,8 +50,14 @@ def resolve_workspaces() -> tuple[list[tuple[str, str]], list[str]]:
             the platform writes this on provision).
 
     Returns ``(workspaces, errors)``:
-      * ``workspaces``: list of ``(workspace_id, token)`` — non-empty
-        on the happy path.
+      * ``workspaces``: list of ``(workspace_id, token, platform_url)``
+        triples — non-empty on the happy path. ``platform_url`` is the
+        empty string when the entry didn't carry one and the caller
+        should fall through to the module-level ``PLATFORM_URL`` env
+        var. Carrying it as the third element (rather than two distinct
+        list shapes) keeps the resolver's contract single-shape so
+        downstream wiring in :mod:`mcp_cli` doesn't branch on
+        per-workspace mode.
       * ``errors``: human-readable strings describing what's missing /
         malformed. ``main()`` surfaces these with the same shape as
         ``print_missing_env_help`` so the operator's first run gives
@@ -57,6 +67,14 @@ def resolve_workspaces() -> tuple[list[tuple[str, str]], list[str]]:
     string in ``mcpServers.molecule.env`` instead of a sidecar file)
     and for CI / launchers. A separate config-file path can be added
     later without breaking this.
+
+    Why the per-entry ``platform_url`` field (RFC#601, task #296 Phase
+    B0): an external agent registered into workspaces that live on
+    DIFFERENT platform tenants (e.g. one personal tenant + one staging
+    tenant) needs to dispatch each workspace's outbound HTTP to the
+    correct host. Same-tenant operators omit the field — the
+    module-level ``PLATFORM_URL`` covers them and behavior is
+    unchanged.
     """
     raw = os.environ.get("MOLECULE_WORKSPACES", "").strip()
     if raw:
@@ -73,7 +91,7 @@ def resolve_workspaces() -> tuple[list[tuple[str, str]], list[str]]:
                 "MOLECULE_WORKSPACES must be a non-empty JSON array of "
                 "{\"id\":\"...\",\"token\":\"...\"} objects"
             ]
-        out: list[tuple[str, str]] = []
+        out: list[tuple[str, str, str]] = []
         seen: set[str] = set()
         errors: list[str] = []
         for i, entry in enumerate(parsed):
@@ -95,7 +113,22 @@ def resolve_workspaces() -> tuple[list[tuple[str, str]], list[str]]:
                 )
                 continue
             seen.add(wsid)
-            out.append((wsid, tok))
+            # Optional per-entry platform_url (RFC#601, task #296 Phase
+            # B0). Trail whitespace + trailing slash so the resolved
+            # value matches the canonical form mcp_cli stores in
+            # os.environ["PLATFORM_URL"] (rstrip("/") at startup);
+            # otherwise downstream string-compares against the env-var
+            # form would spuriously diverge. Absent / empty / non-string
+            # → "" so the caller falls through to the module-level env.
+            raw_url = entry.get("platform_url", "")
+            if not isinstance(raw_url, str):
+                errors.append(
+                    f"MOLECULE_WORKSPACES[{i}] 'platform_url' must be a "
+                    f"string — got {type(raw_url).__name__}"
+                )
+                continue
+            ws_platform_url = raw_url.strip().rstrip("/")
+            out.append((wsid, tok, ws_platform_url))
         if errors:
             return [], errors
         return out, []
@@ -131,7 +164,11 @@ def resolve_workspaces() -> tuple[list[tuple[str, str]], list[str]]:
             "MOLECULE_WORKSPACE_TOKEN, MOLECULE_WORKSPACE_TOKEN_FILE, or "
             "CONFIGS_DIR/.auth_token is required"
         ]
-    return [(wsid, tok)], []
+    # Single-workspace path never carries a per-entry platform_url —
+    # the operator's only knob is the module-level PLATFORM_URL env var,
+    # so emit an empty string for the third tuple element and let
+    # downstream wiring fall through to the env-level default.
+    return [(wsid, tok, "")], []
 
 
 def _read_token_from_file_env() -> tuple[str, str]:

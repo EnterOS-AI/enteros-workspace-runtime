@@ -20,6 +20,7 @@ import httpx
 import molecule_runtime.a2a_response as a2a_response
 from molecule_runtime.platform_auth import (
     auth_headers,
+    get_workspace_platform_url,
     self_source_headers,
     validate_workspace_id as _validate_workspace_id,
 )
@@ -39,6 +40,35 @@ except ValueError as _exc:
 # is only reachable via the Docker network mesh from inside a workspace
 # container regardless of the runtime environment (Docker/host).
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
+
+
+def _resolve_platform_url(src: str | None) -> str:
+    """Return the platform URL to use for an outbound call from ``src``.
+
+    Single resolution gate for the multi-tenant platform_url support
+    introduced in RFC#601 / task #296 Phase B0. Every outbound URL
+    construction below routes through here so the policy lives in one
+    place:
+
+        1. ``src`` set AND that workspace has a per-entry platform_url
+           registered → use it. Lets a multi-tenant external agent
+           dispatch each workspace's outbound HTTP to the correct
+           platform host without each tool re-deriving the lookup.
+        2. Otherwise → fall through to the module-level ``PLATFORM_URL``
+           constant. This is the only path single-workspace callers
+           ever see; their behavior is unchanged.
+
+    Returning ``str`` (not ``str | None``) keeps every call-site's f-string
+    interpolation safe — the helper always picks SOME url and the empty
+    string is reserved for "no value available" which the legacy path
+    never produced. Single-workspace + same-tenant multi-workspace
+    operators get identical URLs to the pre-RFC#601 code.
+    """
+    if src:
+        ws_url = get_workspace_platform_url(src)
+        if ws_url:
+            return ws_url
+    return PLATFORM_URL
 
 # Cache workspace ID → name mappings (populated by list_peers calls)
 _peer_names: dict[str, str] = {}
@@ -316,7 +346,7 @@ def enrich_peer_metadata(
             return record
 
     src = (source_workspace_id or "").strip() or WORKSPACE_ID
-    url = f"{PLATFORM_URL}/registry/discover/{canon}"
+    url = f"{_resolve_platform_url(src)}/registry/discover/{canon}"
     try:
         with httpx.Client(timeout=2.0) as client:
             resp = client.get(url, headers={"X-Workspace-ID": src, **auth_headers(src)})
@@ -437,10 +467,11 @@ async def discover_peer(target_id: str, source_workspace_id: str | None = None) 
     if safe_id is None:
         return None
     src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    base = _resolve_platform_url(src)
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.get(
-                f"{PLATFORM_URL}/registry/discover/{safe_id}",
+                f"{base}/registry/discover/{safe_id}",
                 headers={"X-Workspace-ID": src, **auth_headers(src)},
             )
             if resp.status_code == 200:
@@ -561,7 +592,7 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
     if safe_id is None:
         return f"{_A2A_ERROR_PREFIX}invalid peer_id (expected UUID): {peer_id!r}"
     src = (source_workspace_id or "").strip() or WORKSPACE_ID
-    target_url = f"{PLATFORM_URL}/workspaces/{safe_id}/a2a"
+    target_url = f"{_resolve_platform_url(src)}/workspaces/{safe_id}/a2a"
 
     # Fix F (Cycle 5 / H2 — flagged 5 consecutive audits): timeout=None allowed
     # a hung upstream to block the agent indefinitely. Use a generous but bounded
@@ -718,7 +749,8 @@ async def get_peers_with_diagnostic(source_workspace_id: str | None = None) -> t
     non-tool callers.
     """
     src = (source_workspace_id or "").strip() or WORKSPACE_ID
-    url = f"{PLATFORM_URL}/registry/{src}/peers"
+    base = _resolve_platform_url(src)
+    url = f"{base}/registry/{src}/peers"
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.get(
@@ -726,7 +758,7 @@ async def get_peers_with_diagnostic(source_workspace_id: str | None = None) -> t
                 headers={"X-Workspace-ID": src, **auth_headers(src)},
             )
         except Exception as e:
-            return [], f"Cannot reach platform at {PLATFORM_URL}: {e}"
+            return [], f"Cannot reach platform at {base}: {e}"
 
         if resp.status_code == 200:
             try:
@@ -778,10 +810,11 @@ async def get_workspace_info(source_workspace_id: str | None = None) -> dict:
       - exception       → network / auth failure
     """
     src = source_workspace_id or WORKSPACE_ID
+    base = _resolve_platform_url(src)
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{src}",
+                f"{base}/workspaces/{src}",
                 headers=auth_headers(src),
             )
             if resp.status_code == 200:

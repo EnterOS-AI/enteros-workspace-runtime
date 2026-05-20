@@ -25,10 +25,10 @@ import os
 import httpx
 
 from molecule_runtime.a2a_client import (
-    PLATFORM_URL,
     WORKSPACE_ID,
     _peer_names,
     _peer_to_source,
+    _resolve_platform_url,
     get_peers_with_diagnostic,
     get_workspace_info,
 )
@@ -81,9 +81,10 @@ async def _upload_chat_files(
             mime_type = "application/octet-stream"
         files_payload.append(("files", (os.path.basename(p), data, mime_type)))
     target_workspace_id = (workspace_id or "").strip() or WORKSPACE_ID
+    base = _resolve_platform_url(target_workspace_id)
     try:
         resp = await client.post(
-            f"{PLATFORM_URL}/workspaces/{target_workspace_id}/chat/uploads",
+            f"{base}/workspaces/{target_workspace_id}/chat/uploads",
             files=files_payload,
             headers=_auth_headers_for_heartbeat(target_workspace_id),
         )
@@ -123,10 +124,11 @@ async def tool_broadcast_message(
     if not message:
         return "Error: message is required"
     target_workspace_id = (workspace_id or "").strip() or WORKSPACE_ID
+    base = _resolve_platform_url(target_workspace_id)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{target_workspace_id}/broadcast",
+                f"{base}/workspaces/{target_workspace_id}/broadcast",
                 json={"message": message},
                 headers=_auth_headers_for_heartbeat(target_workspace_id),
             )
@@ -176,6 +178,7 @@ async def tool_send_message_to_user(
     if not message:
         return "Error: message is required"
     target_workspace_id = (workspace_id or "").strip() or WORKSPACE_ID
+    base = _resolve_platform_url(target_workspace_id)
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             uploaded, upload_err = await _upload_chat_files(
@@ -187,7 +190,7 @@ async def tool_send_message_to_user(
             if uploaded:
                 payload["attachments"] = uploaded
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{target_workspace_id}/notify",
+                f"{base}/workspaces/{target_workspace_id}/notify",
                 json=payload,
                 headers=_auth_headers_for_heartbeat(target_workspace_id),
             )
@@ -348,10 +351,11 @@ async def tool_chat_history(
     if before_ts:
         params["before_ts"] = before_ts
 
+    base = _resolve_platform_url(src)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{src}/activity",
+                f"{base}/workspaces/{src}/activity",
                 params=params,
                 headers=_auth_headers_for_heartbeat(src),
             )
