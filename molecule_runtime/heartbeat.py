@@ -135,6 +135,15 @@ HEARTBEAT_INTERVAL = 30  # seconds — fallback default when no per-instance val
 MAX_CONSECUTIVE_FAILURES = 10
 MAX_SEEN_DELEGATION_IDS = 200
 SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to prevent loops
+# Statuses that warrant a user-visible canvas chat push. The agent self-
+# message path (above each /notify loop) always fires so the agent can
+# synthesize its own NL summary via send_message_to_user. The /notify
+# chat push exists only to surface failures the agent might otherwise
+# swallow — completed delegations are noise on the canvas (chloe-dong
+# task #384). Keep this list tiny + explicit so adding a new status
+# requires deliberate review.
+NOTIFY_STATUSES = frozenset({"failed", "error", "timeout", "cancelled"})
+_DELEGATION_PREFIX = "Delegation completed:"
 # Shared path — adapter executors (in their template repos) read this
 # same file via executor_helpers.read_delegation_results so heartbeat-
 # delivered async delegation results land in the next agent turn.
@@ -474,12 +483,17 @@ class HeartbeatLoop:
                     except Exception as e:
                         logger.warning("Heartbeat: failed to send self-message: %s", e)
 
-                # Also push notification to user via canvas
+                # Also push notification to user via canvas, but ONLY for
+                # failure-class statuses. Success rows are agent-only — the
+                # self-message above wakes the agent who synthesizes its
+                # own NL via send_message_to_user. See task #384 / CTO
+                # decision 2026-05-20 (canvas pollution from raw envelopes).
                 for r in new_results:
+                    if r.get("status") not in NOTIFY_STATUSES:
+                        continue
                     try:
-                        msg = f"Delegation {r['status']}: {r['summary'][:100]}"
-                        if r.get("response_preview"):
-                            msg += f"\nResult: {r['response_preview'][:200]}"
+                        reason = r.get("error") or r.get("summary", "")
+                        msg = f"Delegation {r['status']}: {reason[:200]}"
                         await client.post(
                             f"{self.platform_url}/workspaces/{self.workspace_id}/notify",
                             json={"message": msg, "type": "delegation_result"},
@@ -687,13 +701,24 @@ class HeartbeatLoop:
                 except Exception as e:
                     logger.warning("Heartbeat: failed to send a2a_receive self-message: %s", e)
 
-            # Also notify the user via canvas.
+            # Also notify the user via canvas — failure-class only. The
+            # a2a_receive path currently hardcodes status="completed"
+            # (peer responses are by definition successful deliveries),
+            # so this loop is normally a no-op now — that is the fix
+            # for task #384 canvas pollution. If a future change emits
+            # failure rows here, the gate + double-prefix dedupe below
+            # keep them clean.
             for r in new_results:
+                if r.get("status") not in NOTIFY_STATUSES:
+                    continue
                 try:
-                    msg = f"Delegation completed: {r['summary'][:100] or '(no summary)'}"
-                    preview = r.get("response_preview", "")
-                    if preview:
-                        msg += f"\nResult: {preview[:200]}"
+                    summary = (r.get("summary") or "").lstrip()
+                    # Strip any pre-existing "Delegation completed:" prefix
+                    # on the upstream summary so we don't double up.
+                    if summary.startswith(_DELEGATION_PREFIX):
+                        summary = summary[len(_DELEGATION_PREFIX):].lstrip()
+                    reason = r.get("error") or summary or "(no detail)"
+                    msg = f"Delegation {r['status']}: {reason[:200]}"
                     await client.post(
                         f"{self.platform_url}/workspaces/{self.workspace_id}/notify",
                         json={"message": msg, "type": "delegation_result"},
