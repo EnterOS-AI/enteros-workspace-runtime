@@ -61,6 +61,23 @@ def _enrich_inbound_for_agent(d: dict) -> dict:
         # canvas_user — no peer to enrich; helper returns the plain
         # message unchanged so the canvas reply path still works.
         return d
+
+    # Layer 1 fast-path: the platform's ?include=peer_info enrichment
+    # may have already populated all three fields on the activity row,
+    # which InboxMessage.to_dict propagates into this dict. If all three
+    # are present, skip the registry round-trip — saves a cache lookup
+    # and a URL-build call per message, more importantly avoids
+    # double-enriching (which would silently overwrite the platform's
+    # authoritative values with whatever the local registry cache
+    # happens to hold). Partial population still falls through to the
+    # registry path: a row with only peer_name (registered peer with
+    # blank role at row-write time) still gets agent_card_url filled.
+    have_name = bool(d.get("peer_name"))
+    have_role = bool(d.get("peer_role"))
+    have_url = bool(d.get("agent_card_url"))
+    if have_name and have_role and have_url:
+        return d
+
     try:
         from molecule_runtime.a2a_client import (  # local import — avoid module-load cycle
             _agent_card_url_for,
@@ -68,18 +85,29 @@ def _enrich_inbound_for_agent(d: dict) -> dict:
         )
     except Exception:  # noqa: BLE001
         # If a2a_client is unavailable (test harness, partial install),
-        # degrade gracefully — agent still gets the bare envelope.
+        # degrade gracefully — agent still gets the bare envelope plus
+        # whatever Layer 1 already supplied.
         return d
-    record = enrich_peer_metadata_nonblocking(peer_id)
-    if record is not None:
-        if name := record.get("name"):
-            d["peer_name"] = name
-        if role := record.get("role"):
-            d["peer_role"] = role
+    # Only call registry enrichment if name OR role is missing — if both
+    # are already supplied by Layer 1, only the URL might need filling
+    # and that's cheap to compute alone.
+    if not (have_name and have_role):
+        record = enrich_peer_metadata_nonblocking(peer_id)
+        if record is not None:
+            if not have_name:
+                if name := record.get("name"):
+                    d["peer_name"] = name
+            if not have_role:
+                if role := record.get("role"):
+                    d["peer_role"] = role
     # agent_card_url is constructable from peer_id alone — surface it
     # even when registry enrichment misses, so the receiving agent has
     # a single endpoint to hit for the peer's full capability list.
-    d["agent_card_url"] = _agent_card_url_for(peer_id)
+    # Don't overwrite a Layer-1-supplied value — the server's
+    # externalPlatformURL is more authoritative than this client's
+    # PLATFORM_URL env when they diverge (CF tunnel vs direct host).
+    if not have_url:
+        d["agent_card_url"] = _agent_card_url_for(peer_id)
     return d
 
 

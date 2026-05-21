@@ -101,6 +101,20 @@ class InboxMessage:
     # know which workspace's identity to reply with.
     arrival_workspace_id: str = ""
 
+    # Layer-1 enrichment fields (from platform /activity?include=peer_info).
+    # All None when the activity row didn't carry them — that's the
+    # current pre-Layer-1 state, or a canvas_user row with no peer
+    # identity, or a row whose peer workspace has been deleted. Tools
+    # that want to display these MUST treat None as "no info" and fall
+    # back to the existing registry-lookup path (peer_name) or peer_id
+    # alone. Never emit None/"null" downstream — to_dict omits absent
+    # fields entirely, matching the omit-when-absent envelope rule the
+    # Layer 3 adaptor uses on the channel side.
+    peer_name: str | None = None
+    peer_role: str | None = None
+    agent_card_url: str | None = None
+    attachments: list[dict[str, Any]] | None = None
+
     def to_dict(self) -> dict[str, Any]:
         # Task #190 / #193 — Distinguish delegation-result rows from peer-agent
         # messages. The platform's pushDelegationResultToInbox (RFC #2829 PR-2)
@@ -138,6 +152,18 @@ class InboxMessage:
         # output.
         if self.arrival_workspace_id:
             d["arrival_workspace_id"] = self.arrival_workspace_id
+        # Layer-1 fields: omit-when-absent — never emit null/empty
+        # placeholders. A consumer that sees `peer_name` in the dict
+        # can trust it's a non-empty string; absence means "fall back
+        # to registry lookup or to peer_id alone."
+        if self.peer_name:
+            d["peer_name"] = self.peer_name
+        if self.peer_role:
+            d["peer_role"] = self.peer_role
+        if self.agent_card_url:
+            d["agent_card_url"] = self.agent_card_url
+        if self.attachments:
+            d["attachments"] = self.attachments
         return d
 
 
@@ -521,13 +547,106 @@ def message_from_activity(row: dict[str, Any]) -> InboxMessage:
     from molecule_runtime.inbox_uploads import rewrite_request_body
     rewrite_request_body(request_body)
 
+    # Layer-1 fields: read defensively. The platform handler ships them
+    # only when the caller passes `?include=peer_info`, AND only when the
+    # underlying row has them (canvas rows + rows whose peer workspace
+    # was deleted yield None/missing). Pre-Layer-1 platform versions or
+    # non-include callers see plain dicts without these keys; treat
+    # missing as None and let consumers fall back to registry-lookup.
+    def _str_or_none(v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    peer_name = _str_or_none(row.get("peer_name"))
+    peer_role = _str_or_none(row.get("peer_role"))
+    agent_card_url = _str_or_none(row.get("agent_card_url"))
+
+    attachments: list[dict[str, Any]] | None = None
+    raw_attachments = row.get("attachments")
+    if isinstance(raw_attachments, list) and raw_attachments:
+        # Defensive copy + shallow validation. Each entry should be a
+        # dict with at least a `kind` string; anything else gets
+        # filtered out rather than propagated to MCP tool consumers.
+        filtered = [a for a in raw_attachments if isinstance(a, dict) and isinstance(a.get("kind"), str)]
+        if filtered:
+            attachments = filtered
+
+    # If Layer 1's row didn't carry attachments[], try the inline
+    # message.parts[] path that's available today (independent of Layer
+    # 1) — same shape Layer 1's extractor produces, but parsed here so
+    # poll-path callers see attachments even on pre-Layer-1 platform.
+    if attachments is None and isinstance(request_body, dict):
+        attachments = _extract_attachments_from_request_body(request_body)
+
     return InboxMessage(
         activity_id=str(row.get("id", "")),
         text=_extract_text(request_body, row.get("summary")),
         peer_id=row.get("source_id") or "",
         method=row.get("method") or "",
         created_at=str(row.get("created_at", "")),
+        peer_name=peer_name,
+        peer_role=peer_role,
+        agent_card_url=agent_card_url,
+        attachments=attachments,
     )
+
+
+def _extract_attachments_from_request_body(
+    request_body: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Surface file/image/audio parts from an a2a inbound's
+    ``request_body.params.message.parts[]`` as a flat ``attachments[]``.
+
+    Mirrors the platform-side ``extractAttachmentsFromRequestBody`` Go
+    helper so poll-path consumers see the same shape regardless of
+    whether Layer 1 has shipped:
+
+    * v1 ``kind=file|image|audio`` and v0 ``type=file|image|audio``
+      discriminators both honored
+    * nested ``.file{uri, mime_type, name}`` shape AND legacy inlined-
+      on-part fields both surface
+    * malformed parts (no uri AND no name) are skipped
+    * returns None when nothing useful surfaces — caller treats this
+      as "no attachments on this row"
+
+    This is the registry-fallback path for Layer 2 — when the platform
+    (Layer 1) doesn't ship row-level ``attachments[]``, the runtime
+    extracts them itself so the poll path still works.
+    """
+    params = request_body.get("params") if isinstance(request_body, dict) else None
+    if not isinstance(params, dict):
+        return None
+    message = params.get("message")
+    if not isinstance(message, dict):
+        return None
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return None
+
+    out: list[dict[str, Any]] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("kind") or part.get("type")
+        if kind not in ("file", "image", "audio"):
+            continue
+        file_obj = part.get("file") if isinstance(part.get("file"), dict) else part
+        uri = file_obj.get("uri") if isinstance(file_obj.get("uri"), str) else None
+        mime_type = file_obj.get("mime_type") if isinstance(file_obj.get("mime_type"), str) else None
+        name = file_obj.get("name") if isinstance(file_obj.get("name"), str) else None
+        if not uri and not name:
+            continue
+        att: dict[str, Any] = {"kind": kind}
+        if uri:
+            att["uri"] = uri
+        if mime_type:
+            att["mime_type"] = mime_type
+        if name:
+            att["name"] = name
+        out.append(att)
+    return out or None
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +682,12 @@ def _poll_once(
     # this state, fall back to the legacy empty-string slot so existing
     # InboxState-with-cursor_path-only constructors keep working.
     cursor_key = workspace_id if workspace_id in state.cursor_paths else ""
-    params: dict[str, str] = {"type": "a2a_receive"}
+    # Request Layer-1 enrichment: peer_name/peer_role/agent_card_url/
+    # attachments[] on each row. A pre-Layer-1 platform silently ignores
+    # the param (additive opt-in), and message_from_activity reads the
+    # fields defensively (treats absence as None) — so this is safe to
+    # request unconditionally even before Layer 1 ships everywhere.
+    params: dict[str, str] = {"type": "a2a_receive", "include": "peer_info"}
     cursor = state.load_cursor(cursor_key)
     if cursor:
         params["since_id"] = cursor

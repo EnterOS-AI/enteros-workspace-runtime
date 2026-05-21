@@ -472,6 +472,19 @@ def _build_channel_instructions() -> str:
         "the platform's discover endpoint for that peer — fetch it if "
         "you need the peer's full capability list (skills, role, "
         "runtime).\n"
+        "- `attachments` is an optional list of file/image/audio "
+        "parts the sender attached to the message — each entry is "
+        "`{kind, uri, mime_type, name}`. `kind` is `file`, `image`, "
+        "or `audio`. `uri` is typically a `workspace:` URI that the "
+        "in-container Read tool can resolve (the platform stages "
+        "bytes into `/workspace/.molecule/chat-uploads/<name>` "
+        "before the message arrives), or in pre-Layer-1 platforms a "
+        "`platform-pending:` URI that the inbox poller swaps to "
+        "`workspace:` once the upload-receive row processes. Present "
+        "on both canvas_user (user dragged files into chat) and "
+        "peer_agent (another agent sent a file). Use Read on the "
+        "URI to inspect the bytes; the sender's intent for the "
+        "attachment is usually described in the surrounding text.\n"
         "- `activity_id` is the inbox row to acknowledge.\n"
         "\n"
         "Reply path:\n"
@@ -669,6 +682,19 @@ def _build_channel_notification(msg: dict) -> dict:
             meta["peer_id"] = ""
         else:
             meta["peer_id"] = safe_peer_id
+
+            # Layer-1 enrichment: InboxMessage.to_dict propagates
+            # platform-supplied peer_name / peer_role / agent_card_url
+            # when the activity row carried them (Layer 1 ships via
+            # ?include=peer_info). Use those directly so the push path
+            # mirrors what poll-path agents see. Sanitisation still
+            # applies on the Layer-1-supplied values: the platform
+            # writes them from registry data which is agent-untrusted
+            # at source.
+            layer1_name = _sanitize_identity_field(msg.get("peer_name"))
+            layer1_role = _sanitize_identity_field(msg.get("peer_role"))
+            layer1_url = msg.get("agent_card_url") or ""
+
             # Cache-first non-blocking enrichment (#2484): on cache miss
             # this returns None immediately and schedules a background
             # fetch. The first push for a new peer renders bare
@@ -677,23 +703,54 @@ def _build_channel_notification(msg: dict) -> dict:
             # is bounded by the inbox poll interval, never by registry
             # RTT — closes the gap that PR #2471's negative-cache path
             # was meant to avoid amplifying.
-            record = enrich_peer_metadata_nonblocking(safe_peer_id)
-            if record is not None:
-                # Sanitise BEFORE storing in meta so both the JSON-RPC
-                # envelope and the rendered content (via
-                # _format_channel_content below, which reads
-                # meta["peer_name"]/meta["peer_role"]) carry the safe
-                # form. See _sanitize_identity_field for the threat
-                # model — registry name/role come from the peer itself
-                # via /registry/register and are agent-untrusted.
-                if name := _sanitize_identity_field(record.get("name")):
-                    meta["peer_name"] = name
-                if role := _sanitize_identity_field(record.get("role")):
-                    meta["peer_role"] = role
-            # agent_card_url is constructable from peer_id alone; surface it
-            # even when enrichment fails so the receiving agent has a single
-            # endpoint to hit for capabilities lookup.
-            meta["agent_card_url"] = _agent_card_url_for(safe_peer_id)
+            #
+            # Skipped entirely when Layer 1 already supplied name+role:
+            # the platform's row-time read is more authoritative than
+            # this process's possibly-stale cache.
+            if layer1_name and layer1_role:
+                meta["peer_name"] = layer1_name
+                meta["peer_role"] = layer1_role
+            else:
+                record = enrich_peer_metadata_nonblocking(safe_peer_id)
+                if record is not None:
+                    # Sanitise BEFORE storing in meta so both the JSON-RPC
+                    # envelope and the rendered content (via
+                    # _format_channel_content below, which reads
+                    # meta["peer_name"]/meta["peer_role"]) carry the safe
+                    # form. See _sanitize_identity_field for the threat
+                    # model — registry name/role come from the peer itself
+                    # via /registry/register and are agent-untrusted.
+                    name = layer1_name or _sanitize_identity_field(record.get("name"))
+                    role = layer1_role or _sanitize_identity_field(record.get("role"))
+                    if name:
+                        meta["peer_name"] = name
+                    if role:
+                        meta["peer_role"] = role
+                else:
+                    # Registry miss — surface whatever Layer 1 supplied.
+                    if layer1_name:
+                        meta["peer_name"] = layer1_name
+                    if layer1_role:
+                        meta["peer_role"] = layer1_role
+
+            # agent_card_url: prefer Layer 1's (platform's
+            # externalPlatformURL is more authoritative than this
+            # process's PLATFORM_URL when they diverge — e.g. CF tunnel
+            # vs direct host). Fall back to client-side construction
+            # when Layer 1 didn't supply it.
+            if layer1_url:
+                meta["agent_card_url"] = layer1_url
+            else:
+                meta["agent_card_url"] = _agent_card_url_for(safe_peer_id)
+
+    # Attachments: surface row-supplied attachments[] (from
+    # InboxMessage.to_dict) when present. Pre-Layer-1 rows don't have
+    # them, but message_from_activity now extracts them inline from
+    # request_body.params.message.parts[] as a fallback path, so the
+    # push path sees attachments either way once Layer 2 ships.
+    msg_attachments = msg.get("attachments")
+    if isinstance(msg_attachments, list) and msg_attachments:
+        meta["attachments"] = msg_attachments
 
     # Compose the conversation-turn text Claude actually sees. Header
     # carries peer identity (name + role when registry-resolved, peer_id
