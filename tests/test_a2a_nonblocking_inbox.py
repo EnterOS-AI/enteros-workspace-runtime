@@ -431,8 +431,8 @@ async def test_cancel_propagates_sigterm_to_active_subprocess(monkeypatch):
     # A2A-compliance: TASK_STATE_CANCELED event was enqueued.
     event_queue.enqueue_event.assert_called_once()
     enqueued = event_queue.enqueue_event.call_args[0][0]
-    from a2a.types import TaskState
-    assert enqueued.status.state == TaskState.TASK_STATE_CANCELED
+    from molecule_runtime.executor_helpers import task_state_value
+    assert enqueued.status.state == task_state_value("TASK_STATE_CANCELED")
     # task_id + context_id round-tripped so the canvas A2A client can
     # correlate the cancel event with the in-flight task.
     assert enqueued.task_id == "task-1"
@@ -503,8 +503,8 @@ async def test_cancel_safe_when_no_inbox_entry(monkeypatch):
 
     event_queue.enqueue_event.assert_called_once()
     enqueued = event_queue.enqueue_event.call_args[0][0]
-    from a2a.types import TaskState
-    assert enqueued.status.state == TaskState.TASK_STATE_CANCELED
+    from molecule_runtime.executor_helpers import task_state_value
+    assert enqueued.status.state == task_state_value("TASK_STATE_CANCELED")
 
 
 # ─── Task #377 — sandbox tool self-registers on inbox entry ──────────────

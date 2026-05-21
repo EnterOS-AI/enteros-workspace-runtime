@@ -8,8 +8,8 @@ messages).
 
 Public surface:
 
-* ``start_inbox_pollers(platform_url, workspace_ids)`` — activate the
-  inbox singleton and spawn one daemon poller per workspace.
+* ``start_inbox_pollers(platform_url, workspace_ids, ...)`` — activate
+  the inbox singleton and spawn one daemon poller per workspace.
 """
 from __future__ import annotations
 
@@ -18,7 +18,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def start_inbox_pollers(platform_url: str, workspace_ids: list[str]) -> None:
+def start_inbox_pollers(
+    platform_url: str,
+    workspace_ids: list[str],
+    platform_url_by_workspace: dict[str, str] | None = None,
+) -> None:
     """Activate the inbox singleton + spawn one poller daemon thread per workspace.
 
     Done lazily here (not at module import) because importing inbox
@@ -37,7 +41,9 @@ def start_inbox_pollers(platform_url: str, workspace_ids: list[str]) -> None:
     Multi-workspace path: N pollers, each with its own cursor file
     keyed by ``workspace_id[:8]``. Cursors live next to each other in
     configs_dir so an operator inspecting state sees all of them
-    together.
+    together. ``platform_url_by_workspace`` lets one local bridge poll
+    workspaces that live on different tenant URLs while still sharing
+    one inbox singleton for the MCP tools.
     """
     try:
         import molecule_runtime.inbox as inbox
@@ -52,7 +58,11 @@ def start_inbox_pollers(platform_url: str, workspace_ids: list[str]) -> None:
         wsid = workspace_ids[0]
         state = inbox.InboxState(cursor_path=inbox.default_cursor_path())
         inbox.activate(state)
-        inbox.start_poller_thread(state, platform_url, wsid)
+        inbox.start_poller_thread(
+            state,
+            (platform_url_by_workspace or {}).get(wsid, platform_url),
+            wsid,
+        )
         return
 
     # Multi-workspace: per-workspace cursor file, one shared queue.
@@ -60,4 +70,8 @@ def start_inbox_pollers(platform_url: str, workspace_ids: list[str]) -> None:
     state = inbox.InboxState(cursor_paths=cursor_paths)
     inbox.activate(state)
     for wsid in workspace_ids:
-        inbox.start_poller_thread(state, platform_url, wsid)
+        inbox.start_poller_thread(
+            state,
+            (platform_url_by_workspace or {}).get(wsid, platform_url),
+            wsid,
+        )

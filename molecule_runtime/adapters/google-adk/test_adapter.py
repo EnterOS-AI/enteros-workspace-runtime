@@ -22,7 +22,7 @@ No live API calls are made.
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -92,6 +92,21 @@ def _make_a2a_stubs() -> None:
     sys.modules["a2a.server.tasks"] = tasks_mod
     sys.modules["a2a.types"] = types_mod
     sys.modules["a2a.helpers"] = helpers_mod
+
+
+def _event_text(event) -> str:
+    """Extract text from either legacy string events or A2A v1 Messages."""
+    if isinstance(event, str):
+        return event
+    return "".join(
+        getattr(part, "text", "")
+        for part in getattr(event, "parts", [])
+        if getattr(part, "text", "")
+    )
+
+
+def _enqueued_text(event_queue) -> str:
+    return _event_text(event_queue.enqueue_event.call_args[0][0])
 
 
 def _make_google_adk_stubs() -> None:
@@ -303,6 +318,20 @@ from adapter import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _stub_common_setup(monkeypatch):
+    async def fake_common_setup(self, config):
+        return SimpleNamespace(
+            system_prompt="mocked system prompt",
+            loaded_skills=[],
+            langchain_tools=[],
+            is_coordinator=False,
+            children=[],
+        )
+
+    monkeypatch.setattr(GoogleADKAdapter, "_common_setup", fake_common_setup)
 
 
 def _make_context(text: str, context_id: str = "ctx-test") -> MagicMock:
@@ -557,7 +586,8 @@ async def test_execute_returns_response_text():
     eq = AsyncMock()
     await executor.execute(ctx, eq)
 
-    eq.enqueue_event.assert_called_once_with("The answer is 42.")
+    eq.enqueue_event.assert_called_once()
+    assert _enqueued_text(eq) == "The answer is 42."
 
 
 @pytest.mark.asyncio
@@ -579,7 +609,8 @@ async def test_execute_concatenates_multiple_final_parts():
     eq = AsyncMock()
     await executor.execute(ctx, eq)
 
-    eq.enqueue_event.assert_called_once_with("Hello world")
+    eq.enqueue_event.assert_called_once()
+    assert _enqueued_text(eq) == "Hello world"
 
 
 @pytest.mark.asyncio
@@ -593,8 +624,7 @@ async def test_execute_skips_non_final_events():
     eq = AsyncMock()
     await executor.execute(ctx, eq)
 
-    enqueued = eq.enqueue_event.call_args[0][0]
-    assert enqueued == "final answer"
+    assert _enqueued_text(eq) == "final answer"
 
 
 @pytest.mark.asyncio
@@ -607,7 +637,8 @@ async def test_execute_fallback_when_no_final_response_events():
     eq = AsyncMock()
     await executor.execute(ctx, eq)
 
-    eq.enqueue_event.assert_called_once_with(_NO_RESPONSE_MSG)
+    eq.enqueue_event.assert_called_once()
+    assert _enqueued_text(eq) == _NO_RESPONSE_MSG
 
 
 @pytest.mark.asyncio
@@ -623,7 +654,8 @@ async def test_execute_fallback_when_response_is_none():
     eq = AsyncMock()
     await executor.execute(ctx, eq)
 
-    eq.enqueue_event.assert_called_once_with(_NO_RESPONSE_MSG)
+    eq.enqueue_event.assert_called_once()
+    assert _enqueued_text(eq) == _NO_RESPONSE_MSG
 
 
 @pytest.mark.asyncio
@@ -643,7 +675,8 @@ async def test_execute_fallback_when_parts_have_no_text():
     eq = AsyncMock()
     await executor.execute(ctx, eq)
 
-    eq.enqueue_event.assert_called_once_with(_NO_RESPONSE_MSG)
+    eq.enqueue_event.assert_called_once()
+    assert _enqueued_text(eq) == _NO_RESPONSE_MSG
 
 
 @pytest.mark.asyncio
@@ -660,7 +693,8 @@ async def test_execute_fallback_when_response_content_is_none():
     eq = AsyncMock()
     await executor.execute(ctx, eq)
 
-    eq.enqueue_event.assert_called_once_with(_NO_RESPONSE_MSG)
+    eq.enqueue_event.assert_called_once()
+    assert _enqueued_text(eq) == _NO_RESPONSE_MSG
 
 
 @pytest.mark.asyncio
@@ -708,7 +742,8 @@ async def test_execute_empty_input_returns_error():
     eq = AsyncMock()
     await executor.execute(ctx, eq)
 
-    eq.enqueue_event.assert_called_once_with(_NO_TEXT_MSG)
+    eq.enqueue_event.assert_called_once()
+    assert _enqueued_text(eq) == _NO_TEXT_MSG
     runner.run_async.assert_not_called()
 
 
@@ -734,8 +769,9 @@ async def test_execute_api_error_returns_sanitized_message():
     eq = AsyncMock()
     await executor.execute(_make_context("hello"), eq)
 
-    enqueued = eq.enqueue_event.call_args[0][0]
-    assert enqueued == "Agent error: _FakeAPIError"
+    enqueued = _enqueued_text(eq)
+    assert "Agent error" in enqueued
+    assert "_FakeAPIError" in enqueued
     assert "secret" not in enqueued
 
 
@@ -766,34 +802,19 @@ async def test_execute_api_error_is_logged(caplog):
 @pytest.mark.asyncio
 async def test_cancel_emits_canceled_event():
     executor = _make_executor()
-
-    import a2a.types as a2a_types
-
-    class _TaskState:
-        canceled = "canceled"
-
-    class _TaskStatus:
-        def __init__(self, state):
-            self.state = state
-
-    class _TaskStatusUpdateEvent:
-        def __init__(self, status, final):
-            self.status = status
-            self.final = final
-
-    a2a_types.TaskState = _TaskState
-    a2a_types.TaskStatus = _TaskStatus
-    a2a_types.TaskStatusUpdateEvent = _TaskStatusUpdateEvent
+    from molecule_runtime.executor_helpers import task_state_value
 
     eq = AsyncMock()
     ctx = MagicMock()
+    ctx.task_id = "task-1"
+    ctx.context_id = "ctx-1"
     await executor.cancel(ctx, eq)
 
     eq.enqueue_event.assert_called_once()
     event = eq.enqueue_event.call_args[0][0]
-    assert isinstance(event, _TaskStatusUpdateEvent)
-    assert event.status.state == "canceled"
-    assert event.final is True
+    assert event.status.state == task_state_value("TASK_STATE_CANCELED")
+    assert event.task_id == "task-1"
+    assert event.context_id == "ctx-1"
 
 
 # ---------------------------------------------------------------------------

@@ -36,9 +36,8 @@ from typing import TYPE_CHECKING, Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.helpers import new_text_message
-
 from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter
+from molecule_runtime.executor_helpers import new_response_message, task_state_value
 
 # Import sanitize_agent_error from the workspace package. The adapter lives
 # in the workspace/adapters/ hierarchy so the workspace package root is
@@ -201,7 +200,7 @@ class GoogleADKA2AExecutor(AgentExecutor):
         if not user_text:
             parts = getattr(getattr(context, "message", None), "parts", None)
             logger.warning("GoogleADKA2AExecutor: no text in message parts: %s", parts)
-            await event_queue.enqueue_event(new_text_message(_NO_TEXT_MSG))
+            await event_queue.enqueue_event(new_response_message(context, _NO_TEXT_MSG))
             return
 
         session_id = getattr(context, "context_id", None) or "default-session"
@@ -233,7 +232,7 @@ class GoogleADKA2AExecutor(AgentExecutor):
                         response_parts.append(text)
 
             final_text = "".join(response_parts).strip() or _NO_RESPONSE_MSG
-            await event_queue.enqueue_event(new_text_message(final_text))
+            await event_queue.enqueue_event(new_response_message(context, final_text))
 
         except Exception as exc:
             logger.error(
@@ -242,25 +241,24 @@ class GoogleADKA2AExecutor(AgentExecutor):
                 type(exc).__name__,
                 exc_info=True,
             )
-            # Include exception detail (first ~1 KB) in the A2A error response so
-            # callers get actionable context without needing workspace log access.
-            # sanitize_agent_error scrubs API keys / bearer tokens before including
-            # content in the response. Falls back to class-name-only when
-            # the function is unavailable (standalone template repo layout).
+            # Keep exception detail in logs only. Adapter SDK exceptions often
+            # include request metadata; the shared sanitizer's class-name path
+            # is the safe response shape for chat-visible A2A errors.
             if sanitize_agent_error is not None:
-                msg = sanitize_agent_error(stderr=str(exc))
+                msg = sanitize_agent_error(exc)
             else:
                 msg = f"Agent error: {type(exc).__name__}"
-            await event_queue.enqueue_event(new_text_message(msg))
+            await event_queue.enqueue_event(new_response_message(context, msg))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Cancel a running task — emits canceled state per A2A protocol."""
-        from a2a.types import TaskState, TaskStatus, TaskStatusUpdateEvent
+        from a2a.types import TaskStatus, TaskStatusUpdateEvent
 
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
-                status=TaskStatus(state=TaskState.TASK_STATE_CANCELED),
-                final=True,
+                task_id=getattr(context, "task_id", "") or "",
+                context_id=getattr(context, "context_id", "") or "",
+                status=TaskStatus(state=task_state_value("TASK_STATE_CANCELED")),
             )
         )
 
