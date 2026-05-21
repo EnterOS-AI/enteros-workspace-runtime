@@ -55,12 +55,10 @@ This repo is the editable source. Open PRs directly here.
 ```bash
 # Run the unit tests
 python -m venv .venv && source .venv/bin/activate
-pip install pytest pytest-asyncio
-pip install httpx uvicorn starlette websockets pyyaml langchain-core \
-            opentelemetry-api opentelemetry-sdk \
-            opentelemetry-exporter-otlp-proto-http \
-            temporalio python-multipart
-pytest tests/
+pip install \
+  --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+  -e . pytest pytest-asyncio
+pytest -q
 ```
 
 ```bash
