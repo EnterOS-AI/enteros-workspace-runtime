@@ -37,12 +37,12 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from molecule_runtime.a2a_client import (
-    PLATFORM_URL,
     WORKSPACE_ID,
     _A2A_ERROR_PREFIX,
     _A2A_QUEUED_PREFIX,
     _peer_names,
     _peer_to_source,
+    _resolve_platform_url,
     discover_peer,
     send_a2a_message,
 )
@@ -97,10 +97,11 @@ async def _delegate_sync_via_polling(
     idem_key = hashlib.sha256(f"{src}:{workspace_id}:{task}".encode()).hexdigest()[:32]
 
     # 1. Dispatch via /delegate (the async, durable path).
+    base = _resolve_platform_url(src)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{src}/delegate",
+                f"{base}/workspaces/{src}/delegate",
                 json={
                     "target_id": workspace_id,
                     "task": task,
@@ -131,7 +132,7 @@ async def _delegate_sync_via_polling(
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 poll = await client.get(
-                    f"{PLATFORM_URL}/workspaces/{src}/delegations",
+                    f"{base}/workspaces/{src}/delegations",
                     headers=_auth_headers_for_heartbeat(src),
                 )
         except Exception as e:  # pylint: disable=broad-except
@@ -386,9 +387,10 @@ async def tool_delegate_task_async(
     idem_key = hashlib.sha256(f"{src}:{workspace_id}:{task}".encode()).hexdigest()[:32]
 
     try:
+        base = _resolve_platform_url(src)
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{src}/delegate",
+                f"{base}/workspaces/{src}/delegate",
                 json={"target_id": workspace_id, "task": task, "idempotency_key": idem_key},
                 headers=_auth_headers_for_heartbeat(src),
             )
@@ -423,9 +425,10 @@ async def tool_check_task_status(
     """
     src = source_workspace_id or WORKSPACE_ID
     try:
+        base = _resolve_platform_url(src)
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{src}/delegations",
+                f"{base}/workspaces/{src}/delegations",
                 headers=_auth_headers_for_heartbeat(src),
             )
             if resp.status_code != 200:

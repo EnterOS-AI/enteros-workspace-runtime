@@ -303,6 +303,131 @@ class TestMcpCliWiresPerWorkspacePlatformUrl:
         ]
 
 
+class TestDurableDelegationUsesPerWorkspacePlatformUrl:
+    @pytest.mark.asyncio
+    async def test_sync_via_polling_uses_source_platform_url(self, monkeypatch):
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools_delegation as delegation
+
+        platform_auth.register_workspace_token("ws-source", "tok-source")
+        platform_auth.register_workspace_platform_url("ws-source", "https://source.example")
+        monkeypatch.setattr(a2a_client, "PLATFORM_URL", "https://module.example")
+
+        seen: list[str] = []
+
+        class _PostResp:
+            status_code = 202
+            text = ""
+
+            def json(self):
+                return {"delegation_id": "del-1"}
+
+        class _GetResp:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return [{
+                    "delegation_id": "del-1",
+                    "status": "completed",
+                    "response_preview": "done",
+                }]
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+
+            async def post(self, url, json, headers):
+                seen.append(url)
+                return _PostResp()
+
+            async def get(self, url, headers):
+                seen.append(url)
+                return _GetResp()
+
+        monkeypatch.setattr(delegation.httpx, "AsyncClient", lambda timeout: _Client())
+
+        out = await delegation._delegate_sync_via_polling("ws-target", "do work", "ws-source")
+
+        assert out == "done"
+        assert seen == [
+            "https://source.example/workspaces/ws-source/delegate",
+            "https://source.example/workspaces/ws-source/delegations",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_async_delegate_uses_source_platform_url(self, monkeypatch):
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools_delegation as delegation
+
+        platform_auth.register_workspace_token("ws-source", "tok-source")
+        platform_auth.register_workspace_platform_url("ws-source", "https://source.example")
+        monkeypatch.setattr(a2a_client, "PLATFORM_URL", "https://module.example")
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 202
+            text = ""
+
+            def json(self):
+                return {"delegation_id": "del-2"}
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+
+            async def post(self, url, json, headers):
+                captured["url"] = url
+                captured["body"] = json
+                return _Resp()
+
+        monkeypatch.setattr(delegation.httpx, "AsyncClient", lambda timeout: _Client())
+
+        await delegation.tool_delegate_task_async(
+            "ws-target", "do work", source_workspace_id="ws-source",
+        )
+
+        assert captured["url"] == "https://source.example/workspaces/ws-source/delegate"
+        assert captured["body"]["target_id"] == "ws-target"
+
+    @pytest.mark.asyncio
+    async def test_check_task_status_uses_source_platform_url(self, monkeypatch):
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools_delegation as delegation
+
+        platform_auth.register_workspace_token("ws-source", "tok-source")
+        platform_auth.register_workspace_platform_url("ws-source", "https://source.example")
+        monkeypatch.setattr(a2a_client, "PLATFORM_URL", "https://module.example")
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return [{"delegation_id": "del-3", "status": "queued"}]
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+
+            async def get(self, url, headers):
+                captured["url"] = url
+                return _Resp()
+
+        monkeypatch.setattr(delegation.httpx, "AsyncClient", lambda timeout: _Client())
+
+        await delegation.tool_check_task_status(
+            "", "del-3", source_workspace_id="ws-source",
+        )
+
+        assert captured["url"] == "https://source.example/workspaces/ws-source/delegations"
+
+
 class TestInboxPollersPerWorkspacePlatformUrl:
     def test_start_inbox_pollers_uses_url_map_with_one_shared_state(self, monkeypatch, tmp_path):
         import molecule_runtime.inbox as inbox
