@@ -29,3 +29,13 @@ jobs:
             exit 1
           fi
           python scripts/check_consumer_runtime_drift.py
+
+      - name: Check platform communication contract
+        env:
+          GITEA_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::error::DISPATCH_TOKEN secret is required for cross-repo communication drift checks"
+            exit 1
+          fi
+          python scripts/check_platform_comm_contract.py
