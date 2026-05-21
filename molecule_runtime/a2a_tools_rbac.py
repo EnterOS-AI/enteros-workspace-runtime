@@ -32,18 +32,7 @@ from __future__ import annotations
 
 import os
 
-
-# Mirror ``builtin_tools/audit.py`` for a2a_tools isolation. Listed as a
-# module-level constant rather than computed lazily so the table is
-# discoverable in static analysis + ``grep``.
-ROLE_PERMISSIONS: dict[str, set[str]] = {
-    "admin": {"delegate", "approve", "memory.read", "memory.write"},
-    "operator": {"delegate", "approve", "memory.read", "memory.write"},
-    "read-only": {"memory.read"},
-    "no-delegation": {"approve", "memory.read", "memory.write"},
-    "no-approval": {"delegate", "memory.read", "memory.write"},
-    "memory-readonly": {"memory.read"},
-}
+from molecule_runtime.rbac_policy import ROLE_PERMISSIONS, check_permission
 
 
 def get_workspace_tier() -> int:
@@ -79,29 +68,13 @@ def _resolve_role_state() -> tuple[list[str], dict]:
 def check_memory_write_permission() -> bool:
     """Return True if this workspace's RBAC roles grant memory.write."""
     roles, allowed = _resolve_role_state()
-    for role in roles:
-        if role == "admin":
-            return True
-        if role in allowed:
-            if "memory.write" in allowed[role]:
-                return True
-        elif role in ROLE_PERMISSIONS and "memory.write" in ROLE_PERMISSIONS[role]:
-            return True
-    return False
+    return check_permission("memory.write", roles, allowed)
 
 
 def check_memory_read_permission() -> bool:
     """Return True if this workspace's RBAC roles grant memory.read."""
     roles, allowed = _resolve_role_state()
-    for role in roles:
-        if role == "admin":
-            return True
-        if role in allowed:
-            if "memory.read" in allowed[role]:
-                return True
-        elif role in ROLE_PERMISSIONS and "memory.read" in ROLE_PERMISSIONS[role]:
-            return True
-    return False
+    return check_permission("memory.read", roles, allowed)
 
 
 def is_root_workspace() -> bool:
