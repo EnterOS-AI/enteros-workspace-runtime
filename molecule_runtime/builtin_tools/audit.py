@@ -43,6 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from molecule_runtime.rbac_policy import ROLE_PERMISSIONS, check_permission
+
 if TYPE_CHECKING:
     pass  # avoid circular import at runtime
 
@@ -68,28 +70,6 @@ except ValueError:
 # Protects the open() + write() sequence; prevents interleaved JSON lines
 # when multiple async tasks run in the same event-loop thread.
 _write_lock = threading.Lock()
-
-
-# ---------------------------------------------------------------------------
-# Built-in role → permitted-action mappings
-# ---------------------------------------------------------------------------
-
-#: Maps each built-in role name to the set of actions it grants.
-#: Custom roles can be added in config.yaml under ``rbac.allowed_actions``.
-ROLE_PERMISSIONS: dict[str, set[str]] = {
-    # Full access — shortcircuits all other checks
-    "admin": {"delegate", "approve", "memory.read", "memory.write"},
-    # Standard agent role
-    "operator": {"delegate", "approve", "memory.read", "memory.write"},
-    # Read-only observer — no writes, no delegation, no approvals
-    "read-only": {"memory.read"},
-    # Can approve and write memory, but cannot delegate
-    "no-delegation": {"approve", "memory.read", "memory.write"},
-    # Can delegate and write memory, but cannot invoke approval gate
-    "no-approval": {"delegate", "memory.read", "memory.write"},
-    # Memory reads only (useful for analytic sidecars)
-    "memory-readonly": {"memory.read"},
-}
 
 
 # ---------------------------------------------------------------------------
@@ -122,57 +102,6 @@ def get_workspace_roles() -> tuple[list[str], dict[str, list[str]]]:
     if cfg is None:
         return ["read-only"], {}
     return list(cfg.rbac.roles), dict(cfg.rbac.allowed_actions)
-
-
-# ---------------------------------------------------------------------------
-# RBAC helpers
-# ---------------------------------------------------------------------------
-
-def check_permission(
-    action: str,
-    roles: list[str],
-    custom_permissions: dict[str, list[str]] | None = None,
-) -> bool:
-    """Return True if *any* of ``roles`` grants ``action``.
-
-    Evaluation order
-    ~~~~~~~~~~~~~~~~
-    1. ``"admin"`` shortcircuits — always grants everything.
-    2. Custom role definitions (from ``rbac.allowed_actions`` in config.yaml).
-    3. Built-in :data:`ROLE_PERMISSIONS` table.
-
-    When a role appears in *custom_permissions* its built-in definition is
-    **ignored** — the custom list is the complete permission set for that role.
-
-    Args:
-        action:             Action to authorise, e.g. ``"delegate"``.
-        roles:              Roles assigned to the calling workspace.
-        custom_permissions: Optional ``{role: [action, ...]}`` mapping loaded
-                            from ``WorkspaceConfig.rbac.allowed_actions``.
-
-    Returns:
-        ``True`` if the action is permitted, ``False`` otherwise.
-
-    Examples::
-
-        >>> check_permission("delegate", ["operator"])
-        True
-        >>> check_permission("delegate", ["read-only"])
-        False
-        >>> check_permission("deploy", ["developer"], {"developer": ["deploy"]})
-        True
-    """
-    for role in roles:
-        if role == "admin":
-            return True
-        if custom_permissions and role in custom_permissions:
-            # Custom entry is definitive for this role
-            if action in custom_permissions[role]:
-                return True
-            continue  # Don't fall through to built-ins for custom roles
-        if role in ROLE_PERMISSIONS and action in ROLE_PERMISSIONS[role]:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------

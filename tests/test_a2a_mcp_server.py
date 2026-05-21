@@ -14,8 +14,9 @@ class TestMcpServerRbacGate:
     """The A2A MCP server must enforce RBAC on sensitive tools."""
 
     @pytest.fixture(autouse=True)
-    def _clear_cache(self):
+    def _clear_cache(self, monkeypatch, tmp_path):
         """Keep audit config cache cold so each test starts clean."""
+        monkeypatch.setenv("WORKSPACE_CONFIG_PATH", str(tmp_path / "missing-config"))
         import molecule_runtime.builtin_tools.audit as audit_mod
         audit_mod._load_workspace_config.cache_clear()
         yield
