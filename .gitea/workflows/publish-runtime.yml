@@ -145,12 +145,14 @@ jobs:
           fi
           TEMPLATES="claude-code hermes openclaw codex langgraph autogen"
           FAILED=""
+          CREATED=""
           WORKDIR="$(mktemp -d)"
           git config --global user.name "publish-runtime cascade"
           git config --global user.email "publish-runtime@moleculesai.app"
           for tpl in $TEMPLATES; do
             REPO="molecule-ai/molecule-ai-workspace-template-$tpl"
             CLONE="$WORKDIR/$tpl"
+            BRANCH="chore/runtime-$RUNTIME_VERSION"
             git clone "https://x-access-token:${DISPATCH_TOKEN}@${GITEA_URL#https://}/$REPO.git" "$CLONE"
             if [ $? -ne 0 ]; then
               FAILED="$FAILED $tpl:clone"
@@ -163,12 +165,44 @@ jobs:
               cd - >/dev/null
               continue
             fi
+            git checkout -B "$BRANCH"
             git add .runtime-version
             git commit -m "chore(runtime): bump runtime to $RUNTIME_VERSION"
-            git push origin HEAD:main
-            [ $? -ne 0 ] && FAILED="$FAILED $tpl:push"
+            git push -u origin "$BRANCH" --force
+            if [ $? -ne 0 ]; then
+              FAILED="$FAILED $tpl:push-branch"
+              cd - >/dev/null
+              continue
+            fi
+
+            BODY=$(printf 'Runtime SSOT cascade from molecule-ai-workspace-runtime publish-runtime.\n\nVersion: `%s`.' "$RUNTIME_VERSION" | sed ':a;N;$!ba;s/\n/\\n/g')
+            RESP=$(curl -sS -w "\n%{http_code}" \
+              -X POST \
+              -H "Authorization: token ${DISPATCH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"base\":\"main\",\"head\":\"$BRANCH\",\"title\":\"chore(runtime): bump runtime to $RUNTIME_VERSION\",\"body\":\"$BODY\"}" \
+              "$GITEA_URL/api/v1/repos/$REPO/pulls")
+            HTTP=$(printf '%s' "$RESP" | tail -n 1)
+            PAYLOAD=$(printf '%s' "$RESP" | sed '$d')
+            if [ "$HTTP" = "201" ]; then
+              URL=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"html_url":"\([^"]*\)".*/\1/p')
+              echo "$tpl PR: $URL"
+              CREATED="$CREATED $tpl:$URL"
+            elif printf '%s' "$PAYLOAD" | grep -qi 'pull request already exists'; then
+              echo "$tpl PR already exists for $BRANCH"
+              CREATED="$CREATED $tpl:existing"
+            else
+              echo "::error::$tpl PR create failed (HTTP $HTTP): $PAYLOAD"
+              FAILED="$FAILED $tpl:pr"
+            fi
             cd - >/dev/null
           done
+          {
+            echo "## runtime cascade $(date -u +%FT%TZ)"
+            echo
+            echo "**Version:** \`$RUNTIME_VERSION\`"
+            echo "**PRs:** \`$CREATED\`"
+          } >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$FAILED" ]; then
             echo "::error::cascade failures:$FAILED"
             exit 1
