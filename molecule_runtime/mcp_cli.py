@@ -80,6 +80,22 @@ _read_token_file = mcp_workspace_resolver.read_token_file
 _start_inbox_pollers = mcp_inbox_pollers.start_inbox_pollers
 
 
+def _effective_platform_url(default_platform_url: str, workspace_platform_url: str) -> str:
+    """Return the tenant URL a workspace should use for platform calls."""
+    return (workspace_platform_url or default_platform_url).strip().rstrip("/")
+
+
+def _platform_url_by_workspace(
+    default_platform_url: str,
+    workspaces: list[tuple[str, str, str]],
+) -> dict[str, str]:
+    """Build the per-workspace tenant URL map for standalone runtime threads."""
+    return {
+        wsid: _effective_platform_url(default_platform_url, ws_platform_url)
+        for wsid, _tok, ws_platform_url in workspaces
+    }
+
+
 def main() -> None:
     """Entry point for the ``molecule-mcp`` console script.
 
@@ -204,10 +220,12 @@ def main() -> None:
     # console-script path always runs them; the
     # MOLECULE_MCP_DISABLE_HEARTBEAT escape hatch exists for tests +
     # the rare embedded use-case.
+    workspace_platform_urls = _platform_url_by_workspace(platform_url, workspaces)
     if not os.environ.get("MOLECULE_MCP_DISABLE_HEARTBEAT", "").strip():
         for wsid, tok, _ws_platform_url in workspaces:
-            _platform_register(platform_url, wsid, tok)
-            _start_heartbeat_thread(platform_url, wsid, tok)
+            ws_platform_url = workspace_platform_urls[wsid]
+            _platform_register(ws_platform_url, wsid, tok)
+            _start_heartbeat_thread(ws_platform_url, wsid, tok)
 
     # Inbox poller — the inbound side of the standalone path. Without
     # this thread, the universal MCP server is OUTBOUND-ONLY: an agent
@@ -221,7 +239,11 @@ def main() -> None:
     # push delivery via canvas WebSocket) skip this to avoid duplicate
     # delivery; tests use the env to keep imports cheap.
     if not os.environ.get("MOLECULE_MCP_DISABLE_INBOX", "").strip():
-        _start_inbox_pollers(platform_url, [w[0] for w in workspaces])
+        _start_inbox_pollers(
+            platform_url,
+            [w[0] for w in workspaces],
+            platform_url_by_workspace=workspace_platform_urls,
+        )
 
     # Env is valid — safe to import the heavy module now. Importing
     # earlier would trigger a2a_client.py:22's module-level RuntimeError

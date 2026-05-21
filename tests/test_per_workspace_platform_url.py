@@ -231,3 +231,110 @@ class TestMcpCliWiresPerWorkspacePlatformUrl:
         # Tokens both landed regardless of per-entry URL presence.
         assert platform_auth.get_workspace_token("ws-a") == "tok-a"
         assert platform_auth.get_workspace_token("ws-b") == "tok-b"
+
+    def test_main_registers_and_heartbeats_against_each_workspace_url(self, monkeypatch):
+        # The per-workspace URL must reach the startup register and
+        # heartbeat path itself, not only the later auth-header registry.
+        monkeypatch.setenv("PLATFORM_URL", "https://module-level.example")
+        monkeypatch.setenv(
+            "MOLECULE_WORKSPACES",
+            json.dumps([
+                {"id": "ws-a", "token": "tok-a", "platform_url": "https://a.example"},
+                {"id": "ws-b", "token": "tok-b"},
+            ]),
+        )
+        monkeypatch.setenv("MOLECULE_MCP_DISABLE_INBOX", "1")
+        mcp_cli = _import_mcp_cli()
+        register_calls = []
+        heartbeat_calls = []
+        monkeypatch.setattr(mcp_cli, "_platform_register", lambda *args: register_calls.append(args))
+        monkeypatch.setattr(
+            mcp_cli, "_start_heartbeat_thread", lambda *args: heartbeat_calls.append(args)
+        )
+        monkeypatch.setattr(
+            "molecule_runtime.a2a_mcp_server.cli_main", lambda: None, raising=False
+        )
+
+        mcp_cli.main()
+
+        assert register_calls == [
+            ("https://a.example", "ws-a", "tok-a"),
+            ("https://module-level.example", "ws-b", "tok-b"),
+        ]
+        assert heartbeat_calls == register_calls
+
+    def test_main_starts_inbox_pollers_with_workspace_url_map(self, monkeypatch):
+        # Inbox pollers share one inbox state, so mcp_cli passes the
+        # full workspace list plus a URL map instead of starting one
+        # singleton per platform URL.
+        monkeypatch.setenv("PLATFORM_URL", "https://module-level.example")
+        monkeypatch.setenv(
+            "MOLECULE_WORKSPACES",
+            json.dumps([
+                {"id": "ws-a", "token": "tok-a", "platform_url": "https://a.example"},
+                {"id": "ws-b", "token": "tok-b"},
+                {"id": "ws-c", "token": "tok-c", "platform_url": "https://c.example/"},
+            ]),
+        )
+        monkeypatch.setenv("MOLECULE_MCP_DISABLE_HEARTBEAT", "1")
+        mcp_cli = _import_mcp_cli()
+        inbox_calls = []
+
+        def fake_start_inbox_pollers(platform_url, workspace_ids, platform_url_by_workspace=None):
+            inbox_calls.append((platform_url, workspace_ids, platform_url_by_workspace))
+
+        monkeypatch.setattr(mcp_cli, "_start_inbox_pollers", fake_start_inbox_pollers)
+        monkeypatch.setattr(
+            "molecule_runtime.a2a_mcp_server.cli_main", lambda: None, raising=False
+        )
+
+        mcp_cli.main()
+
+        assert inbox_calls == [
+            (
+                "https://module-level.example",
+                ["ws-a", "ws-b", "ws-c"],
+                {
+                    "ws-a": "https://a.example",
+                    "ws-b": "https://module-level.example",
+                    "ws-c": "https://c.example",
+                },
+            )
+        ]
+
+
+class TestInboxPollersPerWorkspacePlatformUrl:
+    def test_start_inbox_pollers_uses_url_map_with_one_shared_state(self, monkeypatch, tmp_path):
+        import molecule_runtime.inbox as inbox
+        import molecule_runtime.mcp_inbox_pollers as mcp_inbox_pollers
+
+        activated_states = []
+        started = []
+        monkeypatch.setattr(
+            inbox,
+            "default_cursor_path",
+            lambda wsid="": tmp_path / f"cursor-{wsid or 'legacy'}",
+        )
+        monkeypatch.setattr(inbox, "activate", lambda state: activated_states.append(state))
+        monkeypatch.setattr(
+            inbox,
+            "start_poller_thread",
+            lambda state, platform_url, wsid: started.append((state, platform_url, wsid)),
+        )
+
+        mcp_inbox_pollers.start_inbox_pollers(
+            "https://module-level.example",
+            ["ws-a", "ws-b", "ws-c"],
+            platform_url_by_workspace={
+                "ws-a": "https://a.example",
+                "ws-c": "https://c.example",
+            },
+        )
+
+        assert len(activated_states) == 1
+        state = activated_states[0]
+        assert started == [
+            (state, "https://a.example", "ws-a"),
+            (state, "https://module-level.example", "ws-b"),
+            (state, "https://c.example", "ws-c"),
+        ]
