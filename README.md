@@ -28,6 +28,35 @@ This package provides the core machinery every Molecule AI workspace container n
   process serve N workspaces concurrently (introduced in the multi-WS PR
   series, finalised in 0.2.0)
 
+## Multiple External Workspaces
+
+`molecule-mcp` can serve more than one external workspace from the same local
+process. Set `MOLECULE_WORKSPACES` to a JSON array of workspace credentials:
+
+```json
+[
+  {
+    "id": "workspace-id-local-to-hongming-org",
+    "token": "...",
+    "platform_url": "https://hongming.moleculesai.app"
+  },
+  {
+    "id": "different-workspace-id-local-to-agents-team-org",
+    "token": "...",
+    "platform_url": "https://agents-team.moleculesai.app"
+  }
+]
+```
+
+Each entry is independently registered and heartbeated against its own
+`platform_url`; inbox polling and outbound A2A calls also route by the
+workspace ID that initiated the call.
+
+`org_id` is intentionally not part of this local MCP bridge config. The
+tenant is selected by `platform_url`, and the workspace token is scoped by the
+tenant that issued it. Workspace IDs do not need to match across orgs; use the
+ID and token returned by each tenant.
+
 ## Installation
 
 ```bash
