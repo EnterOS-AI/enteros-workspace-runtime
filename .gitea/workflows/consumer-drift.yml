@@ -23,4 +23,9 @@ jobs:
       - name: Check consumers do not vendor runtime source
         env:
           GITEA_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-        run: python scripts/check_consumer_runtime_drift.py
+        run: |
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::error::DISPATCH_TOKEN secret is required for cross-repo consumer drift checks"
+            exit 1
+          fi
+          python scripts/check_consumer_runtime_drift.py
