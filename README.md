@@ -78,7 +78,8 @@ molecule-mcp --help
    additive features, major for breaking API)
 3. Tag `runtime-vX.Y.Z` on `main` post-merge
 4. `publish-runtime.yml` (Gitea Actions) fires on the tag → builds wheel +
-   sdist → publishes to PyPI → cascades the version pin to template repos
+   sdist → publishes to the Gitea package registry → cascades the version pin
+   to template repos
 
 ## Consumer pinning
 
@@ -86,7 +87,9 @@ Monorepo `workspace-server` (and the 8 workspace template Dockerfiles) pin
 this package by exact version:
 
 ```dockerfile
-RUN pip install --no-cache-dir molecule-ai-workspace-runtime==0.2.0
+RUN pip install --no-cache-dir \
+    --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+    molecule-ai-workspace-runtime==0.2.0
 ```
 
 The version bump in this repo is the gating event; consumers pick up the
