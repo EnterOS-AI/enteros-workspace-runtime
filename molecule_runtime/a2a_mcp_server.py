@@ -28,84 +28,13 @@ from typing import Callable
 # which is invalid — see scripts/build_runtime_package.py:rewrite_imports.
 import molecule_runtime.inbox as inbox
 
-from molecule_runtime.a2a_tools import (
-    tool_broadcast_message,
-    tool_chat_history,
-    tool_check_task_status,
-    tool_commit_memory,
-    tool_delegate_task,
-    tool_delegate_task_async,
-    tool_get_runtime_identity,
-    tool_get_workspace_info,
-    tool_inbox_peek,
-    tool_inbox_pop,
-    tool_list_peers,
-    tool_recall_memory,
-    tool_send_message_to_user,
-    tool_update_agent_card,
-    tool_wait_for_message,
+from molecule_runtime.mcp_tools import (
+    MOLECULE_MCP_TOOLS,
+    handle_molecule_tool_call,
+    _tool_permission_check,
 )
-from molecule_runtime.platform_tools.registry import TOOLS as _PLATFORM_TOOL_SPECS
 
 logger = logging.getLogger(__name__)
-
-# --- RBAC gate (task #343, CWE-862) ---
-#
-# Maps MCP tool name → action capability that must be granted by the
-# workspace's configured roles. Tools omitted from this map are always
-# allowed (read-only / env-only surface — list_peers, recall_memory,
-# get_workspace_info, get_runtime_identity, inbox_peek/pop, wait_for_message,
-# chat_history, broadcast_message).
-#
-# Originally landed standalone (#12 era, c72fbfc-adjacent), dropped during
-# the standalone-as-SSOT migration (6988bec) because monorepo lacked it.
-# Re-ported here.
-_PERMISSION_MAP: dict[str, str] = {
-    "delegate_task": "delegate",
-    "delegate_task_async": "delegate",
-    "check_task_status": "delegate",
-    "send_message_to_user": "approve",
-    "commit_memory": "memory.write",
-    # update_agent_card mutates the workspace's own platform-side card —
-    # gate it behind the same memory.write capability the agent already
-    # needs to persist anything outbound. Read-only roles can still call
-    # get_runtime_identity / get_workspace_info to read their identity.
-    "update_agent_card": "memory.write",
-}
-
-
-def _check_permission(action: str) -> None:
-    """Raise PermissionError if the caller lacks ``action`` permission.
-
-    Lazy import of builtin_tools.audit avoids a circular dep at startup
-    (audit.py → config.py → eventually back to this module's siblings).
-    """
-    from molecule_runtime.builtin_tools.audit import (
-        check_permission,
-        get_workspace_roles,
-    )
-
-    roles, custom = get_workspace_roles()
-    if not check_permission(action, roles, custom):
-        raise PermissionError(f"RBAC: action '{action}' denied for roles {roles}")
-
-
-def _tool_permission_check(name: str, arguments: dict) -> str | None:
-    """Run RBAC check for ``name``; return error string, or None if allowed.
-
-    ``arguments`` is accepted (and currently unused) so future per-arg
-    gating (e.g. memory scope-aware checks) can land without changing
-    every call site.
-    """
-    action = _PERMISSION_MAP.get(name)
-    if action is None:
-        return None  # No RBAC gate for this tool
-    try:
-        _check_permission(action)
-    except PermissionError as exc:
-        return str(exc)
-    return None
-
 
 # Re-export constants and client functions so existing imports
 # (e.g. tests that do `import a2a_mcp_server`) still work.
@@ -135,14 +64,7 @@ from molecule_runtime.a2a_tools import report_activity  # noqa: F401, E402
 # too long to live in MCP `description` without bloating every
 # tool-list response the model sees).
 
-TOOLS = [
-    {
-        "name": _spec.name,
-        "description": _spec.short,
-        "inputSchema": _spec.input_schema,
-    }
-    for _spec in _PLATFORM_TOOL_SPECS
-]
+TOOLS = MOLECULE_MCP_TOOLS
 
 
 
@@ -151,100 +73,7 @@ TOOLS = [
 
 async def handle_tool_call(name: str, arguments: dict) -> str:
     """Handle a tool call and return the result as text."""
-    # RBAC gate (task #343, CWE-862) — block tools the workspace's
-    # configured roles do not grant. Returns a tool-result string so
-    # the caller surfaces an actionable reason without leaking which
-    # role / config knob would lift the denial.
-    rbac_error = _tool_permission_check(name, arguments)
-    if rbac_error is not None:
-        return f"PERMISSION DENIED: {rbac_error}"
-
-    if name == "delegate_task":
-        return await tool_delegate_task(
-            arguments.get("workspace_id", ""),
-            arguments.get("task", ""),
-            source_workspace_id=arguments.get("source_workspace_id") or None,
-        )
-    elif name == "delegate_task_async":
-        return await tool_delegate_task_async(
-            arguments.get("workspace_id", ""),
-            arguments.get("task", ""),
-            source_workspace_id=arguments.get("source_workspace_id") or None,
-        )
-    elif name == "check_task_status":
-        return await tool_check_task_status(
-            arguments.get("workspace_id", ""),
-            arguments.get("task_id", ""),
-            source_workspace_id=arguments.get("source_workspace_id") or None,
-        )
-    elif name == "send_message_to_user":
-        raw_attachments = arguments.get("attachments")
-        attachments: list[str] | None = None
-        if isinstance(raw_attachments, list):
-            # Defensive: filter to strings only — claude-code SDK occasionally
-            # emits dicts here when the model misreads the schema. Drop the
-            # bad entries rather than 500 the whole call.
-            attachments = [p for p in raw_attachments if isinstance(p, str) and p]
-        return await tool_send_message_to_user(
-            arguments.get("message", ""),
-            attachments=attachments,
-            workspace_id=arguments.get("workspace_id") or None,
-        )
-    elif name == "list_peers":
-        return await tool_list_peers(
-            source_workspace_id=arguments.get("source_workspace_id") or None,
-        )
-    elif name == "get_workspace_info":
-        return await tool_get_workspace_info(
-            source_workspace_id=arguments.get("source_workspace_id") or None,
-        )
-    elif name == "get_runtime_identity":
-        return await tool_get_runtime_identity()
-    elif name == "update_agent_card":
-        return await tool_update_agent_card(arguments.get("card"))
-    elif name == "commit_memory":
-        return await tool_commit_memory(
-            arguments.get("content", ""),
-            arguments.get("scope", "LOCAL"),
-            source_workspace_id=arguments.get("source_workspace_id") or None,
-        )
-    elif name == "recall_memory":
-        return await tool_recall_memory(
-            arguments.get("query", ""),
-            arguments.get("scope", ""),
-            source_workspace_id=arguments.get("source_workspace_id") or None,
-        )
-    elif name == "wait_for_message":
-        return await tool_wait_for_message(
-            arguments.get("timeout_secs", 60.0),
-        )
-    elif name == "inbox_peek":
-        return await tool_inbox_peek(
-            arguments.get("limit", 10),
-        )
-    elif name == "inbox_pop":
-        return await tool_inbox_pop(
-            arguments.get("activity_id", ""),
-        )
-    elif name == "chat_history":
-        return await tool_chat_history(
-            arguments.get("peer_id", ""),
-            arguments.get("limit", 20),
-            arguments.get("before_ts", ""),
-            source_workspace_id=arguments.get("source_workspace_id") or None,
-        )
-    elif name == "broadcast_message":
-        return await tool_broadcast_message(
-            arguments.get("message", ""),
-            workspace_id=arguments.get("workspace_id") or None,
-        )
-    elif name == "get_runtime_identity":
-        return await tool_get_runtime_identity()
-    elif name == "update_agent_card":
-        return await tool_update_agent_card(
-            arguments.get("card"),
-        )
-    return f"Unknown tool: {name}"
+    return await handle_molecule_tool_call(name, arguments)
 
 
 # --- MCP Notification bridge ---
