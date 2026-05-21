@@ -79,6 +79,44 @@ def _set_attrs(mod: types.ModuleType, attrs: list[str]) -> None:
                 ROLE_USER = 1
                 ROLE_AGENT = 2
             setattr(mod, attr, Role)
+        elif attr == "TaskState":
+            # a2a-sdk 1.x: TaskState is a protobuf EnumTypeWrapper.
+            # Stub exposes the canonical SCREAMING_SNAKE_CASE attrs so
+            # callers like ``TaskState.TASK_STATE_CANCELED`` resolve to
+            # the matching int. Tests added for task #377 (canvas Stop
+            # All → A2A tasks/cancel) read TASK_STATE_CANCELED, so the
+            # stub MUST expose it.
+            class TaskState:
+                TASK_STATE_UNSPECIFIED = 0
+                TASK_STATE_SUBMITTED = 1
+                TASK_STATE_WORKING = 2
+                TASK_STATE_COMPLETED = 3
+                TASK_STATE_FAILED = 4
+                TASK_STATE_CANCELED = 5
+                TASK_STATE_INPUT_REQUIRED = 6
+                TASK_STATE_REJECTED = 7
+                TASK_STATE_AUTH_REQUIRED = 8
+            setattr(mod, attr, TaskState)
+        elif attr == "TaskStatus":
+            class TaskStatus:
+                def __init__(self, state=0, message=None, timestamp=None, **kwargs):
+                    self.state = state
+                    self.message = message
+                    self.timestamp = timestamp
+                    for k, v in kwargs.items():
+                        setattr(self, k, v)
+            setattr(mod, attr, TaskStatus)
+        elif attr == "TaskStatusUpdateEvent":
+            class TaskStatusUpdateEvent:
+                def __init__(self, status=None, final=False, task_id="",
+                             context_id="", **kwargs):
+                    self.status = status
+                    self.final = final
+                    self.task_id = task_id
+                    self.context_id = context_id
+                    for k, v in kwargs.items():
+                        setattr(self, k, v)
+            setattr(mod, attr, TaskStatusUpdateEvent)
         elif attr == "Message":
             # a2a-sdk 1.x Message stub — kwargs-preserving so tests can assert on
             # message_id / role / parts / task_id / context_id.

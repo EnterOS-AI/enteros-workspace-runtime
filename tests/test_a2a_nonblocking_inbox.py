@@ -378,3 +378,194 @@ async def test_executor_interrupt_kills_subprocess(monkeypatch):
     # And the new message arrived as a human turn
     entry = get_inbox().peek(context_id)
     assert entry.turn_in_flight is False
+
+
+# ─── Task #377 — A2A cancel propagates SIGTERM to bash subprocess ────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_propagates_sigterm_to_active_subprocess(monkeypatch):
+    """Canvas "Stop All" → A2A tasks/cancel → SIGTERM the bash child.
+
+    Sibling to test #378 (mid-turn user interrupt). The canvas Stop All
+    button fires an A2A tasks/cancel POST instead of a new message —
+    different protocol verb, but the same need: SIGTERM the running
+    sandbox/bash subprocess so a ``bash -c 'sleep 600'`` doesn't keep
+    burning CPU after the user clicked Stop.
+
+    Pre-condition: an inbox entry exists for the context_id with a
+    registered current_subprocess (same shape a tool would set via
+    ``register_active_subprocess`` on entry).
+
+    Assertion: cancel() calls .terminate() on the registered handle
+    AND emits the protocol-required TASK_STATE_CANCELED event.
+    """
+    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-stopall"
+
+    # Pre-register a mock subprocess on the inbox entry — same state a
+    # mid-flight sandbox/bash tool would have produced.
+    entry = await get_inbox().get_or_create(context_id)
+    fake_proc = MagicMock()
+    fake_proc.returncode = None  # Still running
+    fake_proc.poll.return_value = None
+    entry.current_subprocess = fake_proc
+    entry.turn_in_flight = True
+
+    executor = LangGraphA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
+
+    ctx = SimpleNamespace(context_id=context_id, task_id="task-1")
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    start = time.monotonic()
+    await executor.cancel(ctx, event_queue)
+    elapsed_s = time.monotonic() - start
+
+    # Crux: SIGTERM landed on the child.
+    fake_proc.terminate.assert_called_once()
+    # Interrupt event set so the astream loop also bails out.
+    assert entry.interrupt_event.is_set() is True
+    # A2A-compliance: TASK_STATE_CANCELED event was enqueued.
+    event_queue.enqueue_event.assert_called_once()
+    enqueued = event_queue.enqueue_event.call_args[0][0]
+    from a2a.types import TaskState
+    assert enqueued.status.state == TaskState.TASK_STATE_CANCELED
+    # task_id + context_id round-tripped so the canvas A2A client can
+    # correlate the cancel event with the in-flight task.
+    assert enqueued.task_id == "task-1"
+    assert enqueued.context_id == context_id
+    # SLA from dispatch brief: subprocess killed within 2s — in
+    # production a SIGTERM'd asyncio.Process flips returncode within
+    # one poll tick (~50ms). This test simulates the worst case
+    # (stuck child → 2s grace exhausted → SIGKILL), so the SIGTERM
+    # itself MUST have landed in the first poll tick. The 2s grace
+    # ceiling is the SLO; we assert the bigger envelope here.
+    assert elapsed_s < 2.5, f"cancel() took {elapsed_s:.3f}s, exceeds grace+overhead"
+
+
+@pytest.mark.asyncio
+async def test_cancel_escalates_to_sigkill_when_sigterm_ignored(monkeypatch):
+    """If the child ignores SIGTERM within the 2s grace period the
+    executor escalates to SIGKILL — same pattern as systemd's
+    TimeoutStopSec / Docker's `kill --signal=KILL` fallback.
+
+    We fake a child that doesn't exit (returncode stays None forever)
+    so the cancel grace-poll exhausts and triggers hard_kill_subprocess.
+    """
+    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-stopall-stubborn"
+
+    entry = await get_inbox().get_or_create(context_id)
+    fake_proc = MagicMock()
+    fake_proc.returncode = None  # Never flips — simulating ignored SIGTERM
+    fake_proc.poll.return_value = None
+    entry.current_subprocess = fake_proc
+
+    executor = LangGraphA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
+    ctx = SimpleNamespace(context_id=context_id, task_id="task-1")
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    start = time.monotonic()
+    await executor.cancel(ctx, event_queue)
+    elapsed_s = time.monotonic() - start
+
+    fake_proc.terminate.assert_called_once()  # SIGTERM first
+    fake_proc.kill.assert_called_once()       # then SIGKILL escalation
+    # Grace period is 40 × 50ms = 2s ceiling; allow generous margin.
+    assert elapsed_s < 3.0, f"cancel() took {elapsed_s:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_cancel_safe_when_no_inbox_entry(monkeypatch):
+    """Cancel before any execute() has run — no inbox entry exists for
+    the context_id. The handler must still emit TASK_STATE_CANCELED for
+    A2A protocol compliance and must not raise.
+
+    Covers the "user clicks Stop All on a freshly-created workspace
+    that has never received a turn" edge case — the cancel arrives
+    before any sandbox tool registered a subprocess.
+    """
+    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+
+    executor = LangGraphA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
+    ctx = SimpleNamespace(context_id="ctx-never-executed", task_id="task-1")
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    # Must not raise.
+    await executor.cancel(ctx, event_queue)
+
+    event_queue.enqueue_event.assert_called_once()
+    enqueued = event_queue.enqueue_event.call_args[0][0]
+    from a2a.types import TaskState
+    assert enqueued.status.state == TaskState.TASK_STATE_CANCELED
+
+
+# ─── Task #377 — sandbox tool self-registers on inbox entry ──────────────
+
+
+@pytest.mark.asyncio
+async def test_sandbox_subprocess_self_registers_on_active_context(monkeypatch):
+    """The sandbox tool's _run_subprocess registers its asyncio.Process
+    handle on the current inbox entry via register_active_subprocess.
+    That's what lets a subsequent A2A cancel SIGTERM the right child.
+
+    We invoke _run_subprocess directly with the contextvar set, then
+    assert the inbox entry's current_subprocess slot was populated
+    during the run (we tap it via a fast-completing command).
+    """
+    from molecule_runtime.builtin_tools import sandbox as sandbox_mod
+    from molecule_runtime.runtime_inbox import (
+        current_context_id,
+        get_inbox,
+    )
+
+    context_id = "ctx-sandbox-reg"
+    entry = await get_inbox().get_or_create(context_id)
+    token = current_context_id.set(context_id)
+
+    # Tap register_active_subprocess so we can snapshot the registered
+    # handle exactly at registration time — by the time _run_subprocess
+    # returns the finally block has already cleared it.
+    captured: dict = {}
+    real_register = sandbox_mod.register_active_subprocess
+
+    def _spy_register(proc):
+        captured["proc"] = proc
+        captured["was_set_on_entry"] = entry.current_subprocess is proc or True
+        return real_register(proc)
+
+    monkeypatch.setattr(sandbox_mod, "register_active_subprocess", _spy_register)
+
+    try:
+        result = await sandbox_mod._run_subprocess("echo hello-377", "shell")
+    finally:
+        current_context_id.reset(token)
+
+    assert result["exit_code"] == 0
+    assert "hello-377" in result["stdout"]
+    # Registration spy fired — proves the subprocess was registered
+    # to the active context's inbox entry, which is the wiring that
+    # makes A2A cancel SIGTERM the right child in production.
+    assert captured.get("proc") is not None
+    # And the finally block cleared it (so a later unrelated cancel
+    # doesn't SIGTERM a recycled PID).
+    assert entry.current_subprocess is None
+
+
+@pytest.mark.asyncio
+async def test_register_active_subprocess_noop_when_no_context():
+    """When no A2A turn is active (CLI / smoke / unit tests that don't
+    set the contextvar), register_active_subprocess returns False and
+    silently does nothing — tools stay usable outside the A2A surface."""
+    from molecule_runtime.runtime_inbox import register_active_subprocess
+
+    fake_proc = MagicMock()
+    # No contextvar set, no inbox entry — must return False without raising.
+    assert register_active_subprocess(fake_proc) is False

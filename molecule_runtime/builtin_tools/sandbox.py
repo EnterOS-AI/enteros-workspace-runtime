@@ -32,6 +32,11 @@ import tempfile
 
 from langchain_core.tools import tool
 
+from molecule_runtime.runtime_inbox import (
+    clear_active_subprocess,
+    register_active_subprocess,
+)
+
 logger = logging.getLogger(__name__)
 
 SANDBOX_BACKEND = os.environ.get("SANDBOX_BACKEND", "subprocess")
@@ -77,12 +82,16 @@ async def _run_subprocess(code: str, language: str) -> dict:
     if not cmd_prefix:
         return {"error": f"Unsupported language: {language}", "exit_code": -1}
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd_prefix, code,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Task #377 — register on the per-context inbox so canvas
+        # "Stop All" (A2A tasks/cancel) can SIGTERM us mid-flight.
+        register_active_subprocess(proc)
 
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SANDBOX_TIMEOUT)
 
@@ -102,6 +111,12 @@ async def _run_subprocess(code: str, language: str) -> dict:
         return {"error": f"Timeout after {SANDBOX_TIMEOUT}s", "exit_code": -1}
     except Exception as e:
         return {"error": str(e), "exit_code": -1}
+    finally:
+        # Always clear our handle so a later unrelated cancel doesn't
+        # SIGTERM a recycled PID. Identity-match inside clear_* ensures
+        # we don't stomp another tool's registration.
+        if proc is not None:
+            clear_active_subprocess(proc)
 
 
 async def _run_docker(code: str, language: str) -> dict:
@@ -119,6 +134,7 @@ async def _run_docker(code: str, language: str) -> dict:
 
     image, run_cmd = entry
     code_file = None
+    proc = None
 
     try:
         # Write code to temp file — avoids shell metacharacter injection
@@ -143,6 +159,10 @@ async def _run_docker(code: str, language: str) -> dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Task #377 — register on the per-context inbox so canvas
+        # "Stop All" propagates SIGTERM to the docker-run wrapper
+        # (which docker forwards to the container with --init).
+        register_active_subprocess(proc)
 
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SANDBOX_TIMEOUT)
 
@@ -159,6 +179,8 @@ async def _run_docker(code: str, language: str) -> dict:
     except Exception as e:
         return {"error": str(e), "exit_code": -1}
     finally:
+        if proc is not None:
+            clear_active_subprocess(proc)
         if code_file:
             try:
                 os.unlink(code_file)

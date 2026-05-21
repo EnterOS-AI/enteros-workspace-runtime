@@ -41,6 +41,7 @@ content (tool_use, etc.) is silently skipped.  A fresh ``artifact_id`` is
 generated for each new LLM ``run_id`` so tool-call cycles are grouped cleanly.
 """
 
+import asyncio
 import functools
 import logging
 import os
@@ -65,6 +66,7 @@ from molecule_runtime.executor_helpers import (
     sanitize_agent_error,
 )
 from molecule_runtime.runtime_inbox import (
+    current_context_id as _current_context_id,
     get_inbox as _get_runtime_inbox,
     is_nonblocking_enabled as _nonblocking_enabled,
 )
@@ -301,6 +303,13 @@ class LangGraphA2AExecutor(AgentExecutor):
             # we generate fallbacks for safety (e.g. in unit tests).
             task_id = context.task_id or str(uuid.uuid4())
             context_id = context.context_id or str(uuid.uuid4())
+
+            # Task #377 — stamp the active context_id into the runtime
+            # contextvar so any subprocess-spawning tool (sandbox, etc.)
+            # can self-register its handle on the matching inbox entry.
+            # Cancel() then has a Process handle to SIGTERM, propagating
+            # the canvas "Stop All" all the way down to the bash child.
+            _current_context_id.set(context_id)
 
             # A2A v1 contract (a2a-sdk ≥ 1.0): enqueue a Task event before any
             # TaskStatusUpdateEvent. The framework only auto-creates the Task
@@ -683,11 +692,74 @@ class LangGraphA2AExecutor(AgentExecutor):
         return _result
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        """Cancel a running task — emits canceled state to comply with A2A protocol."""
+        """Cancel a running task — propagate Stop All down to the bash subprocess.
+
+        Task #377 — canvas "Stop All" arrives as an A2A tasks/cancel POST.
+        The handler must propagate the signal DOWN into any active
+        subprocess-spawning tool (sandbox / bash) so a long-running
+        ``bash -c 'sleep 600'`` doesn't keep burning CPU after the user
+        clicked Stop. Steps:
+
+          1. Look up the inbox entry for this context_id.
+          2. Set ``interrupt_event`` so the astream loop wakes between
+             LangGraph events and bails out cooperatively (the same path
+             a follow-on canvas message takes — #378).
+          3. SIGTERM the registered subprocess via ``kill_subprocess()``.
+          4. Grace-poll for up to 2s; SIGKILL via ``hard_kill_subprocess()``
+             if the child hasn't exited (matches the dispatch SLA from
+             feedback_canvas_stop_all 2026-05-20).
+          5. Emit the protocol-required TASK_STATE_CANCELED event so the
+             A2A client sees a terminal status update.
+
+        Best-effort: if the feature flag is off or no entry exists, we
+        still emit the canceled event so the A2A surface stays compliant.
+        """
+        context_id = getattr(context, "context_id", None) or ""
+        task_id = getattr(context, "task_id", "") or ""
+        if context_id and _nonblocking_enabled():
+            entry = _get_runtime_inbox().peek(context_id)
+            if entry is not None:
+                logger.info(
+                    "A2A cancel: propagating Stop All for context_id=%s "
+                    "(turn_in_flight=%s, has_subprocess=%s)",
+                    context_id, entry.turn_in_flight,
+                    entry.current_subprocess is not None,
+                )
+                # Wake the astream loop so it bails out cooperatively.
+                entry.interrupt_event.set()
+                # SIGTERM the active tool subprocess (if any).
+                terminated = entry.kill_subprocess()
+                if terminated:
+                    # Grace-poll for up to 2s; SIGKILL the child if it
+                    # hasn't exited. Poll cadence 50ms = 40 iterations
+                    # — empirically enough for an asyncio Process to
+                    # flip returncode after a clean SIGTERM exit.
+                    proc = entry.current_subprocess
+                    for _ in range(40):
+                        if proc is None:
+                            break
+                        rc = getattr(proc, "returncode", None)
+                        if rc is not None:
+                            break
+                        if hasattr(proc, "poll") and callable(proc.poll):
+                            if proc.poll() is not None:
+                                break
+                        await asyncio.sleep(0.05)
+                    else:
+                        # Loop exhausted without an exit — escalate to SIGKILL
+                        entry.hard_kill_subprocess()
+
         from a2a.types import TaskStatus, TaskState, TaskStatusUpdateEvent
+        # a2a-sdk 1.x proto: TaskStatusUpdateEvent has fields
+        # {task_id, context_id, status, metadata} — NO `final` field.
+        # Finality is conveyed by the terminal TaskState
+        # (TASK_STATE_CANCELED / COMPLETED / FAILED). The pre-existing
+        # `final=True` kwarg silently raised proto AttributeError in
+        # real cancel calls — fixed as part of task #377.
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
+                task_id=task_id,
+                context_id=context_id,
                 status=TaskStatus(state=TaskState.TASK_STATE_CANCELED),  # v1: TaskState uses SCREAMING_SNAKE_CASE
-                final=True,
             )
         )

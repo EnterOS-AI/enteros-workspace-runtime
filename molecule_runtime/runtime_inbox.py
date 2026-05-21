@@ -49,6 +49,7 @@ default-on in a follow-up PR after 24h on chloe-dong + agents-team.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import time
@@ -58,11 +59,60 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# Task #377 — Stop All propagation. The A2A executor stamps the active
+# context_id into this contextvar at the start of every turn so any
+# subprocess-spawning tool (sandbox, future bash, etc.) can self-register
+# its handle on the matching inbox entry. Default empty string means "no
+# active context" — tools fall through to a no-op self-registration.
+current_context_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "molecule_runtime_current_context_id", default=""
+)
+
+
 def is_nonblocking_enabled() -> bool:
     """Return True when MOLECULE_A2A_NONBLOCKING is set to a truthy value."""
     return os.environ.get("MOLECULE_A2A_NONBLOCKING", "").lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def register_active_subprocess(proc: Any) -> bool:
+    """Register ``proc`` as the current_subprocess for the active context_id.
+
+    Returns True if registration succeeded (active context_id present + entry
+    exists), False otherwise. Best-effort — a tool that calls this when no
+    A2A turn is active (CLI/tests/smoke) simply gets a False and continues.
+
+    Tools using this MUST clear via ``clear_active_subprocess(proc)`` in their
+    finally block so a finished tool call doesn't leave a stale handle
+    pointing at a freed Process — a subsequent unrelated cancel could
+    otherwise SIGTERM whatever recycled that PID.
+    """
+    cid = current_context_id.get()
+    if not cid:
+        return False
+    entry = _INBOX.peek(cid)
+    if entry is None:
+        return False
+    entry.current_subprocess = proc
+    return True
+
+
+def clear_active_subprocess(proc: Any) -> None:
+    """Clear the registered subprocess if it matches ``proc``.
+
+    Identity match prevents a slow-tool-A's finally block from clearing a
+    new tool-B's registration in the rare interleaved case. No-op when
+    nothing is registered or a different proc is registered.
+    """
+    cid = current_context_id.get()
+    if not cid:
+        return
+    entry = _INBOX.peek(cid)
+    if entry is None:
+        return
+    if entry.current_subprocess is proc:
+        entry.current_subprocess = None
 
 
 @dataclass
@@ -113,6 +163,11 @@ class InboxEntry:
         Best-effort: a subprocess that's already exited or doesn't expose
         ``terminate()`` is silently skipped. Both ``subprocess.Popen`` and
         ``asyncio.subprocess.Process`` shapes are accepted.
+
+        Sends SIGTERM via ``terminate()`` first (graceful — lets the child
+        flush stdout/stderr buffers). The caller is expected to poll for
+        liveness within the 2s SLA from feedback_canvas_stop_all; if the
+        child ignores SIGTERM the executor follows up with ``hard_kill()``.
         """
         proc = self.current_subprocess
         if proc is None:
@@ -134,6 +189,35 @@ class InboxEntry:
         except (ProcessLookupError, OSError) as exc:
             logger.debug(
                 "runtime_inbox: kill_subprocess no-op: %s", exc,
+            )
+            return False
+
+    def hard_kill_subprocess(self) -> bool:
+        """Escalation path — SIGKILL the registered subprocess.
+
+        Called by the A2A cancel handler after a short SIGTERM grace period
+        when the child hasn't exited. Returns True on kill attempt. Safe to
+        call even when no subprocess is registered or the proc has exited.
+        """
+        proc = self.current_subprocess
+        if proc is None:
+            return False
+        try:
+            if hasattr(proc, "returncode") and proc.returncode is not None:
+                return False
+            if hasattr(proc, "poll") and callable(proc.poll):
+                if proc.poll() is not None:
+                    return False
+            proc.kill()
+            logger.warning(
+                "runtime_inbox: SIGKILL'd subprocess for context_id=%s "
+                "(did not exit on SIGTERM grace)",
+                self.context_id,
+            )
+            return True
+        except (ProcessLookupError, OSError) as exc:
+            logger.debug(
+                "runtime_inbox: hard_kill_subprocess no-op: %s", exc,
             )
             return False
 
