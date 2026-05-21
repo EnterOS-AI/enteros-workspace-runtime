@@ -1166,3 +1166,15 @@ def new_response_message(
         task_id=getattr(context, "task_id", None) or _uuid.uuid4().hex,
         context_id=getattr(context, "context_id", None) or _uuid.uuid4().hex,
     )
+
+
+def task_state_value(name: str) -> Any:
+    """Return an A2A TaskState value across protobuf and test-stub shapes."""
+    from a2a.types import TaskState
+
+    value = getattr(TaskState, name, None)
+    if value is not None:
+        return value
+    if hasattr(TaskState, "Value"):
+        return TaskState.Value(name)
+    raise AttributeError(f"TaskState has no value {name!r}")

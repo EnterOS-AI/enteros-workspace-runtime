@@ -64,6 +64,7 @@ from molecule_runtime.executor_helpers import (
     extract_attached_files,
     read_delegation_results,
     sanitize_agent_error,
+    task_state_value,
 )
 from molecule_runtime.runtime_inbox import (
     current_context_id as _current_context_id,
@@ -322,12 +323,12 @@ class LangGraphA2AExecutor(AgentExecutor):
             # surface to v1 but missed this contract; the synth-E2E gate
             # surfaced it on every run after staging deploy.
             if getattr(context, "current_task", None) is None:
-                from a2a.types import Task, TaskState, TaskStatus
+                from a2a.types import Task, TaskStatus
                 await event_queue.enqueue_event(
                     Task(
                         id=task_id,
                         context_id=context_id,
-                        status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
+                        status=TaskStatus(state=task_state_value("TASK_STATE_SUBMITTED")),
                     )
                 )
 
@@ -749,7 +750,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                         # Loop exhausted without an exit — escalate to SIGKILL
                         entry.hard_kill_subprocess()
 
-        from a2a.types import TaskStatus, TaskState, TaskStatusUpdateEvent
+        from a2a.types import TaskStatus, TaskStatusUpdateEvent
         # a2a-sdk 1.x proto: TaskStatusUpdateEvent has fields
         # {task_id, context_id, status, metadata} — NO `final` field.
         # Finality is conveyed by the terminal TaskState
@@ -760,6 +761,6 @@ class LangGraphA2AExecutor(AgentExecutor):
             TaskStatusUpdateEvent(
                 task_id=task_id,
                 context_id=context_id,
-                status=TaskStatus(state=TaskState.TASK_STATE_CANCELED),  # v1: TaskState uses SCREAMING_SNAKE_CASE
+                status=TaskStatus(state=task_state_value("TASK_STATE_CANCELED")),
             )
         )
