@@ -49,6 +49,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 
 import molecule_runtime.configs_dir as configs_dir
 import molecule_runtime.mcp_heartbeat as mcp_heartbeat
@@ -78,6 +79,24 @@ _print_missing_env_help = mcp_workspace_resolver.print_missing_env_help
 _read_token_file = mcp_workspace_resolver.read_token_file
 
 _start_inbox_pollers = mcp_inbox_pollers.start_inbox_pollers
+
+
+def _runtime_config_dir() -> Path:
+    """Return the config directory load_config() will use."""
+    explicit = os.environ.get("WORKSPACE_CONFIG_PATH", "").strip()
+    if explicit:
+        path = Path(explicit)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    return configs_dir.resolve()
+
+
+def _ensure_default_config() -> None:
+    """Seed standalone MCP's default RBAC config when none exists."""
+    config_file = _runtime_config_dir() / "config.yaml"
+    if config_file.exists():
+        return
+    config_file.write_text("rbac:\n  roles:\n    - operator\n", encoding="utf-8")
 
 
 def _effective_platform_url(default_platform_url: str, workspace_platform_url: str) -> str:
@@ -160,6 +179,8 @@ def main() -> None:
                 have_token_file=(configs_dir.resolve() / ".auth_token").is_file(),
             )
         sys.exit(2)
+
+    _ensure_default_config()
 
     platform_url = os.environ["PLATFORM_URL"].strip().rstrip("/")
 

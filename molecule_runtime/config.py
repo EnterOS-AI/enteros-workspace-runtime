@@ -480,7 +480,11 @@ def _clamp_heartbeat(value: object) -> int:
 def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
     """Load config from WORKSPACE_CONFIG_PATH or the given path."""
     if config_path is None:
-        config_path = os.environ.get("WORKSPACE_CONFIG_PATH", "/configs")
+        config_path = os.environ.get("WORKSPACE_CONFIG_PATH")
+        if config_path is None:
+            from molecule_runtime.configs_dir import resolve as resolve_configs_dir
+
+            config_path = str(resolve_configs_dir())
 
     config_file = Path(config_path) / "config.yaml"
     if not config_file.exists():

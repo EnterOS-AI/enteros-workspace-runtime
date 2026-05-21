@@ -32,6 +32,8 @@ def _isolate_env(monkeypatch):
         "WORKSPACE_ID",
         "MOLECULE_WORKSPACE_TOKEN",
         "PLATFORM_URL",
+        "WORKSPACE_CONFIG_PATH",
+        "CONFIGS_DIR",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -154,6 +156,28 @@ class TestResolveWorkspaces:
         out, errors = mcp_cli._resolve_workspaces()
         assert out == []
         assert any("MOLECULE_WORKSPACE_TOKEN" in e for e in errors)
+
+    def test_mcp_startup_creates_default_operator_rbac_config(self, monkeypatch, tmp_path):
+        # External operators running molecule-mcp on a laptop normally do not
+        # have /configs/config.yaml. Startup must seed a minimal config so the
+        # MCP RBAC gate sees the documented operator default instead of the
+        # fail-secure read-only fallback.
+        monkeypatch.setenv("CONFIGS_DIR", str(tmp_path))
+        mcp_cli = _import_mcp_cli()
+
+        cfg = tmp_path / "config.yaml"
+        assert not cfg.exists()
+        mcp_cli._ensure_default_config()
+
+        assert cfg.read_text(encoding="utf-8") == "rbac:\n  roles:\n    - operator\n"
+
+        import molecule_runtime.builtin_tools.audit as audit_mod
+
+        audit_mod._load_workspace_config.cache_clear()
+        roles, custom = audit_mod.get_workspace_roles()
+        assert roles == ["operator"]
+        assert custom == {}
+        audit_mod._load_workspace_config.cache_clear()
 
 
 class TestPlatformAuthRegistry:
