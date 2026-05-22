@@ -29,7 +29,7 @@ Activated by setting `MOLECULE_SMOKE_MODE=1` in the env. Wired into
 full adapter setup path runs first; the smoke just adds one more
 exercise step before exit.
 
-CI usage (intended for `molecule-ci/.github/workflows/publish-template-image.yml`):
+CI usage (intended for `molecule-ci/.gitea/workflows/publish-template-image.yml`):
   docker run --rm \
     -e WORKSPACE_ID=fake -e MOLECULE_SMOKE_MODE=1 \
     -e MOLECULE_SMOKE_TIMEOUT_SECS=90 \
