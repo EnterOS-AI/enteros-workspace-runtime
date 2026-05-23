@@ -133,7 +133,7 @@ class InboxEntry:
     # (fresh turn).
     turn_in_flight: bool = False
 
-    def request_interrupt(self, new_message: str) -> None:
+    def request_interrupt(self, new_message: Any) -> None:
         """Queue a new message and signal the running turn to interrupt.
 
         Idempotent — calling twice in rapid succession just enqueues both
@@ -146,9 +146,9 @@ class InboxEntry:
         self.pending_messages.put_nowait(new_message)
         self.interrupt_event.set()
 
-    def consume_pending(self) -> list[str]:
+    def consume_pending(self) -> list[Any]:
         """Drain all queued messages without blocking. Clears the interrupt event."""
-        out: list[str] = []
+        out: list[Any] = []
         while True:
             try:
                 out.append(self.pending_messages.get_nowait())

@@ -73,6 +73,27 @@ def _build_context(text: str, context_id: str, task_id: str = "task-1"):
     )
 
 
+def _build_context_with_file(
+    text: str,
+    context_id: str,
+    *,
+    name: str,
+    mime_type: str,
+    path: str,
+    task_id: str = "task-1",
+):
+    text_part = SimpleNamespace(text=text, root=None)
+    file_obj = SimpleNamespace(uri=f"file://{path}", name=name, mimeType=mime_type)
+    file_part = SimpleNamespace(kind="file", file=file_obj)
+    msg = SimpleNamespace(parts=[text_part, file_part])
+    return SimpleNamespace(
+        message=msg,
+        task_id=task_id,
+        context_id=context_id,
+        current_task=SimpleNamespace(),
+    )
+
+
 # ─── Fixtures ───────────────────────────────────────────────────────────
 
 
@@ -310,6 +331,176 @@ async def test_executor_drains_inbox_and_restarts_astream(monkeypatch):
     assert entry.turn_in_flight is False
     # The executor returned the (empty in this mock) final text
     assert result == "(no response generated)"
+
+
+@pytest.mark.asyncio
+async def test_executor_passes_image_attachment_as_multimodal_content(
+    tmp_path, monkeypatch
+):
+    """Image file parts must reach LangGraph as model-visible image
+    content, not only as a text manifest."""
+    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+
+    png = tmp_path / "shape-probe.png"
+    png.write_bytes(bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f"
+        "15c4890000000a49444154789c6300010000000500010d0a2db40000000049454e44ae426082"
+    ))
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+
+    captured_messages: list[list] = []
+
+    async def _agent_astream(payload, **_kwargs):
+        captured_messages.append(list(payload["messages"]))
+        yield {
+            "event": "on_chat_model_end",
+            "run_id": "r1",
+            "data": {"output": None},
+        }
+
+    agent = MagicMock()
+    agent.astream_events = _agent_astream
+    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test")
+
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater",
+        lambda *a, **kw: fake_updater,
+    )
+
+    ctx = _build_context_with_file(
+        "describe the image",
+        "ctx-image",
+        name="shape-probe.png",
+        mime_type="image/png",
+        path=str(png),
+    )
+    from molecule_runtime.executor_helpers import (
+        build_user_content_with_files,
+        extract_attached_files,
+    )
+    attached = extract_attached_files(ctx.message)
+    assert attached
+    assert isinstance(build_user_content_with_files("describe the image", attached), list)
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    await executor._core_execute(ctx, event_queue)
+
+    assert captured_messages
+    role, content = captured_messages[0][-1]
+    assert role == "human"
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert "shape-probe.png" in content[0]["text"]
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_executor_accepts_image_only_attachment(tmp_path, monkeypatch):
+    """Image-only messages must not fail the empty-text guard."""
+    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+
+    png = tmp_path / "shape-probe.png"
+    png.write_bytes(b"png")
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+
+    captured_messages: list[list] = []
+
+    async def _agent_astream(payload, **_kwargs):
+        captured_messages.append(list(payload["messages"]))
+        yield {
+            "event": "on_chat_model_end",
+            "run_id": "r1",
+            "data": {"output": None},
+        }
+
+    agent = MagicMock()
+    agent.astream_events = _agent_astream
+    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater",
+        lambda *a, **kw: fake_updater,
+    )
+
+    ctx = _build_context_with_file(
+        "",
+        "ctx-image-only",
+        name="shape-probe.png",
+        mime_type="image/png",
+        path=str(png),
+    )
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    await executor._core_execute(ctx, event_queue)
+
+    assert captured_messages
+    role, content = captured_messages[0][-1]
+    assert role == "human"
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert "Attached files:" in content[0]["text"]
+    assert content[1]["type"] == "image_url"
+
+
+@pytest.mark.asyncio
+async def test_executor_fast_ack_preserves_interrupt_image_attachment(
+    tmp_path, monkeypatch
+):
+    """The nonblocking interrupt queue must keep multimodal content."""
+    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-fastack-image"
+    entry = await get_inbox().get_or_create(context_id)
+    entry.turn_in_flight = True
+
+    png = tmp_path / "interrupt.png"
+    png.write_bytes(b"png")
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+
+    async def _hang_astream(*_args, **_kwargs):
+        await asyncio.sleep(60)
+        yield  # pragma: no cover
+
+    agent = MagicMock()
+    agent.astream_events = _hang_astream
+    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test-model")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater",
+        lambda *a, **kw: fake_updater,
+    )
+
+    ctx = _build_context_with_file(
+        "use this replacement image",
+        context_id,
+        name="interrupt.png",
+        mime_type="image/png",
+        path=str(png),
+    )
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    await executor._core_execute(ctx, event_queue)
+
+    queued = entry.consume_pending()
+    assert len(queued) == 1
+    assert isinstance(queued[0], list)
+    assert queued[0][0]["type"] == "text"
+    assert queued[0][1]["type"] == "image_url"
 
 
 # ─── Test 3 — Interrupt kills registered subprocess + processes new msg ─
