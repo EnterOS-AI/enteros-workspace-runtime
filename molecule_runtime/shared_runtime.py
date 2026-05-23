@@ -26,13 +26,29 @@ def _extract_part_text(part) -> str:
 
 
 def extract_message_text(context_or_parts) -> str:
-    """Extract concatenated plain text from A2A message parts."""
-    parts = getattr(getattr(context_or_parts, "message", None), "parts", None)
+    """Extract text plus a local-path attachment manifest from A2A parts."""
+    message = getattr(context_or_parts, "message", None)
+    parts = getattr(message, "parts", None)
     if parts is None:
         parts = context_or_parts
-    return " ".join(
+        message = context_or_parts
+    text = " ".join(
         text for part in (parts or []) if (text := _extract_part_text(part))
     ).strip()
+    try:
+        from molecule_runtime.executor_helpers import extract_attached_files
+
+        attached = extract_attached_files(message)
+    except Exception:
+        attached = []
+    if not attached:
+        return text
+    manifest = "\n".join(
+        f"- {f['name']} ({f['mime_type'] or 'unknown type'}) at {f['path']}"
+        for f in attached
+    )
+    attachment_text = f"Attached files:\n{manifest}"
+    return f"{text}\n\n{attachment_text}" if text else attachment_text
 
 
 def extract_history(context: RequestContext) -> list[tuple[str, str]]:

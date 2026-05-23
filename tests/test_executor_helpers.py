@@ -955,6 +955,209 @@ def test_extract_attached_files_accepts_v1_protobuf_part(tmp_path, monkeypatch):
     assert out[0]["path"] == str(img)
 
 
+def test_extract_attached_files_fetches_platform_pending_attachment(tmp_path, monkeypatch):
+    """Unresolved platform-pending URIs are fetched with the workspace
+    bearer token and cached to a local path before the runtime sees them."""
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    calls = []
+
+    class Response:
+        status_code = 200
+        content = b"png-bytes"
+        headers = {"content-type": "image/png"}
+        text = ""
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):
+            calls.append({"method": "GET", "url": url, "params": params, "headers": headers})
+            return Response()
+
+        def post(self, url, *, headers=None):
+            calls.append({"method": "POST", "url": url, "headers": headers})
+            return Response()
+
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.auth_headers",
+        lambda workspace_id: {"Authorization": "Bearer workspace-token"},
+    )
+    monkeypatch.setenv("WORKSPACE_ID", "ws-runtime")
+    monkeypatch.setenv("MOLECULE_API_URL", "https://platform.example")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="platform-pending:ws-runtime/file-123",
+            name="screenshot.png",
+            mimeType="image/png",
+        ))),
+    ])
+
+    out = extract_attached_files(msg)
+
+    assert len(out) == 1
+    assert out[0]["name"] == "screenshot.png"
+    assert out[0]["mime_type"] == "image/png"
+    assert Path(out[0]["path"]).read_bytes() == b"png-bytes"
+    assert calls == [
+        {
+            "method": "GET",
+            "url": "https://platform.example/workspaces/ws-runtime/pending-uploads/file-123/content",
+            "params": None,
+            "headers": {"Authorization": "Bearer workspace-token"},
+        },
+        {
+            "method": "POST",
+            "url": "https://platform.example/workspaces/ws-runtime/pending-uploads/file-123/ack",
+            "headers": {"Authorization": "Bearer workspace-token"},
+        },
+    ]
+
+
+def test_extract_attached_files_platform_pending_cache_is_idempotent(tmp_path, monkeypatch):
+    """A replayed inbox message should reuse the cached file and avoid a
+    second network fetch for the same URI/name pair."""
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    calls = 0
+
+    class Response:
+        status_code = 200
+        content = b"cached"
+        headers = {"content-type": "text/plain"}
+        text = ""
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):
+            nonlocal calls
+            calls += 1
+            return Response()
+
+        def post(self, url, *, headers=None):
+            return Response()
+
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.auth_headers",
+        lambda workspace_id: {"Authorization": "Bearer workspace-token"},
+    )
+    monkeypatch.setenv("WORKSPACE_ID", "ws-runtime")
+    monkeypatch.setenv("PLATFORM_URL", "https://platform.example")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="platform-pending:ws-runtime/file-abc",
+            name="notes.txt",
+            mimeType="text/plain",
+        ))),
+    ])
+
+    first = extract_attached_files(msg)
+    second = extract_attached_files(msg)
+
+    assert calls == 1
+    assert first == second
+    assert Path(first[0]["path"]).read_bytes() == b"cached"
+
+
+def test_extract_attached_files_downloads_missing_workspace_uri(tmp_path, monkeypatch):
+    """A workspace: URI with an absolute path can be downloaded from the
+    platform when the file is not present on the local filesystem."""
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    calls = []
+
+    class Response:
+        status_code = 200
+        content = b"remote-bytes"
+        headers = {"content-type": "application/pdf"}
+        text = ""
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):
+            calls.append({"url": url, "params": params, "headers": headers})
+            return Response()
+
+        def post(self, url, *, headers=None):  # pragma: no cover
+            raise AssertionError("workspace: download should not ack pending uploads")
+
+    workspace_path = tmp_path / "missing.pdf"
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.auth_headers",
+        lambda workspace_id: {"Authorization": "Bearer workspace-token"},
+    )
+    monkeypatch.setenv("WORKSPACE_ID", "ws-runtime")
+    monkeypatch.setenv("MOLECULE_API_URL", "https://platform.example")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri=f"workspace:{workspace_path}",
+            name="missing.pdf",
+            mimeType="application/pdf",
+        ))),
+    ])
+
+    out = extract_attached_files(msg)
+
+    assert len(out) == 1
+    assert Path(out[0]["path"]).read_bytes() == b"remote-bytes"
+    assert calls == [{
+        "url": "https://platform.example/workspaces/ws-runtime/chat/download",
+        "params": {"path": str(workspace_path)},
+        "headers": {"Authorization": "Bearer workspace-token"},
+    }]
+
+
+def test_extract_attached_files_platform_pending_requires_workspace_token(tmp_path, monkeypatch):
+    """The resolver must not try a public download when the workspace
+    bearer token is absent; it fails closed and the attachment is skipped."""
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):  # pragma: no cover
+            raise AssertionError("network should not be called without workspace token")
+
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr("molecule_runtime.platform_auth.auth_headers", lambda workspace_id: {})
+    monkeypatch.setenv("WORKSPACE_ID", "ws-runtime")
+    monkeypatch.setenv("MOLECULE_API_URL", "https://platform.example")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="platform-pending:ws-runtime/file-123",
+            name="screenshot.png",
+            mimeType="image/png",
+        ))),
+    ])
+
+    assert extract_attached_files(msg) == []
+
+
 def test_extract_attached_files_empty_v1_part_returns_empty(tmp_path, monkeypatch):
     """Documents the v0→v1 silent-drop failure mode this fix defends
     against. When canvas pre-fix sends ``{kind:"file", file:{...}}``
