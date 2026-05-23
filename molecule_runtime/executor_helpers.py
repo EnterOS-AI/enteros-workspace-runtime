@@ -887,23 +887,63 @@ def _pending_file_id_from_uri(uri: str) -> str:
     return parts[1].strip() if len(parts) == 2 else ""
 
 
+def _validated_pending_parts(uri: str) -> tuple[str, str] | None:
+    workspace_id = _workspace_id_from_uri(uri)
+    file_id = _pending_file_id_from_uri(uri)
+    if not workspace_id or not file_id:
+        return None
+    try:
+        from molecule_runtime.platform_auth import validate_workspace_id
+
+        workspace_id = validate_workspace_id(workspace_id)
+        file_id = str(_uuid.UUID(file_id))
+    except (ValueError, TypeError):
+        return None
+    return workspace_id, file_id
+
+
 def _attachment_cache_path(uri: str, name: str) -> str:
     digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:24]
     safe_name = _sanitize_attachment_name(name or "attachment")
     return os.path.join(INBOX_ATTACHMENTS_DIR, digest, safe_name)
 
 
-def _download_attachment_uri(uri: str, name: str, resolved_path: str | None = None) -> str | None:
+def _platform_url_for_workspace(workspace_id: str) -> str:
+    try:
+        from molecule_runtime.platform_auth import get_workspace_platform_url
+
+        return (get_workspace_platform_url(workspace_id) or "").strip().rstrip("/")
+    except Exception:
+        return ""
+
+
+def _download_attachment_uri(
+    uri: str,
+    name: str,
+    resolved_path: str | None = None,
+) -> str | None:
     """Fetch an unresolved platform attachment into the local inbox cache."""
     cache_path = _attachment_cache_path(uri, name)
     if os.path.isfile(cache_path):
         return cache_path
 
+    pending_parts = (
+        _validated_pending_parts(uri) if uri.startswith("platform-pending:") else None
+    )
+    if uri.startswith("platform-pending:") and pending_parts is None:
+        logger.warning("skipping attached file uri=%r: invalid pending upload URI", uri)
+        return None
+
+    env_workspace_id = os.environ.get("WORKSPACE_ID", "").strip()
+    workspace_id = pending_parts[0] if pending_parts else env_workspace_id
     platform_url = (
+        ""
+        if not workspace_id
+        else _platform_url_for_workspace(workspace_id)
+    ) or (
         os.environ.get("MOLECULE_API_URL", "").strip()
         or os.environ.get("PLATFORM_URL", "").strip()
     ).rstrip("/")
-    workspace_id = os.environ.get("WORKSPACE_ID", "").strip() or _workspace_id_from_uri(uri)
     if not platform_url or not workspace_id:
         logger.warning(
             "skipping attached file uri=%r: platform URL or workspace id missing",
@@ -911,8 +951,19 @@ def _download_attachment_uri(uri: str, name: str, resolved_path: str | None = No
         )
         return None
     try:
-        from molecule_runtime.platform_auth import auth_headers
+        from molecule_runtime.platform_auth import auth_headers, get_workspace_token
 
+        if (
+            env_workspace_id
+            and workspace_id != env_workspace_id
+            and not get_workspace_token(workspace_id)
+        ):
+            logger.warning(
+                "skipping attached file uri=%r: no registered token for workspace %s",
+                uri,
+                workspace_id,
+            )
+            return None
         headers = auth_headers(workspace_id)
     except Exception:
         headers = {}
@@ -922,10 +973,8 @@ def _download_attachment_uri(uri: str, name: str, resolved_path: str | None = No
 
     params: dict[str, str] | None = None
     if uri.startswith("platform-pending:"):
-        file_id = _pending_file_id_from_uri(uri)
-        if not file_id:
-            logger.warning("skipping attached file uri=%r: missing pending file id", uri)
-            return None
+        assert pending_parts is not None
+        file_id = pending_parts[1]
         url = f"{platform_url}/workspaces/{workspace_id}/pending-uploads/{file_id}/content"
         ack_url = f"{platform_url}/workspaces/{workspace_id}/pending-uploads/{file_id}/ack"
     else:

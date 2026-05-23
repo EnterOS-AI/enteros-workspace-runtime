@@ -993,7 +993,7 @@ def test_extract_attached_files_fetches_platform_pending_attachment(tmp_path, mo
 
     msg = SimpleNamespace(parts=[
         SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
-            uri="platform-pending:ws-runtime/file-123",
+            uri="platform-pending:ws-runtime/11111111-1111-1111-1111-111111111111",
             name="screenshot.png",
             mimeType="image/png",
         ))),
@@ -1008,13 +1008,13 @@ def test_extract_attached_files_fetches_platform_pending_attachment(tmp_path, mo
     assert calls == [
         {
             "method": "GET",
-            "url": "https://platform.example/workspaces/ws-runtime/pending-uploads/file-123/content",
+            "url": "https://platform.example/workspaces/ws-runtime/pending-uploads/11111111-1111-1111-1111-111111111111/content",
             "params": None,
             "headers": {"Authorization": "Bearer workspace-token"},
         },
         {
             "method": "POST",
-            "url": "https://platform.example/workspaces/ws-runtime/pending-uploads/file-123/ack",
+            "url": "https://platform.example/workspaces/ws-runtime/pending-uploads/11111111-1111-1111-1111-111111111111/ack",
             "headers": {"Authorization": "Bearer workspace-token"},
         },
     ]
@@ -1058,7 +1058,7 @@ def test_extract_attached_files_platform_pending_cache_is_idempotent(tmp_path, m
 
     msg = SimpleNamespace(parts=[
         SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
-            uri="platform-pending:ws-runtime/file-abc",
+            uri="platform-pending:ws-runtime/22222222-2222-2222-2222-222222222222",
             name="notes.txt",
             mimeType="text/plain",
         ))),
@@ -1127,6 +1127,146 @@ def test_extract_attached_files_downloads_missing_workspace_uri(tmp_path, monkey
     }]
 
 
+def test_extract_attached_files_uses_per_workspace_platform_url(tmp_path, monkeypatch):
+    """Multi-workspace external runtimes must download attachments from
+    the platform URL registered for the message workspace, not the
+    process-wide fallback tenant URL."""
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    calls = []
+
+    class Response:
+        status_code = 200
+        content = b"tenant-b-bytes"
+        headers = {"content-type": "text/plain"}
+        text = ""
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):
+            calls.append({"method": "GET", "url": url, "params": params, "headers": headers})
+            return Response()
+
+        def post(self, url, *, headers=None):
+            calls.append({"method": "POST", "url": url, "headers": headers})
+            return Response()
+
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.auth_headers",
+        lambda workspace_id: {"Authorization": f"Bearer token-for-{workspace_id}"},
+    )
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.get_workspace_token",
+        lambda workspace_id: f"token-for-{workspace_id}" if workspace_id == "ws-b" else None,
+    )
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.get_workspace_platform_url",
+        lambda workspace_id: "https://tenant-b.example" if workspace_id == "ws-b" else None,
+    )
+    monkeypatch.setenv("WORKSPACE_ID", "ws-a")
+    monkeypatch.setenv("MOLECULE_API_URL", "https://tenant-a.example")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="platform-pending:ws-b/33333333-3333-3333-3333-333333333333",
+            name="remote.txt",
+            mimeType="text/plain",
+        ))),
+    ])
+
+    out = extract_attached_files(msg)
+
+    assert len(out) == 1
+    assert Path(out[0]["path"]).read_bytes() == b"tenant-b-bytes"
+    assert calls[0] == {
+        "method": "GET",
+        "url": "https://tenant-b.example/workspaces/ws-b/pending-uploads/33333333-3333-3333-3333-333333333333/content",
+        "params": None,
+        "headers": {"Authorization": "Bearer token-for-ws-b"},
+    }
+
+
+def test_extract_attached_files_rejects_invalid_pending_upload_id(tmp_path, monkeypatch):
+    """Malformed pending-upload IDs are rejected before any platform request."""
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):  # pragma: no cover
+            raise AssertionError("network should not be called for invalid pending URI")
+
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.auth_headers",
+        lambda workspace_id: {"Authorization": "Bearer workspace-token"},
+    )
+    monkeypatch.setenv("WORKSPACE_ID", "ws-runtime")
+    monkeypatch.setenv("MOLECULE_API_URL", "https://platform.example")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="platform-pending:ws-runtime/not-a-uuid/extra",
+            name="screenshot.png",
+            mimeType="image/png",
+        ))),
+    ])
+
+    assert extract_attached_files(msg) == []
+
+
+def test_extract_attached_files_rejects_cross_workspace_without_token(
+    tmp_path,
+    monkeypatch,
+):
+    """A pending upload for another workspace must have a registered
+    workspace token; the process-wide token must not be reused."""
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):  # pragma: no cover
+            raise AssertionError("network should not be called without workspace token")
+
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.auth_headers",
+        lambda workspace_id: {"Authorization": f"Bearer token-for-{workspace_id}"},
+    )
+    monkeypatch.setattr("molecule_runtime.platform_auth.get_workspace_token", lambda workspace_id: None)
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.get_workspace_platform_url",
+        lambda workspace_id: "https://tenant-b.example" if workspace_id == "ws-b" else None,
+    )
+    monkeypatch.setenv("WORKSPACE_ID", "ws-a")
+    monkeypatch.setenv("MOLECULE_API_URL", "https://tenant-a.example")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="platform-pending:ws-b/44444444-4444-4444-4444-444444444444",
+            name="remote.txt",
+            mimeType="text/plain",
+        ))),
+    ])
+
+    assert extract_attached_files(msg) == []
+
+
 def test_extract_attached_files_platform_pending_requires_workspace_token(tmp_path, monkeypatch):
     """The resolver must not try a public download when the workspace
     bearer token is absent; it fails closed and the attachment is skipped."""
@@ -1149,7 +1289,7 @@ def test_extract_attached_files_platform_pending_requires_workspace_token(tmp_pa
 
     msg = SimpleNamespace(parts=[
         SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
-            uri="platform-pending:ws-runtime/file-123",
+            uri="platform-pending:ws-runtime/11111111-1111-1111-1111-111111111111",
             name="screenshot.png",
             mimeType="image/png",
         ))),
