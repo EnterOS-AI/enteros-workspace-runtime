@@ -953,10 +953,11 @@ def _download_attachment_uri(
     try:
         from molecule_runtime.platform_auth import auth_headers, get_workspace_token
 
+        registered_token = get_workspace_token(workspace_id)
         if (
-            env_workspace_id
+            uri.startswith("platform-pending:")
             and workspace_id != env_workspace_id
-            and not get_workspace_token(workspace_id)
+            and not registered_token
         ):
             logger.warning(
                 "skipping attached file uri=%r: no registered token for workspace %s",

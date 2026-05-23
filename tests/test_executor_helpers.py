@@ -1267,6 +1267,45 @@ def test_extract_attached_files_rejects_cross_workspace_without_token(
     assert extract_attached_files(msg) == []
 
 
+def test_extract_attached_files_rejects_pending_without_workspace_registry(
+    tmp_path,
+    monkeypatch,
+):
+    """When no single WORKSPACE_ID exists, pending uploads must resolve
+    through the per-workspace registry, not the process-wide token."""
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):  # pragma: no cover
+            raise AssertionError("network should not be called with process token")
+
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr("molecule_runtime.platform_auth.get_workspace_token", lambda workspace_id: None)
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.auth_headers",
+        lambda workspace_id: {"Authorization": "Bearer process-token"},
+    )
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
+    monkeypatch.setenv("MOLECULE_API_URL", "https://tenant-a.example")
+    monkeypatch.setenv("MOLECULE_WORKSPACE_TOKEN", "process-token")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="platform-pending:ws-b/55555555-5555-5555-5555-555555555555",
+            name="remote.txt",
+            mimeType="text/plain",
+        ))),
+    ])
+
+    assert extract_attached_files(msg) == []
+
+
 def test_extract_attached_files_platform_pending_requires_workspace_token(tmp_path, monkeypatch):
     """The resolver must not try a public download when the workspace
     bearer token is absent; it fails closed and the attachment is skipped."""
