@@ -60,6 +60,7 @@ from molecule_runtime.shared_runtime import (
     set_current_task,
 )
 from molecule_runtime.executor_helpers import (
+    build_user_content_with_files,
     collect_outbound_files,
     extract_attached_files,
     read_delegation_results,
@@ -98,6 +99,23 @@ except ValueError:
 # PM fan-outs (plan → 6 delegations → 6 awaits → 6 results → synthesize ≈
 # 30+ steps even before retries). Overridable via LANGGRAPH_RECURSION_LIMIT.
 DEFAULT_RECURSION_LIMIT = 500
+
+
+def _extract_plain_message_text(context: RequestContext) -> str:
+    """Extract only text parts, leaving file parts for explicit attachment handling."""
+    message = getattr(context, "message", None)
+    parts = getattr(message, "parts", None) or []
+    texts: list[str] = []
+    for part in parts:
+        text = getattr(part, "text", None)
+        if text:
+            texts.append(text)
+            continue
+        root = getattr(part, "root", None)
+        root_text = getattr(root, "text", None) if root is not None else None
+        if root_text:
+            texts.append(root_text)
+    return " ".join(texts).strip()
 
 
 def _parse_recursion_limit() -> int:
@@ -240,7 +258,7 @@ class LangGraphA2AExecutor(AgentExecutor):
           2. TaskArtifactUpdateEvent chunks           — token-by-token via astream_events
           3. Message(final_text)                      — terminal event
         """
-        user_input = extract_message_text(context)
+        user_input = _extract_plain_message_text(context)
         # Inject delegation results from prior turns. Heartbeat writes
         # completed delegation rows to DELEGATION_RESULTS_FILE and sends
         # a self-message to wake the agent; this consumes the file and
@@ -252,18 +270,7 @@ class LangGraphA2AExecutor(AgentExecutor):
         if pending_results:
             logger.info("A2A execute: injecting %d delegation result(s)", pending_results.count("\n") + 1)
             user_input = f"[Delegation results available]\n{pending_results}\n\n{user_input}"
-        # Pull attached files from A2A message parts (kind: "file") and
-        # append a manifest to the prompt so the agent knows they exist.
-        # LangGraph tools (filesystem, bash, skills) can then open the
-        # files by path — without this the agent silently ignores the
-        # attachments and replies "I'm not sure what you're referring to".
         _attached_files = extract_attached_files(getattr(context, "message", None))
-        if _attached_files:
-            _manifest = "\n\nAttached files:\n" + "\n".join(
-                f"- {f['name']} ({f['mime_type'] or 'unknown type'}) at {f['path']}"
-                for f in _attached_files
-            )
-            user_input = (user_input + _manifest) if user_input else _manifest.lstrip()
         if not user_input:
             parts = getattr(getattr(context, "message", None), "parts", None)
             logger.warning("A2A execute: no text content in message parts: %s", parts)
@@ -373,11 +380,12 @@ class LangGraphA2AExecutor(AgentExecutor):
                 # during the heartbeat HTTP push. Moving it outside the try
                 # created a window where cancellation left active_tasks stuck
                 # at 1, permanently blocking queue drain. (#2026)
+                user_content = build_user_content_with_files(user_input, _attached_files)
                 await set_current_task(self._heartbeat, brief_task(user_input))
                 messages = _extract_history(context)
                 if messages:
                     logger.info("A2A execute: injecting %d history messages", len(messages))
-                messages.append(("human", user_input))
+                messages.append(("human", user_content))
 
                 # Recursion limit: see DEFAULT_RECURSION_LIMIT and
                 # _parse_recursion_limit() at module top. Re-read on every
