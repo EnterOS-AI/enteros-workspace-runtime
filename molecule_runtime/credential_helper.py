@@ -132,8 +132,6 @@ def _start_refresh_daemon(daemon_path: Path) -> None:
             pass
 
     _DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = open(_DAEMON_LOG_FILE, "ab")
-
     # Wrap the daemon in a respawn loop so a single crash doesn't leave
     # the workspace stuck on an expired token (which is exactly how #1933
     # was discovered).
@@ -144,13 +142,14 @@ def _start_refresh_daemon(daemon_path: Path) -> None:
         f"sleep 30; "
         f"done"
     )
-    proc = subprocess.Popen(
-        ["bash", "-c", wrapper],
-        stdout=log_handle, stderr=log_handle,
-        # Detach: new session so the daemon survives the runtime exiting.
-        start_new_session=True,
-        env={**os.environ, "TOKEN_HELPER_SCRIPT": str(_INSTALL_DIR / _HELPER_SCRIPT)},
-    )
+    with open(_DAEMON_LOG_FILE, "ab") as log_handle:
+        proc = subprocess.Popen(
+            ["bash", "-c", wrapper],
+            stdout=log_handle, stderr=log_handle,
+            # Detach: new session so the daemon survives the runtime exiting.
+            start_new_session=True,
+            env={**os.environ, "TOKEN_HELPER_SCRIPT": str(_INSTALL_DIR / _HELPER_SCRIPT)},
+        )
     _DAEMON_PID_FILE.write_text(str(proc.pid))
     log.info("credential_helper: refresh daemon spawned pid=%d", proc.pid)
 
