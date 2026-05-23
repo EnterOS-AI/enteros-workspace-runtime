@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -856,6 +857,9 @@ def ensure_workspace_writable() -> None:
 # limits. Images larger than this fall back to a path mention only —
 # the agent can still read them via file_read / bash tools.
 MAX_INLINE_ATTACHMENT_BYTES = 8 * 1024 * 1024
+MAX_INBOUND_ATTACHMENT_BYTES = 100 * 1024 * 1024
+INBOUND_ATTACHMENT_DOWNLOAD_TIMEOUT_S = 60.0
+INBOX_ATTACHMENTS_DIR = f"{WORKSPACE_MOUNT}/.molecule/inbox"
 
 # Absolute /workspace/... paths the agent may mention in its reply.
 # Leading boundary prevents matching the middle of URLs like
@@ -866,6 +870,194 @@ _WORKSPACE_PATH_RE = re.compile(
     r"(?:^|[\s`\"'*_(\[])(/workspace/[A-Za-z0-9_./\-]+)"
 )
 _UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._\-]")
+
+
+def _workspace_id_from_uri(uri: str) -> str:
+    if uri.startswith("platform-pending:"):
+        rest = uri[len("platform-pending:"):]
+        return rest.split("/", 1)[0].strip()
+    return ""
+
+
+def _pending_file_id_from_uri(uri: str) -> str:
+    if not uri.startswith("platform-pending:"):
+        return ""
+    rest = uri[len("platform-pending:"):]
+    parts = rest.split("/", 1)
+    return parts[1].strip() if len(parts) == 2 else ""
+
+
+def _validated_pending_parts(uri: str) -> tuple[str, str] | None:
+    workspace_id = _workspace_id_from_uri(uri)
+    file_id = _pending_file_id_from_uri(uri)
+    if not workspace_id or not file_id:
+        return None
+    try:
+        from molecule_runtime.platform_auth import validate_workspace_id
+
+        workspace_id = validate_workspace_id(workspace_id)
+        file_id = str(_uuid.UUID(file_id))
+    except (ValueError, TypeError):
+        return None
+    return workspace_id, file_id
+
+
+def _attachment_cache_path(uri: str, name: str) -> str:
+    digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:24]
+    safe_name = _sanitize_attachment_name(name or "attachment")
+    return os.path.join(INBOX_ATTACHMENTS_DIR, digest, safe_name)
+
+
+def _platform_url_for_workspace(workspace_id: str) -> str:
+    try:
+        from molecule_runtime.platform_auth import get_workspace_platform_url
+
+        return (get_workspace_platform_url(workspace_id) or "").strip().rstrip("/")
+    except Exception:
+        return ""
+
+
+def _download_attachment_uri(
+    uri: str,
+    name: str,
+    resolved_path: str | None = None,
+) -> str | None:
+    """Fetch an unresolved platform attachment into the local inbox cache."""
+    cache_path = _attachment_cache_path(uri, name)
+    if os.path.isfile(cache_path):
+        return cache_path
+
+    pending_parts = (
+        _validated_pending_parts(uri) if uri.startswith("platform-pending:") else None
+    )
+    if uri.startswith("platform-pending:") and pending_parts is None:
+        logger.warning("skipping attached file uri=%r: invalid pending upload URI", uri)
+        return None
+
+    env_workspace_id = os.environ.get("WORKSPACE_ID", "").strip()
+    workspace_id = pending_parts[0] if pending_parts else env_workspace_id
+    platform_url = (
+        ""
+        if not workspace_id
+        else _platform_url_for_workspace(workspace_id)
+    ) or (
+        os.environ.get("MOLECULE_API_URL", "").strip()
+        or os.environ.get("PLATFORM_URL", "").strip()
+    ).rstrip("/")
+    if not platform_url or not workspace_id:
+        logger.warning(
+            "skipping attached file uri=%r: platform URL or workspace id missing",
+            uri,
+        )
+        return None
+    try:
+        from molecule_runtime.platform_auth import auth_headers, get_workspace_token
+
+        registered_token = get_workspace_token(workspace_id)
+        if (
+            uri.startswith("platform-pending:")
+            and workspace_id != env_workspace_id
+            and not registered_token
+        ):
+            logger.warning(
+                "skipping attached file uri=%r: no registered token for workspace %s",
+                uri,
+                workspace_id,
+            )
+            return None
+        headers = auth_headers(workspace_id)
+    except Exception:
+        headers = {}
+    if not headers.get("Authorization"):
+        logger.warning("skipping attached file uri=%r: workspace bearer token missing", uri)
+        return None
+
+    params: dict[str, str] | None = None
+    if uri.startswith("platform-pending:"):
+        assert pending_parts is not None
+        file_id = pending_parts[1]
+        url = f"{platform_url}/workspaces/{workspace_id}/pending-uploads/{file_id}/content"
+        ack_url = f"{platform_url}/workspaces/{workspace_id}/pending-uploads/{file_id}/ack"
+    else:
+        ack_url = None
+        path = resolved_path or resolve_attachment_uri(uri)
+        if not path:
+            return None
+        url = f"{platform_url}/workspaces/{workspace_id}/chat/download"
+        params = {"path": path}
+    client = httpx.Client(timeout=INBOUND_ATTACHMENT_DOWNLOAD_TIMEOUT_S)
+    try:
+        resp = client.get(url, params=params, headers=headers)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to download attachment uri=%r: %s", uri, exc)
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    if resp.status_code >= 400:
+        logger.warning(
+            "download attachment uri=%r returned HTTP %d: %s",
+            uri,
+            resp.status_code,
+            (resp.text or "")[:200],
+        )
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    content = resp.content or b""
+    if len(content) > MAX_INBOUND_ATTACHMENT_BYTES:
+        logger.warning(
+            "refusing attachment uri=%r: size %d exceeds cap %d",
+            uri,
+            len(content),
+            MAX_INBOUND_ATTACHMENT_BYTES,
+        )
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = f"{cache_path}.tmp-{os.getpid()}"
+        with open(tmp_path, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp_path, cache_path)
+    except OSError as exc:
+        logger.warning("failed to cache attachment uri=%r: %s", uri, exc)
+        try:
+            if "tmp_path" in locals():
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    if ack_url:
+        try:
+            ack_resp = client.post(ack_url, headers=headers)
+            if ack_resp.status_code >= 400:
+                logger.warning(
+                    "ack attachment uri=%r returned HTTP %d: %s",
+                    uri,
+                    ack_resp.status_code,
+                    (ack_resp.text or "")[:200],
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to ack attachment uri=%r: %s", uri, exc)
+    try:
+        client.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return cache_path
 
 
 def resolve_attachment_uri(uri: str) -> str | None:
@@ -964,6 +1156,8 @@ def extract_attached_files(message: Any) -> list[dict[str, str]]:
             )
 
         path = resolve_attachment_uri(uri)
+        if not path or not os.path.isfile(path):
+            path = _download_attachment_uri(uri, name, path)
         if not path or not os.path.isfile(path):
             logger.warning("skipping attached file with unresolvable uri=%r", uri)
             continue

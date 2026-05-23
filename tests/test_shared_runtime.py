@@ -1,6 +1,7 @@
 """Regression tests for set_current_task() phantom-busy fix (issue #1372)."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -113,6 +114,62 @@ class TestSetCurrentTask:
             _run(set_current_task(heartbeat, "Any task"))
 
         mock_client.post.assert_not_called()
+
+
+def test_extract_message_text_appends_attachment_manifest(monkeypatch, tmp_path):
+    """Shared-runtime adapters should see fetched/local attachments in the
+    prompt, not just the text parts."""
+    from molecule_runtime.adapters.shared_runtime import extract_message_text
+
+    attached = tmp_path / "report.pdf"
+    attached.write_bytes(b"%PDF")
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.WORKSPACE_MOUNT",
+        str(tmp_path),
+    )
+
+    context = SimpleNamespace(message=SimpleNamespace(parts=[
+        SimpleNamespace(text="summarize this"),
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri=f"workspace:{attached}",
+            name="report.pdf",
+            mimeType="application/pdf",
+        ))),
+    ]))
+
+    text = extract_message_text(context)
+
+    assert "summarize this" in text
+    assert "Attached files:" in text
+    assert "report.pdf (application/pdf)" in text
+    assert str(attached) in text
+
+
+def test_extract_message_text_file_only_message_returns_manifest(monkeypatch, tmp_path):
+    """File-only requests should be actionable instead of becoming an empty
+    prompt for shared-runtime adapters."""
+    from molecule_runtime.adapters.shared_runtime import extract_message_text
+
+    image = tmp_path / "diagram.png"
+    image.write_bytes(b"png")
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.WORKSPACE_MOUNT",
+        str(tmp_path),
+    )
+
+    context = SimpleNamespace(message=SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri=f"workspace:{image}",
+            name="diagram.png",
+            mimeType="image/png",
+        ))),
+    ]))
+
+    text = extract_message_text(context)
+
+    assert text.startswith("Attached files:")
+    assert "diagram.png (image/png)" in text
+    assert str(image) in text
 
     def test_none_heartbeat_skips_post(self, monkeypatch):
         """Passing None as heartbeat object skips post (no-op, no crash).
