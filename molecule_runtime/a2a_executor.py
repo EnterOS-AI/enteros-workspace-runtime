@@ -271,7 +271,7 @@ class LangGraphA2AExecutor(AgentExecutor):
             logger.info("A2A execute: injecting %d delegation result(s)", pending_results.count("\n") + 1)
             user_input = f"[Delegation results available]\n{pending_results}\n\n{user_input}"
         _attached_files = extract_attached_files(getattr(context, "message", None))
-        if not user_input:
+        if not user_input and not _attached_files:
             parts = getattr(getattr(context, "message", None), "parts", None)
             logger.warning("A2A execute: no text content in message parts: %s", parts)
             await event_queue.enqueue_event(
@@ -356,7 +356,9 @@ class LangGraphA2AExecutor(AgentExecutor):
                         "requesting interrupt + acking new message",
                         context_id,
                     )
-                    _inbox_entry.request_interrupt(user_input)
+                    _inbox_entry.request_interrupt(
+                        build_user_content_with_files(user_input, _attached_files)
+                    )
                     # Fast-ack the new POST: complete() with a stub Message
                     # so the platform proxy gets a prompt 200 response. The
                     # in-flight turn will deliver the real reply (which it
