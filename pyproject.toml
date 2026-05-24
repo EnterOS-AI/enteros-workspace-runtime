@@ -45,6 +45,9 @@ molecule-runtime = "molecule_runtime.main:main_sync"
 # container-bound runtimes get via the auto-spawned MCP.
 molecule-mcp = "molecule_runtime.mcp_cli:main"
 
+[tool.ruff]
+lint.ignore = ["E402"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["molecule_runtime*", "plugins_registry*"]
