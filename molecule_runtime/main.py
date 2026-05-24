@@ -37,10 +37,23 @@ from molecule_runtime.platform_auth import auth_headers, self_source_headers
 
 
 def get_machine_ip() -> str:  # pragma: no cover
-    """Get the machine's IP for A2A discovery."""
+    """Get the machine's IP for A2A discovery.
+
+    Uses a UDP "connection" to a public probe address to discover the local
+    routable IP without sending any actual traffic.  The probe host/port are
+    configurable via ``MOLECULE_NETWORK_PROBE_HOST`` and
+    ``MOLECULE_NETWORK_PROBE_PORT`` so operators in air-gapped or restricted
+    networks can point the probe at an internal gateway instead of a public
+    DNS server.
+    """
+    probe_host = os.environ.get("MOLECULE_NETWORK_PROBE_HOST", "8.8.8.8")
+    try:
+        probe_port = int(os.environ.get("MOLECULE_NETWORK_PROBE_PORT", "80"))
+    except ValueError:
+        probe_port = 80
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
+        s.connect((probe_host, probe_port))
         ip = s.getsockname()[0]
         s.close()
         return ip
