@@ -67,6 +67,7 @@ from molecule_runtime.executor_helpers import (
     sanitize_agent_error,
     task_state_value,
 )
+from molecule_runtime.attachment_vision import append_image_descriptions
 from molecule_runtime.runtime_inbox import (
     current_context_id as _current_context_id,
     get_inbox as _get_runtime_inbox,
@@ -271,6 +272,8 @@ class LangGraphA2AExecutor(AgentExecutor):
             logger.info("A2A execute: injecting %d delegation result(s)", pending_results.count("\n") + 1)
             user_input = f"[Delegation results available]\n{pending_results}\n\n{user_input}"
         _attached_files = extract_attached_files(getattr(context, "message", None))
+        if _attached_files:
+            user_input = await append_image_descriptions(user_input, _attached_files)
         if not user_input and not _attached_files:
             parts = getattr(getattr(context, "message", None), "parts", None)
             logger.warning("A2A execute: no text content in message parts: %s", parts)
