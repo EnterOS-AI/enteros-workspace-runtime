@@ -53,11 +53,11 @@ def test_desktop_open_url_requires_browser(monkeypatch):
     assert "no supported desktop browser" in out
 
 
-def test_desktop_open_url_prefers_falkon_when_available(monkeypatch, tmp_path):
+def test_desktop_open_url_prefers_firefox_when_available(monkeypatch, tmp_path):
     spawn_calls = []
     host_calls = []
 
-    monkeypatch.setattr(desktop, "_host_ok", lambda binary: binary in {"falkon", "google-chrome"})
+    monkeypatch.setattr(desktop, "_host_ok", lambda binary: binary in {"firefox", "falkon", "google-chrome"})
     monkeypatch.setattr(desktop, "_host_spawn", lambda args: spawn_calls.append(args))
     monkeypatch.setattr(desktop, "_host_cmd", lambda args, timeout=10: host_calls.append((args, timeout)))
     monkeypatch.setattr(desktop, "Path", lambda value: tmp_path / value.lstrip("/"))
@@ -65,7 +65,7 @@ def test_desktop_open_url_prefers_falkon_when_available(monkeypatch, tmp_path):
     out = asyncio.run(desktop.tool_desktop_open_url("https://example.com/?q=$(id)"))
 
     assert '"ok": true' in out
-    assert '"browser": "falkon"' in out
+    assert '"browser": "firefox"' in out
     assert spawn_calls == [[
         "runuser",
         "-u",
@@ -74,11 +74,11 @@ def test_desktop_open_url_prefers_falkon_when_available(monkeypatch, tmp_path):
         "/usr/bin/env",
         "DISPLAY=:99",
         "XDG_RUNTIME_DIR=/tmp/runtime-ubuntu",
-        "falkon",
+        "MOZ_DISABLE_RDD_SANDBOX=1",
+        "MOZ_DISABLE_CONTENT_SANDBOX=1",
+        "firefox",
         "--no-remote",
         "--new-window",
-        "--profile",
-        "molecule-desktop",
         "https://example.com/?q=$(id)",
     ]]
     assert host_calls == [([
@@ -87,7 +87,7 @@ def test_desktop_open_url_prefers_falkon_when_available(monkeypatch, tmp_path):
         "--sync",
         "--onlyvisible",
         "--class",
-        "falkon",
+        "firefox",
         "windowmove",
         "%@",
         "10",
@@ -100,6 +100,23 @@ def test_desktop_open_url_prefers_falkon_when_available(monkeypatch, tmp_path):
         "%@",
     ], 20)]
     assert "/bin/sh" not in spawn_calls[0]
+
+
+def test_desktop_open_url_falls_back_to_falkon(monkeypatch, tmp_path):
+    spawn_calls = []
+    host_calls = []
+
+    monkeypatch.setattr(desktop, "_host_ok", lambda binary: binary in {"falkon", "google-chrome"})
+    monkeypatch.setattr(desktop, "_host_spawn", lambda args: spawn_calls.append(args))
+    monkeypatch.setattr(desktop, "_host_cmd", lambda args, timeout=10: host_calls.append((args, timeout)))
+    monkeypatch.setattr(desktop, "Path", lambda value: tmp_path / value.lstrip("/"))
+
+    out = asyncio.run(desktop.tool_desktop_open_url("https://example.com/?q=$(id)"))
+
+    assert '"ok": true' in out
+    assert '"browser": "falkon"' in out
+    assert "falkon" in spawn_calls[0]
+    assert host_calls[0][0][5] == "falkon"
 
 
 def test_desktop_open_url_spawns_chrome_with_xvfb_flags(monkeypatch, tmp_path):
