@@ -119,6 +119,7 @@ async def tool_desktop_status() -> str:
         "host_mount": Path("/host").is_dir(),
         "xdotool": _host_ok("xdotool"),
         "scrot": _host_ok("scrot"),
+        "firefox": _host_ok("firefox"),
         "falkon": _host_ok("falkon"),
         "google_chrome": _host_ok("google-chrome"),
         "chromium": _host_ok("chromium-browser") or _host_ok("chromium"),
@@ -183,7 +184,9 @@ async def tool_desktop_open_url(url: str) -> str:
     url = (url or "").strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         return _json({"ok": False, "error": "url must start with http:// or https://"})
-    browser = "falkon" if _host_ok("falkon") else ""
+    browser = "firefox" if _host_ok("firefox") else ""
+    if not browser:
+        browser = "falkon" if _host_ok("falkon") else ""
     if not browser:
         browser = "google-chrome" if _host_ok("google-chrome") else ""
     if not browser:
@@ -204,14 +207,24 @@ async def tool_desktop_open_url(url: str) -> str:
             f"DISPLAY={DISPLAY}",
             *_browser_args(browser, profile, url),
         ])
-        if browser == "falkon":
-            _size_falkon_window()
+        if browser in {"firefox", "falkon"}:
+            _size_browser_window(browser)
     except OSError as exc:
         return _json({"ok": False, "error": str(exc)})
     return _json({"ok": True, "browser": browser, "url": url})
 
 
 def _browser_args(browser: str, profile: Path, url: str) -> list[str]:
+    if browser == "firefox":
+        return [
+            "XDG_RUNTIME_DIR=/tmp/runtime-ubuntu",
+            "MOZ_DISABLE_RDD_SANDBOX=1",
+            "MOZ_DISABLE_CONTENT_SANDBOX=1",
+            browser,
+            "--no-remote",
+            "--new-window",
+            url,
+        ]
     if browser == "falkon":
         return [
             "XDG_RUNTIME_DIR=/tmp/runtime-ubuntu",
@@ -233,14 +246,14 @@ def _browser_args(browser: str, profile: Path, url: str) -> list[str]:
     ]
 
 
-def _size_falkon_window() -> None:
+def _size_browser_window(browser: str) -> None:
     _host_cmd([
         "xdotool",
         "search",
         "--sync",
         "--onlyvisible",
         "--class",
-        "falkon",
+        browser,
         "windowmove",
         "%@",
         "10",
