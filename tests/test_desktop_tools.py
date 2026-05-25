@@ -98,6 +98,8 @@ def test_desktop_open_url_prefers_firefox_when_available(monkeypatch, tmp_path):
         "900",
         "windowactivate",
         "%@",
+        "key",
+        "F11",
     ], 20)]
     assert "/bin/sh" not in spawn_calls[0]
 
