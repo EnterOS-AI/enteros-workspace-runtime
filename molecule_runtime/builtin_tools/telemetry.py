@@ -9,8 +9,7 @@ Architecture
     2. **Langfuse OTLP bridge** — activated when the ``LANGFUSE_HOST``,
        ``LANGFUSE_PUBLIC_KEY`` and ``LANGFUSE_SECRET_KEY`` env vars are all present.
        Langfuse ≥4 accepts OTLP/HTTP at ``<host>/api/public/otel``.
-       This is a *second* exporter alongside the existing Langfuse LangChain
-       callback handler in agent.py — both paths emit spans simultaneously.
+       This can run alongside adapter-native tracing when a template provides it.
     3. **Console** (debug) — activated when ``OTEL_DEBUG=1``.
 
 * **W3C TraceContext** propagation (``traceparent`` / ``tracestate``) is used for
@@ -354,12 +353,11 @@ def gen_ai_system_from_model(model_str: str) -> str:
         "openrouter": "openrouter",
         "groq": "groq",
         "google_genai": "google",
-        "ollama": "ollama",
     }.get(provider, provider)
 
 
 def record_llm_token_usage(span: Any, result: dict) -> None:
-    """Extract token counts from a LangGraph ainvoke result and set span attrs.
+    """Extract token counts from a native runtime ainvoke result and set span attrs.
 
     Handles both Anthropic (``usage``) and OpenAI (``token_usage``) metadata
     shapes.  Silently skips if metadata is absent.

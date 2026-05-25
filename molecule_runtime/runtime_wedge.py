@@ -33,7 +33,7 @@ wedge_reason(). The reset_for_test() helper is for unit tests only.
 How to use from a NEW adapter (template repo)
 ---------------------------------------------
 
-Hermes, Codex, LangGraph, or any future adapter that wants the same
+Hermes, Codex, native runtime, or any future adapter that wants the same
 "flip-to-degraded-on-fatal-wedge" UX should call mark_wedged + clear_wedge
 from its executor. The runtime imports + heartbeat plumbing are already
 in place — adapters do not change anything in molecule-runtime.

@@ -14,7 +14,7 @@ def _validate_runtime_via_adapter(runtime: str) -> tuple[bool, str]:
     operator-actionable failure message when ok is False.
 
     Replaces the previous hardcoded SUPPORTED_RUNTIMES allowlist
-    (claude-code / codex / ollama / langgraph / etc.). The static list
+    (claude-code / codex / openclaw / hermes / etc.). The static list
     couldn't keep up with new template repos: each new adapter required
     a code change in molecule-runtime to be 'supported', a violation of
     the universal-runtime principle (#87).
@@ -174,7 +174,7 @@ def run_preflight(config: WorkspaceConfig, config_path: str) -> PreflightReport:
                 # paths (OAuth token vs API key vs third-party provider key);
                 # unioning would re-introduce the very crash-loop this fix
                 # closes. An explicit empty list means "no auth needed"
-                # (e.g. local Ollama or self-hosted endpoints) and MUST
+                # (e.g. self-hosted endpoints) and MUST
                 # short-circuit the top-level fallback — that's why we key
                 # off `"required_env" in entry` rather than truthiness.
                 required_env = list(entry.get("required_env") or [])

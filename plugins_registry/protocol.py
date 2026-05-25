@@ -8,7 +8,7 @@ plugin into a workspace.
 The :class:`InstallContext` deliberately gives adaptors ONLY the hooks they
 need (``register_tool``, ``register_subagent``, ``append_to_memory``) — it
 does not leak runtime internals. This keeps adaptors thin and lets the
-workspace runtime adapter (claude_code, deepagents, …) own its own state.
+workspace runtime adapter own its own state.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 
 
 # Default filename for the runtime's long-lived memory file. Claude Code
-# and DeepAgents both read CLAUDE.md natively; other runtimes override via
+# reads CLAUDE.md natively; other runtimes override via
 # BaseAdapter.memory_filename() and that value flows through
 # InstallContext.memory_filename so adaptors don't hardcode the name.
 DEFAULT_MEMORY_FILENAME = "CLAUDE.md"
@@ -44,7 +44,7 @@ class InstallContext:
     """Workspace UUID — useful for per-workspace state or logging."""
 
     runtime: str
-    """Runtime identifier (``claude_code``, ``deepagents``, …)."""
+    """Runtime identifier (for example, ``claude_code`` or ``codex``)."""
 
     plugin_root: Path
     """Path to the plugin's directory (where plugin.yaml + content lives)."""
@@ -65,7 +65,7 @@ class InstallContext:
     register_subagent: Callable[[str, dict[str, Any]], None] = field(
         default=lambda name, spec: None
     )
-    """Register a sub-agent specification (DeepAgents-only). No-op elsewhere."""
+    """Register a sub-agent specification. No-op on runtimes without sub-agents."""
 
     append_to_memory: Callable[[str, str], None] = field(
         default=lambda filename, content: None

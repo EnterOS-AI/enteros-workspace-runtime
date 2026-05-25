@@ -93,8 +93,8 @@ class SandboxConfig:
 
 @dataclass
 class RuntimeConfig:
-    """Configuration for CLI-based agent runtimes (claude-code, codex, ollama, custom)."""
-    command: str = ""          # e.g. "claude", "codex", "ollama" (model goes in model field)
+    """Configuration for CLI-based agent runtimes (claude-code, codex, openclaw, hermes)."""
+    command: str = ""          # e.g. "claude" or "codex" (model goes in model field)
     args: list[str] = field(default_factory=list)  # additional CLI args
     required_env: list[str] = field(default_factory=list)  # env vars required to run (e.g. ["CLAUDE_CODE_OAUTH_TOKEN"])
     timeout: int = 0           # seconds (0 = no timeout — agents wait until done)
@@ -330,7 +330,7 @@ class WorkspaceConfig:
     is provider-ambiguous (e.g., a custom alias) or when an adapter needs
     a specific gateway distinct from the model namespace.
     """
-    runtime: str = "langgraph"  # langgraph | claude-code | codex | ollama | custom
+    runtime: str = "claude-code"  # claude-code | codex | openclaw | hermes | custom
     runtime_config: RuntimeConfig = field(default_factory=RuntimeConfig)
     initial_prompt: str = ""
     """Auto-sent as the first A2A message after startup. Default empty = no auto-message.
@@ -508,16 +508,15 @@ def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
     #        ``minimax/abab7-chat-preview`` → ``minimax``
     #        bare model names → ``""``  (signals "use adapter default")
     # Empty after all three is fine — adapters that don't need an explicit
-    # provider (langgraph, claude-code-default, codex) keep their existing
-    # routing; adapters that do (hermes via derive-provider.sh) prefer this
-    # over slug-parsing the model name.
+    # provider keep their existing routing; adapters that do (hermes via
+    # derive-provider.sh) prefer this over slug-parsing the model name.
     provider = (
         os.environ.get("LLM_PROVIDER")
         or raw.get("provider")
         or _derive_provider_from_model(model)
     )
 
-    runtime = raw.get("runtime", "langgraph")
+    runtime = raw.get("runtime", "claude-code")
     runtime_raw = raw.get("runtime_config", {})
 
     a2a_raw = raw.get("a2a", {})

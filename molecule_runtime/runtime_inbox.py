@@ -16,7 +16,7 @@ Per-context inbox state object holds:
 
 * ``pending_messages`` — ``asyncio.Queue`` of unprocessed user inputs that
   arrived while a turn was in flight for the same ``context_id``. The SDK
-  turn loop drains this between LangGraph events.
+  turn loop drains this between runtime events.
 * ``interrupt_event`` — set when a fresh message arrived. The executor
   checks this between ``astream_events`` iterations and aborts the
   in-flight turn so the new message can be processed.
