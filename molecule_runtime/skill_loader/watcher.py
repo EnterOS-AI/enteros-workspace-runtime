@@ -165,7 +165,7 @@ class SkillsWatcher:
         logger.info("SkillsWatcher: reloading skill '%s' (changed: %s)", skill_name, changed_files)
 
         # Evict stale module entries so importlib loads fresh copies
-        stale = [k for k in sys.modules if k.startswith(f"skill_tool_")]
+        stale = [k for k in sys.modules if k.startswith("skill_tool_")]
         for key in stale:
             del sys.modules[key]
 

@@ -32,7 +32,7 @@ import molecule_runtime.inbox as inbox
 from molecule_runtime.mcp_tools import (
     MOLECULE_MCP_TOOLS,
     handle_molecule_tool_call,
-    _tool_permission_check,
+    _tool_permission_check,  # noqa: F401  — re-exported for test compatibility
 )
 
 logger = logging.getLogger(__name__)

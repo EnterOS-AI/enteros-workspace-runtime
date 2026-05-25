@@ -50,7 +50,6 @@ from molecule_runtime.a2a_tools_rbac import auth_headers_for_heartbeat as _auth_
 from molecule_runtime._sanitize_a2a import (
     _A2A_BOUNDARY_END,
     _A2A_BOUNDARY_END_ESCAPED,
-    _A2A_BOUNDARY_START,
     _A2A_BOUNDARY_START_ESCAPED,
     sanitize_a2a_result,
 )  # noqa: E402

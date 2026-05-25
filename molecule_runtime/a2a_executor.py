@@ -148,7 +148,6 @@ def _parse_recursion_limit() -> int:
 try:
     from molecule_runtime.builtin_tools.compliance import (
         AgencyTracker,
-        ExcessiveAgencyError,
         PromptInjectionError,
         redact_pii as _redact_pii,
         sanitize_input as _sanitize_input,

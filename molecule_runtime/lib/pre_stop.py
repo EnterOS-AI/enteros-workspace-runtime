@@ -38,8 +38,6 @@ import os
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from .snapshot_scrub import scrub_snapshot
-
 if TYPE_CHECKING:
     from molecule_runtime.heartbeat import HeartbeatLoop
 

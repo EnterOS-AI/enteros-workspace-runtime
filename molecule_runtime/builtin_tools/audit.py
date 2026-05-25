@@ -43,7 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from molecule_runtime.rbac_policy import ROLE_PERMISSIONS, check_permission
+from molecule_runtime.rbac_policy import ROLE_PERMISSIONS  # noqa: F401
+from molecule_runtime.rbac_policy import check_permission  # noqa: F401
 
 if TYPE_CHECKING:
     pass  # avoid circular import at runtime

@@ -4,16 +4,12 @@ Loads config -> discovers adapter -> setup -> create executor -> wrap in A2A -> 
 """
 
 import asyncio
-import json
 import os
 import socket
 
 import httpx
 import uvicorn
 # KI-009 a2a-sdk v1 migration: A2AStarletteApplication removed; use Starlette route factory
-from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCard, AgentCapabilities, AgentSkill, AgentInterface
 from starlette.applications import Starlette
 
@@ -473,7 +469,6 @@ async def main():  # pragma: no cover
     # (claude-code reads ~/.claude/projects/<cwd>/<session>.jsonl). Other
     # runtimes return supported:false.
     from starlette.responses import JSONResponse
-    from starlette.routing import Route
 
     async def _transcript_handler(request):
         # Require workspace bearer token — the same token issued at registration

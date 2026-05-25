@@ -7,7 +7,7 @@ This shim provides backward-compatible imports for local dev + tests.
 import importlib
 import os
 import logging
-from molecule_runtime.adapter_base import BaseAdapter, AdapterConfig
+from molecule_runtime.adapter_base import BaseAdapter, AdapterConfig  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
