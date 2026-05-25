@@ -56,7 +56,11 @@ async def delegate(target_id: str, task: str, async_mode: bool = False):
     """Delegate a task to another workspace."""
     peer = await discover(target_id)
     if not peer:
-        print(f"Error: cannot reach workspace {target_id} (access denied or offline)", file=sys.stderr)
+        print(
+            f"Error: cannot reach workspace {target_id} "
+            "(access denied or offline)",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     target_url = peer.get("url", "")
@@ -95,12 +99,16 @@ async def delegate(target_id: str, task: str, async_mode: bool = False):
                     "target_url": target_url,
                 }))
             except httpx.TimeoutException:
-                # Request was sent but we didn't get confirmation — task may or may not have been received
+                # Request was sent but we didn't get confirmation — task may
+                # or may not have been received.
                 print(json.dumps({
                     "task_id": task_id,
                     "target": target_id,
                     "status": "uncertain",
-                    "note": "Request sent but response timed out — delivery unconfirmed. Use 'a2a status' to check.",
+                    "note": (
+                        "Request sent but response timed out — delivery "
+                        "unconfirmed. Use 'a2a status' to check."
+                    ),
                 }), file=sys.stderr)
         return
 
@@ -127,7 +135,10 @@ async def delegate(target_id: str, task: str, async_mode: bool = False):
                 try:
                     data = resp.json()
                 except Exception:
-                    print(f"Error: invalid JSON response (status {resp.status_code})", file=sys.stderr)
+                    print(
+                        f"Error: invalid JSON response (status {resp.status_code})",
+                        file=sys.stderr,
+                    )
                     sys.exit(1)
                 if "result" in data:
                     parts = data["result"].get("parts", [])
@@ -138,15 +149,25 @@ async def delegate(target_id: str, task: str, async_mode: bool = False):
                     # Empty or no-response — might be rate limited, retry
                     if attempt < max_retries - 1:
                         delay = 5 * (2 ** attempt)
-                        print(f"(empty response, retrying in {delay}s...)", file=sys.stderr)
+                        print(
+                            f"(empty response, retrying in {delay}s...)",
+                            file=sys.stderr,
+                        )
                         await asyncio.sleep(delay)
                         continue
                     print(text or "(no response after retries)")
                 elif "error" in data:
                     error_msg = data['error'].get('message', 'unknown')
-                    if ("rate" in error_msg.lower() or "overloaded" in error_msg.lower()) and attempt < max_retries - 1:
+                    is_rate_limited = (
+                        "rate" in error_msg.lower()
+                        or "overloaded" in error_msg.lower()
+                    )
+                    if is_rate_limited and attempt < max_retries - 1:
                         delay = 5 * (2 ** attempt)
-                        print(f"(rate limited, retrying in {delay}s...)", file=sys.stderr)
+                        print(
+                            f"(rate limited, retrying in {delay}s...)",
+                            file=sys.stderr,
+                        )
                         await asyncio.sleep(delay)
                         continue
                     print(f"Error: {error_msg}", file=sys.stderr)
@@ -227,7 +248,10 @@ def main():
         print("Usage: a2a <command> [args]")
         print("Commands:")
         print("  delegate <workspace_id> <task>        — Send task, wait for response")
-        print("  delegate --async <workspace_id> <task> — Send task, return immediately")
+        print(
+            "  delegate --async <workspace_id> <task> "
+            "— Send task, return immediately"
+        )
         print("  status <workspace_id> <task_id>       — Check async task status")
         print("  peers                                 — List available peers")
         print("  info                                  — Show workspace info")
@@ -239,7 +263,10 @@ def main():
         async_mode = "--async" in sys.argv
         args = [a for a in sys.argv[2:] if a != "--async"]
         if len(args) < 2:
-            print("Usage: a2a delegate [--async] <workspace_id> <task>", file=sys.stderr)
+            print(
+                "Usage: a2a delegate [--async] <workspace_id> <task>",
+                file=sys.stderr,
+            )
             sys.exit(1)
         asyncio.run(delegate(args[0], " ".join(args[1:]), async_mode))
     elif cmd == "status":
