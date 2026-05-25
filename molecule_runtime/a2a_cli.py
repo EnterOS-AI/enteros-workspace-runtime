@@ -24,7 +24,9 @@ import httpx
 # Validate WORKSPACE_ID (CWE-20, issue #14) — interpolated into
 # /registry/{WORKSPACE_ID}/peers + /workspaces/{WORKSPACE_ID} URL paths
 # and the X-Workspace-ID header below.
-from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
+from molecule_runtime.platform_auth import (
+    validate_workspace_id as _validate_workspace_id,
+)
 _WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
 if not _WORKSPACE_ID_raw:
     raise RuntimeError("WORKSPACE_ID environment variable is required but not set")
