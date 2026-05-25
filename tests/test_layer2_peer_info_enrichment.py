@@ -103,6 +103,22 @@ class TestExtractAttachmentsFromRequestBody:
         atts = self._extract(body)
         assert atts == [{"kind": "file", "uri": "workspace:ok.bin"}]
 
+    def test_flat_chat_upload_manifest_image(self):
+        body = {
+            "uri": "platform-pending:091a9180-b303-4a20-aefe-3a4a675b8aa4/26111d48-aaaa-bbbb-cccc-dddddddddddd",
+            "name": "pasted-2026-05-25T01-22-33-0-0.png",
+            "mimeType": "image/png",
+            "size": 1234,
+            "file_id": "26111d48-aaaa-bbbb-cccc-dddddddddddd",
+        }
+        atts = self._extract(body)
+        assert atts == [{
+            "kind": "image",
+            "uri": "platform-pending:091a9180-b303-4a20-aefe-3a4a675b8aa4/26111d48-aaaa-bbbb-cccc-dddddddddddd",
+            "mime_type": "image/png",
+            "name": "pasted-2026-05-25T01-22-33-0-0.png",
+        }]
+
 
 # ---------------------------------------------------------------------------
 # InboxMessage.to_dict — omit-when-absent envelope for the Layer-1 fields
@@ -441,3 +457,84 @@ class TestPollerRequestsPeerInfo:
         assert n == 0  # empty response
         assert captured["params"].get("include") == "peer_info"
         assert captured["params"].get("type") == "a2a_receive"
+
+    def test_poll_once_enqueues_chat_upload_receive_with_attachments(self, monkeypatch, tmp_path):
+        """Image-only canvas uploads are real messages.
+
+        The upload row itself is the only activity row for a pasted image
+        without caption, so the poller must fetch/stage the bytes and then
+        enqueue an InboxMessage carrying attachments[].
+        """
+        from molecule_runtime import inbox, inbox_uploads
+
+        inbox_uploads.get_cache().clear()
+
+        pending_uri = "platform-pending:091a9180-b303-4a20-aefe-3a4a675b8aa4/26111d48-aaaa-bbbb-cccc-dddddddddddd"
+        local_uri = "workspace:/workspace/.molecule/chat-uploads/abc-pasted.png"
+        row = {
+            "id": "act-upload",
+            "source_id": None,
+            "method": "chat_upload_receive",
+            "created_at": "2026-05-25T01:22:33Z",
+            "summary": "chat_upload_receive: pasted-2026-05-25T01-22-33-0-0.png",
+            "request_body": {
+                "uri": pending_uri,
+                "name": "pasted-2026-05-25T01-22-33-0-0.png",
+                "mimeType": "image/png",
+                "size": 1234,
+                "file_id": "26111d48-aaaa-bbbb-cccc-dddddddddddd",
+            },
+        }
+
+        class _StubResp:
+            status_code = 200
+
+            def json(self):
+                return [row]
+
+        class _StubClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def get(self, url, params=None, headers=None):
+                return _StubResp()
+
+        class _FakeBatchFetcher:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def submit(self, upload_row):
+                inbox_uploads.get_cache().set(pending_uri, local_uri)
+
+            def wait_all(self):
+                pass
+
+            def close(self):
+                pass
+
+        stub_httpx = mock.MagicMock()
+        stub_httpx.Client = _StubClient
+        monkeypatch.setitem(__import__("sys").modules, "httpx", stub_httpx)
+        monkeypatch.setattr(inbox_uploads, "BatchFetcher", _FakeBatchFetcher)
+
+        state = inbox.InboxState(cursor_path=tmp_path / "cursor")
+        n = inbox._poll_once(state, "https://platform.test", "091a9180-b303-4a20-aefe-3a4a675b8aa4", headers={}, timeout_secs=5.0)
+
+        assert n == 1
+        messages = state.peek()
+        assert len(messages) == 1
+        msg = messages[0]
+        assert msg.method == "chat_upload_receive"
+        assert msg.peer_id == ""
+        assert msg.attachments == [{
+            "kind": "image",
+            "uri": local_uri,
+            "mime_type": "image/png",
+            "name": "pasted-2026-05-25T01-22-33-0-0.png",
+        }]
