@@ -119,6 +119,7 @@ async def tool_desktop_status() -> str:
         "host_mount": Path("/host").is_dir(),
         "xdotool": _host_ok("xdotool"),
         "scrot": _host_ok("scrot"),
+        "falkon": _host_ok("falkon"),
         "google_chrome": _host_ok("google-chrome"),
         "chromium": _host_ok("chromium-browser") or _host_ok("chromium"),
     }
@@ -182,7 +183,9 @@ async def tool_desktop_open_url(url: str) -> str:
     url = (url or "").strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         return _json({"ok": False, "error": "url must start with http:// or https://"})
-    browser = "google-chrome" if _host_ok("google-chrome") else ""
+    browser = "falkon" if _host_ok("falkon") else ""
+    if not browser:
+        browser = "google-chrome" if _host_ok("google-chrome") else ""
     if not browser:
         browser = "chromium-browser" if _host_ok("chromium-browser") else ""
     if not browser and _host_ok("chromium"):
@@ -199,14 +202,22 @@ async def tool_desktop_open_url(url: str) -> str:
             "--",
             "/usr/bin/env",
             f"DISPLAY={DISPLAY}",
-            browser,
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--no-first-run",
-            "--no-default-browser-check",
-            f"--user-data-dir={profile}",
-            url,
+            *_browser_args(browser, profile, url),
         ])
     except OSError as exc:
         return _json({"ok": False, "error": str(exc)})
     return _json({"ok": True, "browser": browser, "url": url})
+
+
+def _browser_args(browser: str, profile: Path, url: str) -> list[str]:
+    if browser == "falkon":
+        return [browser, url]
+    return [
+        browser,
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-first-run",
+        "--no-default-browser-check",
+        f"--user-data-dir={profile}",
+        url,
+    ]
