@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re as _re
 import os
 import stat
 import sys
@@ -145,7 +146,6 @@ def _channel_notification_method() -> str:
 _VALID_KINDS = frozenset({"canvas_user", "peer_agent"})
 _VALID_METHODS = frozenset({"message/send", "tasks/send", "tasks/get", "notify", ""})
 
-import re as _re
 _ACTIVITY_ID_RE = _re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _ISO8601_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 

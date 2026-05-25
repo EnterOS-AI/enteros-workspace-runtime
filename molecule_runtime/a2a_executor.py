@@ -84,13 +84,13 @@ from molecule_runtime.builtin_tools.telemetry import (
     get_tracer,
     record_llm_token_usage,
 )
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 
 logger = logging.getLogger(__name__)
 
 # CWE-20 (issue #14): _WORKSPACE_ID becomes an OpenTelemetry span
 # attribute; "unknown" sentinel preserved for the no-env fallback so the
 # tracer keeps working before the workspace ID is provisioned.
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     _WORKSPACE_ID = _get_workspace_id()
 except ValueError:
