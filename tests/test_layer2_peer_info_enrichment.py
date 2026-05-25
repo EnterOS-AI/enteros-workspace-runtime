@@ -403,7 +403,6 @@ class TestEnrichInboundForAgentLayer1FastPath:
             {"molecule_runtime.a2a_client": mock.MagicMock()},
         ):
             out = a2a_tools_inbox._enrich_inbound_for_agent(dict(d))
-            mod = __import__("molecule_runtime.a2a_client")
         assert out == d
 
 

@@ -131,7 +131,7 @@ class TestBuildChannelNotificationLayer1:
         with _patched_module_imports(
             registry_record={"name": "FromRegistry", "role": "from registry"},
             fallback_url="https://fallback/discover/" + self.PEER_ID,
-        ) as patches:
+        ):
             msg = self._msg(peer_name="From Layer 1")
             envelope = srv._build_channel_notification(msg)
             meta = envelope["params"]["meta"]
