@@ -68,6 +68,22 @@ class TestMcpServerRbacGate:
         assert rbac_error is not None, "read-only should be denied send_message_to_user"
         assert "approve" in rbac_error or "RBAC" in rbac_error
 
+    @pytest.mark.parametrize("tool_name", [
+        "desktop_status",
+        "desktop_screenshot",
+        "desktop_click",
+        "desktop_type",
+        "desktop_key",
+        "desktop_open_url",
+    ])
+    def test_desktop_tools_denied_for_read_only(self, tool_name):
+        """Desktop-control tools must be blocked for read-only roles."""
+        import molecule_runtime.a2a_mcp_server as mcp_mod
+
+        rbac_error = mcp_mod._tool_permission_check(tool_name, {})
+        assert rbac_error is not None, f"read-only should be denied {tool_name}"
+        assert "display.control" in rbac_error or "RBAC" in rbac_error
+
     def test_delegate_task_allowed_for_operator(self):
         """delegate_task passes when roles include operator (config present)."""
         import molecule_runtime.a2a_mcp_server as mcp_mod
@@ -83,3 +99,16 @@ class TestMcpServerRbacGate:
                 "task": "work",
             })
         assert rbac_error is None, f"operator should be allowed delegate_task: {rbac_error}"
+
+    def test_desktop_control_allowed_for_operator(self):
+        """desktop tools pass when roles include operator (config present)."""
+        import molecule_runtime.a2a_mcp_server as mcp_mod
+
+        mock_cfg = mock.MagicMock()
+        mock_cfg.rbac.roles = ["operator"]
+        mock_cfg.rbac.allowed_actions = {}
+
+        import molecule_runtime.builtin_tools.audit as audit_mod
+        with mock.patch.object(audit_mod, "_load_workspace_config", return_value=mock_cfg):
+            rbac_error = mcp_mod._tool_permission_check("desktop_click", {})
+        assert rbac_error is None, f"operator should be allowed desktop_click: {rbac_error}"

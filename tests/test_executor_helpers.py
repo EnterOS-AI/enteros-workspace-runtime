@@ -39,6 +39,7 @@ from molecule_runtime.executor_helpers import (
     commit_memory,
     extract_message_text,
     get_a2a_instructions,
+    get_display_instructions,
     get_http_client,
     get_mcp_server_path,
     get_system_prompt,
@@ -547,6 +548,22 @@ def test_a2a_mcp_instructions_reference_existing_tools():
             f"A2A instructions are missing the tool {spec.name!r} that "
             f"the registry declares — the doc generator drifted."
         )
+        assert spec.name in registered, (
+            f"MCP server no longer registers {spec.name!r} that the registry "
+            f"declares — the MCP TOOLS list drifted from the registry."
+        )
+
+
+def test_get_display_instructions_mcp_tools_registered():
+    from molecule_runtime.a2a_mcp_server import TOOLS as MCP_TOOLS
+    from molecule_runtime.platform_tools.registry import display_tools
+
+    registered = {t["name"] for t in MCP_TOOLS}
+    instructions = get_display_instructions()
+
+    assert "## Desktop Display Control" in instructions
+    for spec in display_tools():
+        assert spec.name in instructions
         assert spec.name in registered, (
             f"MCP server no longer registers {spec.name!r} that the registry "
             f"declares — the MCP TOOLS list drifted from the registry."

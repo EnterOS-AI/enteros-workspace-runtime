@@ -5,11 +5,11 @@ from __future__ import annotations
 
 # Built-in role -> permitted action mappings.
 ROLE_PERMISSIONS: dict[str, set[str]] = {
-    "admin": {"delegate", "approve", "memory.read", "memory.write"},
-    "operator": {"delegate", "approve", "memory.read", "memory.write"},
+    "admin": {"delegate", "approve", "memory.read", "memory.write", "display.control"},
+    "operator": {"delegate", "approve", "memory.read", "memory.write", "display.control"},
     "read-only": {"memory.read"},
-    "no-delegation": {"approve", "memory.read", "memory.write"},
-    "no-approval": {"delegate", "memory.read", "memory.write"},
+    "no-delegation": {"approve", "memory.read", "memory.write", "display.control"},
+    "no-approval": {"delegate", "memory.read", "memory.write", "display.control"},
     "memory-readonly": {"memory.read"},
 }
 

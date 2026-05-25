@@ -444,7 +444,7 @@ def get_capabilities_preamble(mcp: bool = True) -> str:
         # subcommand keywords).
         return ""
 
-    from molecule_runtime.platform_tools.registry import a2a_tools, memory_tools
+    from molecule_runtime.platform_tools.registry import a2a_tools, display_tools, memory_tools
 
     parts = [
         "## Platform Capabilities",
@@ -460,6 +460,10 @@ def get_capabilities_preamble(mcp: bool = True) -> str:
         "**Inter-agent collaboration (A2A):**",
     ]
     for spec in a2a_tools():
+        parts.append(f"- `{spec.name}` — {spec.short}")
+    parts.append("")
+    parts.append("**Desktop display:**")
+    for spec in display_tools():
         parts.append(f"- `{spec.name}` — {spec.short}")
     parts.append("")
     parts.append("**Persistent memory (HMA):**")
@@ -500,6 +504,24 @@ def get_hma_instructions() -> str:
             "Memory is automatically recalled at the start of each new "
             "session. Use commit_memory proactively during work so future "
             "sessions and teammates can recall what you learned."
+        ),
+    )
+
+
+def get_display_instructions() -> str:
+    """Return native desktop-control instructions for system-prompt injection."""
+    from molecule_runtime.platform_tools.registry import display_tools
+    return _render_section(
+        "## Desktop Display Control",
+        display_tools(),
+        footer=(
+            "These tools control the same display the user can view in the "
+            "Canvas Display tab. Always inspect with desktop_screenshot "
+            "before deciding coordinates, and prefer desktop_open_url to "
+            "start browser work instead of shell-only web access. If "
+            "desktop_status reports unavailable, say the display-control "
+            "tools are not wired for this workspace instead of claiming you "
+            "can use the screen."
         ),
     )
 

@@ -31,6 +31,12 @@ PERMISSION_MAP: dict[str, str] = {
     "delegate_task_async": "delegate",
     "check_task_status": "delegate",
     "send_message_to_user": "approve",
+    "desktop_status": "display.control",
+    "desktop_screenshot": "display.control",
+    "desktop_click": "display.control",
+    "desktop_type": "display.control",
+    "desktop_key": "display.control",
+    "desktop_open_url": "display.control",
     "commit_memory": "memory.write",
     "update_agent_card": "memory.write",
 }
