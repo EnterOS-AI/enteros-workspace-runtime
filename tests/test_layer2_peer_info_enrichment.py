@@ -23,11 +23,9 @@ test file's target — ``inbox.py`` + ``a2a_tools_inbox.py`` +
 
 from __future__ import annotations
 
-import json
 from typing import Any
 from unittest import mock
 
-import pytest
 
 
 # ---------------------------------------------------------------------------

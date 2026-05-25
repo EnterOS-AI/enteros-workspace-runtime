@@ -57,7 +57,8 @@ class TestDiscoverPeerSourceRouting:
     async def test_routes_through_source_workspace_id_when_set(self, monkeypatch):
         """source_workspace_id drives the X-Workspace-ID header AND the
         bearer token (via auth_headers(src))."""
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
 
         platform_auth.register_workspace_token("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "token-A")
 
@@ -148,7 +149,8 @@ class TestSendA2AMessageSourceRouting:
         """The X-Workspace-ID source header must reflect the SENDING
         workspace, not the module-level WORKSPACE_ID. Otherwise
         cross-workspace delegations land in the wrong tenant's audit log."""
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
 
         platform_auth.register_workspace_token("cccc3333-cccc-cccc-cccc-cccccccccccc", "token-C")
 
@@ -184,7 +186,8 @@ class TestSendA2AMessageSourceRouting:
 class TestGetPeersSourceRouting:
     @pytest.mark.asyncio
     async def test_url_and_headers_use_source_workspace_id(self, monkeypatch):
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
 
         platform_auth.register_workspace_token("eeee5555-eeee-eeee-eeee-eeeeeeeeeeee", "token-E")
 
@@ -227,7 +230,9 @@ class TestToolListPeersAggregation:
     @pytest.mark.asyncio
     async def test_aggregates_across_registered_workspaces(self, monkeypatch):
         """Multi-workspace mode (>1 registered) → list_peers aggregates."""
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_tools as a2a_tools, molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.a2a_client as a2a_client
 
         ws_a = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         ws_b = "bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -257,7 +262,8 @@ class TestToolListPeersAggregation:
     async def test_single_workspace_unchanged(self, monkeypatch):
         """Legacy path: no MOLECULE_WORKSPACES → module WORKSPACE_ID,
         no `via:` annotation, no aggregation."""
-        import molecule_runtime.a2a_tools as a2a_tools, molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.a2a_client as a2a_client
 
         async def fake_get_peers(source_workspace_id=None):
             assert source_workspace_id == a2a_client.WORKSPACE_ID
@@ -273,7 +279,8 @@ class TestToolListPeersAggregation:
     async def test_explicit_source_workspace_id_overrides(self, monkeypatch):
         """Explicit source_workspace_id arg → query that workspace only,
         not aggregated."""
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_tools as a2a_tools
 
         ws_a = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         ws_b = "bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -297,7 +304,8 @@ class TestToolListPeersAggregation:
     async def test_aggregated_diagnostic_per_source(self):
         """When all workspaces return empty-with-diagnostic, the message
         prefixes each diagnostic with its source workspace's short id."""
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_tools as a2a_tools
 
         ws_a = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         ws_b = "bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -322,7 +330,8 @@ class TestToolDelegateTaskAutoRouting:
         """When the peer is in the _peer_to_source cache (populated by a
         prior list_peers), delegate_task auto-routes through that
         source without the agent specifying source_workspace_id."""
-        import molecule_runtime.a2a_tools as a2a_tools, molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.a2a_client as a2a_client
 
         ws_a = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         peer_id = "1111aaaa-1111-1111-1111-111111111111"
@@ -350,7 +359,8 @@ class TestToolDelegateTaskAutoRouting:
     @pytest.mark.asyncio
     async def test_explicit_source_overrides_cache(self):
         """Explicit source_workspace_id beats the auto-routing cache."""
-        import molecule_runtime.a2a_tools as a2a_tools, molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.a2a_client as a2a_client
 
         peer_id = "1111aaaa-1111-1111-1111-111111111111"
         ws_cached = "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -441,7 +451,8 @@ class TestCommitMemorySourceRouting:
         """commit_memory(source_workspace_id=X) must POST to /workspaces/X/
         with X's bearer token — otherwise a multi-tenant agent could
         write into the wrong tenant's memory namespace."""
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_tools as a2a_tools
 
         platform_auth.register_workspace_token("ffff6666-ffff-ffff-ffff-ffffffffffff", "token-F")
 
@@ -478,7 +489,8 @@ class TestCommitMemorySourceRouting:
     async def test_falls_back_to_module_workspace_id(self, monkeypatch):
         """Without source_workspace_id, single-workspace operators keep
         the legacy WORKSPACE_ID-based POST — no behavior change."""
-        import molecule_runtime.a2a_client as a2a_client, molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools as a2a_tools
 
         captured: dict = {}
 
@@ -505,7 +517,8 @@ class TestRecallMemorySourceRouting:
     async def test_url_params_and_auth_use_source(self, monkeypatch):
         """recall_memory routes the GET, the workspace_id query param,
         and the auth header through source_workspace_id."""
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_tools as a2a_tools
 
         platform_auth.register_workspace_token("aaaa7777-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "token-G")
 
@@ -550,7 +563,9 @@ class TestChatHistorySourceRouting:
         ``_peer_to_source[peer_id]`` — same auto-routing as delegate_task,
         so the agent doesn't have to remember which workspace surfaced
         each peer."""
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_client as a2a_client, molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools as a2a_tools
 
         platform_auth.register_workspace_token("bbbb8888-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "token-H")
         peer_id = "1111aaaa-1111-1111-1111-111111111111"
@@ -580,7 +595,9 @@ class TestChatHistorySourceRouting:
 
     @pytest.mark.asyncio
     async def test_explicit_source_beats_cache(self, monkeypatch):
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_client as a2a_client, molecule_runtime.a2a_tools as a2a_tools
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.a2a_tools as a2a_tools
 
         platform_auth.register_workspace_token("cccc9999-cccc-cccc-cccc-cccccccccccc", "token-I")
         peer_id = "1111aaaa-1111-1111-1111-111111111111"
@@ -616,7 +633,8 @@ class TestChatHistorySourceRouting:
 class TestGetWorkspaceInfoSourceRouting:
     @pytest.mark.asyncio
     async def test_introspects_named_workspace(self, monkeypatch):
-        import molecule_runtime.platform_auth as platform_auth, molecule_runtime.a2a_client as a2a_client
+        import molecule_runtime.platform_auth as platform_auth
+        import molecule_runtime.a2a_client as a2a_client
 
         platform_auth.register_workspace_token("dddd0000-dddd-dddd-dddd-dddddddddddd", "token-J")
 

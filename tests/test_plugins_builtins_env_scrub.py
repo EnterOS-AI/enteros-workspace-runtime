@@ -1,10 +1,8 @@
 """Regression tests for plugin env scrubbing (issue #19, CWE-C-312)."""
 
 import asyncio
-import os
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
