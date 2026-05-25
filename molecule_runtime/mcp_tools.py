@@ -77,17 +77,6 @@ def _tool_permission_check(name: str, arguments: dict[str, Any]) -> str | None:
 
 def _kwargs_for_spec(spec: ToolSpec, arguments: dict[str, Any]) -> dict[str, Any]:
     """Forward only parameters accepted by the canonical implementation."""
-    if spec.name == "send_message_to_user" and "attachments" in arguments:
-        raw_attachments = arguments.get("attachments")
-        if isinstance(raw_attachments, list):
-            arguments = {
-                **arguments,
-                "attachments": [
-                    p for p in raw_attachments
-                    if isinstance(p, str) and p
-                ],
-            }
-
     signature = inspect.signature(spec.impl)
     kwargs: dict[str, Any] = {}
     for name, parameter in signature.parameters.items():
