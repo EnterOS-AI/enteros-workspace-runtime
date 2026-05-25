@@ -197,19 +197,19 @@ class HeartbeatLoop:
             return 0.0
         return self.error_count / self.request_count
 
-    def record_error(self, error: str):
+    def record_error(self, error: str) -> None:
         self.error_count += 1
         self.request_count += 1
         self.sample_error = error
 
-    def record_success(self):
+    def record_success(self) -> None:
         self.request_count += 1
 
-    def start(self):
+    def start(self) -> None:
         self._task = asyncio.create_task(self._loop())
         self._task.add_done_callback(self._on_done)
 
-    def _on_done(self, task):
+    def _on_done(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled() and task.exception():
             logger.error("Heartbeat loop died: %s — restarting", task.exception())
             self._task = asyncio.create_task(self._loop())

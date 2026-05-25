@@ -132,12 +132,19 @@ class ConsolidationLoop:
             # Fallback: concatenate without agent summarization
             if not (self.agent and summary):
                 combined = " | ".join(contents[:20])
-                await client.post(
+                resp = await client.post(
                     f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
                     json={"content": f"[Consolidated] {combined}", "scope": "TEAM"},
                     headers=auth_headers(),
                 )
-                logger.info("Consolidated %d memories via concatenation fallback", len(memories))
+                if resp.status_code not in (200, 201):
+                    logger.warning(
+                        "Consolidation concatenation POST failed (status %d) — "
+                        "memories may not be persisted",
+                        resp.status_code,
+                    )
+                else:
+                    logger.info("Consolidated %d memories via concatenation fallback", len(memories))
 
     def stop(self):
         self._running = False
