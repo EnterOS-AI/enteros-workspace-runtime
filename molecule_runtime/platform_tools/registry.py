@@ -431,16 +431,33 @@ _SEND_MESSAGE_TO_USER = ToolSpec(
                 "description": (
                     "REQUIRED for any file delivery. Pass absolute file paths inside "
                     "THIS container (e.g. ['/tmp/build.zip', '/workspace/report.pdf']) "
-                    "— the platform uploads each file and returns a download chip "
-                    "with the file's icon + name + size in the user's chat. The chip "
-                    "works in SaaS deployments because the URL is platform-served, "
-                    "not an external host.\n\n"
+                    "or objects with uri/name for already-uploaded workspace refs. "
+                    "Local paths are uploaded and all entries render as download "
+                    "chips with file icon + name + size in the user's chat. The "
+                    "chips work in SaaS deployments because the URL is platform-"
+                    "served, not an external host.\n\n"
                     "USE THIS instead of: pasting URLs in `message`, base64-encoding "
                     "in the body, or telling the user to look at a path on disk. "
                     "If the file isn't already on disk, write it first (Bash, Write "
                     "tool, etc.) then pass its path here. 25 MB per file cap."
                 ),
-                "items": {"type": "string"},
+                "items": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "uri": {"type": "string"},
+                                "name": {"type": "string"},
+                                "mimeType": {"type": "string"},
+                                "mime_type": {"type": "string"},
+                                "size": {"type": "number"},
+                                "path": {"type": "string"},
+                                "file_path": {"type": "string"},
+                            },
+                        },
+                    ],
+                },
             },
             "workspace_id": {
                 "type": "string",

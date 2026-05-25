@@ -149,7 +149,7 @@ async def tool_broadcast_message(
 
 async def tool_send_message_to_user(
     message: str,
-    attachments: list[str] | None = None,
+    attachments: list | None = None,
     workspace_id: str | None = None,
 ) -> str:
     """Send a message directly to the user's canvas chat via WebSocket.
@@ -159,10 +159,11 @@ async def tool_send_message_to_user(
             when sending attachments — set to a short caption like
             "Here's the build output:" or "Done — see attached."
         attachments: Optional list of absolute file paths inside this
-            container. Each is uploaded to the platform and rendered
-            in the canvas as a clickable download chip. Use this
-            instead of pasting paths in the message text — paths
-            render as plain text and the user can't click them.
+            container, or objects with uri/name for already-uploaded
+            workspace refs. Local paths are uploaded to the platform
+            and rendered in the canvas as clickable download chips.
+            Use this instead of pasting paths in the message text —
+            paths render as plain text and the user can't click them.
             Examples:
               attachments=["/tmp/build-output.zip"]
               attachments=["/workspace/report.pdf", "/workspace/data.csv"]
@@ -181,22 +182,26 @@ async def tool_send_message_to_user(
     base = _resolve_platform_url(target_workspace_id)
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
+            paths, refs, split_err = _split_chat_attachments(attachments or [])
+            if split_err:
+                return split_err
             uploaded, upload_err = await _upload_chat_files(
-                client, attachments or [], workspace_id=target_workspace_id,
+                client, paths, workspace_id=target_workspace_id,
             )
             if upload_err:
                 return upload_err
             payload: dict = {"message": message}
-            if uploaded:
-                payload["attachments"] = uploaded
+            all_attachments = refs + uploaded
+            if all_attachments:
+                payload["attachments"] = all_attachments
             resp = await client.post(
                 f"{base}/workspaces/{target_workspace_id}/notify",
                 json=payload,
                 headers=_auth_headers_for_heartbeat(target_workspace_id),
             )
             if resp.status_code == 200:
-                if uploaded:
-                    return f"Message sent to user with {len(uploaded)} attachment(s)"
+                if all_attachments:
+                    return f"Message sent to user with {len(all_attachments)} attachment(s)"
                 return "Message sent to user"
             if resp.status_code == 403:
                 try:
@@ -215,6 +220,37 @@ async def tool_send_message_to_user(
             return f"Error: platform returned {resp.status_code}"
     except Exception as e:
         return f"Error sending message: {e}"
+
+
+def _split_chat_attachments(attachments: list) -> tuple[list[str], list[dict], str | None]:
+    paths: list[str] = []
+    refs: list[dict] = []
+    if not isinstance(attachments, list):
+        return [], [], "Error: attachments must be a list"
+    for i, item in enumerate(attachments):
+        if isinstance(item, str):
+            if item:
+                paths.append(item)
+            continue
+        if not isinstance(item, dict):
+            return [], [], f"Error: attachment[{i}] must be a path or object"
+        path = item.get("path") or item.get("file_path")
+        uri = item.get("uri")
+        name = item.get("name") or item.get("filename") or item.get("file_name")
+        if isinstance(path, str) and path and not isinstance(uri, str):
+            paths.append(path)
+            continue
+        if not isinstance(uri, str) or not uri or not isinstance(name, str) or not name:
+            return [], [], f"Error: attachment[{i}] requires uri/name or path"
+        ref = {"uri": uri, "name": name}
+        mime_type = item.get("mimeType") or item.get("mime_type")
+        if isinstance(mime_type, str) and mime_type:
+            ref["mimeType"] = mime_type
+        size = item.get("size")
+        if isinstance(size, (int, float)) and size > 0:
+            ref["size"] = int(size)
+        refs.append(ref)
+    return paths, refs, None
 
 
 async def tool_list_peers(source_workspace_id: str | None = None) -> str:
