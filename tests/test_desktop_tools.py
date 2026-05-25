@@ -71,7 +71,10 @@ def test_desktop_open_url_spawns_browser_without_shell(monkeypatch, tmp_path):
         "/usr/bin/env",
         "DISPLAY=:99",
         "google-chrome",
+        "--disable-gpu",
         "--disable-dev-shm-usage",
+        "--no-first-run",
+        "--no-default-browser-check",
         f"--user-data-dir={tmp_path / 'workspace/.browser-profile'}",
         "https://example.com/?q=$(id)",
     ]]

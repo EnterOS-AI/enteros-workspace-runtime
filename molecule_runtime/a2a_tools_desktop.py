@@ -200,7 +200,10 @@ async def tool_desktop_open_url(url: str) -> str:
             "/usr/bin/env",
             f"DISPLAY={DISPLAY}",
             browser,
+            "--disable-gpu",
             "--disable-dev-shm-usage",
+            "--no-first-run",
+            "--no-default-browser-check",
             f"--user-data-dir={profile}",
             url,
         ])
