@@ -1209,6 +1209,81 @@ def test_extract_attached_files_uses_per_workspace_platform_url(tmp_path, monkey
     }
 
 
+def test_extract_attached_files_fetches_legacy_platform_content_uri(tmp_path, monkeypatch):
+    """Old canvas/runtime surfaces emitted /workspaces/<ws>/content/<fid>/content.
+
+    The platform route is /pending-uploads/<fid>/content today; runtime
+    receivers must normalize the legacy URI before fetching so historical
+    in-flight attachment messages do not become raw 404 URLs.
+    """
+    from types import SimpleNamespace
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    wsid = "091a9180-b303-4a20-aefe-3a4a675b8aa4"
+    fid = "44444444-4444-4444-4444-444444444444"
+    calls = []
+
+    class Response:
+        status_code = 200
+        content = b"legacy-bytes"
+        headers = {"content-type": "image/png"}
+        text = ""
+
+    class Client:
+        def get(self, url, *, params=None, headers=None):
+            calls.append({"method": "GET", "url": url, "params": params, "headers": headers})
+            return Response()
+
+        def post(self, url, *, headers=None):
+            calls.append({"method": "POST", "url": url, "headers": headers})
+            return Response()
+
+    monkeypatch.setattr("molecule_runtime.executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+    monkeypatch.setattr(
+        "molecule_runtime.executor_helpers.INBOX_ATTACHMENTS_DIR",
+        str(tmp_path / ".molecule" / "inbox"),
+    )
+    monkeypatch.setattr("molecule_runtime.executor_helpers.httpx.Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.auth_headers",
+        lambda workspace_id: {"Authorization": f"Bearer token-for-{workspace_id}"},
+    )
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.get_workspace_token",
+        lambda workspace_id: f"token-for-{workspace_id}" if workspace_id == wsid else None,
+    )
+    monkeypatch.setattr(
+        "molecule_runtime.platform_auth.get_workspace_platform_url",
+        lambda workspace_id: "https://tenant.example" if workspace_id == wsid else None,
+    )
+    monkeypatch.setenv("WORKSPACE_ID", "different-workspace")
+    monkeypatch.setenv("MOLECULE_API_URL", "https://fallback.example")
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri=f"/workspaces/{wsid}/content/{fid}/content",
+            name="pasted.png",
+            mimeType="image/png",
+        ))),
+    ])
+
+    out = extract_attached_files(msg)
+
+    assert len(out) == 1
+    assert Path(out[0]["path"]).read_bytes() == b"legacy-bytes"
+    assert calls[0] == {
+        "method": "GET",
+        "url": f"https://tenant.example/workspaces/{wsid}/pending-uploads/{fid}/content",
+        "params": None,
+        "headers": {"Authorization": f"Bearer token-for-{wsid}"},
+    }
+    assert calls[1] == {
+        "method": "POST",
+        "url": f"https://tenant.example/workspaces/{wsid}/pending-uploads/{fid}/ack",
+        "headers": {"Authorization": f"Bearer token-for-{wsid}"},
+    }
+
+
 def test_extract_attached_files_rejects_invalid_pending_upload_id(tmp_path, monkeypatch):
     """Malformed pending-upload IDs are rejected before any platform request."""
     from types import SimpleNamespace

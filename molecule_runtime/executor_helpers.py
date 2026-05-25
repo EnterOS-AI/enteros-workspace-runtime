@@ -924,6 +924,21 @@ def _validated_pending_parts(uri: str) -> tuple[str, str] | None:
     return workspace_id, file_id
 
 
+def _validated_legacy_content_parts(uri: str) -> tuple[str, str] | None:
+    match = re.match(r"^/workspaces/([^/]+)/content/([^/]+)/content(?:[?#].*)?$", uri)
+    if not match:
+        return None
+    workspace_id, file_id = match.group(1), match.group(2)
+    try:
+        from molecule_runtime.platform_auth import validate_workspace_id
+
+        workspace_id = validate_workspace_id(workspace_id)
+        file_id = str(_uuid.UUID(file_id))
+    except (ValueError, TypeError):
+        return None
+    return workspace_id, file_id
+
+
 def _attachment_cache_path(uri: str, name: str) -> str:
     digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:24]
     safe_name = _sanitize_attachment_name(name or "attachment")
@@ -952,12 +967,17 @@ def _download_attachment_uri(
     pending_parts = (
         _validated_pending_parts(uri) if uri.startswith("platform-pending:") else None
     )
+    legacy_parts = _validated_legacy_content_parts(uri)
     if uri.startswith("platform-pending:") and pending_parts is None:
         logger.warning("skipping attached file uri=%r: invalid pending upload URI", uri)
         return None
 
     env_workspace_id = os.environ.get("WORKSPACE_ID", "").strip()
-    workspace_id = pending_parts[0] if pending_parts else env_workspace_id
+    workspace_id = (
+        pending_parts[0] if pending_parts else
+        legacy_parts[0] if legacy_parts else
+        env_workspace_id
+    )
     platform_url = (
         ""
         if not workspace_id
@@ -977,7 +997,7 @@ def _download_attachment_uri(
 
         registered_token = get_workspace_token(workspace_id)
         if (
-            uri.startswith("platform-pending:")
+            (uri.startswith("platform-pending:") or legacy_parts is not None)
             and workspace_id != env_workspace_id
             and not registered_token
         ):
@@ -995,9 +1015,8 @@ def _download_attachment_uri(
         return None
 
     params: dict[str, str] | None = None
-    if uri.startswith("platform-pending:"):
-        assert pending_parts is not None
-        file_id = pending_parts[1]
+    if uri.startswith("platform-pending:") or legacy_parts is not None:
+        file_id = (pending_parts or legacy_parts)[1]
         url = f"{platform_url}/workspaces/{workspace_id}/pending-uploads/{file_id}/content"
         ack_url = f"{platform_url}/workspaces/{workspace_id}/pending-uploads/{file_id}/ack"
     else:
