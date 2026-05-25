@@ -264,4 +264,6 @@ def _size_browser_window(browser: str) -> None:
         "900",
         "windowactivate",
         "%@",
+        "key",
+        "F11",
     ], timeout=20)
