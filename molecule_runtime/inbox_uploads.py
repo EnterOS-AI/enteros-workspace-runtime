@@ -698,14 +698,14 @@ class BatchFetcher:
 
 
 def _rewrite_part(part: Any) -> None:
-    """Mutate a single A2A Part dict to swap platform-pending: URIs."""
+    """Mutate a single A2A Part dict to swap platform upload URIs."""
     if not isinstance(part, dict):
         return
     file_obj = part.get("file")
     if not isinstance(file_obj, dict):
         return
     uri = file_obj.get("uri")
-    if not isinstance(uri, str) or not uri.startswith("platform-pending:"):
+    if not isinstance(uri, str):
         return
     rewritten = _cache.get(uri)
     if rewritten:
@@ -715,7 +715,7 @@ def _rewrite_part(part: Any) -> None:
 def _rewrite_flat_manifest(body: dict[str, Any]) -> None:
     """Rewrite a root-level chat_upload_receive manifest URI in-place."""
     uri = body.get("uri")
-    if not isinstance(uri, str) or not uri.startswith("platform-pending:"):
+    if not isinstance(uri, str):
         return
     rewritten = _cache.get(uri)
     if rewritten:
