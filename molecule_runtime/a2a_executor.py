@@ -55,7 +55,6 @@ from a2a.types import Part
 from a2a.helpers import new_text_message
 from molecule_runtime.shared_runtime import (
     extract_history as _extract_history,
-    extract_message_text,
     brief_task,
     set_current_task,
 )
