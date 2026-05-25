@@ -643,20 +643,35 @@ def _build_channel_notification(msg: dict) -> dict:
     # (Molecule-AI/molecule-mcp-claude-channel#24); the universal MCP
     # path is the same display surface for in-workspace agents.
     content = _format_channel_content(
-        text=msg.get("text", ""),
+        text=_append_attachment_manifest(msg.get("text", ""), msg_attachments),
         kind=meta["kind"],
         peer_id=meta["peer_id"],
         peer_name=meta.get("peer_name"),
         peer_role=meta.get("peer_role"),
     )
+    params = {
+        "content": content,
+        "meta": meta,
+    }
+    if isinstance(msg_attachments, list) and msg_attachments:
+        params["attachments"] = msg_attachments
     return {
         "jsonrpc": "2.0",
         "method": _channel_notification_method(),
-        "params": {
-            "content": content,
-            "meta": meta,
-        },
+        "params": params,
     }
+
+
+def _append_attachment_manifest(text: str, attachments: object) -> str:
+    if not isinstance(attachments, list) or not attachments:
+        return text
+    try:
+        encoded = json.dumps(attachments, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return text
+    prefix = text.rstrip()
+    manifest = f"attachments: {encoded}"
+    return f"{prefix}\n{manifest}" if prefix else manifest
 
 
 def _format_channel_content(

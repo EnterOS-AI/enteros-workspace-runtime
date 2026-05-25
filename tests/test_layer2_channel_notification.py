@@ -157,8 +157,9 @@ class TestBuildChannelNotificationLayer1:
 
     def test_attachments_propagate_to_meta(self):
         """When the InboxMessage dict has attachments[], the push-path
-        meta must include them so the Claude Code adaptor can render
-        them as the synthetic-turn envelope (Layer 3 contract)."""
+        payload must include them both structurally and in content so
+        Claude Code hosts that render only the synthetic <channel> body
+        still give the agent a URI to inspect."""
         from molecule_runtime import a2a_mcp_server as srv
 
         with _patched_module_imports():
@@ -172,6 +173,9 @@ class TestBuildChannelNotificationLayer1:
             assert meta["attachments"] == [
                 {"kind": "file", "uri": "workspace:foo.pdf", "name": "foo.pdf", "mime_type": "application/pdf"},
             ]
+            assert envelope["params"]["attachments"] == meta["attachments"]
+            assert "attachments:" in envelope["params"]["content"]
+            assert "workspace:foo.pdf" in envelope["params"]["content"]
 
     def test_empty_attachments_list_omitted(self):
         """An empty attachments[] list is OMITTED from meta — same

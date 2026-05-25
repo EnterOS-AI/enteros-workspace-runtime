@@ -50,12 +50,20 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Same on-disk root as internal_chat_uploads.CHAT_UPLOAD_DIR — keeping
-# these decoupled would let drift sneak in. Imported here rather than
-# from internal_chat_uploads to avoid pulling in starlette as a
-# transitive dep (this module runs in the standalone MCP path which
-# doesn't ship the in-container HTTP server).
-CHAT_UPLOAD_DIR = "/workspace/.molecule/chat-uploads"
+# Same on-disk root as internal_chat_uploads.CHAT_UPLOAD_DIR when running
+# in-container. External MCP hosts (Claude Code on a Mac) do not have a
+# writable /workspace, so they stage under the Claude channel inbox and
+# surface file:// URIs instead.
+def _default_chat_upload_dir() -> str:
+    override = os.environ.get("MOLECULE_CHAT_UPLOAD_DIR", "").strip()
+    if override:
+        return os.path.expanduser(override)
+    if os.path.isdir("/workspace") and os.access("/workspace", os.W_OK):
+        return "/workspace/.molecule/chat-uploads"
+    return os.path.expanduser("~/.claude/channels/molecule/inbox")
+
+
+CHAT_UPLOAD_DIR = _default_chat_upload_dir()
 
 # Per-file safety net. The platform enforces 25 MB on the staging side,
 # but a buggy or hostile platform response shouldn't be able to fill the
@@ -210,7 +218,9 @@ def _open_safe(path: str) -> int:
 def stage_to_disk(content: bytes, filename: str) -> str:
     """Write ``content`` under ``CHAT_UPLOAD_DIR`` and return the local URI.
 
-    Returns ``workspace:/workspace/.molecule/chat-uploads/<prefix>-<sanitized>``.
+    Returns ``workspace:/workspace/.molecule/chat-uploads/<prefix>-<sanitized>``
+    in-container, or a ``file://`` URI when running as an external MCP
+    server on the operator's workstation.
     The 32-hex prefix makes the on-disk name unguessable to anything
     that didn't see the response, so even if a stale agent has a guess
     at the original filename it can't construct a URL to a sibling's
@@ -248,7 +258,9 @@ def stage_to_disk(content: bytes, filename: str) -> str:
             pass
         raise
 
-    return f"workspace:{CHAT_UPLOAD_DIR}/{stored}"
+    if os.path.abspath(CHAT_UPLOAD_DIR).startswith("/workspace/"):
+        return f"workspace:{CHAT_UPLOAD_DIR}/{stored}"
+    return Path(target).resolve().as_uri()
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +465,7 @@ def _fetch_and_stage_with_client(
         len(content),
         mime,
         pending_uri,
-        local_uri,
+        _log_safe_local_uri(local_uri),
     )
 
     # Ack last so a write failure above leaves the row available for a
@@ -473,6 +485,12 @@ def _fetch_and_stage_with_client(
         logger.warning("inbox_uploads: POST %s failed: %s", ack_url, exc)
 
     return local_uri
+
+
+def _log_safe_local_uri(uri: str) -> str:
+    if uri.startswith("file://"):
+        return "file://<redacted>"
+    return uri
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +712,16 @@ def _rewrite_part(part: Any) -> None:
         file_obj["uri"] = rewritten
 
 
+def _rewrite_flat_manifest(body: dict[str, Any]) -> None:
+    """Rewrite a root-level chat_upload_receive manifest URI in-place."""
+    uri = body.get("uri")
+    if not isinstance(uri, str) or not uri.startswith("platform-pending:"):
+        return
+    rewritten = _cache.get(uri)
+    if rewritten:
+        body["uri"] = rewritten
+
+
 def rewrite_request_body(body: Any) -> None:
     """Mutate ``body`` in-place, replacing platform-pending: URIs with
     the cached local equivalents.
@@ -709,6 +737,7 @@ def rewrite_request_body(body: Any) -> None:
     """
     if not isinstance(body, dict):
         return
+    _rewrite_flat_manifest(body)
     candidates: list[Any] = []
     params = body.get("params") if isinstance(body.get("params"), dict) else None
     if params:

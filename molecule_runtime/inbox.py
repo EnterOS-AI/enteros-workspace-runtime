@@ -574,9 +574,10 @@ def message_from_activity(row: dict[str, Any]) -> InboxMessage:
             attachments = filtered
 
     # If Layer 1's row didn't carry attachments[], try the inline
-    # message.parts[] path that's available today (independent of Layer
-    # 1) — same shape Layer 1's extractor produces, but parsed here so
-    # poll-path callers see attachments even on pre-Layer-1 platform.
+    # request_body fallback. This handles both the A2A message.parts[]
+    # shape and the flat chat_upload_receive manifest produced by
+    # canvas image/file uploads, so pre-Layer-1 platforms still surface
+    # actionable attachment metadata.
     if attachments is None and isinstance(request_body, dict):
         attachments = _extract_attachments_from_request_body(request_body)
 
@@ -597,7 +598,8 @@ def _extract_attachments_from_request_body(
     request_body: dict[str, Any],
 ) -> list[dict[str, Any]] | None:
     """Surface file/image/audio parts from an a2a inbound's
-    ``request_body.params.message.parts[]`` as a flat ``attachments[]``.
+    ``request_body.params.message.parts[]`` or a flat canvas
+    ``chat_upload_receive`` manifest as a flat ``attachments[]``.
 
     Mirrors the platform-side ``extractAttachmentsFromRequestBody`` Go
     helper so poll-path consumers see the same shape regardless of
@@ -617,13 +619,13 @@ def _extract_attachments_from_request_body(
     """
     params = request_body.get("params") if isinstance(request_body, dict) else None
     if not isinstance(params, dict):
-        return None
+        return _extract_attachment_from_flat_upload_manifest(request_body)
     message = params.get("message")
     if not isinstance(message, dict):
-        return None
+        return _extract_attachment_from_flat_upload_manifest(request_body)
     parts = message.get("parts")
     if not isinstance(parts, list):
-        return None
+        return _extract_attachment_from_flat_upload_manifest(request_body)
 
     out: list[dict[str, Any]] = []
     for part in parts:
@@ -647,6 +649,53 @@ def _extract_attachments_from_request_body(
             att["name"] = name
         out.append(att)
     return out or None
+
+
+def _extract_attachment_from_flat_upload_manifest(
+    request_body: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Parse the platform's flat ``chat_upload_receive`` manifest.
+
+    Shape:
+      {"uri":"platform-pending:<workspace>/<file_id>",
+       "name":"pasted.png",
+       "mimeType":"image/png",
+       "file_id":"..."}
+
+    This mirrors workspace-server's Go-side extractor. ``mimeType`` is
+    normalized to ``mime_type`` on the emitted attachment envelope.
+    """
+    uri = request_body.get("uri") if isinstance(request_body.get("uri"), str) else None
+    file_id = request_body.get("file_id") if isinstance(request_body.get("file_id"), str) else None
+    if not uri and not file_id:
+        return None
+
+    name = request_body.get("name") if isinstance(request_body.get("name"), str) else None
+    if not uri and not name:
+        return None
+
+    mime_type = request_body.get("mimeType") if isinstance(request_body.get("mimeType"), str) else None
+    if not mime_type:
+        mime_type = request_body.get("mime_type") if isinstance(request_body.get("mime_type"), str) else None
+
+    att: dict[str, Any] = {"kind": _kind_from_mime_type(mime_type or "")}
+    if uri:
+        att["uri"] = uri
+    if mime_type:
+        att["mime_type"] = mime_type
+    if name:
+        att["name"] = name
+    return [att]
+
+
+def _kind_from_mime_type(mime_type: str) -> str:
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type.startswith("audio/"):
+        return "audio"
+    if mime_type.startswith("video/"):
+        return "video"
+    return "file"
 
 
 # ---------------------------------------------------------------------------
@@ -763,13 +812,10 @@ def _poll_once(
         if is_chat_upload_row(row):
             # Side-effect row from the platform's poll-mode chat-upload
             # handler — fetch the bytes, stage to /workspace/.molecule/
-            # chat-uploads, ack. NOT enqueued as an InboxMessage; the
-            # agent will see the chat message that REFERENCES this
-            # upload via a separate (later) activity row, with the
-            # pending: URI rewritten to a workspace: URI by
-            # message_from_activity. We DO advance the cursor past
-            # this row so a permanent network outage on /content
-            # doesn't stall the cursor and block real chat traffic.
+            # chat-uploads, ack, then enqueue the upload row itself as
+            # an InboxMessage. Image-only canvas uploads do not always
+            # produce a separate text message row; skipping this row
+            # leaves external agents with only a filename and no bytes.
             if batch_fetcher is None:
                 batch_fetcher = BatchFetcher(
                     platform_url=platform_url,
@@ -777,7 +823,16 @@ def _poll_once(
                     headers=headers,
                 )
             batch_fetcher.submit(row)
-            last_id = str(row.get("id", "")) or last_id
+            _drain_uploads(batch_fetcher)
+            batch_fetcher = None
+            message = message_from_activity(row)
+            if not message.activity_id:
+                last_id = str(row.get("id", "")) or last_id
+                continue
+            message.arrival_workspace_id = workspace_id if cursor_key else ""
+            state.record(message)
+            last_id = message.activity_id
+            new_count += 1
             continue
         # Non-upload row: drain any pending uploads first so the URI
         # cache is populated before we run rewrite_request_body /
