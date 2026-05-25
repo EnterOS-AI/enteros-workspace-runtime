@@ -30,6 +30,7 @@ from molecule_runtime.initial_prompt import (
     resolve_initial_prompt_marker,
 )
 from molecule_runtime.platform_auth import auth_headers, self_source_headers
+from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
 
 
 def get_machine_ip() -> str:  # pragma: no cover
@@ -63,11 +64,6 @@ def _check_delegation_results_pending() -> bool:
             return bool(rf.read().strip())
     except FileNotFoundError:
         return False
-
-
-# Re-exported from transcript_auth for the inline /transcript handler.
-# Separate module keeps the security-critical gate import-light + unit-testable.
-from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
 
 
 async def main():  # pragma: no cover

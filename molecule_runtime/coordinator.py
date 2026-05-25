@@ -19,6 +19,7 @@ import httpx
 from langchain_core.tools import tool
 from molecule_runtime.shared_runtime import build_peer_section
 from molecule_runtime.policies.routing import build_team_routing_payload
+from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,6 @@ else:
 # /registry/{WORKSPACE_ID}/peers URL paths (CWE-20, issue #14).
 # Raises RuntimeError on either empty OR malformed input so the existing
 # "required but not set" contract is preserved.
-from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
 _WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
 if not _WORKSPACE_ID_raw:
     raise RuntimeError("WORKSPACE_ID environment variable is required but not set")

@@ -51,6 +51,7 @@ import httpx
 from langchain_core.tools import tool
 
 from molecule_runtime.builtin_tools.audit import check_permission, get_workspace_roles, log_event
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,6 @@ PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080"
 # crafted env var (containing /, .., #, newlines, etc.) fails fast at
 # import instead of opening a URL/header injection surface
 # (CWE-20, issue #14).
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     WORKSPACE_ID = _get_workspace_id()
 except ValueError:

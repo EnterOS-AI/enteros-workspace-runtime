@@ -34,8 +34,6 @@ import os
 
 import httpx
 
-logger = logging.getLogger(__name__)
-
 from molecule_runtime.a2a_client import (
     WORKSPACE_ID,
     _A2A_ERROR_PREFIX,
@@ -52,7 +50,9 @@ from molecule_runtime._sanitize_a2a import (
     _A2A_BOUNDARY_END_ESCAPED,
     _A2A_BOUNDARY_START_ESCAPED,
     sanitize_a2a_result,
-)  # noqa: E402
+)
+
+logger = logging.getLogger(__name__)
 
 
 # RFC #2829 PR-5 cutover constants. The poll cadence + timeout are
