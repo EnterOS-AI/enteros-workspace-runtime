@@ -67,14 +67,23 @@ from molecule_runtime.a2a_tools import (
     tool_update_agent_card,
     tool_wait_for_message,
 )
+from molecule_runtime.a2a_tools_desktop import (
+    tool_desktop_click,
+    tool_desktop_key,
+    tool_desktop_open_url,
+    tool_desktop_screenshot,
+    tool_desktop_status,
+    tool_desktop_type,
+)
 
 # Section name maps to the heading in the agent-facing system prompt.
 # Adding a new section: add a constant + create a corresponding
 # generator in executor_helpers (or generalize get_*_instructions).
 A2A_SECTION = "a2a"
+DISPLAY_SECTION = "display"
 MEMORY_SECTION = "memory"
 
-Section = Literal["a2a", "memory"]
+Section = Literal["a2a", "display", "memory"]
 
 
 @dataclass(frozen=True)
@@ -479,6 +488,122 @@ _SEND_MESSAGE_TO_USER = ToolSpec(
 
 
 # ---------------------------------------------------------------------------
+# Desktop display — native computer control for display-enabled workspaces
+# ---------------------------------------------------------------------------
+
+_DESKTOP_STATUS = ToolSpec(
+    name="desktop_status",
+    short="Report whether this workspace has host-level desktop control available.",
+    when_to_use=(
+        "Call this before attempting desktop automation. It checks the host "
+        "display mount and required utilities, and returns JSON describing "
+        "whether screenshots/clicks/typing can work."
+    ),
+    input_schema={"type": "object", "properties": {}},
+    impl=tool_desktop_status,
+    section=DISPLAY_SECTION,
+)
+
+_DESKTOP_SCREENSHOT = ToolSpec(
+    name="desktop_screenshot",
+    short="Capture a PNG screenshot of the workspace desktop.",
+    when_to_use=(
+        "Use this to inspect the actual GUI state before and after actions. "
+        "It returns a workspace file path under /workspace/.molecule/display/"
+        "screenshots that you can read or attach to a user message."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Optional relative PNG filename under the screenshots directory.",
+            },
+        },
+    },
+    impl=tool_desktop_screenshot,
+    section=DISPLAY_SECTION,
+)
+
+_DESKTOP_CLICK = ToolSpec(
+    name="desktop_click",
+    short="Move the mouse and click at absolute desktop coordinates.",
+    when_to_use=(
+        "Use after taking a screenshot and identifying coordinates. Button "
+        "1 is left click, 2 middle click, 3 right click."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "x": {"type": "integer", "description": "Absolute X coordinate."},
+            "y": {"type": "integer", "description": "Absolute Y coordinate."},
+            "button": {"type": "integer", "description": "Mouse button, default 1."},
+        },
+        "required": ["x", "y"],
+    },
+    impl=tool_desktop_click,
+    section=DISPLAY_SECTION,
+)
+
+_DESKTOP_TYPE = ToolSpec(
+    name="desktop_type",
+    short="Type text into the focused desktop application.",
+    when_to_use=(
+        "Use after focusing a text field with desktop_click or desktop_key. "
+        "For passwords or secrets, prefer platform secret/config surfaces "
+        "instead of typing sensitive values into the GUI."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Text to type."},
+            "delay_ms": {"type": "integer", "description": "Delay between keystrokes, default 20."},
+        },
+        "required": ["text"],
+    },
+    impl=tool_desktop_type,
+    section=DISPLAY_SECTION,
+)
+
+_DESKTOP_KEY = ToolSpec(
+    name="desktop_key",
+    short="Press a key or key chord on the desktop.",
+    when_to_use=(
+        "Use for keyboard navigation and shortcuts such as Return, Escape, "
+        "ctrl+l, ctrl+r, alt+Tab, or BackSpace."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "keys": {"type": "string", "description": "xdotool key chord, e.g. ctrl+l or Return."},
+        },
+        "required": ["keys"],
+    },
+    impl=tool_desktop_key,
+    section=DISPLAY_SECTION,
+)
+
+_DESKTOP_OPEN_URL = ToolSpec(
+    name="desktop_open_url",
+    short="Open a URL in the workspace desktop browser.",
+    when_to_use=(
+        "Use to start browser-based work on the visible desktop. After "
+        "opening, use desktop_screenshot to inspect the page and "
+        "desktop_click/desktop_type/desktop_key for native interaction."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "HTTP or HTTPS URL to open."},
+        },
+        "required": ["url"],
+    },
+    impl=tool_desktop_open_url,
+    section=DISPLAY_SECTION,
+)
+
+
+# ---------------------------------------------------------------------------
 # Inbox — inbound delivery for the standalone molecule-mcp path.
 #
 # These tools observe a poller-fed in-memory queue (see workspace/inbox.py).
@@ -720,6 +845,13 @@ TOOLS: list[ToolSpec] = [
     _UPDATE_AGENT_CARD,
     _BROADCAST_MESSAGE,
     _SEND_MESSAGE_TO_USER,
+    # Desktop display
+    _DESKTOP_STATUS,
+    _DESKTOP_SCREENSHOT,
+    _DESKTOP_CLICK,
+    _DESKTOP_TYPE,
+    _DESKTOP_KEY,
+    _DESKTOP_OPEN_URL,
     # Inbox (standalone-only; in-container returns informational error)
     _WAIT_FOR_MESSAGE,
     _INBOX_PEEK,
@@ -739,6 +871,11 @@ def a2a_tools() -> list[ToolSpec]:
 def memory_tools() -> list[ToolSpec]:
     """All memory-section tools, in registration order."""
     return [t for t in TOOLS if t.section == MEMORY_SECTION]
+
+
+def display_tools() -> list[ToolSpec]:
+    """All display-section tools, in registration order."""
+    return [t for t in TOOLS if t.section == DISPLAY_SECTION]
 
 
 def by_name(name: str) -> ToolSpec:
