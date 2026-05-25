@@ -165,8 +165,8 @@ def build_system_prompt(
     # Skills and Peers so the A2A docs precede the peer list (which is
     # the data shape the A2A tools operate over).
     #
-    # a2a_mcp=True: MCP tool variant (claude-code, hermes, langchain,
-    # crewai). a2a_mcp=False: CLI subprocess variant (ollama, custom
+    # a2a_mcp=True: MCP tool variant (claude-code, hermes, openclaw,
+    # codex). a2a_mcp=False: CLI subprocess variant (custom
     # runtimes that don't speak MCP). Default True matches the
     # MCP-capable majority; CLI-only adapters override at the call site.
     parts.append(get_a2a_instructions(mcp=a2a_mcp))

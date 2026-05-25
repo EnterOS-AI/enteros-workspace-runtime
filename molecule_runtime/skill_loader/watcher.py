@@ -13,7 +13,7 @@ file inside a skill's folder changes.
 ``_reload_skill()`` calls ``load_skills()`` from ``skills.loader`` for the
 changed skill and passes the fresh ``LoadedSkill`` to every registered
 ``on_reload`` callback.  Adapters register a callback that rebuilds the
-LangGraph agent with the updated tool set, so the change takes effect on
+runtime agent with the updated tool set, so the change takes effect on
 the very next incoming A2A task — zero downtime.
 
 Audit event

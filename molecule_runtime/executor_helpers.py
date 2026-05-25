@@ -1,7 +1,7 @@
 """Shared helpers for AgentExecutor implementations.
 
 Used by adapter executors that live in template repos (claude-code,
-gemini-cli, etc.) post-#87 — this module stays in molecule-runtime
+codex, openclaw, hermes) post-#87 — this module stays in molecule-runtime
 because the helpers are runtime-agnostic, not adapter-specific.
 Provides:
 - Memory recall/commit (HTTP to platform /memories endpoints)
@@ -472,8 +472,8 @@ def get_a2a_instructions(mcp: bool = True) -> str:
     """Return inter-agent communication instructions for system-prompt injection.
 
     Generated from the platform_tools registry. Pass `mcp=True` (default)
-    for MCP-capable runtimes (claude-code, hermes, langchain, crewai).
-    Pass `mcp=False` for CLI-only runtimes (ollama, custom subprocess
+    for MCP-capable runtimes (claude-code, hermes, openclaw, codex).
+    Pass `mcp=False` for CLI-only custom subprocess
     runtimes that don't speak MCP) — those get a static block describing
     the molecule_runtime.a2a_cli subprocess interface instead.
     """
@@ -805,7 +805,7 @@ async def auto_push_hook(cwd: str | None = None) -> None:
 # through ``extract_attached_files`` + ``build_user_content_with_files``
 # and post-processes replies through ``collect_outbound_files`` so a file
 # attached in the canvas shows up correctly across hermes, claude-code,
-# langgraph, CLI runtimes, etc. Living here (not in any one executor)
+# codex, openclaw, and other CLI runtimes. Living here (not in any one executor)
 # keeps the attachment contract in one place — match canvas/ChatTab.tsx
 # and workspace-server/internal/handlers/chat_files.go, and every runtime
 # benefits at once.

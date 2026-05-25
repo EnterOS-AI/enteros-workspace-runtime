@@ -5,7 +5,7 @@ Architecture
 A co-located Temporal worker runs as an asyncio background task **inside the
 same process** as the A2A server.  This means worker activities share the same
 memory space as the A2A handler, which lets us bridge non-serialisable objects
-(LangGraph agent, EventQueue, RequestContext) through an in-process registry
+(runtime agent, EventQueue, RequestContext) through an in-process registry
 without having to serialise them through Temporal's state store.
 
 Workflow stages (names mirror the OTEL span names in a2a_executor.py):
@@ -240,7 +240,7 @@ try:
         """Durable checkpoint: task received and queued for LLM execution.
 
         Mirrors the *task_receive* OTEL span opened in
-        ``LangGraphA2AExecutor._core_execute()``.  This activity is lightweight —
+        ``RuntimeA2AExecutor._core_execute()``.  This activity is lightweight —
         it validates that the in-process registry entry exists and logs receipt.
         The actual A2A "working" signal (``updater.start_work()``) is emitted
         inside ``_core_execute()`` so that SSE timing is preserved.
@@ -283,7 +283,7 @@ try:
     async def llm_call_activity(inp: AgentTaskInput) -> LLMResult:
         """Durable checkpoint: LLM execution with streaming to the event_queue.
 
-        Mirrors the *llm_call* OTEL span in ``LangGraphA2AExecutor._core_execute()``.
+        Mirrors the *llm_call* OTEL span in ``RuntimeA2AExecutor._core_execute()``.
         Calls ``executor._core_execute()`` which handles the full execution pipeline:
         SSE streaming, OTEL sub-spans, final message emission, and heartbeat updates.
 
@@ -346,7 +346,7 @@ try:
     async def task_complete_activity(result: LLMResult) -> None:
         """Durable checkpoint: task execution finished.
 
-        Mirrors the *task_complete* OTEL span in ``LangGraphA2AExecutor._core_execute()``.
+        Mirrors the *task_complete* OTEL span in ``RuntimeA2AExecutor._core_execute()``.
         This activity records the outcome for Temporal observability.  The actual
         OTEL task_complete span fires inside ``_core_execute()``; this activity
         provides a durable, queryable record in Temporal's workflow history.
@@ -374,7 +374,7 @@ try:
         """Durable Temporal workflow for Molecule AI A2A agent task execution.
 
         Sequences three activities that mirror the OTEL span hierarchy in
-        ``LangGraphA2AExecutor._core_execute()``:
+        ``RuntimeA2AExecutor._core_execute()``:
 
             task_receive  →  llm_call  →  task_complete
 
@@ -418,7 +418,7 @@ except ImportError:
 
 
 class TemporalWorkflowWrapper:
-    """Wraps ``LangGraphA2AExecutor.execute()`` with Temporal durable execution.
+    """Wraps ``RuntimeA2AExecutor.execute()`` with Temporal durable execution.
 
     The wrapper intercepts each ``execute()`` call and routes it through a
     ``MoleculeAIAgentWorkflow`` Temporal workflow.  If Temporal is unavailable
@@ -669,7 +669,7 @@ _global_wrapper: Optional[TemporalWorkflowWrapper] = None
 def get_wrapper() -> Optional[TemporalWorkflowWrapper]:
     """Return the global ``TemporalWorkflowWrapper``, or ``None`` if not set.
 
-    Called from ``LangGraphA2AExecutor.execute()`` on every request.
+    Called from ``RuntimeA2AExecutor.execute()`` on every request.
     Returns ``None`` before ``create_wrapper()`` is called (direct-execution mode).
     """
     return _global_wrapper

@@ -9,7 +9,7 @@ runtime format:
     dispatches calls to spec.impl. No tool name or description is
     hardcoded there.
 
-  - builtin_tools/{delegation,memory}.py define LangChain `@tool`
+  - builtin_tools/{delegation,memory}.py define decorated tool
     wrappers using `name=` from the spec; the wrapper body just
     calls spec.impl.
 
@@ -19,7 +19,7 @@ runtime format:
     runtimes.
 
   - executor_helpers._A2A_INSTRUCTIONS_CLI is a SEPARATE hand-maintained
-    block for CLI subprocess runtimes (ollama and any other adapter
+    block for CLI subprocess runtimes (any adapter
     that drives a2a via `python3 -m molecule_runtime.a2a_cli ...`). It
     uses different command-shape names than the registry tool names
     (e.g. `peers` vs `list_peers`), so it cannot be auto-generated

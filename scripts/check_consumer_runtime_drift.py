@@ -25,8 +25,6 @@ DEFAULT_CONSUMERS = (
     "molecule-ai-workspace-template-hermes",
     "molecule-ai-workspace-template-openclaw",
     "molecule-ai-workspace-template-codex",
-    "molecule-ai-workspace-template-langgraph",
-    "molecule-ai-workspace-template-autogen",
     "molecule-core",
 )
 

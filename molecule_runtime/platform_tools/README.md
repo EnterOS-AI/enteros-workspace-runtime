@@ -42,7 +42,7 @@ Adapters consume specs; no hardcoded names anywhere else:
 
 ## CLI subprocess block — special case
 
-Non-MCP runtimes (ollama, custom subprocess adapters) use a separate
+Non-MCP custom subprocess adapters use a separate
 hand-maintained block in `executor_helpers._A2A_INSTRUCTIONS_CLI` because
 the CLI subcommand vocabulary (`peers`, `delegate`, `status`, `info`)
 differs from the MCP tool names (`list_peers`, `delegate_task`, etc.).

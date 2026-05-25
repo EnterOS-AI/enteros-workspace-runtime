@@ -191,7 +191,7 @@ class BaseAdapter(ABC):
     @staticmethod
     @abstractmethod
     def name() -> str:  # pragma: no cover
-        """Return the runtime identifier (e.g. 'langgraph', 'crewai').
+        """Return the runtime identifier (e.g. 'claude-code', 'codex').
         This must match the 'runtime' field in config.yaml."""
         ...
 
@@ -243,8 +243,8 @@ class BaseAdapter(ABC):
         latency profiles — claude-code synthesis on Opus + tool use
         legitimately runs 8-10 min between broadcasts; hermes synth
         with custom providers can be even slower. Hardcoding 5min for
-        everyone either cancels real work (claude-code synth) or
-        leaves wedged runtimes (langgraph) hanging too long.
+        everyone either cancels real work (claude-code synth) or leaves
+        other maintained runtimes hanging too long.
 
         Platform reads this from the heartbeat payload and stashes
         it per-workspace; dispatchA2A consults it before applying the
@@ -280,13 +280,13 @@ class BaseAdapter(ABC):
     #
     # Default implementations are filesystem-only (write to /configs,
     # append to CLAUDE.md). Runtimes with a dynamic tool registry
-    # (e.g. DeepAgents sub-agents) override the hooks to also register
+    # (e.g. sub-agent-capable runtimes) override the hooks to also register
     # in-process state.
 
     def memory_filename(self) -> str:
         """File under /configs that the runtime treats as long-lived memory.
 
-        Both Claude Code and DeepAgents read CLAUDE.md natively, so this is
+        Both Claude Code and maintained runtimes can read CLAUDE.md natively, so this is
         the sensible default. Override only if a runtime expects a different
         filename.
         """
@@ -296,7 +296,7 @@ class BaseAdapter(ABC):
         """Default no-op. Override on runtimes with a dynamic tool registry.
 
         Runtimes that pick tools up at startup via filesystem scan (Claude
-        Code reads /configs/skills, LangGraph globs **/*.py) don't need to
+        Code reads /configs/skills, native runtime globs **/*.py) don't need to
         do anything here — the adaptor's file-write step is enough.
         """
         return None
@@ -403,7 +403,7 @@ class BaseAdapter(ABC):
         self._snapshot_transcript: list | None = snapshot.get("transcript_lines")
 
     def register_subagent_hook(self, name: str, spec: dict) -> None:
-        """Default no-op. DeepAgents overrides to register a sub-agent."""
+        """Default no-op. Sub-agent-capable runtimes override to register a sub-agent."""
         return None
 
     def append_to_memory_hook(self, config: AdapterConfig, filename: str, content: str) -> None:

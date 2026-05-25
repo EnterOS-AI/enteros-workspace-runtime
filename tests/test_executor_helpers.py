@@ -1,6 +1,6 @@
 """Tests for executor_helpers.py — the shared helpers that back the
 adapter executors. Post-#87 the executors live in template repos
-(claude-code, gemini-cli, etc.); this module stays in molecule-runtime
+(claude-code, codex, openclaw, hermes); this module stays in molecule-runtime
 because the helpers are runtime-agnostic.
 
 Covers 100% of the public surface:
@@ -513,7 +513,7 @@ def test_get_a2a_instructions_cli_variant():
 
 def test_a2a_cli_instructions_use_module_invocation_not_legacy_app_path():
     # The CLI variant of the a2a instructions ships in the agent system
-    # prompt for non-MCP runtimes (Ollama, custom). The model copies the
+    # prompt for non-MCP custom runtimes. The model copies the
     # invocation form verbatim into shell calls, so any path drift here
     # silently breaks delegation. The legacy /app/a2a_cli.py path was
     # correct under the pre-#87 monolithic-template Docker layout but
@@ -523,7 +523,7 @@ def test_a2a_cli_instructions_use_module_invocation_not_legacy_app_path():
     out = get_a2a_instructions(mcp=False)
     assert "/app/a2a_cli.py" not in out, (
         "Legacy /app/a2a_cli.py path leaked back into the CLI-variant "
-        "system prompt — agents on Ollama/custom runtimes would copy "
+        "system prompt — agents on custom runtimes would copy "
         "this verbatim and every delegation would fail."
     )
     assert "python3 -m molecule_runtime.a2a_cli" in out

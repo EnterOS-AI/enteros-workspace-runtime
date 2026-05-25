@@ -190,9 +190,9 @@ async def test_executor_fast_acks_within_100ms_when_turn_in_flight(monkeypatch):
     ``turn_in_flight=True`` on the inbox entry — same shape the executor
     would have set when entering its astream loop. The second POST goes
     through the real executor code path and must return within 100 ms
-    instead of starting a fresh LangGraph run.
+    instead of starting a fresh runtime run.
     """
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
     from molecule_runtime.runtime_inbox import get_inbox
 
     context_id = "ctx-fastack"
@@ -210,7 +210,7 @@ async def test_executor_fast_acks_within_100ms_when_turn_in_flight(monkeypatch):
 
     agent = MagicMock()
     agent.astream_events = _hang_astream
-    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test-model")
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test-model")
 
     # Patch out the OTEL + telemetry + set_current_task side effects so
     # the test stays self-contained (no /registry/heartbeat HTTP).
@@ -264,7 +264,7 @@ async def test_executor_drains_inbox_and_restarts_astream(monkeypatch):
     Round 2: agent yields the final on_chat_model_end event and exits.
     The test asserts both messages flowed through the merged history.
     """
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
     from molecule_runtime.runtime_inbox import get_inbox
 
     context_id = "ctx-drain"
@@ -295,7 +295,7 @@ async def test_executor_drains_inbox_and_restarts_astream(monkeypatch):
 
     agent = MagicMock()
     agent.astream_events = _agent_astream
-    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test")
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
 
     monkeypatch.setattr(
         "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
@@ -337,9 +337,9 @@ async def test_executor_drains_inbox_and_restarts_astream(monkeypatch):
 async def test_executor_passes_image_attachment_as_multimodal_content(
     tmp_path, monkeypatch
 ):
-    """Image file parts must reach LangGraph as model-visible image
+    """Image file parts must reach native runtime as model-visible image
     content, not only as a text manifest."""
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
 
     png = tmp_path / "shape-probe.png"
     png.write_bytes(bytes.fromhex(
@@ -360,7 +360,7 @@ async def test_executor_passes_image_attachment_as_multimodal_content(
 
     agent = MagicMock()
     agent.astream_events = _agent_astream
-    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test")
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
 
     monkeypatch.setattr(
         "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
@@ -403,7 +403,7 @@ async def test_executor_passes_image_attachment_as_multimodal_content(
 @pytest.mark.asyncio
 async def test_executor_accepts_image_only_attachment(tmp_path, monkeypatch):
     """Image-only messages must not fail the empty-text guard."""
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
 
     png = tmp_path / "shape-probe.png"
     png.write_bytes(b"png")
@@ -421,7 +421,7 @@ async def test_executor_accepts_image_only_attachment(tmp_path, monkeypatch):
 
     agent = MagicMock()
     agent.astream_events = _agent_astream
-    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test")
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
     monkeypatch.setattr(
         "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
     )
@@ -457,7 +457,7 @@ async def test_executor_fast_ack_preserves_interrupt_image_attachment(
     tmp_path, monkeypatch
 ):
     """The nonblocking interrupt queue must keep multimodal content."""
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
     from molecule_runtime.runtime_inbox import get_inbox
 
     context_id = "ctx-fastack-image"
@@ -474,7 +474,7 @@ async def test_executor_fast_ack_preserves_interrupt_image_attachment(
 
     agent = MagicMock()
     agent.astream_events = _hang_astream
-    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test-model")
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test-model")
     monkeypatch.setattr(
         "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
     )
@@ -512,7 +512,7 @@ async def test_executor_interrupt_kills_subprocess(monkeypatch):
     long-running subprocess in the inbox. On interrupt the executor
     must call ``subprocess.terminate()`` so a ``bash -c "sleep 600"``
     doesn't block the new turn."""
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
     from molecule_runtime.runtime_inbox import get_inbox
 
     context_id = "ctx-killsub"
@@ -547,7 +547,7 @@ async def test_executor_interrupt_kills_subprocess(monkeypatch):
             }
     agent = MagicMock()
     agent.astream_events = _agent_astream
-    executor = LangGraphA2AExecutor(agent, heartbeat=None, model="test")
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
 
     monkeypatch.setattr(
         "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
@@ -591,7 +591,7 @@ async def test_cancel_propagates_sigterm_to_active_subprocess(monkeypatch):
     Assertion: cancel() calls .terminate() on the registered handle
     AND emits the protocol-required TASK_STATE_CANCELED event.
     """
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
     from molecule_runtime.runtime_inbox import get_inbox
 
     context_id = "ctx-stopall"
@@ -605,7 +605,7 @@ async def test_cancel_propagates_sigterm_to_active_subprocess(monkeypatch):
     entry.current_subprocess = fake_proc
     entry.turn_in_flight = True
 
-    executor = LangGraphA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
+    executor = RuntimeA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
 
     ctx = SimpleNamespace(context_id=context_id, task_id="task-1")
     event_queue = MagicMock()
@@ -646,7 +646,7 @@ async def test_cancel_escalates_to_sigkill_when_sigterm_ignored(monkeypatch):
     We fake a child that doesn't exit (returncode stays None forever)
     so the cancel grace-poll exhausts and triggers hard_kill_subprocess.
     """
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
     from molecule_runtime.runtime_inbox import get_inbox
 
     context_id = "ctx-stopall-stubborn"
@@ -657,7 +657,7 @@ async def test_cancel_escalates_to_sigkill_when_sigterm_ignored(monkeypatch):
     fake_proc.poll.return_value = None
     entry.current_subprocess = fake_proc
 
-    executor = LangGraphA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
+    executor = RuntimeA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
     ctx = SimpleNamespace(context_id=context_id, task_id="task-1")
     event_queue = MagicMock()
     event_queue.enqueue_event = AsyncMock()
@@ -682,9 +682,9 @@ async def test_cancel_safe_when_no_inbox_entry(monkeypatch):
     that has never received a turn" edge case — the cancel arrives
     before any sandbox tool registered a subprocess.
     """
-    from molecule_runtime.a2a_executor import LangGraphA2AExecutor
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
 
-    executor = LangGraphA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
+    executor = RuntimeA2AExecutor(MagicMock(), heartbeat=None, model="test-model")
     ctx = SimpleNamespace(context_id="ctx-never-executed", task_id="task-1")
     event_queue = MagicMock()
     event_queue.enqueue_event = AsyncMock()

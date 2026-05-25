@@ -143,7 +143,7 @@ jobs:
             echo "::error::DISPATCH_TOKEN secret missing; cannot update template runtime pins"
             exit 1
           fi
-          TEMPLATES="claude-code hermes openclaw codex langgraph autogen"
+          TEMPLATES="claude-code hermes openclaw codex"
           FAILED=""
           CREATED=""
           WORKDIR="$(mktemp -d)"

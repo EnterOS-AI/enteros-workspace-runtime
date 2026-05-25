@@ -166,7 +166,7 @@ async def main():  # pragma: no cover
     )
 
     # 3. Get adapter for this runtime
-    runtime = config.runtime or "langgraph"
+    runtime = config.runtime or "claude-code"
     adapter_cls = get_adapter(runtime)  # Raises KeyError if unknown — no silent fallback
 
     adapter = adapter_cls()
@@ -423,7 +423,7 @@ async def main():  # pragma: no cover
             from molecule_runtime.skill_loader.watcher import SkillsWatcher
 
             def _on_skill_reload(updated_skill):
-                """Rebuild the LangGraph agent when a skill changes in-place."""
+                """Rebuild the runtime agent when a skill changes in-place."""
                 if not hasattr(adapter, "loaded_skills"):
                     return
                 # Replace the matching skill in the adapter's skill list
@@ -448,17 +448,8 @@ async def main():  # pragma: no cover
                     for sk in adapter.loaded_skills:
                         skill_tools.extend(sk.tools)
                     adapter.all_tools = base_tools + skill_tools
-                    # Rebuild compiled agent so next ainvoke picks up new tools
-                    try:
-                        from molecule_runtime.agent import create_agent
-                        new_agent = create_agent(
-                            config.model, adapter.all_tools, adapter.system_prompt
-                        )
-                        executor.agent = new_agent
-                        print(f"Skills hot-reload: '{updated_skill.metadata.id}' reloaded — "
-                              f"{len(updated_skill.tools)} tool(s)")
-                    except Exception as rebuild_err:
-                        print(f"Skills hot-reload: agent rebuild failed: {rebuild_err}")
+                    print(f"Skills hot-reload: '{updated_skill.metadata.id}' reloaded — "
+                          f"{len(updated_skill.tools)} tool(s)")
 
             skills_watcher = SkillsWatcher(
                 config_path=config_path,

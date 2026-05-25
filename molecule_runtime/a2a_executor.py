@@ -1,11 +1,11 @@
-"""Bridge between LangGraph agent and A2A protocol, with SSE streaming support.
+"""Bridge between runtime agent and A2A protocol, with SSE streaming support.
 
 Non-blocking inbound (task #378)
 --------------------------------
 When ``MOLECULE_A2A_NONBLOCKING=true``, ``_core_execute`` cooperates with
 ``molecule_runtime.runtime_inbox`` so a second POST sharing the running
 turn's ``context_id`` returns within ~50 ms instead of queuing behind the
-in-flight LangGraph turn. The in-flight turn polls the inbox between
+in-flight runtime turn. The in-flight turn polls the inbox between
 ``astream_events`` iterations and re-runs with the merged message history
 when an interrupt fires. See ``runtime_inbox.py`` for the full design and
 upstream a2a-protocol spec citation ("Task Execution and Interruption" §3).
@@ -32,7 +32,7 @@ Client compatibility
     ``consume_and_emit()`` yields every event above as SSE, letting the client
     render tokens in real time.
 
-LangGraph integration
+native runtime integration
 ---------------------
 Uses ``agent.astream_events(version="v2")`` to receive ``on_chat_model_stream``
 events with ``AIMessageChunk`` payloads.  Text is extracted from both plain
@@ -96,9 +96,9 @@ try:
 except ValueError:
     _WORKSPACE_ID = "unknown"
 
-# LangGraph ReAct cycle budget per turn. Library default is 25; 500 covers
+# runtime agent cycle budget per turn. Library default is 25; 500 covers
 # PM fan-outs (plan → 6 delegations → 6 awaits → 6 results → synthesize ≈
-# 30+ steps even before retries). Overridable via LANGGRAPH_RECURSION_LIMIT.
+# 30+ steps even before retries). Overridable via MOLECULE_RECURSION_LIMIT.
 DEFAULT_RECURSION_LIMIT = 500
 
 
@@ -120,22 +120,22 @@ def _extract_plain_message_text(context: RequestContext) -> str:
 
 
 def _parse_recursion_limit() -> int:
-    """Read LANGGRAPH_RECURSION_LIMIT; fall back to DEFAULT_RECURSION_LIMIT
+    """Read MOLECULE_RECURSION_LIMIT; fall back to DEFAULT_RECURSION_LIMIT
     with a WARNING log on any unparseable or non-positive value."""
-    raw = os.environ.get("LANGGRAPH_RECURSION_LIMIT", "")
+    raw = os.environ.get("MOLECULE_RECURSION_LIMIT", "")
     if not raw:
         return DEFAULT_RECURSION_LIMIT
     try:
         n = int(raw)
     except ValueError:
         logger.warning(
-            "LANGGRAPH_RECURSION_LIMIT=%r is not an integer; using default %d",
+            "MOLECULE_RECURSION_LIMIT=%r is not an integer; using default %d",
             raw, DEFAULT_RECURSION_LIMIT,
         )
         return DEFAULT_RECURSION_LIMIT
     if n <= 0:
         logger.warning(
-            "LANGGRAPH_RECURSION_LIMIT=%d is not positive; using default %d",
+            "MOLECULE_RECURSION_LIMIT=%d is not positive; using default %d",
             n, DEFAULT_RECURSION_LIMIT,
         )
         return DEFAULT_RECURSION_LIMIT
@@ -201,8 +201,8 @@ def _extract_chunk_text(content) -> list[str]:
     return []
 
 
-class LangGraphA2AExecutor(AgentExecutor):
-    """Bridges LangGraph agent to A2A event model with SSE streaming support.
+class RuntimeA2AExecutor(AgentExecutor):
+    """Bridges runtime agent to A2A event model with SSE streaming support.
 
     Always uses ``agent.astream_events()`` so that:
     - Streaming clients (``message/stream``) receive token-level SSE events.
@@ -211,7 +211,7 @@ class LangGraphA2AExecutor(AgentExecutor):
     """
 
     def __init__(self, agent, heartbeat=None, model: str = "unknown"):
-        self.agent = agent  # Compiled LangGraph graph (create_react_agent output)
+        self.agent = agent  # Compiled runtime graph (create_react_agent output)
         self._heartbeat = heartbeat
         self._model = model  # e.g. "anthropic:claude-sonnet-4-6"
 
@@ -412,7 +412,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                     # ── Step 1: signal "working" to streaming clients ─────────
                     await updater.start_work()
 
-                    # ── Step 2: stream tokens via LangGraph astream_events ────
+                    # ── Step 2: stream tokens via native runtime astream_events ────
                     # Each "on_chat_model_stream" event carries an AIMessageChunk.
                     # We emit one TaskArtifactUpdateEvent per text chunk so SSE
                     # clients can render tokens in real time.
@@ -437,7 +437,7 @@ class LangGraphA2AExecutor(AgentExecutor):
 
                     # ── Tool trace: collect every tool invocation for
                     # platform-level observability ────────────────────
-                    # Keyed by run_id so parallel tool calls (LangGraph
+                    # Keyed by run_id so parallel tool calls (native runtime
                     # supports them) pair start→end correctly. Capped at
                     # MAX_TOOL_TRACE entries to prevent runaway loops from
                     # ballooning the JSONB payload.
@@ -462,7 +462,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                         _was_interrupted = False
                         async for event in _astream_iter:
                             # Cooperative interrupt check — runs between
-                            # every LangGraph event so even a long
+                            # every runtime event so even a long
                             # tool-call iteration can be aborted by an
                             # inbound message. The check is O(1)
                             # (asyncio.Event.is_set) so this stays
@@ -476,7 +476,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                                 _inbox_entry.kill_subprocess()
                                 _was_interrupted = True
                                 # Close the iterator promptly so any
-                                # pending LangGraph coroutines see the
+                                # pending native runtime coroutines see the
                                 # cancellation and clean up.
                                 try:
                                     await _astream_iter.aclose()
@@ -562,7 +562,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                             messages.append(("ai", _partial))
                             _inbox_entry.last_accumulated = _partial
                         # Each queued message becomes a fresh human turn
-                        # in arrival order. The LangGraph agent treats
+                        # in arrival order. The runtime agent treats
                         # them as a normal multi-turn continuation.
                         for _m in _pending:
                             messages.append(("human", _m))
@@ -610,8 +610,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                 # If the reply mentions /workspace/... paths, stage each one
                 # and emit as FileParts alongside the text so the canvas can
                 # render a download button. Same contract the hermes executor
-                # uses — every runtime going through this code path (langgraph,
-                # deepagents, future ReAct variants) inherits it.
+                # uses — every runtime going through this code path inherits it.
                 _outbound = collect_outbound_files(final_text)
                 if _outbound:
                     # NOTE: do NOT re-import `Part` here. It is already imported
@@ -716,7 +715,7 @@ class LangGraphA2AExecutor(AgentExecutor):
 
           1. Look up the inbox entry for this context_id.
           2. Set ``interrupt_event`` so the astream loop wakes between
-             LangGraph events and bails out cooperatively (the same path
+             runtime events and bails out cooperatively (the same path
              a follow-on canvas message takes — #378).
           3. SIGTERM the registered subprocess via ``kill_subprocess()``.
           4. Grace-poll for up to 2s; SIGKILL via ``hard_kill_subprocess()``
