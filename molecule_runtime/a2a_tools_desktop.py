@@ -204,6 +204,8 @@ async def tool_desktop_open_url(url: str) -> str:
             f"DISPLAY={DISPLAY}",
             *_browser_args(browser, profile, url),
         ])
+        if browser == "falkon":
+            _size_falkon_window()
     except OSError as exc:
         return _json({"ok": False, "error": str(exc)})
     return _json({"ok": True, "browser": browser, "url": url})
@@ -211,7 +213,15 @@ async def tool_desktop_open_url(url: str) -> str:
 
 def _browser_args(browser: str, profile: Path, url: str) -> list[str]:
     if browser == "falkon":
-        return [browser, url]
+        return [
+            "XDG_RUNTIME_DIR=/tmp/runtime-ubuntu",
+            browser,
+            "--no-remote",
+            "--new-window",
+            "--profile",
+            "molecule-desktop",
+            url,
+        ]
     return [
         browser,
         "--disable-gpu",
@@ -221,3 +231,24 @@ def _browser_args(browser: str, profile: Path, url: str) -> list[str]:
         f"--user-data-dir={profile}",
         url,
     ]
+
+
+def _size_falkon_window() -> None:
+    _host_cmd([
+        "xdotool",
+        "search",
+        "--sync",
+        "--onlyvisible",
+        "--class",
+        "falkon",
+        "windowmove",
+        "%@",
+        "10",
+        "37",
+        "windowsize",
+        "%@",
+        "1280",
+        "900",
+        "windowactivate",
+        "%@",
+    ], timeout=20)
