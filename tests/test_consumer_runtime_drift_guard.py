@@ -17,9 +17,12 @@ def test_detects_top_level_workspace_runtime_tree(tmp_path: Path) -> None:
     repo = tmp_path / "molecule-core"
     (repo / "workspace").mkdir(parents=True)
 
-    findings = guard.find_runtime_drift("molecule-core", repo)
+    import check_consumer_runtime_drift as guard
 
-    assert [(finding.path, finding.reason) for finding in findings] == [
+    assert [(finding.path, finding.reason) for finding in guard.find_runtime_drift(
+        "molecule-core", repo,
+        runtime_root=Path(__file__).resolve().parents[1]
+    )] == [
         (
             "workspace/",
             "top-level workspace/ runtime tree is forbidden; use the runtime package",
@@ -31,9 +34,12 @@ def test_detects_nested_vendored_molecule_runtime_package(tmp_path: Path) -> Non
     repo = tmp_path / "molecule-ai-workspace-template-hermes"
     (repo / "vendor" / "molecule_runtime").mkdir(parents=True)
 
-    findings = guard.find_runtime_drift("molecule-ai-workspace-template-hermes", repo)
+    import check_consumer_runtime_drift as guard
 
-    assert [(finding.path, finding.reason) for finding in findings] == [
+    assert [(finding.path, finding.reason) for finding in guard.find_runtime_drift(
+        "molecule-ai-workspace-template-hermes", repo,
+        runtime_root=Path(__file__).resolve().parents[1]
+    )] == [
         (
             "vendor/molecule_runtime/",
             "vendored molecule_runtime/ package is forbidden; import the SSOT package",
@@ -41,14 +47,42 @@ def test_detects_nested_vendored_molecule_runtime_package(tmp_path: Path) -> Non
     ]
 
 
-def test_allows_runtime_pins_and_workspace_path_mentions(tmp_path: Path) -> None:
+def test_detects_runtime_pin_drift(tmp_path: Path) -> None:
+    """DriftFinding fires when .runtime-version differs from SSOT (runtime#53)."""
+    repo = tmp_path / "molecule-ai-workspace-template-claude-code"
+    repo.mkdir()
+    (repo / ".runtime-version").write_text("0.2.1\n")  # stale drift from SSOT 0.3.6
+
+    import check_consumer_runtime_drift as guard
+
+    findings = guard.find_runtime_drift(
+        "molecule-ai-workspace-template-claude-code", repo,
+        runtime_root=Path(__file__).resolve().parents[1],
+    )
+    assert len(findings) == 1
+    assert findings[0].path == ".runtime-version"
+    assert "runtime pin drift" in findings[0].reason
+    assert "0.2.1" in findings[0].reason
+
+
+def test_allows_runtime_pin_matching_ssot(tmp_path: Path) -> None:
+    """No drift finding when .runtime-version matches SSOT (even if older)."""
     repo = tmp_path / "molecule-ai-workspace-template-codex"
     repo.mkdir()
-    (repo / ".runtime-version").write_text("0.2.0\n")
-    (repo / "requirements.txt").write_text("molecule-ai-workspace-runtime==0.2.0\n")
+
+    import check_consumer_runtime_drift as guard
+
+    # SSOT 0.3.6 is fresh; use that version so no drift.
+    (repo / ".runtime-version").write_text(guard.current_runtime_version(
+        Path(__file__).resolve().parents[1]
+    ) + "\n")
+    (repo / "requirements.txt").write_text("molecule-ai-workspace-runtime==0.3.6\n")
     (repo / "README.md").write_text("Mount files at /workspace and import molecule_runtime.\n")
 
-    assert guard.find_runtime_drift("molecule-ai-workspace-template-codex", repo) == []
+    assert guard.find_runtime_drift(
+        "molecule-ai-workspace-template-codex", repo,
+        runtime_root=Path(__file__).resolve().parents[1],
+    ) == []
 
 
 def test_clone_consumers_retries_on_transient_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

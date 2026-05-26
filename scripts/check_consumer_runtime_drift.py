@@ -51,8 +51,39 @@ class DriftFinding:
     reason: str
 
 
-def find_runtime_drift(repo_name: str, repo_path: Path) -> list[DriftFinding]:
+def current_runtime_version(runtime_root: Path) -> str:
+    """Read the SSOT runtime version from runtime_root/pyproject.toml."""
+    pyproject = runtime_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return ""
+    try:
+        import tomli as _tomli
+
+        return _tomli.load(pyproject.open("rb")).get("project", {}).get("version", "")
+    except Exception:
+        # Fallback: regex scan if tomli unavailable
+        content = pyproject.read_text()
+        for line in content.splitlines():
+            if line.strip().startswith("version"):
+                return line.split("=")[1].strip().strip('"').strip("'")
+        return ""
+
+
+def find_runtime_drift(repo_name: str, repo_path: Path, runtime_root: Path | None = None) -> list[DriftFinding]:
     findings: list[DriftFinding] = []
+    sso_runtime_version = current_runtime_version(runtime_root or Path(__file__).resolve().parents[1])
+
+    runtime_version_path = repo_path / ".runtime-version"
+    if runtime_version_path.is_file():
+        pinned = runtime_version_path.read_text().strip()
+        if pinned and sso_runtime_version and pinned != sso_runtime_version:
+            findings.append(
+                DriftFinding(
+                    repo=repo_name,
+                    path=".runtime-version",
+                    reason=f"runtime pin drift: pinned={pinned}, SSOT={sso_runtime_version}",
+                )
+            )
 
     workspace_dir = repo_path / "workspace"
     if workspace_dir.is_dir():
@@ -186,8 +217,9 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         findings: list[DriftFinding] = []
+        runtime_root = Path(__file__).resolve().parents[1]
         for repo, path in paths.items():
-            findings.extend(find_runtime_drift(repo, path))
+            findings.extend(find_runtime_drift(repo, path, runtime_root=runtime_root))
 
         if findings:
             print(format_findings(findings), file=sys.stderr)
