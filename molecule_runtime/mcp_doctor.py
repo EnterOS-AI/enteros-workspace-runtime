@@ -411,7 +411,7 @@ def run() -> int:
             verdicts.append(chk())
         except Exception as e:
             # A buggy check shouldn't kill the rest of the doctor run.
-            print(f"  [BUG]  {chk.__name__}: unexpected {type(e).__name__}: {e}")
+            print(f"  [CHECK-ERROR]  {chk.__name__}: unexpected {type(e).__name__}: {e}")
             verdicts.append("fail")
     print()
     fails = sum(1 for v in verdicts if v == "fail")

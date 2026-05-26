@@ -16,15 +16,21 @@ Shape taxonomy (one class per shape; add more as the ecosystem evolves):
   <https://agentskills.io>`_ format (``SKILL.md`` + ``scripts/`` +
   ``references/`` + ``assets/``), plus Molecule AI's optional ``rules/`` and
   root-level prompt fragments at the plugin level. Works on every runtime
-  we support. **This is the default and covers the common case.**
+  we support (the spec's filesystem layout makes activation trivial on
+  Claude Code, our adapter code does the equivalent on DeepAgents /
+  LangGraph / etc.). **This is the default and covers the common case.**
 
 Planned as the ecosystem matures (none are implemented yet — rule of
 three: promote a class here only after 3+ plugins ship the same custom
 shape via their own ``adapters/<runtime>.py``):
 
 * :class:`MCPServerAdaptor` — install a plugin as an MCP server ✅ (issue #847)
-* ``RAGPipelineAdaptor`` — wire a retriever + index *(TODO)*
-* ``WebhookAdaptor`` — register an event handler *(TODO)*
+* ``DeepAgentsSubagentAdaptor`` — register a DeepAgents sub-agent
+  (runtime-locked to deepagents) *(backlog — no concrete timeline)*
+* ``LangGraphSubgraphAdaptor`` — install a LangGraph sub-graph *(backlog)*
+* ``RAGPipelineAdaptor`` — wire a retriever + index *(backlog)*
+* ``SwarmAdaptor`` — bind an OpenAI-swarm / AutoGen-swarm *(backlog)*
+* ``WebhookAdaptor`` — register an event handler *(backlog)*
 
 Plugins whose shape doesn't match any built-in ship their own adapter
 class in ``plugins/<name>/adapters/<runtime>.py`` — full Python, no
@@ -45,8 +51,7 @@ from .protocol import SKILLS_SUBDIR, InstallContext, InstallResult
 # Keys scrubbed from plugin setup.sh env — matches skill_loader/loader.py's
 # _SCRUB_KEYS so a malicious plugin's setup.sh cannot exfiltrate credentials
 # that are available to the parent process. Fixes issue #19 (CWE-C-312).
-# Re-applied during standalone-as-SSOT migration; originally landed in
-# standalone commit d694408.
+# Enforced by test_plugins_builtins_env_scrub.py.
 _SCRUB_KEYS = frozenset((
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -113,8 +118,8 @@ class AgentskillsAdaptor:
     marker (best-effort — if the user edited CLAUDE.md manually, only the
     marker line itself is removed).
 
-    For shapes other than agentskills (MCP server, sub-agent,
-    native runtime sub-graph, RAG pipeline, swarm, webhook handler, etc.), see
+    For shapes other than agentskills (MCP server, DeepAgents sub-agent,
+    LangGraph sub-graph, RAG pipeline, swarm, webhook handler, etc.), see
     the module docstring for the planned sibling adapters, or ship a custom
     adapter class in the plugin's ``adapters/<runtime>.py``.
     """
