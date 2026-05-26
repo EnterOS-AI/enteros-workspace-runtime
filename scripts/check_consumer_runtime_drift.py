@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -99,17 +100,24 @@ def clone_consumers(
     for repo in repos:
         dest = workdir / repo
         clone_url = f"{base_url}/molecule-ai/{repo}.git"
-        result = subprocess.run(
-            ["git", "clone", "--depth", "1", clone_url, str(dest)],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode != 0:
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", clone_url, str(dest)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                paths[repo] = dest
+                break
+            if attempt < 3:
+                time.sleep(2 ** (attempt - 1))
+                continue
             stderr = result.stderr.replace(token, "<redacted>").replace(safe_token, "<redacted>")
-            raise RuntimeError(f"failed to clone {repo}: {stderr.strip()}")
-        paths[repo] = dest
+            raise RuntimeError(f"failed to clone {repo} after 3 attempts: {stderr.strip()}")
     return paths
 
 

@@ -143,7 +143,13 @@ jobs:
             echo "::error::DISPATCH_TOKEN secret missing; cannot update template runtime pins"
             exit 1
           fi
-          TEMPLATES="claude-code hermes openclaw codex"
+          # RCA #52 Finding 1 (High): credential in clone URL + no timeout.
+          # Fix: add 60s timeout to git clone/push to prevent indefinite hangs and
+          # reduce token-exposure surface. GIT_TERMINAL_PROMPT=0 prevents interactive
+          # re-prompt which could log the token-bearing URL.
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_SSH_COMMAND="timeout 60 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+          TEMPLATES="claude-code hermes openclaw codex langgraph autogen"
           FAILED=""
           CREATED=""
           WORKDIR="$(mktemp -d)"
@@ -153,7 +159,7 @@ jobs:
             REPO="molecule-ai/molecule-ai-workspace-template-$tpl"
             CLONE="$WORKDIR/$tpl"
             BRANCH="chore/runtime-$RUNTIME_VERSION"
-            git clone "https://x-access-token:${DISPATCH_TOKEN}@${GITEA_URL#https://}/$REPO.git" "$CLONE"
+            timeout 60 git clone "https://x-access-token:${DISPATCH_TOKEN}@${GITEA_URL#https://}/$REPO.git" "$CLONE"
             if [ $? -ne 0 ]; then
               FAILED="$FAILED $tpl:clone"
               continue
@@ -168,7 +174,7 @@ jobs:
             git checkout -B "$BRANCH"
             git add .runtime-version
             git commit -m "chore(runtime): bump runtime to $RUNTIME_VERSION"
-            git push -u origin "$BRANCH" --force
+            timeout 60 git push -u origin "$BRANCH" --force
             if [ $? -ne 0 ]; then
               FAILED="$FAILED $tpl:push-branch"
               cd - >/dev/null
@@ -180,6 +186,7 @@ jobs:
               -X POST \
               -H "Authorization: token ${DISPATCH_TOKEN}" \
               -H "Content-Type: application/json" \
+              -m 30 \
               -d "{\"base\":\"main\",\"head\":\"$BRANCH\",\"title\":\"chore(runtime): bump runtime to $RUNTIME_VERSION\",\"body\":\"$BODY\"}" \
               "$GITEA_URL/api/v1/repos/$REPO/pulls")
             HTTP=$(printf '%s' "$RESP" | tail -n 1)
