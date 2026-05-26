@@ -1,6 +1,5 @@
 """Regression tests for RBAC fail-secure fix (issue #11, CWE-285)."""
 
-import pytest
 from unittest import mock
 
 

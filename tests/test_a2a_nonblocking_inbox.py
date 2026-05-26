@@ -30,7 +30,6 @@ in-flight turn. See ``runtime_inbox.py`` docstring for the citation.
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock

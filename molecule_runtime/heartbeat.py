@@ -13,8 +13,6 @@ import json
 import logging
 import os
 import time
-from pathlib import Path
-
 import httpx
 
 from molecule_runtime.platform_auth import auth_headers, refresh_cache, self_source_headers

@@ -7,6 +7,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from a2a.server.agent_execution import AgentExecutor
+
+from molecule_runtime.event_log import DisabledEventLog, EventLogBackend
+
 # ---------------------------------------------------------------------------
 # Provider routing — type alias + resolver used by individual adapters.
 # Each adapter defines its own ProviderRegistry with the providers it accepts.
@@ -53,10 +57,6 @@ def resolve_provider_routing(
     base_url = env_url or config_url or default_url
 
     return api_key, base_url, model_id
-
-from a2a.server.agent_execution import AgentExecutor
-
-from molecule_runtime.event_log import DisabledEventLog, EventLogBackend
 
 logger = logging.getLogger(__name__)
 

@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from molecule_runtime.attachment_vision import append_image_descriptions

@@ -55,7 +55,6 @@ from a2a.types import Part
 from a2a.helpers import new_text_message
 from molecule_runtime.shared_runtime import (
     extract_history as _extract_history,
-    extract_message_text,
     brief_task,
     set_current_task,
 )
@@ -84,13 +83,13 @@ from molecule_runtime.builtin_tools.telemetry import (
     get_tracer,
     record_llm_token_usage,
 )
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 
 logger = logging.getLogger(__name__)
 
 # CWE-20 (issue #14): _WORKSPACE_ID becomes an OpenTelemetry span
 # attribute; "unknown" sentinel preserved for the no-env fallback so the
 # tracer keeps working before the workspace ID is provisioned.
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     _WORKSPACE_ID = _get_workspace_id()
 except ValueError:
@@ -148,7 +147,6 @@ def _parse_recursion_limit() -> int:
 try:
     from molecule_runtime.builtin_tools.compliance import (
         AgencyTracker,
-        ExcessiveAgencyError,
         PromptInjectionError,
         redact_pii as _redact_pii,
         sanitize_input as _sanitize_input,

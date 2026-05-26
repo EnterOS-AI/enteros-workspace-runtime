@@ -9,8 +9,6 @@ import asyncio
 import json
 import logging
 
-import httpx
-
 logger = logging.getLogger(__name__)
 
 # Events that should trigger a system prompt rebuild

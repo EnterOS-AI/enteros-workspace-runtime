@@ -15,6 +15,7 @@ import os
 import httpx
 
 from molecule_runtime.platform_auth import auth_headers
+from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,6 @@ else:
     PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://localhost:8080")
 # Validate WORKSPACE_ID (CWE-20, issue #14) — interpolated into
 # /workspaces/{WORKSPACE_ID}/memories URL paths below.
-from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
 _WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
 if not _WORKSPACE_ID_raw:
     raise RuntimeError("WORKSPACE_ID environment variable is required but not set")

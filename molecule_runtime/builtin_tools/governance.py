@@ -50,9 +50,10 @@ import logging
 import os
 from typing import Any, Optional
 
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+
 logger = logging.getLogger(__name__)
 # CWE-20 (issue #14): WORKSPACE_ID flows into governance event records.
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     WORKSPACE_ID: str = _get_workspace_id()
 except ValueError:

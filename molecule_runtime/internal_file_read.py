@@ -33,8 +33,6 @@ import logging
 import mimetypes
 import os
 import urllib.parse
-from pathlib import Path
-
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 

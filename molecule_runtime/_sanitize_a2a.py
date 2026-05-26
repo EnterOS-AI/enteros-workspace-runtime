@@ -72,7 +72,10 @@ _INJECTION_PATTERNS = [
     # "INSTRUCTIONS" may appear at the start of a string or after a newline.
     (re.compile(r"(^|\n)INSTRUCTIONS?\b", re.IGNORECASE), " [ESCAPED_INSTRUCTIONS]"),
     (re.compile(r"(^|[^\w])IGNORE\s+ALL\b", re.IGNORECASE), r"\1[ESCAPED_IGNORE_ALL]"),
-    (re.compile(r"(^|[^\w])YOU\s+ARE\s+NOW\b", re.IGNORECASE), r"\1[ESCAPED_YOU_ARE_NOW]"),
+    (
+        re.compile(r"(^|[^\w])YOU\s+ARE\s+NOW\b", re.IGNORECASE),
+        r"\1[ESCAPED_YOU_ARE_NOW]",
+    ),
 ]
 
 

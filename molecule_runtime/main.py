@@ -4,16 +4,12 @@ Loads config -> discovers adapter -> setup -> create executor -> wrap in A2A -> 
 """
 
 import asyncio
-import json
 import os
 import socket
 
 import httpx
 import uvicorn
 # KI-009 a2a-sdk v1 migration: A2AStarletteApplication removed; use Starlette route factory
-from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCard, AgentCapabilities, AgentSkill, AgentInterface
 from starlette.applications import Starlette
 
@@ -34,6 +30,7 @@ from molecule_runtime.initial_prompt import (
     resolve_initial_prompt_marker,
 )
 from molecule_runtime.platform_auth import auth_headers, self_source_headers
+from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
 
 
 def get_machine_ip() -> str:  # pragma: no cover
@@ -67,11 +64,6 @@ def _check_delegation_results_pending() -> bool:
             return bool(rf.read().strip())
     except FileNotFoundError:
         return False
-
-
-# Re-exported from transcript_auth for the inline /transcript handler.
-# Separate module keeps the security-critical gate import-light + unit-testable.
-from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
 
 
 async def main():  # pragma: no cover
@@ -473,7 +465,6 @@ async def main():  # pragma: no cover
     # (claude-code reads ~/.claude/projects/<cwd>/<session>.jsonl). Other
     # runtimes return supported:false.
     from starlette.responses import JSONResponse
-    from starlette.routing import Route
 
     async def _transcript_handler(request):
         # Require workspace bearer token — the same token issued at registration

@@ -43,7 +43,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from molecule_runtime.rbac_policy import ROLE_PERMISSIONS, check_permission
+from molecule_runtime.rbac_policy import ROLE_PERMISSIONS  # noqa: F401
+from molecule_runtime.rbac_policy import check_permission  # noqa: F401
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 
 if TYPE_CHECKING:
     pass  # avoid circular import at runtime
@@ -61,7 +63,6 @@ AUDIT_LOG_PATH: str = os.environ.get(
 # though audit.jsonl is local-only (no URL/header surface), validating
 # at module load keeps an injection-bearing env from being persisted
 # into long-term audit storage.
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     WORKSPACE_ID: str = _get_workspace_id()
 except ValueError:

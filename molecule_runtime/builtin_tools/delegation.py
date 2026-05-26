@@ -11,7 +11,7 @@ via a status update.
 import asyncio
 import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -28,11 +28,11 @@ from molecule_runtime.builtin_tools.telemetry import (
     get_tracer,
     inject_trace_headers,
 )
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
 # CWE-20 (issue #14): validate WORKSPACE_ID before it lands in
 # /workspaces/{WORKSPACE_ID}/... URL paths or the X-Workspace-ID header.
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     WORKSPACE_ID = _get_workspace_id()
 except ValueError:

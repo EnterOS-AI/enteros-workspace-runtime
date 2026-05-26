@@ -15,11 +15,11 @@ import httpx
 # context — same surface as a2a_tools_delegation.py:325 (fixed via #492).
 # Issue #537.
 from molecule_runtime._sanitize_a2a import sanitize_a2a_result
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
 # Validate WORKSPACE_ID (CWE-20, issue #14) — interpolated into
 # /registry/{WORKSPACE_ID}/peers URL path below.
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     WORKSPACE_ID = _get_workspace_id()
 except ValueError:

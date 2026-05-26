@@ -42,11 +42,12 @@ try:  # pragma: no cover - optional runtime dependency in lightweight test envs
 except ImportError:  # pragma: no cover
     httpx = SimpleNamespace(AsyncClient=None)
 
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
 # CWE-20 (issue #14): validate WORKSPACE_ID before it lands in
 # /workspaces/{WORKSPACE_ID}/memories URL paths used by commit_memory /
 # recall_memory below.
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     WORKSPACE_ID = _get_workspace_id()
 except ValueError:

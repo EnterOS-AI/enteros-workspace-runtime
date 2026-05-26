@@ -3,13 +3,9 @@
 Verifies that plugin adapters using "from plugins_registry.builtins import ..."
 can be loaded via _load_module_from_path() without ModuleNotFoundError.
 """
-import sys
-import tempfile
 import os
+import tempfile
 from pathlib import Path
-
-# Ensure the plugins_registry package is importable
-import plugins_registry
 
 from plugins_registry import _load_module_from_path
 

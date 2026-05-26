@@ -52,3 +52,10 @@ include = ["molecule_runtime*", "plugins_registry*"]
 [tool.setuptools.package-data]
 "molecule_runtime" = ["py.typed", "scripts/*.sh"]
 "plugins_registry" = ["py.typed"]
+
+[tool.ruff.lint.per-file-ignores]
+# a2a_tools.py is the canonical re-export module — downstream consumers
+# (platform_tools/registry.py, builtin_tools/delegation.py, tests) import
+# tool handlers from here rather than from the submodules they were
+# extracted into (RFC #2873). F401 is expected and correct.
+"molecule_runtime/a2a_tools.py" = ["F401"]

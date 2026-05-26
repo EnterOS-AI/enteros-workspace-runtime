@@ -55,6 +55,8 @@ import os
 from contextvars import ContextVar
 from typing import Any, Optional
 
+from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -87,7 +89,6 @@ MEMORY_QUERY = "memory.query"
 # or appear in span attributes verbatim. Validate at module load —
 # "unknown" sentinel kept for the no-env fallback (multi-workspace mode
 # or pre-provision boot).
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 try:
     WORKSPACE_ID: str = _get_workspace_id()
 except ValueError:

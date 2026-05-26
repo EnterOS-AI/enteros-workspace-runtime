@@ -295,8 +295,8 @@ def test_read_delegation_results_valid_records(tmp_path, monkeypatch):
     assert "Response:" in out
     assert "Here is A" in out
     # Preview omitted when absent
-    lines_for_b = [l for l in out.splitlines() if "Task B" in l]
-    assert lines_for_b and not any("Response:" in l for l in lines_for_b[1:2])
+    lines_for_b = [ln for ln in out.splitlines() if "Task B" in ln]
+    assert lines_for_b and not any("Response:" in ln for ln in lines_for_b[1:2])
     # File consumed
     assert not results_file.exists()
 
