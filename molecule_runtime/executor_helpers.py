@@ -563,20 +563,24 @@ def brief_summary(text: str, max_len: int = BRIEF_SUMMARY_MAX_LEN) -> str:
 
 
 def extract_message_text(message: Any) -> str:
-    """Extract text from an A2A message (handles both .text and .root.text patterns)."""
-    parts = getattr(message, "parts", None) or []
-    text_parts: list[str] = []
-    for part in parts:
-        text = getattr(part, "text", None)
-        if text:
-            text_parts.append(text)
-            continue
-        root = getattr(part, "root", None)
-        if root is not None:
-            root_text = getattr(root, "text", None)
-            if root_text:
-                text_parts.append(root_text)
-    return " ".join(text_parts).strip()
+    """Extract text (plus a local-path attachment manifest) from an A2A message.
+
+    SSOT (runtime #2914): there used to be a SECOND, divergent definition of
+    this function here that ONLY pulled text parts and silently dropped
+    file-manifest attachments, while `shared_runtime.extract_message_text`
+    handled both. Callers split across the two and got different behaviour for
+    file-only / mixed messages. The canonical implementation now lives in
+    `shared_runtime` (it calls `extract_attached_files` from this module to
+    build the manifest). This thin wrapper delegates to it so there is exactly
+    one implementation. The lazy import avoids a module-level import cycle
+    (`shared_runtime` already imports from `executor_helpers`). Signature and
+    return type are unchanged for existing callers.
+    """
+    from molecule_runtime.shared_runtime import (
+        extract_message_text as _canonical_extract_message_text,
+    )
+
+    return _canonical_extract_message_text(message)
 
 
 # Word-boundary patterns for subprocess stderr classification. Using word

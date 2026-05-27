@@ -7,6 +7,19 @@ from typing import Any
 
 from a2a.server.agent_execution import RequestContext
 
+# SSOT (runtime #2914): `set_current_task` previously had a SECOND, divergent
+# definition here that opened a raw `httpx.AsyncClient` and posted the
+# heartbeat UNAUTHENTICATED. Every adapter that imports through
+# `shared_runtime` (langgraph + claude-code via a2a_executor, autogen via
+# adapters.shared_runtime) silently used that un-auth'd path. The canonical,
+# authenticated implementation lives in `executor_helpers` (it routes through
+# the shared `get_http_client()` and attaches `platform_auth.auth_headers()`).
+# Re-export it here so there is exactly one implementation and every caller
+# gets the authenticated heartbeat push. The name and signature are unchanged,
+# so existing `from ...shared_runtime import set_current_task` callers keep
+# working.
+from molecule_runtime.executor_helpers import set_current_task  # noqa: F401
+
 
 def _extract_part_text(part) -> str:
     """Extract text from a message part, handling dicts and A2A objects."""
@@ -26,12 +39,38 @@ def _extract_part_text(part) -> str:
 
 
 def extract_message_text(context_or_parts) -> str:
-    """Extract text plus a local-path attachment manifest from A2A parts."""
+    """Extract text plus a local-path attachment manifest from an A2A message.
+
+    SSOT (runtime #2914): this is the single canonical implementation. It used
+    to be duplicated in `executor_helpers` (text-only, dropped attachments);
+    that copy now delegates here. Accepts any of three shapes so every former
+    caller of either copy keeps working:
+
+      * a ``RequestContext`` (``.message.parts``),
+      * a bare A2A ``Message`` (``.parts``), or
+      * a raw list/iterable of parts.
+
+    Returns the joined text and, when the message carries file attachments,
+    appends an ``Attached files:`` manifest of resolved local paths (built via
+    ``executor_helpers.extract_attached_files``).
+    """
+    # Resolve (message, parts) across the three accepted input shapes.
     message = getattr(context_or_parts, "message", None)
-    parts = getattr(message, "parts", None)
-    if parts is None:
-        parts = context_or_parts
+    if message is not None and getattr(message, "parts", None) is not None:
+        # RequestContext: parts live under .message.parts
+        parts = message.parts
+    elif getattr(context_or_parts, "parts", None) is not None:
+        # Bare A2A Message: parts live directly on the object
         message = context_or_parts
+        parts = context_or_parts.parts
+    else:
+        # Raw parts list (or an object with neither attr)
+        message = context_or_parts
+        parts = context_or_parts
+    if not isinstance(parts, (list, tuple)):
+        # Defensive: an object exposing neither .message nor .parts (e.g. an
+        # empty SimpleNamespace) must not blow up the iteration below.
+        parts = []
     text = " ".join(
         text for part in (parts or []) if (text := _extract_part_text(part))
     ).strip()
@@ -182,44 +221,6 @@ def brief_task(text: str, limit: int = 60) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
-async def set_current_task(heartbeat: Any, task: str) -> None:
-    """Update current task on heartbeat and push immediately to platform.
-
-    Uses increment/decrement instead of binary 0/1 so agents can track
-    multiple concurrent tasks (e.g. a cron running while an A2A delegation
-    arrives). The counter never goes below 0.
-
-    Pushes immediately on BOTH increment and decrement to avoid phantom-busy
-    (#1372) where active_tasks=1 persisted in the platform DB indefinitely.
-    """
-    if heartbeat:
-        if task:
-            heartbeat.active_tasks = getattr(heartbeat, "active_tasks", 0) + 1
-            heartbeat.current_task = task
-        else:
-            heartbeat.active_tasks = max(0, getattr(heartbeat, "active_tasks", 0) - 1)
-            if heartbeat.active_tasks == 0:
-                heartbeat.current_task = ""
-
-    import os
-    workspace_id = os.environ.get("WORKSPACE_ID", "")
-    platform_url = os.environ.get("PLATFORM_URL", "")
-    if workspace_id and platform_url:
-        try:
-            import httpx
-            active = getattr(heartbeat, "active_tasks", 0) if heartbeat else (1 if task else 0)
-            cur_task = getattr(heartbeat, "current_task", task or "") if heartbeat else (task or "")
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                await client.post(
-                    f"{platform_url}/registry/heartbeat",
-                    json={
-                        "workspace_id": workspace_id,
-                        "current_task": cur_task,
-                        "active_tasks": active,
-                        "error_rate": 0,
-                        "sample_error": "",
-                        "uptime_seconds": 0,
-                    },
-                )
-        except Exception:
-            pass  # Best-effort
+# `set_current_task` is re-exported from `executor_helpers` at the top of this
+# module (see the SSOT note there). The previous local, unauthenticated
+# implementation was removed in runtime #2914.
