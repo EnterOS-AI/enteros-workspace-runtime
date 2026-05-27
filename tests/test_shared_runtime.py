@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -24,76 +24,92 @@ def _run(coro):
         loop.close()
 
 
+def _install_mock_http_client(monkeypatch) -> AsyncMock:
+    """Pin a mock onto the shared `executor_helpers._http_client`.
+
+    runtime #2914: `set_current_task` re-exports the authenticated
+    `executor_helpers` implementation, which posts via the shared
+    `get_http_client()` (and attaches `platform_auth.auth_headers()`) rather
+    than opening a raw `httpx.AsyncClient`. Tests must mock that shared client.
+    """
+    import molecule_runtime.executor_helpers as eh
+
+    client = AsyncMock()
+    client.is_closed = False
+    monkeypatch.setattr(eh, "_http_client", client)
+    return client
+
+
 class TestSetCurrentTask:
-    """set_current_task() must push heartbeat on both SET and CLEAR."""
+    """set_current_task() must push an AUTHENTICATED heartbeat on SET and CLEAR."""
 
     @pytest.fixture(autouse=True)
     def _env(self, monkeypatch):
         monkeypatch.setenv("WORKSPACE_ID", "test-workspace-001")
         monkeypatch.setenv("PLATFORM_URL", "http://test.platform:8080")
 
+    @pytest.fixture(autouse=True)
+    def _reset_http_client(self):
+        import molecule_runtime.executor_helpers as eh
+
+        eh.reset_http_client_for_tests()
+        yield
+        eh.reset_http_client_for_tests()
+
     @pytest.fixture
     def heartbeat(self):
         return MockHeartbeat()
 
-    def test_set_pushes_with_active_tasks_1(self, heartbeat):
-        """Setting a task posts active_tasks=1 immediately."""
+    def test_set_pushes_with_active_tasks_1(self, heartbeat, monkeypatch):
+        """Setting a task posts active_tasks=1 immediately via the shared client."""
         from molecule_runtime.adapters.shared_runtime import set_current_task
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client_cls.return_value.__aenter__.return_value = mock_client
-            mock_response = AsyncMock()
-            mock_response.status_code = 200
-            mock_client.post.return_value = mock_response
+        client = _install_mock_http_client(monkeypatch)
+        client.post = AsyncMock(return_value=AsyncMock(status_code=200))
 
-            _run(set_current_task(heartbeat, "Summarising docs"))
+        _run(set_current_task(heartbeat, "Summarising docs"))
 
-            mock_client.post.assert_called_once()
-            call_args = mock_client.post.call_args
-            assert call_args.kwargs["json"]["active_tasks"] == 1
-            assert call_args.kwargs["json"]["current_task"] == "Summarising docs"
+        client.post.assert_called_once()
+        call_args = client.post.call_args
+        assert call_args.kwargs["json"]["active_tasks"] == 1
+        assert call_args.kwargs["json"]["current_task"] == "Summarising docs"
+        # The authenticated path always passes a headers kwarg (auth_headers()).
+        assert "headers" in call_args.kwargs
 
         assert heartbeat.active_tasks == 1
         assert heartbeat.current_task == "Summarising docs"
 
-    def test_clear_pushes_with_active_tasks_0(self, heartbeat):
+    def test_clear_pushes_with_active_tasks_0(self, heartbeat, monkeypatch):
         """Clearing a task posts active_tasks=0 immediately (phantom-busy fix)."""
         from molecule_runtime.adapters.shared_runtime import set_current_task
 
         heartbeat.current_task = "Previous task"
         heartbeat.active_tasks = 1
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client_cls.return_value.__aenter__.return_value = mock_client
-            mock_response = AsyncMock()
-            mock_response.status_code = 200
-            mock_client.post.return_value = mock_response
+        client = _install_mock_http_client(monkeypatch)
+        client.post = AsyncMock(return_value=AsyncMock(status_code=200))
 
-            _run(set_current_task(heartbeat, ""))
+        _run(set_current_task(heartbeat, ""))
 
-            mock_client.post.assert_called_once()
-            call_args = mock_client.post.call_args
-            assert call_args.kwargs["json"]["active_tasks"] == 0
-            assert call_args.kwargs["json"]["current_task"] == ""
+        client.post.assert_called_once()
+        call_args = client.post.call_args
+        assert call_args.kwargs["json"]["active_tasks"] == 0
+        assert call_args.kwargs["json"]["current_task"] == ""
 
         assert heartbeat.active_tasks == 0
         assert heartbeat.current_task == ""
 
-    def test_clear_updates_heartbeat_object_even_if_post_fails(self, heartbeat):
+    def test_clear_updates_heartbeat_object_even_if_post_fails(self, heartbeat, monkeypatch):
         """Heartbeat object is updated even when the HTTP POST raises."""
         from molecule_runtime.adapters.shared_runtime import set_current_task
 
         heartbeat.current_task = "Long running task"
         heartbeat.active_tasks = 1
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client_cls.return_value.__aenter__.return_value = mock_client
-            mock_client.post.side_effect = Exception("network error")
+        client = _install_mock_http_client(monkeypatch)
+        client.post = AsyncMock(side_effect=Exception("network error"))
 
-            _run(set_current_task(heartbeat, ""))
+        _run(set_current_task(heartbeat, ""))
 
         # Heartbeat object must still be updated even if post fails
         assert heartbeat.active_tasks == 0
@@ -107,13 +123,12 @@ class TestSetCurrentTask:
         monkeypatch.delenv("WORKSPACE_ID", raising=False)
         monkeypatch.setenv("PLATFORM_URL", "http://test.platform:8080")
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client_cls.return_value.__aenter__.return_value = mock_client
+        client = _install_mock_http_client(monkeypatch)
+        client.post = AsyncMock()
 
-            _run(set_current_task(heartbeat, "Any task"))
+        _run(set_current_task(heartbeat, "Any task"))
 
-        mock_client.post.assert_not_called()
+        client.post.assert_not_called()
 
 
 def test_extract_message_text_appends_attachment_manifest(monkeypatch, tmp_path):
@@ -171,23 +186,25 @@ def test_extract_message_text_file_only_message_returns_manifest(monkeypatch, tm
     assert "diagram.png (image/png)" in text
     assert str(image) in text
 
-    def test_none_heartbeat_skips_post(self, monkeypatch):
-        """Passing None as heartbeat object skips post (no-op, no crash).
 
-        When heartbeat is None the function must not raise even if env vars
-        are present — None is valid when heartbeat isn't wired yet.
-        """
-        from molecule_runtime.adapters.shared_runtime import set_current_task
+def test_none_heartbeat_skips_post(monkeypatch):
+    """Passing None as heartbeat object skips post (no-op, no crash).
 
-        # Ensure no env vars so httpx is definitely not called
-        monkeypatch.delenv("WORKSPACE_ID", raising=False)
-        monkeypatch.delenv("PLATFORM_URL", raising=False)
+    When heartbeat is None the function must not raise even if env vars
+    are present — None is valid when heartbeat isn't wired yet. (This used to
+    be dead code nested inside another test; lifted to module scope in
+    runtime #2914 and re-pointed at the shared authenticated client.)
+    """
+    from molecule_runtime.adapters.shared_runtime import set_current_task
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client_cls.return_value.__aenter__.return_value = mock_client
+    # Ensure no env vars so the heartbeat push is definitely skipped.
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
+    monkeypatch.delenv("PLATFORM_URL", raising=False)
 
-            # Must not raise — None is valid when heartbeat isn't wired yet
-            _run(set_current_task(None, "Task"))
+    client = _install_mock_http_client(monkeypatch)
+    client.post = AsyncMock()
 
-        mock_client.post.assert_not_called()
+    # Must not raise — None is valid when heartbeat isn't wired yet
+    _run(set_current_task(None, "Task"))
+
+    client.post.assert_not_called()
