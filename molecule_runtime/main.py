@@ -104,9 +104,16 @@ async def register_with_platform(
 
     Both failure shapes from the incident are retried here:
       * a transport-level exception (orchestrator unreachable), and
-      * a non-2xx HTTP response (Cloudflare 530 while the origin is down) —
-        the old code only special-cased ``== 200`` and silently treated
-        every other status as "registered".
+      * a transient server-side HTTP response — 5xx, plus Cloudflare edge
+        errors 520–530 (e.g. 530 while the origin is down) — the old code
+        only special-cased ``== 200`` and silently treated every other
+        status as "registered".
+
+    review 7658: a *client* error (4xx other than the Cloudflare 520–530
+    band) is NOT transient — it almost always means misconfiguration (bad
+    platform URL / wrong or missing auth → 401/403/404). Retrying it just
+    masks the real cause behind ~91s of backoff, so we short-circuit: log
+    the status (code only, no secrets) and return False immediately.
 
     Bounded by ``max_attempts`` so a permanently-misconfigured platform URL
     can't wedge boot forever. On exhaustion we return False (the caller
@@ -155,9 +162,26 @@ async def register_with_platform(
                 except Exception as parse_exc:
                     print(f"Warning: couldn't parse register response for token: {parse_exc}")
                 return True
-            # Non-2xx (e.g. Cloudflare 530 / tunnel 1033 while the
-            # orchestrator is down): NOT a successful registration — retry.
-            last_detail = f"HTTP {status}"
+            # internal#688 review (review 7658): classify the failure.
+            # Cloudflare edge errors 520–530 (e.g. 530 / tunnel 1033 while
+            # the orchestrator origin is down) are TRANSIENT — keep retrying.
+            if 520 <= status <= 530:
+                last_detail = f"HTTP {status} (Cloudflare edge — transient)"
+            elif 400 <= status < 500:
+                # A real 4xx (401/403/404/…) means misconfiguration, not a
+                # momentary outage: retrying just masks it behind ~91s of
+                # backoff. Fail fast and log the status so the misconfig is
+                # visible. Status code only — no headers/body — so no secret
+                # (e.g. the bearer in `headers`) can leak (CWE-532).
+                print(
+                    f"Register: HTTP {status} is a client error "
+                    f"(misconfiguration) — not retrying; proceeding "
+                    f"(heartbeat backfill is the recovery path)"
+                )
+                return False
+            else:
+                # 5xx (and any other non-2xx) — transient server-side, retry.
+                last_detail = f"HTTP {status}"
         except Exception as e:  # transport error — orchestrator unreachable
             last_detail = repr(e)
 

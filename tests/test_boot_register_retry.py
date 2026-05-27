@@ -27,7 +27,11 @@ backoff until it gets a 2xx, then returns True. These tests pin:
   - retries are bounded (gives up after max attempts, returns False, does
     NOT raise — boot must continue so the workspace can still serve
     traffic / be recovered by the heartbeat backfill),
-  - a first-try 200 does NOT sleep/retry (no regression in the hot path).
+  - a first-try 200 does NOT sleep/retry (no regression in the hot path),
+  - a 4xx client error (e.g. 401 — bad/missing auth, a misconfiguration)
+    is NOT retried: it fails fast (review 7658), since retrying just masks
+    the real cause behind ~91s of backoff. The Cloudflare 520-530 band is
+    the exception and is still retried (it is a transient edge error).
 """
 from __future__ import annotations
 
@@ -188,3 +192,65 @@ async def test_first_try_success_does_not_retry():
 
     assert ok is True
     assert client.calls == 1, "the happy path must not pay any retry/backoff cost"
+
+
+@pytest.mark.asyncio
+async def test_client_error_401_is_not_retried_and_fails_fast():
+    # review 7658: a 401 (bad/missing auth — a misconfiguration) is a CLIENT
+    # error, not a transient outage. Retrying it would just burn ~91s of
+    # backoff and mask the real cause. It must fail fast: exactly one POST,
+    # no retry, returns False (boot still continues), and must NOT raise.
+    client = _ScriptedClient([
+        _FakeResponse(401),
+        # Any further outcome would mean we wrongly retried — assert on calls.
+        _FakeResponse(200, {"auth_token": "should-never-reach"}),
+    ])
+
+    ok = await runtime_main.register_with_platform(
+        client,
+        platform_url="https://agents-team.moleculesai.app",
+        workspace_id="ws-1",
+        workspace_url="http://10.0.0.5:8080",
+        agent_card={"name": "pm"},
+        headers={},
+    )
+
+    assert ok is False, "a 401 is a misconfiguration, not a successful registration"
+    assert client.calls == 1, "a 4xx must fail fast — exactly one attempt, no backoff retry"
+
+
+@pytest.mark.asyncio
+async def test_other_4xx_403_404_also_fail_fast():
+    # The whole 4xx band (except Cloudflare 520-530) short-circuits.
+    for code in (403, 404, 400, 422):
+        client = _ScriptedClient([_FakeResponse(code), _FakeResponse(200, {})])
+        ok = await runtime_main.register_with_platform(
+            client,
+            platform_url="https://agents-team.moleculesai.app",
+            workspace_id="ws-1",
+            workspace_url="http://10.0.0.5:8080",
+            agent_card={"name": "pm"},
+            headers={},
+        )
+        assert ok is False, f"HTTP {code} must not be treated as success"
+        assert client.calls == 1, f"HTTP {code} must fail fast (1 attempt), got {client.calls}"
+
+
+@pytest.mark.asyncio
+async def test_5xx_is_still_retried():
+    # A genuine server error (502/503) is transient — keep the retry behavior.
+    client = _ScriptedClient([
+        _FakeResponse(503),
+        _FakeResponse(502),
+        _FakeResponse(200, {}),
+    ])
+    ok = await runtime_main.register_with_platform(
+        client,
+        platform_url="https://agents-team.moleculesai.app",
+        workspace_id="ws-1",
+        workspace_url="http://10.0.0.5:8080",
+        agent_card={"name": "pm"},
+        headers={},
+    )
+    assert ok is True
+    assert client.calls == 3, "5xx is transient server-side and must be retried"
