@@ -79,6 +79,130 @@ def _check_delegation_results_pending() -> bool:
         return False
 
 
+async def register_with_platform(
+    client,
+    *,
+    platform_url: str,
+    workspace_id: str,
+    workspace_url: str,
+    agent_card: dict,
+    headers: dict,
+    max_attempts: int = 8,
+) -> bool:
+    """POST the boot registration to ``/registry/register`` with bounded
+    exponential backoff until it gets a 2xx.
+
+    internal#688: the original boot-register fired EXACTLY ONCE. If the
+    tenant orchestrator (workspace-server) was momentarily down — e.g. a
+    workspace-recreate sweep stopped its EC2, so Cloudflare returned 530 /
+    tunnel-error 1033 — the one POST failed, a warning was printed, and the
+    workspace proceeded with ``workspaces.url`` left empty in the platform
+    DB. The workspace heartbeats fine and shows ``online``, but it's
+    undialable: schedule ticks throw ``workspace has no URL`` and A2A
+    dispatch can't reach it. The only recovery was a manual
+    ``docker restart molecule-workspace`` per affected EC2.
+
+    Both failure shapes from the incident are retried here:
+      * a transport-level exception (orchestrator unreachable), and
+      * a transient server-side HTTP response — 5xx, plus Cloudflare edge
+        errors 520–530 (e.g. 530 while the origin is down) — the old code
+        only special-cased ``== 200`` and silently treated every other
+        status as "registered".
+
+    review 7658: a *client* error (4xx other than the Cloudflare 520–530
+    band) is NOT transient — it almost always means misconfiguration (bad
+    platform URL / wrong or missing auth → 401/403/404). Retrying it just
+    masks the real cause behind ~91s of backoff, so we short-circuit: log
+    the status (code only, no secrets) and return False immediately.
+
+    Bounded by ``max_attempts`` so a permanently-misconfigured platform URL
+    can't wedge boot forever. On exhaustion we return False (the caller
+    proceeds to start the heartbeat — the workspace can still serve traffic,
+    and the server-side heartbeat backfill is the belt-and-suspenders net)
+    rather than raising, which would crash the container.
+
+    Returns True once a 2xx is observed (token capture done here on the
+    successful response); False if every attempt failed.
+    """
+    last_detail = "no attempts made"
+    for attempt in range(max_attempts):
+        try:
+            resp = await client.post(
+                f"{platform_url}/registry/register",
+                json={
+                    "id": workspace_id,
+                    "url": workspace_url,
+                    "agent_card": agent_card,
+                },
+                headers=headers,
+            )
+            status = resp.status_code
+            if 200 <= status < 300:
+                print(f"Registered with platform: {status}")
+                # Phase 30.1 — capture the auth token issued at first
+                # register. The platform only mints one on first register
+                # per workspace, so a subsequent restart gets an empty
+                # auth_token and we keep using the on-disk copy.
+                try:
+                    body = resp.json()
+                    tok = body.get("auth_token")
+                    if tok:
+                        from molecule_runtime.platform_auth import save_token
+                        save_token(tok)
+                        # CWE-532 (task #344): redacted — never log token.
+                        print("Saved workspace auth token (value=[REDACTED])")
+                    # RFC #2312 PR-F: persist platform_inbound_secret if the
+                    # platform supplied one. Idempotent.
+                    inbound = body.get("platform_inbound_secret")
+                    if inbound:
+                        from molecule_runtime.platform_inbound_auth import save_inbound_secret
+                        save_inbound_secret(inbound)
+                        # CWE-532 (task #344): redacted — never log secret.
+                        print("Saved platform_inbound_secret (value=[REDACTED])")
+                except Exception as parse_exc:
+                    print(f"Warning: couldn't parse register response for token: {parse_exc}")
+                return True
+            # internal#688 review (review 7658): classify the failure.
+            # Cloudflare edge errors 520–530 (e.g. 530 / tunnel 1033 while
+            # the orchestrator origin is down) are TRANSIENT — keep retrying.
+            if 520 <= status <= 530:
+                last_detail = f"HTTP {status} (Cloudflare edge — transient)"
+            elif 400 <= status < 500:
+                # A real 4xx (401/403/404/…) means misconfiguration, not a
+                # momentary outage: retrying just masks it behind ~91s of
+                # backoff. Fail fast and log the status so the misconfig is
+                # visible. Status code only — no headers/body — so no secret
+                # (e.g. the bearer in `headers`) can leak (CWE-532).
+                print(
+                    f"Register: HTTP {status} is a client error "
+                    f"(misconfiguration) — not retrying; proceeding "
+                    f"(heartbeat backfill is the recovery path)"
+                )
+                return False
+            else:
+                # 5xx (and any other non-2xx) — transient server-side, retry.
+                last_detail = f"HTTP {status}"
+        except Exception as e:  # transport error — orchestrator unreachable
+            last_detail = repr(e)
+
+        if attempt < max_attempts - 1:
+            # Exponential backoff capped at 30s: 1, 2, 4, 8, 16, 30, 30…
+            # Mirrors the initial-prompt retry pattern already in this file.
+            delay = min(2 ** attempt, 30)
+            print(
+                f"Register: attempt {attempt + 1}/{max_attempts} failed "
+                f"({last_detail}), retrying in {delay}s..."
+            )
+            await asyncio.sleep(delay)
+        else:
+            print(
+                f"Warning: failed to register with platform after "
+                f"{max_attempts} attempts ({last_detail}) — proceeding; "
+                f"heartbeat backfill is the recovery path"
+            )
+    return False
+
+
 async def main():  # pragma: no cover
     workspace_id = os.environ.get("WORKSPACE_ID", "")
     if not workspace_id:
@@ -370,50 +494,20 @@ async def main():  # pragma: no cover
         **({"configuration_error": adapter_error} if adapter_error else {}),
     }
 
+    # internal#688: boot-register with bounded retry + backoff. A one-shot
+    # POST silently leaves workspaces.url empty when the orchestrator is
+    # momentarily down (Cloudflare 530 / tunnel 1033 during a recreate
+    # sweep), making the workspace online-but-undialable. register_with_platform
+    # retries until a 2xx and never raises, so boot continues regardless.
     async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.post(
-                f"{platform_url}/registry/register",
-                json={
-                    "id": workspace_id,
-                    "url": workspace_url,
-                    "agent_card": agent_card_dict,
-                },
-                headers=auth_headers(),
-            )
-            print(f"Registered with platform: {resp.status_code}")
-            # Phase 30.1 — capture the auth token issued at first register.
-            # The platform only mints one on first register per workspace,
-            # so a subsequent restart gets an empty auth_token and we
-            # keep using the on-disk copy from the original issuance.
-            if resp.status_code == 200:
-                try:
-                    body = resp.json()
-                    tok = body.get("auth_token")
-                    if tok:
-                        from molecule_runtime.platform_auth import save_token
-                        save_token(tok)
-                        # CWE-532 (task #344): redacted — never log token
-                        # prefix. Even 8 chars narrows the guess space for
-                        # logs scraped from container stdout / journald.
-                        print("Saved workspace auth token (value=[REDACTED])")
-                    # RFC #2312 PR-F: persist platform_inbound_secret if the
-                    # platform supplied one. Idempotent — writing the same
-                    # value over an existing file is harmless. Required for
-                    # SaaS where there's no persistent /configs volume; on
-                    # Docker mode it overwrites the value the provisioner
-                    # already wrote at workspace creation.
-                    inbound = body.get("platform_inbound_secret")
-                    if inbound:
-                        from molecule_runtime.platform_inbound_auth import save_inbound_secret
-                        save_inbound_secret(inbound)
-                        # CWE-532 (task #344): redacted — never log secret
-                        # prefix.
-                        print("Saved platform_inbound_secret (value=[REDACTED])")
-                except Exception as parse_exc:
-                    print(f"Warning: couldn't parse register response for token: {parse_exc}")
-        except Exception as e:
-            print(f"Warning: failed to register with platform: {e}")
+        await register_with_platform(
+            client,
+            platform_url=platform_url,
+            workspace_id=workspace_id,
+            workspace_url=workspace_url,
+            agent_card=agent_card_dict,
+            headers=auth_headers(),
+        )
 
     # 9. Start heartbeat
     heartbeat.start()
