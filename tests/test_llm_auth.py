@@ -190,3 +190,72 @@ def test_malformed_base_url_does_not_crash():
     r = normalise_llm_env(env)
     assert r.detected_kind == "oauth"
     assert "ANTHROPIC_BASE_URL" not in env
+
+
+# --- Provider-honoring guard (drain fix 2026-05-29) ---------------------------
+
+
+def test_provider_minimax_drops_inherited_oauth():
+    # Shared tenant global leaks CLAUDE_CODE_OAUTH_TOKEN into a minimax
+    # workspace; it must be dropped so claude-code can't bill Anthropic.
+    env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-tenant-shared"}
+    r = normalise_llm_env(env, provider="minimax")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in r.cleared_vars
+    assert r.detected_kind == "none"
+
+
+def test_provider_anthropic_keeps_oauth():
+    env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-legit"}
+    r = normalise_llm_env(env, provider="anthropic")
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-legit"
+    assert r.detected_kind == "oauth"
+
+
+def test_provider_claude_code_alias_keeps_oauth():
+    env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-legit"}
+    r = normalise_llm_env(env, provider="claude-code")
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-legit"
+    assert r.detected_kind == "oauth"
+
+
+def test_provider_minimax_keeps_proxy_token_after_dropping_oauth():
+    # minimax via claude-code proxy mode: the inherited oauth must go, but the
+    # proxy token + base_url stay so the call actually reaches minimax.
+    env = {
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-shared",
+        "ANTHROPIC_AUTH_TOKEN": "sk-cp-minimax-tok",
+        "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+    }
+    r = normalise_llm_env(env, provider="minimax")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert r.detected_kind == "proxy"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-cp-minimax-tok"
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.minimax.io/anthropic"
+
+
+def test_empty_provider_preserves_legacy_oauth_behaviour():
+    env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"}
+    r = normalise_llm_env(env, provider="")
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-x"
+    assert r.detected_kind == "oauth"
+
+
+def test_none_provider_preserves_legacy_oauth_behaviour():
+    env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"}
+    r = normalise_llm_env(env)  # no provider arg = legacy call sites
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-x"
+    assert r.detected_kind == "oauth"
+
+
+def test_provider_case_insensitive_drop():
+    env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"}
+    r = normalise_llm_env(env, provider="MiniMax")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+
+def test_provider_openai_drops_oauth():
+    env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"}
+    r = normalise_llm_env(env, provider="openai")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert r.detected_kind == "none"

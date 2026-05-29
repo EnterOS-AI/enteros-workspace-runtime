@@ -24,6 +24,17 @@ Call :func:`normalise_llm_env` once, early in the runtime bootstrap
 boot log shows the mapping.
 
 Safe to call multiple times — idempotent.
+
+Provider is SSOT (internal#718). The platform injects the tenant's shared
+global secrets into *every* workspace, so a non-Anthropic workspace
+(``provider=minimax``/``openai``/``moonshot``…) inherits a stray
+``CLAUDE_CODE_OAUTH_TOKEN`` that belongs to the tenant's Claude agents.
+claude-code auto-prefers that OAuth token and silently bills Anthropic
+instead of the configured provider — the 2026-05-28 drain. Pass the
+resolved ``provider`` to :func:`normalise_llm_env`: when it is not an
+Anthropic-OAuth provider, the OAuth token is dropped here so downstream
+auth follows the configured provider (and preflight fails *clearly* if
+that provider's own key is absent — never a silent Anthropic fallback).
 """
 
 from __future__ import annotations
@@ -31,6 +42,20 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+# Providers that legitimately authenticate via CLAUDE_CODE_OAUTH_TOKEN (the
+# Claude Code subscription OAuth path). For every other provider the OAuth
+# token is a foreign credential inherited from shared tenant globals and MUST
+# NOT be used — keeping it is the silent-Anthropic-drain bug. Compared
+# case-insensitively; the empty string means "provider unknown" and is treated
+# as "do not touch" for backward compatibility with pre-provider templates.
+_ANTHROPIC_OAUTH_PROVIDERS = frozenset({
+    "anthropic",
+    "anthropic-oauth",
+    "claude",
+    "claude-code",
+})
 
 
 @dataclass
@@ -44,7 +69,12 @@ class NormalisationResult:
 
     def summary(self) -> str:
         if self.detected_kind == "none":
-            return "llm-auth: no ANTHROPIC_AUTH_TOKEN set"
+            base = "llm-auth: no ANTHROPIC_AUTH_TOKEN set"
+            if self.cleared_vars:
+                base += f" (cleared: {', '.join(self.cleared_vars)})"
+            if self.warning:
+                base += f" [WARN: {self.warning}]"
+            return base
         line = f"llm-auth: detected {self.detected_kind}"
         if self.renamed_to:
             line += f" → exported as {self.renamed_to}"
@@ -93,7 +123,10 @@ def _prefix_of(token: str) -> str:
     return "unknown"
 
 
-def normalise_llm_env(env: Optional[dict[str, str]] = None) -> NormalisationResult:
+def normalise_llm_env(
+    env: Optional[dict[str, str]] = None,
+    provider: Optional[str] = None,
+) -> NormalisationResult:
     """Inspect and rewrite LLM auth env vars in place.
 
     Parameters
@@ -101,6 +134,13 @@ def normalise_llm_env(env: Optional[dict[str, str]] = None) -> NormalisationResu
     env
         The env mapping to mutate. Defaults to ``os.environ``.
         Passing a dict is useful for tests.
+    provider
+        The workspace's resolved LLM provider slug (SSOT — ``config.provider``).
+        When set to a non-Anthropic provider, any inherited
+        ``CLAUDE_CODE_OAUTH_TOKEN`` is dropped so the runtime authenticates
+        with the *configured* provider rather than silently falling back to
+        the tenant's Claude OAuth (the 2026-05-28 Anthropic drain). ``None``
+        or empty preserves the legacy behaviour (no provider-scoped clearing).
 
     Returns
     -------
@@ -112,8 +152,27 @@ def normalise_llm_env(env: Optional[dict[str, str]] = None) -> NormalisationResu
 
     result = NormalisationResult()
 
+    # Provider-honoring guard (drain fix, 2026-05-29). Provider is SSOT: a
+    # non-Anthropic workspace must never authenticate via an inherited
+    # CLAUDE_CODE_OAUTH_TOKEN from shared tenant globals. Drop it BEFORE any
+    # detection so the OAuth short-circuit below can't hijack a minimax /
+    # openai / moonshot workspace into billing Anthropic. If the configured
+    # provider's own key is missing, preflight fails loudly — no silent
+    # fallback, no drain.
+    prov = (provider or "").strip().lower()
+    if prov and prov not in _ANTHROPIC_OAUTH_PROVIDERS:
+        if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            result.cleared_vars.append("CLAUDE_CODE_OAUTH_TOKEN")
+            result.warning = (
+                f"dropped inherited CLAUDE_CODE_OAUTH_TOKEN for "
+                f"provider='{prov}' (provider is SSOT; Anthropic OAuth is "
+                f"not used by this provider — prevents silent Anthropic drain)"
+            )
+
     # Priority: explicit CLAUDE_CODE_OAUTH_TOKEN wins if already present
-    # (operator set it deliberately — don't override).
+    # (operator set it deliberately — don't override). NB: a non-Anthropic
+    # provider already had this dropped by the guard above.
     existing_oauth = env.get("CLAUDE_CODE_OAUTH_TOKEN", "")
     if existing_oauth:
         result.detected_kind = "oauth"
