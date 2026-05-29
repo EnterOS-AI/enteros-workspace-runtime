@@ -225,7 +225,10 @@ async def main():  # pragma: no cover
     # Doing this early means every downstream adapter/executor sees a
     # consistent, correct env — no per-adapter detection needed.
     from molecule_runtime.llm_auth import normalise_llm_env
-    print(normalise_llm_env().summary())
+    # NB: the actual call is deferred to step 0.1b (after load_config) so
+    # the resolved provider (SSOT) can be passed. Provider-scoped clearing
+    # of an inherited CLAUDE_CODE_OAUTH_TOKEN prevents the silent Anthropic
+    # drain (2026-05-28) on non-Anthropic workspaces.
 
     # 0.2 GitHub credential helper installer — extracts bundled .sh scripts,
     # configures git, starts refresh daemon, primes gh CLI. Eliminates the
@@ -256,6 +259,14 @@ async def main():  # pragma: no cover
 
     # 1. Load config
     config = load_config(config_path)
+    # 0.1b Normalise LLM auth env vars now that the resolved provider is
+    # known. Platform stores tokens as ANTHROPIC_AUTH_TOKEN, but the Claude
+    # SDK/CLI expects different env vars per token kind (OAuth vs API key vs
+    # proxy). Passing config.provider lets a non-Anthropic workspace shed an
+    # inherited CLAUDE_CODE_OAUTH_TOKEN (a shared tenant global) so it can
+    # never silently bill Anthropic instead of the configured provider.
+    # Runs before preflight so required-env checks see the normalised shape.
+    print(normalise_llm_env(provider=getattr(config, "provider", "")).summary())
     port = config.a2a.port
     preflight = run_preflight(config, config_path)
     render_preflight_report(preflight)
