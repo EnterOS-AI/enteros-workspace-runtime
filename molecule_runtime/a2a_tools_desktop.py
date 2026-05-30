@@ -195,7 +195,13 @@ async def tool_desktop_open_url(url: str) -> str:
         browser = "chromium"
     if not browser:
         return _json({"ok": False, "error": "no supported desktop browser is installed"})
-    profile = Path("/workspace/.browser-profile")
+    # internal#734 Ask-3 (SSOT, Option A): the control-plane provisioner is the
+    # single source of the browser-profile path — it publishes it as
+    # MOLECULE_BROWSER_PROFILE_DIR (provisioner const browserProfileDir). Read
+    # it from there so the path is defined ONCE; fall back to the historical
+    # literal only when the env is absent (older CP / local dev), for rollout
+    # safety. The dir lives under /workspace so it rides the cp#326 data volume.
+    profile = Path(os.environ.get("MOLECULE_BROWSER_PROFILE_DIR") or "/workspace/.browser-profile")
     profile.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         _host_spawn([
