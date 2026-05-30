@@ -148,3 +148,21 @@ def test_desktop_open_url_spawns_chrome_with_xvfb_flags(monkeypatch, tmp_path):
         "https://example.com/?q=$(id)",
     ]]
     assert "/bin/sh" not in calls[0]
+
+
+# internal#734 Ask-3 (SSOT Option A): the browser profile path comes from the
+# control-plane-published MOLECULE_BROWSER_PROFILE_DIR when present, so the path
+# is defined ONCE (in the provisioner). The literal above is only the fallback.
+def test_desktop_open_url_uses_browser_profile_dir_env(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setenv("MOLECULE_BROWSER_PROFILE_DIR", "/workspace/.custom-profile")
+    monkeypatch.setattr(desktop, "_host_ok", lambda binary: binary == "google-chrome")
+    monkeypatch.setattr(desktop, "_host_spawn", lambda args: calls.append(args))
+    monkeypatch.setattr(desktop, "Path", lambda value: tmp_path / value.lstrip("/"))
+
+    out = asyncio.run(desktop.tool_desktop_open_url("https://example.com"))
+
+    assert '"ok": true' in out
+    assert f"--user-data-dir={tmp_path / 'workspace/.custom-profile'}" in calls[0], calls
+    # and the historical literal must NOT be used when the env is set.
+    assert f"--user-data-dir={tmp_path / 'workspace/.browser-profile'}" not in calls[0]
