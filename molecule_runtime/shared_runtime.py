@@ -67,10 +67,19 @@ def extract_message_text(context_or_parts) -> str:
         # Raw parts list (or an object with neither attr)
         message = context_or_parts
         parts = context_or_parts
-    if not isinstance(parts, (list, tuple)):
-        # Defensive: an object exposing neither .message nor .parts (e.g. an
-        # empty SimpleNamespace) must not blow up the iteration below.
+    if isinstance(parts, (str, bytes, dict)):
+        # Strings/bytes/dicts are never a parts *sequence* — fall back to empty.
         parts = []
+    elif not isinstance(parts, (list, tuple)):
+        # a2a-sdk >=1.0 migrated to protobuf, so message.parts is a
+        # RepeatedCompositeContainer (iterable but NOT list/tuple). Per this
+        # function's own docstring it accepts "a raw list/iterable of parts";
+        # materialise any iterable. Only genuine non-iterables (e.g. an empty
+        # SimpleNamespace) fall back to empty.
+        try:
+            parts = list(parts)
+        except TypeError:
+            parts = []
     text = " ".join(
         text for part in (parts or []) if (text := _extract_part_text(part))
     ).strip()
