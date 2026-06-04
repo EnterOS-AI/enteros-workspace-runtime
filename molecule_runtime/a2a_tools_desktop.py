@@ -21,6 +21,18 @@ DISPLAY = os.environ.get("MOLECULE_DISPLAY", ":99")
 SCREENSHOT_DIR = Path("/workspace/.molecule/display/screenshots")
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
+# core#2200: the desktop is captured at native pixels (scrot, no resize) and
+# clicked at native pixels (xdotool), so screenshot(x,y) == click(x,y) ONLY as
+# long as the model sees the screenshot at those same pixels. Claude's vision
+# silently DOWNSCALES any image above ~1.15 MP / 1568px on the long edge before
+# the model reasons over it — so a 1920x1080 (2.07 MP) display desyncs the two
+# coordinate spaces and clicks miss. The provisioner pins :99 to 1280x800
+# (WXGA, Anthropic's recommended computer-use resolution: 1.02 MP, 1280<1568 ->
+# no downscale -> 1:1). These bounds let the screenshot tool surface the pixel
+# space and warn loudly if a larger display ever slips through.
+_VISION_SAFE_PIXELS = 1_150_000
+_VISION_SAFE_EDGE = 1568
+
 
 def _host_cmd(args: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
     cmd = [
@@ -94,6 +106,22 @@ def _clean_screenshot_path(value: str | None) -> Path:
     return SCREENSHOT_DIR / path
 
 
+def _png_dimensions(path: Path) -> tuple[int, int] | None:
+    """Read (width, height) from a PNG's IHDR chunk without an image library."""
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(24)
+    except OSError:
+        return None
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    width = int.from_bytes(header[16:20], "big")
+    height = int.from_bytes(header[20:24], "big")
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
 def _copy_screenshot_from_host_tmp(host_tmp_path: str, out_path: Path) -> None:
     _ensure_safe_screenshot_dir()
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -146,7 +174,27 @@ async def tool_desktop_screenshot(path: str = "") -> str:
         return _json({"ok": False, "error": str(exc)})
     finally:
         _host_cmd(["rm", "-f", host_path], timeout=5)
-    return _json({"ok": True, "path": str(out_path)})
+    payload: dict = {"ok": True, "path": str(out_path)}
+    # Surface the exact pixel space so the agent never has to infer DPI/scale
+    # (core#2200): the coordinates it reads off this screenshot are the same
+    # coordinates tool_desktop_click expects, as long as the image stays within
+    # the vision-safe bounds (i.e. Claude does not downscale it).
+    dims = _png_dimensions(out_path)
+    if dims is not None:
+        width, height = dims
+        vision_safe = width * height <= _VISION_SAFE_PIXELS and max(width, height) <= _VISION_SAFE_EDGE
+        payload["width"] = width
+        payload["height"] = height
+        payload["vision_safe"] = vision_safe
+        if not vision_safe:
+            payload["warning"] = (
+                f"screenshot is {width}x{height} which exceeds the vision-safe bound "
+                f"({_VISION_SAFE_EDGE}px long edge / {_VISION_SAFE_PIXELS // 1000}kpx); the "
+                "model sees a DOWNSCALED copy, so click coordinates read off it will be "
+                "misaligned. Reduce the desktop to <=1280x800 via MOLECULE_DISPLAY_WIDTH/"
+                "MOLECULE_DISPLAY_HEIGHT."
+            )
+    return _json(payload)
 
 
 async def tool_desktop_click(x: int, y: int, button: int = 1) -> str:
@@ -267,7 +315,7 @@ def _size_browser_window(browser: str) -> None:
         "windowsize",
         "%@",
         "1280",
-        "900",
+        "800",
         "windowactivate",
         "%@",
         "key",
