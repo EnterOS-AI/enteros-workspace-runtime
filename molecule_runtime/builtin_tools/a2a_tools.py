@@ -14,7 +14,7 @@ import httpx
 # the trust-boundary entry points where peer output crosses into our agent's
 # context — same surface as a2a_tools_delegation.py:325 (fixed via #492).
 # Issue #537.
-from molecule_runtime.a2a_client import normalize_a2a_message_send_params
+from molecule_runtime.a2a_client import build_message_send_params
 from molecule_runtime._sanitize_a2a import sanitize_a2a_result
 from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 
@@ -96,11 +96,9 @@ async def delegate_task(workspace_id: str, task: str) -> str:
                     "jsonrpc": "2.0",
                     "id": str(uuid.uuid4()),
                     "method": "message/send",
-                    # #2251: single normalizer guarantees role/messageId/parts
-                    # satisfy the receiver's a2a-sdk v0.3 SendMessageRequest.
-                    "params": normalize_a2a_message_send_params(
-                        {"message": {"parts": [{"kind": "text", "text": task}]}}
-                    ),
+                    # #2251: single model-based builder — params generated
+                    # FROM the receiver's a2a-sdk v0.3 SendMessageRequest schema.
+                    "params": build_message_send_params(task),
                 },
             )
             data = a2a_resp.json()

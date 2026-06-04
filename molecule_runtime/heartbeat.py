@@ -15,7 +15,7 @@ import os
 import time
 import httpx
 
-from molecule_runtime.a2a_client import normalize_a2a_message_send_params
+from molecule_runtime.a2a_client import build_message_send_params
 from molecule_runtime.platform_auth import auth_headers, refresh_cache, self_source_headers
 
 
@@ -468,12 +468,10 @@ class HeartbeatLoop:
                             f"{self.platform_url}/workspaces/{self.workspace_id}/a2a",
                             json={
                                 "method": "message/send",
-                                # #2251: normalize so role/messageId/parts are
-                                # schema-valid and the legacy `type` part is
-                                # rewritten to the v0.3 `kind` discriminator.
-                                "params": normalize_a2a_message_send_params(
-                                    {"message": {"parts": [{"kind": "text", "text": trigger_msg}]}}
-                                ),
+                                # #2251: single model-based builder — params
+                                # generated FROM the receiver's a2a-sdk v0.3
+                                # SendMessageRequest schema.
+                                "params": build_message_send_params(trigger_msg),
                             },
                             headers=self_source_headers(self.workspace_id),
                             timeout=120.0,
@@ -686,12 +684,10 @@ class HeartbeatLoop:
                         f"{self.platform_url}/workspaces/{self.workspace_id}/a2a",
                         json={
                             "method": "message/send",
-                            # #2251: normalize so role/messageId/parts are
-                            # schema-valid and the legacy `type` part is
-                            # rewritten to the v0.3 `kind` discriminator.
-                            "params": normalize_a2a_message_send_params(
-                                {"message": {"parts": [{"kind": "text", "text": trigger_msg}]}}
-                            ),
+                            # #2251: single model-based builder — params
+                            # generated FROM the receiver's a2a-sdk v0.3
+                            # SendMessageRequest schema.
+                            "params": build_message_send_params(trigger_msg),
                         },
                         headers=self_source_headers(self.workspace_id),
                         timeout=120.0,

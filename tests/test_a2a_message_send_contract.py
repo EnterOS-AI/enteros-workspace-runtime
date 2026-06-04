@@ -101,6 +101,68 @@ def _envelope(params: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
+# 0. The canonical OUTBOUND builder generates schema-valid params (#2251
+#    SSOT upgrade). This is THE single source of truth every outbound
+#    send funnels through — its output must validate for every shape the
+#    call sites use (plain text, custom messageId, sibling metadata,
+#    file attachments).
+# --------------------------------------------------------------------------
+
+def test_builder_plain_text_validates():
+    from molecule_runtime.a2a_client import build_message_send_params
+
+    params = build_message_send_params("hello")
+    assert params["message"]["role"] == "user"
+    assert params["message"]["messageId"]  # defaulted
+    assert params["message"]["parts"] == [{"kind": "text", "text": "hello"}]
+    _validate(_envelope(params))
+
+
+def test_builder_defaults_role_when_invalid():
+    from molecule_runtime.a2a_client import build_message_send_params
+
+    params = build_message_send_params("x", role="bogus")
+    assert params["message"]["role"] == "user"
+    _validate(_envelope(params))
+
+
+def test_builder_preserves_message_id_and_metadata():
+    from molecule_runtime.a2a_client import build_message_send_params
+
+    # Exactly the shape builtin_tools/delegation.py constructs.
+    params = build_message_send_params(
+        "do the thing",
+        message_id="msg-task1-0",
+        metadata={"parent_task_id": "task1", "source_workspace_id": "w"},
+    )
+    assert params["message"]["messageId"] == "msg-task1-0"
+    assert params["metadata"]["parent_task_id"] == "task1"
+    _validate(_envelope(params))
+
+
+def test_builder_agent_role_validates():
+    from molecule_runtime.a2a_client import build_message_send_params
+
+    params = build_message_send_params("x", role="agent")
+    assert params["message"]["role"] == "agent"
+    _validate(_envelope(params))
+
+
+def test_builder_attachments_become_file_parts_and_validate():
+    from molecule_runtime.a2a_client import build_message_send_params
+
+    params = build_message_send_params(
+        "see attached",
+        attachments=[
+            {"uri": "workspace:/x.png", "name": "x.png", "mimeType": "image/png"}
+        ],
+    )
+    kinds = [p["kind"] for p in params["message"]["parts"]]
+    assert kinds == ["text", "file"]
+    _validate(_envelope(params))
+
+
+# --------------------------------------------------------------------------
 # 1. The normalizer output is schema-valid for every input shape.
 # --------------------------------------------------------------------------
 
@@ -223,3 +285,103 @@ def test_send_a2a_message_outbound_body_validates(monkeypatch):
     # The exact body that went on the wire must satisfy the receiver schema.
     _validate(captured["json"])
     assert captured["json"]["params"]["message"]["role"] == "user"
+
+
+# --------------------------------------------------------------------------
+# 4. EVERY outbound send helper funnels through the single builder, so the
+#    body each one actually puts on the wire is schema-valid (#2251 SSOT).
+#    Each case captures the real httpx POST json and validates it against
+#    the genuine SendMessageRequest schema.
+# --------------------------------------------------------------------------
+
+class _CapturingPostClient:
+    """httpx.AsyncClient stand-in that captures the FIRST message/send POST
+    body into the shared ``captured`` dict. Discovery GETs return a fake
+    peer URL; the message/send POST returns a minimal JSON-RPC success.
+    """
+
+    def __init__(self, captured: dict, *a, **kw):
+        self._captured = captured
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url, headers=None, **kw):
+        return _FakeGet()
+
+    async def post(self, url, headers=None, json=None, **kw):
+        if isinstance(json, dict) and json.get("method") == "message/send":
+            self._captured.setdefault("json", json)
+        return _FakePost()
+
+
+class _FakeGet:
+    status_code = 200
+
+    def json(self):
+        # Discovery response — a URL so the helper proceeds to the POST.
+        return {"url": "http://peer.local/a2a", "id": "peer", "name": "peer"}
+
+
+class _FakePost:
+    status_code = 200
+
+    def json(self):
+        return {"jsonrpc": "2.0", "id": "x", "result": {"parts": []}}
+
+
+_PEER = "22222222-2222-2222-2222-222222222222"
+
+
+def _drive_builtin_delegate_task(captured, monkeypatch):
+    import asyncio
+
+    import molecule_runtime.builtin_tools.a2a_tools as bt
+
+    monkeypatch.setattr(
+        bt.httpx, "AsyncClient",
+        lambda *a, **kw: _CapturingPostClient(captured, *a, **kw),
+    )
+    asyncio.run(bt.delegate_task(_PEER, "do the thing"))
+
+
+def _drive_builtin_execute_delegation(captured, monkeypatch):
+    import asyncio
+
+    import molecule_runtime.builtin_tools.delegation as dele
+
+    monkeypatch.setattr(
+        dele.httpx, "AsyncClient",
+        lambda *a, **kw: _CapturingPostClient(captured, *a, **kw),
+    )
+    # _execute_delegation reads the in-memory record keyed by task_id —
+    # register it first (the same thing delegate_task_async does).
+    dele._delegations["task-xyz"] = dele.DelegationTask(
+        task_id="task-xyz", workspace_id=_PEER, task_description="do the thing"
+    )
+    try:
+        # _record_delegation_on_platform / _update fire their own POSTs that
+        # are NOT message/send; the capturing client ignores those.
+        asyncio.run(dele._execute_delegation("task-xyz", _PEER, "do the thing"))
+    finally:
+        dele._delegations.pop("task-xyz", None)
+
+
+@pytest.mark.parametrize(
+    "driver",
+    [_drive_builtin_delegate_task, _drive_builtin_execute_delegation],
+    ids=["builtin_tools.a2a_tools.delegate_task",
+         "builtin_tools.delegation._execute_delegation"],
+)
+def test_every_outbound_send_helper_body_validates(driver, monkeypatch):
+    captured: dict = {}
+    driver(captured, monkeypatch)
+    assert "json" in captured, "helper did not emit a message/send POST"
+    body = captured["json"]
+    assert body["method"] == "message/send"
+    # The real body must satisfy the receiver's SendMessageRequest schema.
+    _validate(body)
+    assert body["params"]["message"]["role"] in ("user", "agent")

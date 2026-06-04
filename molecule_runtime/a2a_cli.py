@@ -21,6 +21,8 @@ import uuid
 
 import httpx
 
+from molecule_runtime.a2a_client import build_message_send_params
+
 # Validate WORKSPACE_ID (CWE-20, issue #14) — interpolated into
 # /registry/{WORKSPACE_ID}/peers + /workspaces/{WORKSPACE_ID} URL paths
 # and the X-Workspace-ID header below.
@@ -82,13 +84,9 @@ async def delegate(target_id: str, task: str, async_mode: bool = False):
                         "jsonrpc": "2.0",
                         "id": task_id,
                         "method": "message/send",
-                        "params": {
-                            "message": {
-                                "role": "user",
-                                "messageId": str(uuid.uuid4()),
-                                "parts": [{"kind": "text", "text": task}],
-                            }
-                        },
+                        # #2251: single model-based builder — params generated
+                        # FROM the receiver's a2a-sdk v0.3 SendMessageRequest schema.
+                        "params": build_message_send_params(task),
                     },
                 )
                 # Even if we timeout, the task is queued on the target
@@ -123,13 +121,9 @@ async def delegate(target_id: str, task: str, async_mode: bool = False):
                         "jsonrpc": "2.0",
                         "id": task_id,
                         "method": "message/send",
-                        "params": {
-                            "message": {
-                                "role": "user",
-                                "messageId": str(uuid.uuid4()),
-                                "parts": [{"kind": "text", "text": task}],
-                            }
-                        },
+                        # #2251: single model-based builder — params generated
+                        # FROM the receiver's a2a-sdk v0.3 SendMessageRequest schema.
+                        "params": build_message_send_params(task),
                     },
                 )
                 try:

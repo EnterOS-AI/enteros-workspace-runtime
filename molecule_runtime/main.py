@@ -29,6 +29,7 @@ from molecule_runtime.initial_prompt import (
     mark_initial_prompt_attempted,
     resolve_initial_prompt_marker,
 )
+from molecule_runtime.a2a_client import build_message_send_params
 from molecule_runtime.platform_auth import auth_headers, self_source_headers
 from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
 
@@ -725,13 +726,12 @@ async def main():  # pragma: no cover
                 import time as _time
                 payload = _json.dumps({
                     "method": "message/send",
-                    "params": {
-                        "message": {
-                            "role": "user",
-                            "messageId": f"initial-{_uuid.uuid4().hex[:8]}",
-                            "parts": [{"kind": "text", "text": config.initial_prompt}],
-                        },
-                    },
+                    # #2251: single model-based builder — params generated
+                    # FROM the receiver's a2a-sdk v0.3 SendMessageRequest schema.
+                    "params": build_message_send_params(
+                        config.initial_prompt,
+                        message_id=f"initial-{_uuid.uuid4().hex[:8]}",
+                    ),
                 }).encode()
 
                 # #220: include platform bearer token so the request isn't
@@ -846,13 +846,12 @@ async def main():  # pragma: no cover
                 # the post — that's the expected safety valve.
                 payload = _json.dumps({
                     "method": "message/send",
-                    "params": {
-                        "message": {
-                            "role": "user",
-                            "messageId": f"idle-{_uuid.uuid4().hex[:8]}",
-                            "parts": [{"kind": "text", "text": config.idle_prompt}],
-                        },
-                    },
+                    # #2251: single model-based builder — params generated
+                    # FROM the receiver's a2a-sdk v0.3 SendMessageRequest schema.
+                    "params": build_message_send_params(
+                        config.idle_prompt,
+                        message_id=f"idle-{_uuid.uuid4().hex[:8]}",
+                    ),
                 }).encode()
 
                 def _post_sync():

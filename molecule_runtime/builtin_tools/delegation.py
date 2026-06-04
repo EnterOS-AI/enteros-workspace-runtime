@@ -18,7 +18,7 @@ from typing import Optional
 import httpx
 from langchain_core.tools import tool
 
-from molecule_runtime.a2a_client import normalize_a2a_message_send_params
+from molecule_runtime.a2a_client import build_message_send_params
 from molecule_runtime.builtin_tools.audit import check_permission, get_workspace_roles, log_event
 from molecule_runtime.builtin_tools.telemetry import (
     A2A_SOURCE_WORKSPACE,
@@ -279,22 +279,18 @@ async def _execute_delegation(task_id: str, workspace_id: str, task: str):
                             "jsonrpc": "2.0",
                             "method": "message/send",
                             "id": f"delegation-{task_id}-{attempt}",
-                            # #2251: route through the single normalizer so
-                            # role/messageId/parts stay schema-valid for the
-                            # receiver's a2a-sdk v0.3 SendMessageRequest. The
-                            # sibling `metadata` key is preserved untouched.
-                            "params": normalize_a2a_message_send_params(
-                                {
-                                    "message": {
-                                        "parts": [{"kind": "text", "text": task}],
-                                        "messageId": f"msg-{task_id}-{attempt}",
-                                    },
-                                    "metadata": {
-                                        "parent_task_id": task_id,
-                                        "source_workspace_id": WORKSPACE_ID,
-                                        "traceparent": traceparent,
-                                    },
-                                }
+                            # #2251: single model-based builder — params
+                            # generated FROM the receiver's a2a-sdk v0.3
+                            # SendMessageRequest schema. messageId + the
+                            # sibling metadata chain are passed through.
+                            "params": build_message_send_params(
+                                task,
+                                message_id=f"msg-{task_id}-{attempt}",
+                                metadata={
+                                    "parent_task_id": task_id,
+                                    "source_workspace_id": WORKSPACE_ID,
+                                    "traceparent": traceparent,
+                                },
                             ),
                         },
                     )
