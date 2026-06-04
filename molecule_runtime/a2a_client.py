@@ -14,6 +14,7 @@ import time
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import httpx
 
@@ -415,6 +416,221 @@ _A2A_ERROR_PREFIX = "[A2A_ERROR] "
 # different from both success-with-text and failure.
 _A2A_QUEUED_PREFIX = "[A2A_QUEUED] "
 
+# A2A `message/send` envelope normalization — the DEFENSIVE BACKSTOP for
+# params we did NOT construct (inbound / proxy paths). Outbound
+# construction is owned by ``build_message_send_params`` below, which
+# generates the body FROM the a2a-sdk model (#2251 SSOT upgrade).
+#
+# Root cause (#2251): the receiver runs a2a-sdk 1.x with
+# `enable_v0_3_compat=True` (see boot_routes.py). That compat layer
+# validates the inbound body against a Pydantic `SendMessageRequest`
+# whose `Message.role` and `Message.parts` are BOTH required. An
+# outbound envelope that omits `role` is rejected at parse time with
+#   "1 validation error for SendMessageRequest
+#    params.message.role  Field required"
+# and the JSON-RPC call fails with -32600 Invalid Request — silently
+# breaking the whole delegation (this is the agents-team transport-retry
+# storm root). The part discriminator (`type` vs `kind`) is NOT
+# rejected — the v0.3 TextPart defaults `kind="text"` and tolerates an
+# extra `type` — but we normalize it to `kind` anyway so the wire shape
+# matches the schema's canonical field and never drifts.
+#
+# This normalizer is still the implementation the builder's no-SDK
+# fallback delegates to, and remains available for any path that
+# receives a hand-shaped params dict from elsewhere. New OUTBOUND sends
+# must call ``build_message_send_params``, not this.
+_A2A_VALID_ROLES = ("user", "agent")
+_A2A_DEFAULT_ROLE = "user"
+
+
+def _normalize_a2a_part(part: Any) -> dict[str, Any]:
+    """Normalize a single A2A message part to the v0.3 ``kind`` shape.
+
+    Accepts the legacy ``{"type": "text", ...}`` shape (emitted by some
+    older builders) and rewrites the discriminator to ``kind`` — the
+    field name the a2a-sdk v0.3 schema canonicalizes on. Non-dict parts
+    are returned unchanged so the schema validator (not this helper) is
+    the one that rejects genuinely malformed parts with a clear error.
+    """
+    if not isinstance(part, dict):
+        return part
+    out = dict(part)
+    # Promote legacy `type` discriminator to `kind` when `kind` is absent.
+    # If both are present, `kind` wins (it's the schema field); drop the
+    # redundant `type` so the wire shape is unambiguous.
+    if "kind" not in out and "type" in out:
+        out["kind"] = out["type"]
+    out.pop("type", None)
+    return out
+
+
+def normalize_a2a_message_send_params(
+    params: dict[str, Any], *, default_text: str | None = None
+) -> dict[str, Any]:
+    """Return a copy of ``params`` with a schema-valid ``message`` (#2251).
+
+    Guarantees the outbound ``message/send`` ``params.message`` carries:
+
+      * ``role`` — defaulted to ``"user"`` when absent or not one of the
+        v0.3-valid roles (``user`` / ``agent``). Missing role is the
+        exact field that triggers the receiver's
+        ``SendMessageRequest params.message.role Field required``
+        rejection — defaulting it here makes the failure impossible.
+      * ``messageId`` — defaulted to a fresh UUID when absent.
+      * ``parts`` — each part normalized to the ``kind`` discriminator
+        (``type`` → ``kind``). When ``parts`` is absent and
+        ``default_text`` is supplied, a single text part is synthesized.
+
+    Pure + side-effect-free (operates on a shallow copy) so it is safe to
+    call from any builder. The receiver's Pydantic schema remains the
+    authority on full validity — this helper only closes the
+    deterministic gaps (role / messageId / part discriminator) that our
+    own builders are responsible for.
+    """
+    out = dict(params)
+    message = dict(out.get("message") or {})
+
+    role = message.get("role")
+    if role not in _A2A_VALID_ROLES:
+        message["role"] = _A2A_DEFAULT_ROLE
+
+    if not message.get("messageId"):
+        message["messageId"] = str(uuid.uuid4())
+
+    parts = message.get("parts")
+    if isinstance(parts, list):
+        message["parts"] = [_normalize_a2a_part(p) for p in parts]
+    elif parts is None and default_text is not None:
+        message["parts"] = [{"kind": "text", "text": default_text}]
+
+    out["message"] = message
+    return out
+
+
+# Canonical OUTBOUND `message/send` params builder (#2251 — SSOT upgrade).
+#
+# This is the single source of truth for constructing an outbound
+# `message/send` ``params`` body. Every outbound send in the runtime
+# funnels through here so the wire shape is GENERATED FROM the a2a-sdk
+# v0.3 ``MessageSendParams`` Pydantic schema rather than hand-rolled and
+# normalized after the fact. Because the model is the same one the
+# receiver validates against (``a2a.compat.v0_3.types`` — see
+# boot_routes.py ``enable_v0_3_compat=True`` and
+# tests/test_a2a_message_send_contract.py), the envelope cannot drift
+# out of schema: a field the schema requires (``role`` / ``messageId`` /
+# ``parts`` discriminator) is produced by the model's own serializer,
+# not by a literal a future edit might break.
+#
+# ``normalize_a2a_message_send_params`` above is retained ONLY as a
+# defensive backstop for inbound / proxy params we did not construct.
+# All OUTBOUND construction goes through ``build_message_send_params``.
+_A2A_COMPAT_TYPES_MODULE = "a2a.compat.v0_3.types"
+
+
+def _build_message_send_params_from_model(
+    text: str,
+    *,
+    role: str,
+    message_id: str,
+    metadata: dict[str, Any] | None,
+    attachments: list[dict[str, Any]] | None,
+):
+    """Construct the real a2a-sdk ``MessageSendParams`` and dump it.
+
+    Returns ``None`` when a2a-sdk is not importable (the stubbed unit
+    test environment — ``conftest.py`` stubs ``a2a.types`` but not the
+    ``a2a.compat.v0_3`` compat layer), letting the caller fall back to
+    the hand-built canonical dict. CI installs the real wheel, so the
+    model path is what the contract test exercises.
+    """
+    try:
+        import importlib
+
+        t = importlib.import_module(_A2A_COMPAT_TYPES_MODULE)
+    except ImportError:
+        return None
+
+    parts = [t.Part(root=t.TextPart(text=text))]
+    for att in attachments or []:
+        if not isinstance(att, dict):
+            continue
+        # Accept either {"uri": ...} or {"bytes": ...} file descriptors;
+        # let the schema decide which FileWithUri/FileWithBytes variant
+        # applies and reject anything malformed with a clear error.
+        if "bytes" in att:
+            file_obj = t.FileWithBytes(**att)
+        else:
+            file_obj = t.FileWithUri(**att)
+        parts.append(t.Part(root=t.FilePart(file=file_obj)))
+
+    message = t.Message(role=role, messageId=message_id, parts=parts)
+    params = t.MessageSendParams(message=message, metadata=metadata)
+    # by_alias → camelCase wire field names (messageId, etc.);
+    # exclude_none → omit unset optionals so the body matches what the
+    # hand-rolled fallback produces byte-for-byte where they overlap.
+    return params.model_dump(by_alias=True, exclude_none=True)
+
+
+def build_message_send_params(
+    text: str,
+    *,
+    role: str = "user",
+    message_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build a schema-valid outbound ``message/send`` ``params`` body.
+
+    THE single canonical builder for outbound A2A sends (#2251). The
+    returned dict is suitable as the ``params`` value of a JSON-RPC
+    ``message/send`` envelope and is guaranteed to satisfy the
+    receiver's a2a-sdk v0.3 ``SendMessageRequest`` schema:
+
+      * ``role`` — required; defaults to ``"user"``. An invalid role is
+        coerced to the default rather than shipping a body the receiver
+        rejects with ``params.message.role``.
+      * ``messageId`` — defaults to a fresh UUID when not supplied.
+      * ``parts`` — the ``text`` becomes a ``TextPart(kind="text")``;
+        each ``attachments`` entry becomes a ``FilePart``.
+      * ``metadata`` — passed through as the sibling ``params.metadata``
+        when supplied (e.g. delegation's ``parent_task_id`` chain).
+
+    When a2a-sdk is installed (CI + the workspace image) the body is
+    GENERATED FROM the real Pydantic model so it cannot drift from the
+    schema. In the stubbed unit-test env (no compat layer) it falls
+    back to ``normalize_a2a_message_send_params`` over the same inputs,
+    which produces the identical canonical shape.
+    """
+    if role not in _A2A_VALID_ROLES:
+        role = _A2A_DEFAULT_ROLE
+    if not message_id:
+        message_id = str(uuid.uuid4())
+
+    from_model = _build_message_send_params_from_model(
+        text,
+        role=role,
+        message_id=message_id,
+        metadata=metadata,
+        attachments=attachments,
+    )
+    if from_model is not None:
+        return from_model
+
+    # Fallback (a2a-sdk absent): build the same canonical dict by hand
+    # and run it through the normalizer so the shape is identical to the
+    # model-dumped path on the fields they share.
+    parts: list[dict[str, Any]] = [{"kind": "text", "text": text}]
+    for att in attachments or []:
+        if isinstance(att, dict):
+            parts.append({"kind": "file", "file": dict(att)})
+    raw: dict[str, Any] = {
+        "message": {"role": role, "messageId": message_id, "parts": parts}
+    }
+    if metadata is not None:
+        raw["metadata"] = metadata
+    return normalize_a2a_message_send_params(raw)
+
+
 # Workspace IDs are UUIDs everywhere we generate them (platform's
 # workspaces.id column, /registry/discover/:id route param, etc.) but
 # the agent-facing tool surface receives them as free-form strings via
@@ -617,13 +833,11 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
                         "jsonrpc": "2.0",
                         "id": str(uuid.uuid4()),
                         "method": "message/send",
-                        "params": {
-                            "message": {
-                                "role": "user",
-                                "messageId": str(uuid.uuid4()),
-                                "parts": [{"kind": "text", "text": message}],
-                            }
-                        },
+                        # #2251: build params from the canonical a2a-sdk
+                        # v0.3 model so role/messageId/parts are generated
+                        # FROM the receiver's SendMessageRequest schema and
+                        # cannot drift. Single builder for every outbound send.
+                        "params": build_message_send_params(message),
                     },
                 )
                 data = resp.json()

@@ -15,6 +15,7 @@ import os
 import time
 import httpx
 
+from molecule_runtime.a2a_client import build_message_send_params
 from molecule_runtime.platform_auth import auth_headers, refresh_cache, self_source_headers
 
 
@@ -467,12 +468,10 @@ class HeartbeatLoop:
                             f"{self.platform_url}/workspaces/{self.workspace_id}/a2a",
                             json={
                                 "method": "message/send",
-                                "params": {
-                                    "message": {
-                                        "role": "user",
-                                        "parts": [{"type": "text", "text": trigger_msg}],
-                                    },
-                                },
+                                # #2251: single model-based builder — params
+                                # generated FROM the receiver's a2a-sdk v0.3
+                                # SendMessageRequest schema.
+                                "params": build_message_send_params(trigger_msg),
                             },
                             headers=self_source_headers(self.workspace_id),
                             timeout=120.0,
@@ -685,12 +684,10 @@ class HeartbeatLoop:
                         f"{self.platform_url}/workspaces/{self.workspace_id}/a2a",
                         json={
                             "method": "message/send",
-                            "params": {
-                                "message": {
-                                    "role": "user",
-                                    "parts": [{"type": "text", "text": trigger_msg}],
-                                },
-                            },
+                            # #2251: single model-based builder — params
+                            # generated FROM the receiver's a2a-sdk v0.3
+                            # SendMessageRequest schema.
+                            "params": build_message_send_params(trigger_msg),
                         },
                         headers=self_source_headers(self.workspace_id),
                         timeout=120.0,
