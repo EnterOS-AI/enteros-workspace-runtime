@@ -242,3 +242,19 @@ def test_desktop_screenshot_warns_when_display_exceeds_vision_bound(monkeypatch,
     assert '"vision_safe": false' in out
     assert "warning" in out
     assert "1280x800" in out
+
+
+def test_desktop_screenshot_vision_safe_boundary_each_clause(monkeypatch, tmp_path):
+    # vision_safe is an AND of two clauses (<=1.15 MP AND long edge <=1568).
+    # Exercise each clause independently so a refactor that drops one is caught.
+    # 1600x700 = 1.12 MP (pixel clause OK) but 1600 > 1568 (edge clause fails).
+    out = _screenshot_with_dims(monkeypatch, tmp_path, 1600, 700)
+    assert '"vision_safe": false' in out, "edge clause must veto a wide-but-low-MP capture"
+    assert "warning" in out
+
+
+def test_desktop_screenshot_vision_safe_boundary_pixel_clause(monkeypatch, tmp_path):
+    # 1400x900 = 1.26 MP (pixel clause fails) but 1400 < 1568 (edge clause OK).
+    out = _screenshot_with_dims(monkeypatch, tmp_path, 1400, 900)
+    assert '"vision_safe": false' in out, "pixel clause must veto a high-MP capture"
+    assert "warning" in out
