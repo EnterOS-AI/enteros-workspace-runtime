@@ -14,6 +14,7 @@ import time
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import httpx
 
@@ -415,6 +416,96 @@ _A2A_ERROR_PREFIX = "[A2A_ERROR] "
 # different from both success-with-text and failure.
 _A2A_QUEUED_PREFIX = "[A2A_QUEUED] "
 
+# A2A `message/send` envelope normalization — the single chokepoint that
+# guarantees every outbound message/send body satisfies the receiver's
+# a2a-sdk v0.3 Pydantic `SendMessageRequest` schema (#2251).
+#
+# Root cause (#2251): the receiver runs a2a-sdk 1.x with
+# `enable_v0_3_compat=True` (see boot_routes.py). That compat layer
+# validates the inbound body against a Pydantic `SendMessageRequest`
+# whose `Message.role` and `Message.parts` are BOTH required. An
+# outbound envelope that omits `role` is rejected at parse time with
+#   "1 validation error for SendMessageRequest
+#    params.message.role  Field required"
+# and the JSON-RPC call fails with -32600 Invalid Request — silently
+# breaking the whole delegation (this is the agents-team transport-retry
+# storm root). The part discriminator (`type` vs `kind`) is NOT
+# rejected — the v0.3 TextPart defaults `kind="text"` and tolerates an
+# extra `type` — but we normalize it to `kind` anyway so the wire shape
+# matches the schema's canonical field and never drifts.
+#
+# Every outbound builder must route its params through
+# ``normalize_a2a_message_send_params`` so role/messageId/parts are
+# guaranteed present-and-valid in ONE place rather than re-derived (and
+# re-broken) at each call site.
+_A2A_VALID_ROLES = ("user", "agent")
+_A2A_DEFAULT_ROLE = "user"
+
+
+def _normalize_a2a_part(part: Any) -> dict[str, Any]:
+    """Normalize a single A2A message part to the v0.3 ``kind`` shape.
+
+    Accepts the legacy ``{"type": "text", ...}`` shape (emitted by some
+    older builders) and rewrites the discriminator to ``kind`` — the
+    field name the a2a-sdk v0.3 schema canonicalizes on. Non-dict parts
+    are returned unchanged so the schema validator (not this helper) is
+    the one that rejects genuinely malformed parts with a clear error.
+    """
+    if not isinstance(part, dict):
+        return part
+    out = dict(part)
+    # Promote legacy `type` discriminator to `kind` when `kind` is absent.
+    # If both are present, `kind` wins (it's the schema field); drop the
+    # redundant `type` so the wire shape is unambiguous.
+    if "kind" not in out and "type" in out:
+        out["kind"] = out["type"]
+    out.pop("type", None)
+    return out
+
+
+def normalize_a2a_message_send_params(
+    params: dict[str, Any], *, default_text: str | None = None
+) -> dict[str, Any]:
+    """Return a copy of ``params`` with a schema-valid ``message`` (#2251).
+
+    Guarantees the outbound ``message/send`` ``params.message`` carries:
+
+      * ``role`` — defaulted to ``"user"`` when absent or not one of the
+        v0.3-valid roles (``user`` / ``agent``). Missing role is the
+        exact field that triggers the receiver's
+        ``SendMessageRequest params.message.role Field required``
+        rejection — defaulting it here makes the failure impossible.
+      * ``messageId`` — defaulted to a fresh UUID when absent.
+      * ``parts`` — each part normalized to the ``kind`` discriminator
+        (``type`` → ``kind``). When ``parts`` is absent and
+        ``default_text`` is supplied, a single text part is synthesized.
+
+    Pure + side-effect-free (operates on a shallow copy) so it is safe to
+    call from any builder. The receiver's Pydantic schema remains the
+    authority on full validity — this helper only closes the
+    deterministic gaps (role / messageId / part discriminator) that our
+    own builders are responsible for.
+    """
+    out = dict(params)
+    message = dict(out.get("message") or {})
+
+    role = message.get("role")
+    if role not in _A2A_VALID_ROLES:
+        message["role"] = _A2A_DEFAULT_ROLE
+
+    if not message.get("messageId"):
+        message["messageId"] = str(uuid.uuid4())
+
+    parts = message.get("parts")
+    if isinstance(parts, list):
+        message["parts"] = [_normalize_a2a_part(p) for p in parts]
+    elif parts is None and default_text is not None:
+        message["parts"] = [{"kind": "text", "text": default_text}]
+
+    out["message"] = message
+    return out
+
+
 # Workspace IDs are UUIDs everywhere we generate them (platform's
 # workspaces.id column, /registry/discover/:id route param, etc.) but
 # the agent-facing tool surface receives them as free-form strings via
@@ -617,13 +708,14 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
                         "jsonrpc": "2.0",
                         "id": str(uuid.uuid4()),
                         "method": "message/send",
-                        "params": {
-                            "message": {
-                                "role": "user",
-                                "messageId": str(uuid.uuid4()),
-                                "parts": [{"kind": "text", "text": message}],
-                            }
-                        },
+                        # #2251: route through the single normalizer so
+                        # role/messageId/parts are guaranteed schema-valid
+                        # against the receiver's a2a-sdk v0.3 SendMessageRequest.
+                        # A future edit that drops `role` from the literal
+                        # below can no longer ship a request the peer rejects.
+                        "params": normalize_a2a_message_send_params(
+                            {"message": {"parts": [{"kind": "text", "text": message}]}}
+                        ),
                     },
                 )
                 data = resp.json()
