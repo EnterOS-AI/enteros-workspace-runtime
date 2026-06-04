@@ -25,18 +25,23 @@ jobs:
         env:
           GITEA_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
         run: |
+          # runtime#83: a missing DISPATCH_TOKEN is a config gap, not a runtime
+          # regression. Without the token we cannot clone the private consumer
+          # repos, so this cross-repo check is SKIPPED with a loud warning rather
+          # than painting runtime main red. When the token is present, run it for
+          # real and let real drift fail the job.
           if [ -z "${GITEA_TOKEN:-}" ]; then
-            echo "::error::DISPATCH_TOKEN secret is required for cross-repo consumer drift checks"
-            exit 1
+            echo "::warning::DISPATCH_TOKEN secret absent; skipping cross-repo consumer drift check. Provision DISPATCH_TOKEN to enable it (runtime#83)."
+          else
+            python scripts/check_consumer_runtime_drift.py
           fi
-          python scripts/check_consumer_runtime_drift.py
 
       - name: Check platform communication contract
         env:
           GITEA_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
         run: |
           if [ -z "${GITEA_TOKEN:-}" ]; then
-            echo "::error::DISPATCH_TOKEN secret is required for cross-repo communication drift checks"
-            exit 1
+            echo "::warning::DISPATCH_TOKEN secret absent; skipping cross-repo communication contract check. Provision DISPATCH_TOKEN to enable it (runtime#83)."
+          else
+            python scripts/check_platform_comm_contract.py
           fi
-          python scripts/check_platform_comm_contract.py
