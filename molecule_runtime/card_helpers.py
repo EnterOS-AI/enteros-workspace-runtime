@@ -45,6 +45,18 @@ def enrich_card_skills(card: AgentCard, loaded_skills: Iterable | None) -> bool:
             )
             for skill in loaded_skills
         ]
+        # a2a-sdk 1.x AgentCard is a protobuf message: ``card.skills`` is a
+        # repeated field that does NOT allow direct assignment
+        # (``AttributeError: Assignment not allowed to ... repeated field``).
+        # Clear-and-extend is the protobuf-correct in-place swap. The old
+        # ``card.skills = rich`` only worked against the conftest stub;
+        # against the real SDK it raised AttributeError, which was swallowed
+        # below and silently degraded enrichment to the static config stubs —
+        # PR #2756's rich metadata never reached the served card. Kept inside
+        # the try so the no-raise contract above still holds. Pinned by
+        # tests/test_agent_card_contract.py against the genuine a2a.types.
+        del card.skills[:]
+        card.skills.extend(rich)
     except Exception as enrich_err:  # noqa: BLE001
         print(
             f"Warning: skill metadata enrichment failed (keeping static "
@@ -53,5 +65,4 @@ def enrich_card_skills(card: AgentCard, loaded_skills: Iterable | None) -> bool:
         )
         return False
 
-    card.skills = rich
     return True
