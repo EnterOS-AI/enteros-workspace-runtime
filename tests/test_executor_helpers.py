@@ -1709,3 +1709,140 @@ def test_new_response_message_handles_missing_attrs():
     msg = new_response_message(BareContext(), "hi")
     assert len(msg.task_id) == 32  # fallback uuid
     assert len(msg.context_id) == 32
+
+
+# ======================================================================
+# 3.12-compat regression: non-string uri/name in attached-file parts
+# ======================================================================
+#
+# Background: a MagicMock (or any other non-string truthy object) used
+# to slip through extract_attached_files' `getattr(..., "") or ""` filter
+# because MagicMock is truthy. The result was a non-string `uri`
+# passed to `_attachment_cache_path`, which then called
+# `hashlib.sha256(uri.encode("utf-8"))` and raised
+#   TypeError: object supporting the buffer API required
+# on Python 3.12 (the buffer-protocol checks are stricter; the same
+# error fires on 3.11 too, which is how this regression was first
+# reproducibly exposed in openclaw#43's test_session_id_derivation).
+#
+# The fix is a `_coerce_str` helper that returns v if isinstance(v, str)
+# else "", applied at every point a Pydantic-shape or v1-protobuf
+# attribute is extracted from a Part.
+
+def test_extract_attached_files_tolerates_non_string_uri_in_v0_shape(monkeypatch):
+    """MagicMock-style non-string uri on the v0 Pydantic-shape file
+    part must NOT propagate down to _attachment_cache_path. The
+    expected behaviour: extract_attached_files returns an empty list
+    (the unresolvable-uri skip fires), no TypeError."""
+    from types import SimpleNamespace
+    from molecule_runtime import executor_helpers as eh
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    # Monkeypatch WORKSPACE_MOUNT to a tmp dir so any path-resolution
+    # would be local (it won't fire here because uri is invalid).
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(eh, "WORKSPACE_MOUNT", tmp)
+        # v0 Pydantic shape: part.root.kind == 'file', part.root.file.uri
+        # We deliberately make `file.uri` a non-string truthy object
+        # (the exact regression shape from openclaw#43).
+        fake_file = SimpleNamespace()
+        fake_file.uri = "real-looking-but-not-string"  # plain str — should pass through
+        # Now build a v0 part where the URL is intentionally a MagicMock
+        # (simulating a mock inbound context). The test in openclaw uses
+        # a MagicMock directly; do the same here.
+        from unittest.mock import MagicMock
+        mm_file = MagicMock()
+        mm_file.uri = MagicMock(name="uri")  # MagicMock — truthy, non-str
+        mm_file.name = MagicMock(name="name")
+        mm_file.mimeType = MagicMock(name="mimeType")
+        v0_part = SimpleNamespace(
+            root=SimpleNamespace(kind="file", file=mm_file),
+        )
+        msg = SimpleNamespace(parts=[v0_part])
+        # Must NOT raise. The expected return is an empty list (the
+        # unresolvable-uri skip fires after _coerce_str returns '').
+        result = extract_attached_files(msg)
+        assert result == []
+
+
+def test_extract_attached_files_tolerates_non_string_url_in_v1_shape(monkeypatch):
+    """Same fix in the v1-protobuf-shape branch. When `part.url` is
+    a non-string truthy object (e.g. a MagicMock), the v1 branch
+    must NOT propagate it as the cache-path uri."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import tempfile
+    from molecule_runtime import executor_helpers as eh
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(eh, "WORKSPACE_MOUNT", tmp)
+        # v1 protobuf-shape part: no `root` attr, has `url` directly.
+        v1_part = MagicMock()
+        v1_part.url = MagicMock(name="url")
+        v1_part.filename = MagicMock(name="filename")
+        v1_part.media_type = MagicMock(name="media_type")
+        v1_part.mediaType = MagicMock(name="mediaType")
+        msg = SimpleNamespace(parts=[v1_part])
+        # Must NOT raise. The expected return is an empty list
+        # (the v1 branch's `if not v1_url: continue` fires after
+        # _coerce_str returns '').
+        result = extract_attached_files(msg)
+        assert result == []
+
+
+def test_extract_attached_files_accepts_real_strings_unaffected():
+    """The fix must not regress the happy path. A normal text part
+    with a real v0 Pydantic file part (real strings for uri/name/mime)
+    still produces the expected out list."""
+    from types import SimpleNamespace
+    import os
+    import tempfile
+    from molecule_runtime import executor_helpers as eh
+    from molecule_runtime.executor_helpers import extract_attached_files
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch_path = os.path.join(tmp, "real-file.png")
+        with open(monkeypatch_path, "wb") as fh:
+            fh.write(b"png-bytes")
+        monkeypatch = __import__("pytest").MonkeyPatch()
+        try:
+            monkeypatch.setattr(eh, "WORKSPACE_MOUNT", tmp)
+            file_obj = SimpleNamespace(
+                uri=f"file://{monkeypatch_path}",
+                name="real-file.png",
+                mimeType="image/png",
+            )
+            v0_part = SimpleNamespace(
+                root=SimpleNamespace(kind="file", file=file_obj),
+            )
+            msg = SimpleNamespace(parts=[v0_part])
+            result = extract_attached_files(msg)
+            assert len(result) == 1
+            assert result[0]["name"] == "real-file.png"
+            assert result[0]["mime_type"] == "image/png"
+            assert result[0]["path"] == monkeypatch_path
+        finally:
+            monkeypatch.undo()
+
+
+def test_coerce_str_helper_passes_strings_filters_non_strings():
+    """The new _coerce_str helper is the regression primitive. Real
+    strings pass through unchanged; anything else (None, MagicMock,
+    ints, empty strings) becomes ""."""
+    from molecule_runtime.executor_helpers import _coerce_str
+    from unittest.mock import MagicMock
+
+    # Real strings pass through.
+    assert _coerce_str("hello") == "hello"
+    assert _coerce_str("file:///x.txt") == "file:///x.txt"
+    # Empty string is filtered (matches `or ""` semantics).
+    assert _coerce_str("") == ""
+    # None / int / MagicMock → "".
+    assert _coerce_str(None) == ""
+    assert _coerce_str(0) == ""
+    assert _coerce_str(42) == ""
+    assert _coerce_str(MagicMock(name="x")) == ""
+    # Non-empty MagicMock also → "" (truthy non-string).
+    assert _coerce_str(MagicMock()) == ""
