@@ -6,6 +6,7 @@ Loads config -> discovers adapter -> setup -> create executor -> wrap in A2A -> 
 import asyncio
 import os
 import socket
+from collections.abc import Mapping
 
 import httpx
 import uvicorn
@@ -59,7 +60,7 @@ def get_machine_ip() -> str:  # pragma: no cover
         return "127.0.0.1"
 
 
-def resolve_workspace_url(env: "Mapping[str, str]", port: int) -> str:
+def resolve_workspace_url(env: Mapping[str, str], port: int) -> str:
     """Resolve the externally-advertised A2A URL the agent registers (runtime#95).
 
     Precedence:
