@@ -6,6 +6,7 @@ Loads config -> discovers adapter -> setup -> create executor -> wrap in A2A -> 
 import asyncio
 import os
 import socket
+from collections.abc import Mapping
 
 import httpx
 import uvicorn
@@ -57,6 +58,31 @@ def get_machine_ip() -> str:  # pragma: no cover
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def resolve_workspace_url(env: Mapping[str, str], port: int) -> str:
+    """Resolve the externally-advertised A2A URL the agent registers (runtime#95).
+
+    Precedence:
+      1. ``MOLECULE_WORKSPACE_URL`` — a platform-injected, externally-reachable
+         URL (full scheme+host, e.g. a per-workspace Cloudflare tunnel
+         ``https://ws-<id>.<appDomain>``). Used VERBATIM — no ``:port`` is
+         appended, since the tunnel/proxy fronts the agent's port.
+      2. Fallback: ``http://<HOSTNAME-or-machine-ip>:<port>``.
+
+    Why (1) exists: the fallback advertises the host's own name — on AWS that is
+    the cloud-internal ``ip-<priv-ip>`` (e.g. ``ip-10-10-1-147``), which only
+    resolves inside the workspace's OWN VPC. A tenant in a DIFFERENT cloud (an
+    EC2 workspace under a GCP tenant) gets a DNS SERVFAIL on it and rejects
+    ``/registry/register`` with 400 → the workspace is undialable. A
+    platform-injected reachable URL fixes cross-cloud push delivery while
+    same-cloud workspaces (no env set) keep the intra-VPC fallback.
+    """
+    injected = (env.get("MOLECULE_WORKSPACE_URL") or "").strip()
+    if injected:
+        return injected
+    machine = (env.get("HOSTNAME") or "").strip() or get_machine_ip()
+    return f"http://{machine}:{port}"
 
 
 def _check_delegation_results_pending() -> bool:
@@ -345,8 +371,10 @@ async def main():  # pragma: no cover
     # operators can deprovision/redeploy normally. Skills built from
     # config.skills (static names from config.yaml) up front; richer metadata
     # from the adapter's loaded_skills swaps in below if setup() succeeds.
-    machine_ip = os.environ.get("HOSTNAME", get_machine_ip())
-    workspace_url = f"http://{machine_ip}:{port}"
+    # Externally-advertised A2A URL — platform-injected MOLECULE_WORKSPACE_URL
+    # (e.g. per-workspace Cloudflare tunnel) wins, else intra-VPC fallback.
+    # See resolve_workspace_url + runtime#95.
+    workspace_url = resolve_workspace_url(os.environ, port)
 
     # v1: AgentCard.url removed; put url+protocol in supported_interfaces instead.
     # v1: AgentCapabilities.inputModes/outputModes removed; move to AgentCard.default_*.
