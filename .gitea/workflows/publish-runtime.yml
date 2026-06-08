@@ -99,6 +99,11 @@ jobs:
         env:
           RUNTIME_VERSION: ${{ steps.version.outputs.version }}
           EXPECTED_SHA256: ${{ steps.wheel_hash.outputs.wheel_sha256 }}
+          # runtime#2429: molecule_runtime validates WORKSPACE_ID at import time.
+          # The smoke must verify the wheel installs correctly without requiring
+          # a real workspace. A dummy ID satisfies validation without weakening
+          # the install check — the import still exercises the installed package.
+          WORKSPACE_ID: dummy-smoke-verify
         run: |
           set -eu
           python -m venv /tmp/runtime-registry-smoke
