@@ -62,7 +62,8 @@ def test_send_message_to_user_forwards_uploaded_attachment_refs(monkeypatch):
     import molecule_runtime.a2a_client as a2a_client
     import molecule_runtime.a2a_tools_messaging as messaging
 
-    monkeypatch.setattr(a2a_client, "WORKSPACE_ID", "ws-test")
+    monkeypatch.setenv("WORKSPACE_ID", "ws-test")
+    a2a_client._WORKSPACE_ID_cache = None
     monkeypatch.setattr(messaging, "_resolve_platform_url", lambda _ws: "http://platform.test")
     monkeypatch.setattr(messaging, "_auth_headers_for_heartbeat", lambda _ws: {})
 
@@ -104,7 +105,8 @@ def test_send_message_to_user_uploads_local_attachment_paths(monkeypatch, tmp_pa
     import molecule_runtime.a2a_client as a2a_client
     import molecule_runtime.a2a_tools_messaging as messaging
 
-    monkeypatch.setattr(a2a_client, "WORKSPACE_ID", "ws-test")
+    monkeypatch.setenv("WORKSPACE_ID", "ws-test")
+    a2a_client._WORKSPACE_ID_cache = None
     monkeypatch.setattr(messaging, "_resolve_platform_url", lambda _ws: "http://platform.test")
     monkeypatch.setattr(messaging, "_auth_headers_for_heartbeat", lambda _ws: {})
     report = tmp_path / "org_chart_v2.png"
