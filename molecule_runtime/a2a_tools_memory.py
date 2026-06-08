@@ -20,7 +20,7 @@ import json
 
 import httpx
 
-from molecule_runtime.a2a_client import PLATFORM_URL, WORKSPACE_ID
+from molecule_runtime.a2a_client import PLATFORM_URL, _resolve_workspace_id
 from molecule_runtime.a2a_tools_rbac import (
     auth_headers_for_heartbeat as _auth_headers_for_heartbeat,
     check_memory_read_permission as _check_memory_read_permission,
@@ -45,7 +45,7 @@ async def tool_commit_memory(
     ``source_workspace_id`` selects which registered workspace this
     memory belongs to when the agent is registered into multiple
     workspaces (PR-1 / multi-workspace mode). When unset, falls back
-    to the module-level WORKSPACE_ID — single-workspace operators see
+    to the module-level _resolve_workspace_id() — single-workspace operators see
     no behaviour change.
     """
     if not content:
@@ -70,7 +70,7 @@ async def tool_commit_memory(
             "Non-root workspaces may use LOCAL or TEAM scope."
         )
 
-    src = source_workspace_id or WORKSPACE_ID
+    src = source_workspace_id or _resolve_workspace_id()
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -106,7 +106,7 @@ async def tool_recall_memory(
 
     ``source_workspace_id`` selects which registered workspace's memories
     to search when the agent is registered into multiple workspaces.
-    Unset → defaults to the module-level WORKSPACE_ID.
+    Unset → defaults to the module-level _resolve_workspace_id().
     """
     # RBAC: require memory.read permission (mirrors builtin_tools/memory.py)
     if not _check_memory_read_permission():
@@ -115,7 +115,7 @@ async def tool_recall_memory(
             "permission for this operation."
         )
 
-    src = source_workspace_id or WORKSPACE_ID
+    src = source_workspace_id or _resolve_workspace_id()
     params: dict[str, str] = {"workspace_id": src}
     if query:
         params["q"] = query

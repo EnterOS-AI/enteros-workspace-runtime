@@ -80,7 +80,6 @@ def _isolate_env(monkeypatch):
     import molecule_runtime.builtin_tools.delegation as builtin_delegation
     import molecule_runtime.builtin_tools.a2a_tools as builtin_a2a_tools
 
-    monkeypatch.setattr(a2a_client, "WORKSPACE_ID", _SELF_WS, raising=True)
     monkeypatch.setattr(a2a_tools_delegation, "WORKSPACE_ID", _SELF_WS, raising=True)
     monkeypatch.setattr(builtin_delegation, "WORKSPACE_ID", _SELF_WS, raising=True)
     monkeypatch.setattr(builtin_a2a_tools, "WORKSPACE_ID", _SELF_WS, raising=True)

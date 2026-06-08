@@ -35,7 +35,7 @@ import os
 import httpx
 
 from molecule_runtime.a2a_client import (
-    WORKSPACE_ID,
+    _resolve_workspace_id,
     _A2A_ERROR_PREFIX,
     _A2A_QUEUED_PREFIX,
     _peer_names,
@@ -54,6 +54,8 @@ from molecule_runtime._sanitize_a2a import (
 
 logger = logging.getLogger(__name__)
 
+# Backwards-compat: tests monkeypatch this attribute.
+WORKSPACE_ID = None
 
 # RFC #2829 PR-5 cutover constants. The poll cadence + timeout are
 # intentionally generous: 3s gives the platform's executeDelegation
@@ -213,7 +215,7 @@ async def tool_delegate_task(
     delegation originates from — drives auth + the X-Workspace-ID source
     header so the platform's a2a_proxy logs the correct sender. Single-
     workspace operators leave it None and routing falls back to the
-    module-level WORKSPACE_ID.
+    module-level _resolve_workspace_id().
     """
     if not workspace_id or not task:
         return "Error: workspace_id and task are required"
@@ -222,8 +224,8 @@ async def tool_delegate_task(
     # the sending turn holds _run_lock while the receive handler waits for the
     # same lock, the request 30s-times-out, and the whole cycle is wasted.
     # Reject immediately with an actionable message. (effective_src mirrors the
-    # `src or WORKSPACE_ID` resolution used below for routing.)
-    effective_src = source_workspace_id or _peer_to_source.get(workspace_id) or WORKSPACE_ID
+    # `src or _resolve_workspace_id()` resolution used below for routing.)
+    effective_src = source_workspace_id or _peer_to_source.get(workspace_id) or _resolve_workspace_id()
     if workspace_id and workspace_id == effective_src:
         return (
             "Error: cannot delegate_task to your own workspace — self-delegation "
@@ -234,7 +236,7 @@ async def tool_delegate_task(
 
     # Auto-route: if source not specified, look up which registered
     # workspace last saw this peer (populated by tool_list_peers). Falls
-    # back to the legacy WORKSPACE_ID for single-workspace operators.
+    # back to the legacy _resolve_workspace_id() for single-workspace operators.
     src = source_workspace_id or _peer_to_source.get(workspace_id) or None
 
     # Discover the target. discover_peer is the access-control gate +
@@ -271,7 +273,7 @@ async def tool_delegate_task(
     # result-push flag (DELEGATION_RESULT_INBOX_PUSH) has been on for
     # ≥1 week without incident.
     if os.environ.get("DELEGATION_SYNC_VIA_INBOX") == "1":
-        result = await _delegate_sync_via_polling(workspace_id, task, src or WORKSPACE_ID)
+        result = await _delegate_sync_via_polling(workspace_id, task, src or _resolve_workspace_id())
     else:
         # send_a2a_message routes through ${PLATFORM_URL}/workspaces/{id}/a2a
         # (the platform proxy) so the same code works for in-container and
@@ -298,7 +300,7 @@ async def tool_delegate_task(
                 workspace_id,
             )
             result = await _delegate_sync_via_polling(
-                workspace_id, task, src or WORKSPACE_ID,
+                workspace_id, task, src or _resolve_workspace_id(),
             )
 
     # Detect delegation failures — wrap them clearly so the calling agent
@@ -364,7 +366,7 @@ async def tool_delegate_task_async(
     if not workspace_id or not task:
         return "Error: workspace_id and task are required"
 
-    src = source_workspace_id or _peer_to_source.get(workspace_id) or WORKSPACE_ID
+    src = source_workspace_id or _peer_to_source.get(workspace_id) or _resolve_workspace_id()
 
     # Self-delegation guard: even on the async path, queuing a task to your own
     # workspace just makes you re-process your own dispatch — never useful, and
@@ -420,9 +422,9 @@ async def tool_check_task_status(
             FIRED the delegations), not the target's.
         task_id: Optional delegation_id to filter. If empty, returns all recent delegations.
         source_workspace_id: Which registered workspace's delegation log
-            to query. Defaults to the module-level WORKSPACE_ID.
+            to query. Defaults to the module-level _resolve_workspace_id().
     """
-    src = source_workspace_id or WORKSPACE_ID
+    src = source_workspace_id or _resolve_workspace_id()
     try:
         base = _resolve_platform_url(src)
         async with httpx.AsyncClient(timeout=10.0) as client:

@@ -8,7 +8,7 @@ Launched automatically by main.py for CLI runtimes. Runs on stdio transport
 and is configured as a local MCP server for the claude --print invocation.
 
 Environment variables (set by the workspace container):
-  WORKSPACE_ID  — this workspace's ID
+  _resolve_workspace_id()  — this workspace's ID
   PLATFORM_URL  — platform API base URL (e.g. http://platform:8080)
 """
 
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # (e.g. tests that do `import a2a_mcp_server`) still work.
 from molecule_runtime.a2a_client import (  # noqa: F401, E402
     PLATFORM_URL,
-    WORKSPACE_ID,
+    _resolve_workspace_id,
     _A2A_ERROR_PREFIX,
     _agent_card_url_for,
     _peer_names,
