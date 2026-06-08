@@ -110,6 +110,14 @@ def get_workspace_id() -> str:
     """
     return str(WORKSPACE_ID)
 
+# Backwards-compat alias: older code paths and several in-package callers
+# (a2a_tools.py, a2a_tools_memory.py, a2a_tools_messaging.py) import
+# ``_resolve_workspace_id`` by name. The current canonical accessor is
+# ``get_workspace_id()`` (returns the same validated ``str``). Keep this
+# thin alias so a rebase or partial re-merge doesn\'t break those
+# import-time references.
+_resolve_workspace_id = get_workspace_id
+
 
 def _resolve_platform_url(src: str | None) -> str:
     """Return the platform URL to use for an outbound call from ``src``.
