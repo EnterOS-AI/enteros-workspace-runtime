@@ -25,7 +25,7 @@ import os
 import httpx
 
 from molecule_runtime.a2a_client import (
-    WORKSPACE_ID,
+    _resolve_workspace_id,
     _peer_names,
     _peer_to_source,
     _resolve_platform_url,
@@ -80,7 +80,7 @@ async def _upload_chat_files(
         if not mime_type:
             mime_type = "application/octet-stream"
         files_payload.append(("files", (os.path.basename(p), data, mime_type)))
-    target_workspace_id = (workspace_id or "").strip() or WORKSPACE_ID
+    target_workspace_id = (workspace_id or "").strip() or _resolve_workspace_id()
     base = _resolve_platform_url(target_workspace_id)
     try:
         resp = await client.post(
@@ -123,7 +123,7 @@ async def tool_broadcast_message(
     """
     if not message:
         return "Error: message is required"
-    target_workspace_id = (workspace_id or "").strip() or WORKSPACE_ID
+    target_workspace_id = (workspace_id or "").strip() or _resolve_workspace_id()
     base = _resolve_platform_url(target_workspace_id)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -178,7 +178,7 @@ async def tool_send_message_to_user(
     """
     if not message:
         return "Error: message is required"
-    target_workspace_id = (workspace_id or "").strip() or WORKSPACE_ID
+    target_workspace_id = (workspace_id or "").strip() or _resolve_workspace_id()
     base = _resolve_platform_url(target_workspace_id)
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -258,7 +258,7 @@ async def tool_list_peers(source_workspace_id: str | None = None) -> str:
 
     Behavior:
         - ``source_workspace_id`` set → list peers of that one workspace.
-        - Unset, single-workspace mode → list peers of WORKSPACE_ID
+        - Unset, single-workspace mode → list peers of _resolve_workspace_id()
           (the legacy path, unchanged).
         - Unset, multi-workspace mode (MOLECULE_WORKSPACES populated) →
           aggregate across every registered workspace, prefixing each
@@ -279,7 +279,7 @@ async def tool_list_peers(source_workspace_id: str | None = None) -> str:
             sources = registered
             aggregate = True
         else:
-            sources = [WORKSPACE_ID]
+            sources = [_resolve_workspace_id()]
 
     all_peers: list[tuple[str, dict]] = []  # (source, peer_record)
     diagnostics: list[tuple[str, str]] = []  # (source, diagnostic)
@@ -323,7 +323,7 @@ async def tool_get_workspace_info(source_workspace_id: str | None = None) -> str
 
     ``source_workspace_id`` selects which registered workspace to
     introspect when the agent is registered into multiple workspaces.
-    Unset → falls back to module-level WORKSPACE_ID.
+    Unset → falls back to module-level _resolve_workspace_id().
     """
     info = await get_workspace_info(source_workspace_id=source_workspace_id)
     return json.dumps(info, indent=2)
@@ -359,7 +359,7 @@ async def tool_chat_history(
         source_workspace_id: Which registered workspace's activity log
             to query. Auto-routes via ``_peer_to_source`` cache when
             unset (the workspace this peer was discovered through);
-            falls back to module-level WORKSPACE_ID for single-workspace
+            falls back to module-level _resolve_workspace_id() for single-workspace
             operators.
 
     Returns a JSON-encoded list of activity rows (or an error string
@@ -376,7 +376,7 @@ async def tool_chat_history(
     if limit > 500:
         limit = 500
 
-    src = source_workspace_id or _peer_to_source.get(peer_id) or WORKSPACE_ID
+    src = source_workspace_id or _peer_to_source.get(peer_id) or _resolve_workspace_id()
 
     params: dict[str, str] = {
         "peer_id": peer_id,

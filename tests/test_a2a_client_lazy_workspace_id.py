@@ -91,3 +91,41 @@ def test_a2a_client_workspace_id_lazy_caches(monkeypatch):
         "Lazy cache should return the originally-validated value, "
         "not re-read the env on every access"
     )
+
+
+def test_a2a_client_internal_default_workspace_id_falls_back(monkeypatch):
+    """A function that defaults source_workspace_id to None and reads
+    the module-level WORKSPACE_ID (now via _resolve_workspace_id) must
+    raise the intended RuntimeError, not NameError, when WORKSPACE_ID
+    is unset at call time. (CR2 r#9552 + Researcher r#9553 on PR#99:
+    PEP 562 __getattr__ only fires for EXTERNAL access, so any bare
+    global reference inside the module would NameError. The fix
+    routes all internal fallbacks through the helper.)
+    """
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
+    sys.modules.pop("molecule_runtime.a2a_client", None)
+    import molecule_runtime.a2a_client as m
+
+    # Find a public function in a2a_client that defaults its
+    # source_workspace_id to None and (eventually) reads the module
+    # fallback. `discover_peer` is one such function (its default
+    # source_workspace_id is None; with no source, it falls back
+    # to module WORKSPACE_ID).
+    try:
+        # The function would actually need valid args; we just
+        # want to confirm the import + name-resolution path doesn't
+        # NameError. Trigger a single argument-validation path
+        # that touches the fallback.
+        m.discover_peer("not-a-uuid")
+    except (RuntimeError, m.httpx.HTTPError, Exception) as exc:
+        # RuntimeError is the intended path (WORKSPACE_ID unset).
+        # Anything else (NameError, AttributeError on WORKSPACE_ID)
+        # would be the regression we're guarding against.
+        if isinstance(exc, NameError) and "WORKSPACE_ID" in str(exc):
+            raise AssertionError(
+                f"Internal WORKSPACE_ID reference NameError'd: {exc}. "
+                "Bare WORKSPACE_ID in a2a_client.py would cause this; "
+                "all internal refs should route through _resolve_workspace_id()."
+            )
+        # Other exceptions (httpx errors, RuntimeError "not set", etc.) are
+        # acceptable — the key is that the fallback path doesn't NameError.

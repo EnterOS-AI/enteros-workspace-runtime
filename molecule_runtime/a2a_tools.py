@@ -7,7 +7,7 @@ import httpx
 
 from molecule_runtime.a2a_client import (
     PLATFORM_URL,
-    WORKSPACE_ID,
+    _resolve_workspace_id,
     _A2A_ERROR_PREFIX,
     _peer_names,
     _peer_to_source,
@@ -69,7 +69,7 @@ async def report_activity(
         async with httpx.AsyncClient(timeout=5.0) as client:
             payload: dict = {
                 "activity_type": activity_type,
-                "source_id": WORKSPACE_ID,
+                "source_id": _resolve_workspace_id,
                 "target_id": target_id,
                 "method": "message/send",
                 "summary": summary,
@@ -87,7 +87,7 @@ async def report_activity(
                 # to scroll into the raw response_body JSON.
                 payload["error_detail"] = error_detail
             await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/activity",
+                f"{PLATFORM_URL}/workspaces/{_resolve_workspace_id()}/activity",
                 json=payload,
                 headers=_auth_headers_for_heartbeat(),
             )
@@ -96,7 +96,7 @@ async def report_activity(
                 await client.post(
                     f"{PLATFORM_URL}/registry/heartbeat",
                     json={
-                        "workspace_id": WORKSPACE_ID,
+                        "workspace_id": _resolve_workspace_id,
                         "current_task": summary,
                         "active_tasks": 1,
                         "error_rate": 0,

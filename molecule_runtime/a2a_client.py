@@ -31,35 +31,56 @@ logger = logging.getLogger(__name__)
 # Validate WORKSPACE_ID (CWE-20, issue #14) — flows into X-Workspace-ID
 # headers on every outbound A2A call below.
 #
-# Lazy validation via PEP 562 module __getattr__: previously this
-# block ran at MODULE IMPORT time and raised RuntimeError if
-# WORKSPACE_ID was unset. That broke the publish-runtime wheel-build
-# job (which imports the runtime for static analysis but has no
-# WORKSPACE_ID), painting main red. We now defer validation to
-# first attribute access — module import never raises. Callers
-# that don't actually use WORKSPACE_ID (e.g., the publish job's
-# `python -m build`) can import freely; callers that do (e.g.,
-# coordinator.py, runtime entry points) get the same RuntimeError
-# on first access, with a clear message.
+# Lazy validation via PEP 562 module __getattr__ + a module-level
+# helper: previously this block ran at MODULE IMPORT time and raised
+# RuntimeError if WORKSPACE_ID was unset. That broke the publish-runtime
+# wheel-build job (which imports the runtime for static analysis but
+# has no WORKSPACE_ID), painting main red. We now defer validation to
+# first access — module import never raises. Callers that don't
+# actually use WORKSPACE_ID (e.g., the publish job's `python -m build`)
+# can import freely; callers that do get the same RuntimeError on
+# first access, with a clear message.
+#
+# IMPORTANT: PEP 562 `__getattr__` only fires for EXTERNAL attribute
+# access (e.g. `a2a_client.WORKSPACE_ID` from another module). It
+# does NOT resolve bare global references from inside this same
+# module — so any internal code path that does `WORKSPACE_ID` directly
+# would raise NameError, not the intended RuntimeError. To avoid that
+# regression, every internal call site goes through the helper
+# `_resolve_workspace_id()` (defined below) instead of a bare
+# reference, and `__getattr__` for external callers also routes
+# through the same helper. Both paths share the cache, so validation
+# runs at most once per process.
 _WORKSPACE_ID_cache: str | None = None
 
 
-def __getattr__(name: str):  # PEP 562
+def _resolve_workspace_id() -> str:
+    """Lazy WORKSPACE_ID resolver. Validates on first call, caches thereafter.
+
+    Used by both the PEP 562 `__getattr__` path (external access) and
+    all internal call sites in this module (which would otherwise
+    NameError on a bare `WORKSPACE_ID` reference). Returns the
+    validated ID; raises RuntimeError on unset or invalid.
+    """
     global _WORKSPACE_ID_cache
+    if _WORKSPACE_ID_cache is None:
+        _raw = os.environ.get("WORKSPACE_ID")
+        if not _raw:
+            raise RuntimeError(
+                "WORKSPACE_ID environment variable is required but not set"
+            )
+        try:
+            _WORKSPACE_ID_cache = _validate_workspace_id(_raw)
+        except ValueError as _exc:
+            raise RuntimeError(
+                f"WORKSPACE_ID failed validation: {_exc}"
+            ) from _exc
+    return _WORKSPACE_ID_cache
+
+
+def __getattr__(name: str):  # PEP 562
     if name == "WORKSPACE_ID":
-        if _WORKSPACE_ID_cache is None:
-            _raw = os.environ.get("WORKSPACE_ID")
-            if not _raw:
-                raise RuntimeError(
-                    "WORKSPACE_ID environment variable is required but not set"
-                )
-            try:
-                _WORKSPACE_ID_cache = _validate_workspace_id(_raw)
-            except ValueError as _exc:
-                raise RuntimeError(
-                    f"WORKSPACE_ID failed validation: {_exc}"
-                ) from _exc
-        return _WORKSPACE_ID_cache
+        return _resolve_workspace_id()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -372,7 +393,7 @@ def enrich_peer_metadata(
             # the same as a registry miss, which is the desired UX.
             return record
 
-    src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    src = (source_workspace_id or "").strip() or _resolve_workspace_id()
     url = f"{_resolve_platform_url(src)}/registry/discover/{canon}"
     try:
         with httpx.Client(timeout=2.0) as client:
@@ -708,7 +729,7 @@ async def discover_peer(target_id: str, source_workspace_id: str | None = None) 
     safe_id = _validate_peer_id(target_id)
     if safe_id is None:
         return None
-    src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    src = (source_workspace_id or "").strip() or _resolve_workspace_id()
     base = _resolve_platform_url(src)
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -833,7 +854,7 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
     safe_id = _validate_peer_id(peer_id)
     if safe_id is None:
         return f"{_A2A_ERROR_PREFIX}invalid peer_id (expected UUID): {peer_id!r}"
-    src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    src = (source_workspace_id or "").strip() or _resolve_workspace_id()
     target_url = f"{_resolve_platform_url(src)}/workspaces/{safe_id}/a2a"
 
     # Fix F (Cycle 5 / H2 — flagged 5 consecutive audits): timeout=None allowed
@@ -988,7 +1009,7 @@ async def get_peers_with_diagnostic(source_workspace_id: str | None = None) -> t
     The legacy get_peers() shim below preserves the bare-list contract for
     non-tool callers.
     """
-    src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    src = (source_workspace_id or "").strip() or _resolve_workspace_id()
     base = _resolve_platform_url(src)
     url = f"{base}/registry/{src}/peers"
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1016,7 +1037,7 @@ async def get_peers_with_diagnostic(source_workspace_id: str | None = None) -> t
             )
         if resp.status_code == 404:
             return [], (
-                f"Workspace ID {WORKSPACE_ID} is not registered with the platform (HTTP 404). "
+                f"Workspace ID {_resolve_workspace_id()} is not registered with the platform (HTTP 404). "
                 "Re-registration via the platform's /registry/register endpoint is needed."
             )
         if 500 <= resp.status_code < 600:
@@ -1049,7 +1070,7 @@ async def get_workspace_info(source_workspace_id: str | None = None) -> dict:
       - 404 / other     → workspace never existed (or transient)
       - exception       → network / auth failure
     """
-    src = source_workspace_id or WORKSPACE_ID
+    src = source_workspace_id or _resolve_workspace_id()
     base = _resolve_platform_url(src)
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
