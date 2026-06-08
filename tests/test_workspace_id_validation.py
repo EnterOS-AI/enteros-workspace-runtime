@@ -220,3 +220,40 @@ class TestRefreshFromDiskAlias:
     def test_refresh_from_disk_is_refresh_cache(self):
         from molecule_runtime import platform_auth
         assert platform_auth.refresh_from_disk is platform_auth.refresh_cache
+
+
+class TestLazyA2aClientImport:
+    """a2a_client.WORKSPACE_ID must not be validated at import time (issue #1180).
+
+    Smoke tests, lint scans, and IDE autocomplete import the module without
+    setting the env var. Validation is deferred to first use.
+    """
+
+    def test_import_succeeds_without_workspace_id(self, monkeypatch):
+        monkeypatch.delenv("WORKSPACE_ID", raising=False)
+        # Force re-import by removing from sys.modules
+        import sys
+        for mod in list(sys.modules):
+            if "molecule_runtime.a2a_client" in mod:
+                del sys.modules[mod]
+        import molecule_runtime.a2a_client as ac
+        assert ac is not None
+
+    def test_first_access_raises_when_workspace_id_unset(self, monkeypatch):
+        monkeypatch.delenv("WORKSPACE_ID", raising=False)
+        import sys
+        for mod in list(sys.modules):
+            if "molecule_runtime.a2a_client" in mod:
+                del sys.modules[mod]
+        import molecule_runtime.a2a_client as ac
+        with pytest.raises(RuntimeError, match="WORKSPACE_ID environment variable is required"):
+            str(ac.WORKSPACE_ID)
+
+    def test_first_access_returns_validated_id_when_set(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ID", "00000000-0000-0000-0000-000000000001")
+        import sys
+        for mod in list(sys.modules):
+            if "molecule_runtime.a2a_client" in mod:
+                del sys.modules[mod]
+        import molecule_runtime.a2a_client as ac
+        assert ac.WORKSPACE_ID == "00000000-0000-0000-0000-000000000001"
