@@ -81,11 +81,14 @@ def _call_install(monkeypatch, ch):
     ch.log.addHandler(cap)
     try:
         # Patch everything that would do real work.
+        # NOTE: do NOT set extract.return_value to a str — install_credential_helper
+        # does `helper_dir / _DAEMON_SCRIPT` which fails on str/str
+        # (TypeError at line ~330). Let the MagicMock default return a
+        # MagicMock that supports `/` with any operand.
         with mock.patch.object(ch, "_extract_scripts") as extract, \
              mock.patch.object(ch, "_TOKEN_CACHE_DIR") as cache_dir, \
              mock.patch.object(ch, "_initial_gh_auth") as initial_gh, \
              mock.patch.object(ch, "_start_refresh_daemon") as daemon:
-            extract.return_value = "/tmp/fake-helper-dir"
             cache_dir.mkdir = mock.MagicMock()
             cache_dir.chmod = mock.MagicMock()
             ch.install_credential_helper()

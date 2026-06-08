@@ -173,10 +173,15 @@ def _git_provider() -> str:
         return explicit
     if explicit:
         # Unknown value — treat as unset, but flag it so a misconfig is loud.
+        # SECURITY: do NOT log the raw env value (it could be a misplaced
+        # token/credential — see RC 9680). Log only a constant marker.
+        # Wording kept "not a recognized value" so the gating test can
+        # match the substring without needing the raw value.
         log.warning(
-            "credential_helper: GIT_PROVIDER=%r is not a recognized value "
-            "(expected 'github' or 'gitea') — treating as unset",
-            os.environ.get("GIT_PROVIDER"),
+            "credential_helper: GIT_PROVIDER is set, but the value is not a "
+            "recognized value (expected 'github' or 'gitea') — treating as "
+            "unset. Set the GIT_PROVIDER env var to a recognized value to "
+            "silence this."
         )
     return ""
 
