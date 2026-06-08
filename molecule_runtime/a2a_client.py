@@ -30,13 +30,39 @@ logger = logging.getLogger(__name__)
 
 # Validate WORKSPACE_ID (CWE-20, issue #14) — flows into X-Workspace-ID
 # headers on every outbound A2A call below.
-_WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
-if not _WORKSPACE_ID_raw:
-    raise RuntimeError("WORKSPACE_ID environment variable is required but not set")
-try:
-    WORKSPACE_ID = _validate_workspace_id(_WORKSPACE_ID_raw)
-except ValueError as _exc:
-    raise RuntimeError(f"WORKSPACE_ID failed validation: {_exc}") from _exc
+#
+# Lazy validation via PEP 562 module __getattr__: previously this
+# block ran at MODULE IMPORT time and raised RuntimeError if
+# WORKSPACE_ID was unset. That broke the publish-runtime wheel-build
+# job (which imports the runtime for static analysis but has no
+# WORKSPACE_ID), painting main red. We now defer validation to
+# first attribute access — module import never raises. Callers
+# that don't actually use WORKSPACE_ID (e.g., the publish job's
+# `python -m build`) can import freely; callers that do (e.g.,
+# coordinator.py, runtime entry points) get the same RuntimeError
+# on first access, with a clear message.
+_WORKSPACE_ID_cache: str | None = None
+
+
+def __getattr__(name: str):  # PEP 562
+    global _WORKSPACE_ID_cache
+    if name == "WORKSPACE_ID":
+        if _WORKSPACE_ID_cache is None:
+            _raw = os.environ.get("WORKSPACE_ID")
+            if not _raw:
+                raise RuntimeError(
+                    "WORKSPACE_ID environment variable is required but not set"
+                )
+            try:
+                _WORKSPACE_ID_cache = _validate_workspace_id(_raw)
+            except ValueError as _exc:
+                raise RuntimeError(
+                    f"WORKSPACE_ID failed validation: {_exc}"
+                ) from _exc
+        return _WORKSPACE_ID_cache
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # Platform URL: always host.docker.internal inside containers. The platform API
 # is only reachable via the Docker network mesh from inside a workspace
 # container regardless of the runtime environment (Docker/host).
