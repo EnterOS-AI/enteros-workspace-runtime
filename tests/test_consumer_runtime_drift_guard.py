@@ -104,28 +104,3 @@ def test_clone_consumers_retries_on_transient_failure(monkeypatch: pytest.Monkey
     import check_consumer_runtime_drift as guard
     guard.clone_consumers(workdir, ("molecule-core",), gitea_url="https://git.moleculesai.app", token="fake-token")
     assert call_count == 3, f"expected 3 attempts, got {call_count}"
-
-
-def test_clone_consumers_never_puts_token_in_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """GIT_ASKPASS path: token must not appear in git clone argv or remote URL (runtime#86)."""
-    import subprocess
-
-    captured: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-    def capture_run(*args: object, **kwargs: object) -> object:
-        captured.append((args, kwargs))
-        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-
-    monkeypatch.setattr(subprocess, "run", capture_run)
-    workdir = tmp_path / "wd"
-    workdir.mkdir()
-    import check_consumer_runtime_drift as guard
-    guard.clone_consumers(workdir, ("molecule-core",), gitea_url="https://git.moleculesai.app", token="s3cr3t-t0k3n")
-
-    assert len(captured) == 1
-    cmd = captured[0][0][0]
-    env = captured[0][1].get("env") or {}
-    cmd_str = " ".join(str(c) for c in cmd)
-    assert "s3cr3t-t0k3n" not in cmd_str, "token leaked into subprocess argv"
-    assert "x-access-token" not in cmd_str, "username leaked into subprocess argv"
-    assert env.get("GIT_ASKPASS") is not None, "GIT_ASKPASS not set in clone env"

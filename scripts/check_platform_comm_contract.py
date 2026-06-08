@@ -278,32 +278,6 @@ def find_platform_comm_drift(repo_name: str, repo_path: Path) -> list[ContractFi
     return []
 
 
-def _git_clone_with_token(dest: Path, url: str, token: str) -> subprocess.CompletedProcess[str]:
-    """Clone using GIT_ASKPASS so the token never appears in argv or remote URL."""
-    import shlex
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
-        f.write("#!/bin/sh\n")
-        f.write('case "$1" in\n')
-        f.write('  *Username*) echo "x-access-token" ;;\n')
-        f.write(f'  *Password*) echo {shlex.quote(token)} ;;\n')
-        f.write("esac\n")
-        askpass = f.name
-    os.chmod(askpass, 0o700)
-    try:
-        return subprocess.run(
-            ["git", "clone", "--depth", "1", url, str(dest)],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30,
-            env={**os.environ, "GIT_ASKPASS": askpass},
-        )
-    finally:
-        os.unlink(askpass)
-
-
 def clone_repos(workdir: Path, repos: tuple[str, ...], *, gitea_url: str, token: str) -> dict[str, Path]:
     if not token:
         raise RuntimeError("GITEA_TOKEN is required when --root is not provided")
@@ -312,20 +286,28 @@ def clone_repos(workdir: Path, repos: tuple[str, ...], *, gitea_url: str, token:
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
         raise RuntimeError(f"invalid Gitea URL: {gitea_url}")
 
-    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    safe_token = quote(token, safe="")
+    base_url = f"{parsed_url.scheme}://x-access-token:{safe_token}@{parsed_url.netloc}"
     paths: dict[str, Path] = {}
     for repo in repos:
         dest = workdir / repo
-        clone_url = f"{base_url}/molecule-ai/{repo}.git"
+        last_exc: Exception | None = None
         for attempt in range(1, 4):
-            result = _git_clone_with_token(dest, clone_url, token)
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", f"{base_url}/molecule-ai/{repo}.git", str(dest)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
             if result.returncode == 0:
                 paths[repo] = dest
                 break
             if attempt < 3:
                 time.sleep(2 ** (attempt - 1))
                 continue
-            stderr = result.stderr.replace(token, "<redacted>")
+            stderr = result.stderr.replace(token, "<redacted>").replace(safe_token, "<redacted>")
             raise RuntimeError(f"failed to clone {repo} after 3 attempts: {stderr.strip()}")
 
     return paths
