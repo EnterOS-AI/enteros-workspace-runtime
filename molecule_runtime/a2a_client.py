@@ -101,6 +101,16 @@ class _LazyWorkspaceID:
 WORKSPACE_ID: str = _LazyWorkspaceID()  # type: ignore[assignment]
 
 
+def get_workspace_id() -> str:
+    """Return the validated WORKSPACE_ID as a real ``str``.
+
+    Use this accessor in internal call sites that pass the id directly
+    into httpx headers/URLs (httpx requires ``str``/``bytes``, not a
+    string-like sentinel). External callers can still use ``str(WORKSPACE_ID)``.
+    """
+    return str(WORKSPACE_ID)
+
+
 def _resolve_platform_url(src: str | None) -> str:
     """Return the platform URL to use for an outbound call from ``src``.
 
@@ -404,7 +414,7 @@ def enrich_peer_metadata(
             # the same as a registry miss, which is the desired UX.
             return record
 
-    src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    src = (source_workspace_id or "").strip() or get_workspace_id()
     url = f"{_resolve_platform_url(src)}/registry/discover/{canon}"
     try:
         with httpx.Client(timeout=2.0) as client:
@@ -740,7 +750,7 @@ async def discover_peer(target_id: str, source_workspace_id: str | None = None) 
     safe_id = _validate_peer_id(target_id)
     if safe_id is None:
         return None
-    src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    src = (source_workspace_id or "").strip() or get_workspace_id()
     base = _resolve_platform_url(src)
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -865,7 +875,7 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
     safe_id = _validate_peer_id(peer_id)
     if safe_id is None:
         return f"{_A2A_ERROR_PREFIX}invalid peer_id (expected UUID): {peer_id!r}"
-    src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    src = (source_workspace_id or "").strip() or get_workspace_id()
     target_url = f"{_resolve_platform_url(src)}/workspaces/{safe_id}/a2a"
 
     # Fix F (Cycle 5 / H2 — flagged 5 consecutive audits): timeout=None allowed
@@ -1020,7 +1030,7 @@ async def get_peers_with_diagnostic(source_workspace_id: str | None = None) -> t
     The legacy get_peers() shim below preserves the bare-list contract for
     non-tool callers.
     """
-    src = (source_workspace_id or "").strip() or WORKSPACE_ID
+    src = (source_workspace_id or "").strip() or get_workspace_id()
     base = _resolve_platform_url(src)
     url = f"{base}/registry/{src}/peers"
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1081,7 +1091,7 @@ async def get_workspace_info(source_workspace_id: str | None = None) -> dict:
       - 404 / other     → workspace never existed (or transient)
       - exception       → network / auth failure
     """
-    src = source_workspace_id or WORKSPACE_ID
+    src = source_workspace_id or get_workspace_id()
     base = _resolve_platform_url(src)
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
