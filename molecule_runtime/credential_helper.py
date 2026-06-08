@@ -154,8 +154,83 @@ def _start_refresh_daemon(daemon_path: Path) -> None:
     log.info("credential_helper: refresh daemon spawned pid=%d", proc.pid)
 
 
+# SCM-provider selector. Set to ``github`` or ``gitea`` to pin a single flow
+# deterministically; unset means "use whichever single flow is configured,
+# else fail-loud if both are present" (see runtime#104 RC). This replaces
+# the prior implicit / order-dependent rule (presence of GH_TOKEN/GITHUB_TOKEN
+# shadowed a working Gitea flow — incident 2026-06-08).
+_VALID_GIT_PROVIDERS = frozenset({"github", "gitea"})
+
+
+def _git_provider() -> str:
+    """Resolve the configured SCM provider.
+
+    Returns ``"github"``, ``"gitea"``, or ``""`` (unset — caller must decide
+    based on which creds are present, and warn if BOTH are).
+    """
+    explicit = (os.environ.get("GIT_PROVIDER") or "").strip().lower()
+    if explicit in _VALID_GIT_PROVIDERS:
+        return explicit
+    if explicit:
+        # Unknown value — treat as unset, but flag it so a misconfig is loud.
+        log.warning(
+            "credential_helper: GIT_PROVIDER=%r is not a recognized value "
+            "(expected 'github' or 'gitea') — treating as unset",
+            os.environ.get("GIT_PROVIDER"),
+        )
+    return ""
+
+
+def _has_gitea_creds() -> bool:
+    """True if any Gitea-style env var is set on this process.
+
+    Covers the two ways Gitea auth is injected: (a) explicit
+    GIT_HTTP_USERNAME/PASSWORD for the Gitea HTTPS endpoint, and
+    (b) GITEA_TOKEN as a bearer-style fallback. Either is enough to
+    signal "this workspace is on the Gitea SCM."
+    """
+    return bool(
+        os.environ.get("GIT_HTTP_USERNAME")
+        and os.environ.get("GIT_HTTP_PASSWORD")
+    ) or bool(os.environ.get("GITEA_TOKEN"))
+
+
+def _has_github_creds() -> bool:
+    """True if any GitHub-style env var is set on this process."""
+    return bool(os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
+
+
+def _warn_stacked_flows(detected_github: bool, detected_gitea: bool) -> str:
+    """Log a LOUD warning if both flows are present. Returns the chosen
+    provider (preferring gitea — this org's canonical SCM).
+    """
+    if detected_github and detected_gitea:
+        log.warning(
+            "credential_helper: STACKED git-credential flows detected "
+            "(both Gitea and GitHub creds present). Defaulting to gitea "
+            "(org canonical). Set GIT_PROVIDER=github explicitly to "
+            "opt into the GitHub flow. Per-agent credentials must be "
+            "exactly ONE flow; stacking is almost always a remediation "
+            "mistake (see runtime#104)."
+        )
+        return "gitea"
+    if detected_github:
+        return "github"
+    if detected_gitea:
+        return "gitea"
+    return ""  # neither; caller will skip helper install entirely
+
+
 def _initial_gh_auth() -> None:
-    """Prime gh CLI with the provision-time token so commands work immediately."""
+    """Prime gh CLI with the provision-time token so commands work immediately.
+
+    Honor ``GIT_PROVIDER=gitea``: if explicitly set to ``gitea``, skip the
+    GitHub flow entirely (this workspace is on the canonical Gitea SCM).
+    See runtime#104 for the RC.
+    """
+    if _git_provider() == "gitea":
+        log.info("credential_helper: GIT_PROVIDER=gitea — skip initial gh auth")
+        return
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if not token:
         log.info("credential_helper: no GH_TOKEN/GITHUB_TOKEN at startup — skip initial gh auth")
@@ -184,7 +259,53 @@ def install_credential_helper() -> None:
 
     Intended to be called once early in the workspace runtime startup,
     before any code path that might invoke git or gh.
+
+    Provider selection (see runtime#104):
+    - ``GIT_PROVIDER=github`` → install + run the GitHub helper machinery.
+    - ``GIT_PROVIDER=gitea`` → skip the GitHub machinery entirely; the
+      workspace uses Gitea auth from ``GIT_HTTP_USERNAME/PASSWORD`` (or
+      ``GITEA_TOKEN``) directly.
+    - Unset, single flow present → use that flow (current behavior).
+    - Unset, BOTH flows present → LOUD warning + default to gitea (the
+      org canonical). Set ``GIT_PROVIDER`` explicitly to override.
+    - Unset, no flows present → no-op (nothing to install).
     """
+    # Resolve the provider up-front so every later step can short-circuit
+    # cleanly if we're a gitea-only workspace.
+    explicit = _git_provider()
+    detected_github = _has_github_creds()
+    detected_gitea = _has_gitea_creds()
+
+    if explicit:
+        provider = explicit
+    else:
+        provider = _warn_stacked_flows(detected_github, detected_gitea)
+
+    if not provider:
+        # No provider at all — nothing to do. (Workspace will rely on
+        # whatever env-based auth git picks up, which is the existing
+        # pre-helper behavior.)
+        log.info(
+            "credential_helper: no SCM provider configured (GIT_PROVIDER unset "
+            "and neither Gitea nor GitHub creds present) — skipping all setup"
+        )
+        return
+
+    if provider == "gitea":
+        log.info(
+            "credential_helper: provider=gitea (GIT_PROVIDER=%s, detected_gitea=%s, "
+            "detected_github=%s) — skipping GitHub helper install; using Gitea "
+            "env auth (GIT_HTTP_USERNAME/PASSWORD or GITEA_TOKEN) directly",
+            explicit or "<unset>", detected_gitea, detected_github,
+        )
+        return
+
+    # provider == "github": install the GitHub helper machinery.
+    log.info(
+        "credential_helper: provider=github (GIT_PROVIDER=%s, detected_github=%s, "
+        "detected_gitea=%s)",
+        explicit or "<unset>", detected_github, detected_gitea,
+    )
     try:
         helper_dir = _extract_scripts()
     except (OSError, ModuleNotFoundError) as exc:
