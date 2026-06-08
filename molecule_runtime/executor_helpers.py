@@ -944,8 +944,17 @@ def _validated_legacy_content_parts(uri: str) -> tuple[str, str] | None:
 
 
 def _attachment_cache_path(uri: str, name: str) -> str:
-    digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:24]
-    safe_name = _sanitize_attachment_name(name or "attachment")
+    # Belt-and-suspenders: even with the type guard in
+    # extract_attached_files, an old caller (or a test) could still pass
+    # a non-string here. Coerce to str before the hash so a MagicMock
+    # doesn't produce a cryptic TypeError on Python 3.12 (buffer
+    # protocol is stricter). The digest is meaningless for a coerced
+    # value, but the function still returns a stable path so the
+    # downstream code path doesn't crash. 3.11- and 3.12-compatible.
+    uri_str = str(uri) if not isinstance(uri, str) else uri
+    name_str = str(name) if not isinstance(name, str) else name
+    digest = hashlib.sha256(uri_str.encode("utf-8")).hexdigest()[:24]
+    safe_name = _sanitize_attachment_name(name_str or "attachment")
     return os.path.join(INBOX_ATTACHMENTS_DIR, digest, safe_name)
 
 
@@ -1137,6 +1146,25 @@ def resolve_attachment_uri(uri: str) -> str | None:
     return resolved
 
 
+def _coerce_str(v: Any) -> str:
+    """Return ``v`` if it's a non-empty string, else ``""``.
+
+    Defensive against non-string values that flow into string-only code
+    paths downstream. The most common offender is
+    ``unittest.mock.MagicMock`` (truthy, so a plain ``or ""`` filter
+    does not catch it). On Python 3.12 the buffer-protocol checks are
+    stricter, so passing a MagicMock into ``hashlib.sha256(uri.encode(
+    "utf-8"))`` raises ``TypeError: object supporting the buffer API
+    required`` — same failure mode on 3.11 (reproduced locally; see the
+    test_session_id_derivation regression in openclaw#43). 3.11- and
+    3.12-compatible: this helper is purely additive, real strings
+    pass through unchanged.
+    """
+    if isinstance(v, str) and v:
+        return v
+    return ""
+
+
 def extract_attached_files(message: Any) -> list[dict[str, str]]:
     """Pull ``{name, mime_type, path}`` dicts out of an A2A message.
 
@@ -1180,25 +1208,38 @@ def extract_attached_files(message: Any) -> list[dict[str, str]]:
             f = getattr(root, "file", None)
             if f is None:
                 continue
-            uri = getattr(f, "uri", "") or ""
-            name = getattr(f, "name", "") or ""
-            mime = getattr(f, "mimeType", None) or getattr(f, "mime_type", None) or ""
+            # 3.12-compat: the v0 Pydantic-shape access uses `or ""` which
+            # catches None / empty but NOT truthy non-string values
+            # (e.g. unittest.mock.MagicMock — a non-string attribute
+            # access from a test that mocks the inbound RequestContext).
+            # Without the isinstance check, a MagicMock slips through,
+            # `uri` is non-string, and downstream
+            # `_attachment_cache_path` raises
+            #   TypeError: object supporting the buffer API required
+            # when `hashlib.sha256(uri.encode("utf-8"))` is called on
+            # the MagicMock. Same root cause as the v1 path below
+            # (the v1 path's MagicMock is the test_executor_helpers
+            # reproducer). 3.11-and-3.12 compat: the isinstance check
+            # is purely additive — real strings still pass through.
+            uri = _coerce_str(getattr(f, "uri", ""))
+            name = _coerce_str(getattr(f, "name", ""))
+            mime = _coerce_str(getattr(f, "mimeType", None)) or _coerce_str(
+                getattr(f, "mime_type", None)
+            )
         else:
             # Defensive v1 path (see docstring): v1 Part has no `kind`,
             # detect by a non-empty `url` (the file/url-of-bytes oneof
             # slot). Fall back from snake_case `media_type` to
             # camelCase `mediaType` for callers that hand us the
             # Pydantic-style attribute name.
-            v1_url = getattr(part, "url", "") or ""
+            v1_url = _coerce_str(getattr(part, "url", ""))
             if not v1_url:
                 continue
             uri = v1_url
-            name = getattr(part, "filename", "") or ""
-            mime = (
+            name = _coerce_str(getattr(part, "filename", ""))
+            mime = _coerce_str(
                 getattr(part, "media_type", None)
-                or getattr(part, "mediaType", None)
-                or ""
-            )
+            ) or _coerce_str(getattr(part, "mediaType", None))
 
         path = resolve_attachment_uri(uri)
         if not path or not os.path.isfile(path):
