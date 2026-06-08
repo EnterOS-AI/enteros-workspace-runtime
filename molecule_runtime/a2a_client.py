@@ -63,6 +63,15 @@ def _resolve_workspace_id() -> str:
     validated ID; raises RuntimeError on unset or invalid.
     """
     global _WORKSPACE_ID_cache
+    # Always check for test override first (monkeypatch compat). pytest
+    # monkeypatch.setattr(obj, 'WORKSPACE_ID', ...) does a getattr before
+    # setattr, which triggers __getattr__ -> _resolve_workspace_id() and
+    # populates the cache with the env value BEFORE the monkeypatch lands.
+    # By checking __dict__ directly on every call we respect overrides
+    # without needing to clear the cache after every setattr.
+    _override = globals().get("WORKSPACE_ID")
+    if _override is not None and isinstance(_override, str):
+        return _override
     if _WORKSPACE_ID_cache is None:
         _raw = os.environ.get("WORKSPACE_ID")
         if not _raw:

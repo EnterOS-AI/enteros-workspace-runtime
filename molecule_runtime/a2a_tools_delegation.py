@@ -54,6 +54,8 @@ from molecule_runtime._sanitize_a2a import (
 
 logger = logging.getLogger(__name__)
 
+# Backwards-compat: tests monkeypatch this attribute.
+WORKSPACE_ID = None
 
 # RFC #2829 PR-5 cutover constants. The poll cadence + timeout are
 # intentionally generous: 3s gives the platform's executeDelegation
@@ -298,7 +300,7 @@ async def tool_delegate_task(
                 workspace_id,
             )
             result = await _delegate_sync_via_polling(
-                workspace_id, task, src or _resolve_workspace_id,
+                workspace_id, task, src or _resolve_workspace_id(),
             )
 
     # Detect delegation failures — wrap them clearly so the calling agent

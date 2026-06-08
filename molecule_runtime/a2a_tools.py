@@ -69,7 +69,7 @@ async def report_activity(
         async with httpx.AsyncClient(timeout=5.0) as client:
             payload: dict = {
                 "activity_type": activity_type,
-                "source_id": _resolve_workspace_id,
+                "source_id": _resolve_workspace_id(),
                 "target_id": target_id,
                 "method": "message/send",
                 "summary": summary,
@@ -96,7 +96,7 @@ async def report_activity(
                 await client.post(
                     f"{PLATFORM_URL}/registry/heartbeat",
                     json={
-                        "workspace_id": _resolve_workspace_id,
+                        "workspace_id": _resolve_workspace_id(),
                         "current_task": summary,
                         "active_tasks": 1,
                         "error_rate": 0,

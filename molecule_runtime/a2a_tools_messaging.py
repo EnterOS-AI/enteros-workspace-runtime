@@ -35,6 +35,9 @@ from molecule_runtime.a2a_client import (
 from molecule_runtime.a2a_tools_rbac import auth_headers_for_heartbeat as _auth_headers_for_heartbeat
 from molecule_runtime.platform_auth import list_registered_workspaces
 
+# Backwards-compat: tests monkeypatch this attribute.
+WORKSPACE_ID = None
+
 
 async def _upload_chat_files(
     client: httpx.AsyncClient,

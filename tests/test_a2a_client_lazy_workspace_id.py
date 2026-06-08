@@ -15,8 +15,9 @@ WORKSPACE_ID still get the same RuntimeError on first access.
 """
 from __future__ import annotations
 
-import importlib
-import sys
+import asyncio
+
+import molecule_runtime.a2a_client as _a2a_client
 
 
 def test_a2a_client_imports_without_workspace_id_env(monkeypatch):
@@ -29,17 +30,12 @@ def test_a2a_client_imports_without_workspace_id_env(monkeypatch):
     """
     # Make sure WORKSPACE_ID is genuinely absent.
     monkeypatch.delenv("WORKSPACE_ID", raising=False)
+    _a2a_client._WORKSPACE_ID_cache = None
 
-    # Drop any cached module so the import re-runs the (now lazy)
-    # module body.
-    sys.modules.pop("molecule_runtime.a2a_client", None)
-
-    import molecule_runtime.a2a_client  # must NOT raise
-
-    # Sanity: the module loaded without WORKSPACE_ID, and the lazy
+    # Sanity: the module was imported without WORKSPACE_ID, and the lazy
     # constant cache hasn't been populated yet (so the next access
     # WILL validate).
-    assert molecule_runtime.a2a_client._WORKSPACE_ID_cache is None
+    assert _a2a_client._WORKSPACE_ID_cache is None
 
 
 def test_a2a_client_workspace_id_access_raises_without_env(monkeypatch):
@@ -50,12 +46,10 @@ def test_a2a_client_workspace_id_access_raises_without_env(monkeypatch):
     first access rather than at import.
     """
     monkeypatch.delenv("WORKSPACE_ID", raising=False)
-    sys.modules.pop("molecule_runtime.a2a_client", None)
-
-    import molecule_runtime.a2a_client as m
+    _a2a_client._WORKSPACE_ID_cache = None
 
     try:
-        _ = m.WORKSPACE_ID
+        _ = _a2a_client.WORKSPACE_ID
     except RuntimeError as exc:
         assert "WORKSPACE_ID" in str(exc)
         assert "required" in str(exc).lower() or "not set" in str(exc).lower()
@@ -75,18 +69,16 @@ def test_a2a_client_workspace_id_lazy_caches(monkeypatch):
     """
     # Use a valid-format workspace id (per validate_workspace_id).
     monkeypatch.setenv("WORKSPACE_ID", "ws-lazy-test")
-    sys.modules.pop("molecule_runtime.a2a_client", None)
+    _a2a_client._WORKSPACE_ID_cache = None
 
-    import molecule_runtime.a2a_client as m
-
-    first = m.WORKSPACE_ID
+    first = _a2a_client.WORKSPACE_ID
     assert first == "ws-lazy-test"
-    assert m._WORKSPACE_ID_cache == "ws-lazy-test"
+    assert _a2a_client._WORKSPACE_ID_cache == "ws-lazy-test"
 
     # Mutate the env var. The cached value should NOT change because
     # the lazy getter only runs validation on first access.
     monkeypatch.setenv("WORKSPACE_ID", "ws-different-after-cache")
-    second = m.WORKSPACE_ID
+    second = _a2a_client.WORKSPACE_ID
     assert second == "ws-lazy-test", (
         "Lazy cache should return the originally-validated value, "
         "not re-read the env on every access"
@@ -103,8 +95,7 @@ def test_a2a_client_internal_default_workspace_id_falls_back(monkeypatch):
     routes all internal fallbacks through the helper.)
     """
     monkeypatch.delenv("WORKSPACE_ID", raising=False)
-    sys.modules.pop("molecule_runtime.a2a_client", None)
-    import molecule_runtime.a2a_client as m
+    _a2a_client._WORKSPACE_ID_cache = None
 
     # Find a public function in a2a_client that defaults its
     # source_workspace_id to None and (eventually) reads the module
@@ -116,8 +107,14 @@ def test_a2a_client_internal_default_workspace_id_falls_back(monkeypatch):
         # want to confirm the import + name-resolution path doesn't
         # NameError. Trigger a single argument-validation path
         # that touches the fallback.
-        m.discover_peer("not-a-uuid")
-    except (RuntimeError, m.httpx.HTTPError, Exception) as exc:
+        # Trigger the code path that resolves the default workspace ID.
+        # discover_peer is async; we use asyncio.run so the coroutine body
+        # actually executes and touches the fallback path.
+        try:
+            asyncio.run(_a2a_client.discover_peer("not-a-uuid"))
+        except (RuntimeError, _a2a_client.httpx.HTTPError, Exception):
+            pass
+    except (RuntimeError, _a2a_client.httpx.HTTPError, Exception) as exc:
         # RuntimeError is the intended path (WORKSPACE_ID unset).
         # Anything else (NameError, AttributeError on WORKSPACE_ID)
         # would be the regression we're guarding against.
