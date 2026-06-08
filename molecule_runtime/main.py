@@ -330,6 +330,7 @@ async def main():  # pragma: no cover
         platform_url,
         workspace_id,
         interval_seconds=config.observability.heartbeat_interval_seconds,
+        agent_card=agent_card_dict,
     )
 
     # 3. Get adapter for this runtime

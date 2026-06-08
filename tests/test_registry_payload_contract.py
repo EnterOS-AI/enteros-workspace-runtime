@@ -212,6 +212,40 @@ async def test_heartbeat_body_satisfies_core_required_fields(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_body_carries_agent_card_when_set(monkeypatch):
+    """#2421: when the initial register failed, the heartbeat must carry
+    agent_card so the platform handler can backfill the NULL DB row."""
+    _WS = "00000000-0000-0000-0000-000000000242"
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        hb_mod.httpx, "AsyncClient", lambda *a, **kw: _CapturingClient(captured)
+    )
+    monkeypatch.setattr(hb_mod, "auth_headers", lambda *a, **kw: {})
+
+    async def _sleep_then_cancel(_seconds):
+        import asyncio
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(hb_mod.asyncio, "sleep", _sleep_then_cancel)
+
+    async def _noop(self, client):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(hb_mod.HeartbeatLoop, "_check_delegations", _noop)
+    monkeypatch.setattr(hb_mod.HeartbeatLoop, "_check_activity_delegations", _noop)
+
+    hb = hb_mod.HeartbeatLoop("https://platform.example", _WS, agent_card={"name": "test-agent"})
+    import asyncio
+    with pytest.raises(asyncio.CancelledError):
+        await hb._loop()
+
+    assert "json" in captured, "heartbeat loop did not emit a POST"
+    body = captured["json"]
+    assert body.get("agent_card") == {"name": "test-agent"}
+
+
 def test_heartbeat_required_set_catches_dropped_workspace_id_regression():
     """Red→green proof: a heartbeat body that drops workspace_id (e.g. a
     rename to `id`) is flagged by the contract check."""
