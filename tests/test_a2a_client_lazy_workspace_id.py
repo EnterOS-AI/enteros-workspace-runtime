@@ -126,3 +126,85 @@ def test_a2a_client_internal_default_workspace_id_falls_back(monkeypatch):
             )
         # Other exceptions (httpx errors, RuntimeError "not set", etc.) are
         # acceptable — the key is that the fallback path doesn't NameError.
+
+
+def test_a2a_client_404_diagnostic_uses_resolved_src_not_env(monkeypatch):
+    """The 404 diagnostic in get_peers_with_diagnostic must use the
+    already-resolved local `src` (line ~1021), NOT re-resolve via
+    _resolve_workspace_id() or read WORKSPACE_ID from the env.
+
+    Why: the diagnostic runs on every 404 from the platform. If it
+    re-resolves via _resolve_workspace_id() (or a bare WORKSPACE_ID
+    ref), it can trigger lazy validation → RuntimeError when an
+    explicit source_workspace_id was passed but env WORKSPACE_ID is
+    unset. The fix on line 1049 interpolates `src` instead.
+
+    Coverage: this test passes a valid-UUID-shaped explicit
+    source_workspace_id (so UUID validation passes and the function
+    reaches the 404 branch at line 1049), monkeypatches the env to
+    a DIFFERENT uuid, and asserts the diagnostic message contains
+    the explicit source (not the env value).
+
+    (CR2 r#9662 on PR#99: the existing test
+    test_a2a_client_internal_default_workspace_id_falls_back uses
+    discover_peer("not-a-uuid") which returns BEFORE touching the
+    fallback because "not-a-uuid" is not a valid UUID. This test
+    closes that coverage gap with a real-UUID-shape id that
+    actually reaches line 1049.)
+    """
+    # Distinct uuids so we can assert which one the diagnostic uses.
+    explicit_src = "11111111-1111-1111-1111-111111111111"
+    env_ws = "22222222-2222-2222-2222-222222222222"
+
+    # Reset the lazy cache so the env read is fresh, then set the
+    # env to a value DIFFERENT from the explicit source.
+    _a2a_client._WORKSPACE_ID_cache = None
+    monkeypatch.setenv("WORKSPACE_ID", env_ws)
+
+    # Mock the platform response to be 404 — that's the branch the
+    # diagnostic at line 1049 lives in.
+    class _FakeResp:
+        status_code = 404
+        def json(self):
+            raise ValueError("not JSON")
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, url, headers=None):
+            return _FakeResp()
+
+    # Patch AsyncClient at the module level so the function under
+    # test uses our fake.
+    monkeypatch.setattr(_a2a_client.httpx, "AsyncClient", lambda *a, **kw: _FakeClient())
+
+    # Resolve platform URL to avoid hitting the real platform in CI
+    # (the test only cares that we reach the 404 branch and that
+    # the diagnostic string contains the explicit src).
+    monkeypatch.setattr(_a2a_client, "_resolve_platform_url", lambda src: f"http://test-platform/{src}")
+
+    import asyncio
+    peers, diagnostic = asyncio.run(
+        _a2a_client.get_peers_with_diagnostic(source_workspace_id=explicit_src)
+    )
+
+    # The 404 branch must have produced a diagnostic.
+    assert peers == []
+    assert diagnostic is not None
+    # The diagnostic must contain the EXPLICIT src, not the env value.
+    # If line 1049 re-resolved via _resolve_workspace_id() (the
+    # pre-fix bug), the diagnostic would say env_ws (22222222...)
+    # because the env is set and that's what the lazy resolver would
+    # return. Post-fix, it must say explicit_src (11111111...).
+    assert explicit_src in diagnostic, (
+        f"404 diagnostic did not contain explicit src={explicit_src!r}; "
+        f"got: {diagnostic!r}. Line 1049 may still be re-resolving "
+        f"via _resolve_workspace_id() instead of using the local `src`."
+    )
+    assert env_ws not in diagnostic, (
+        f"404 diagnostic contained env WORKSPACE_ID={env_ws!r}; "
+        f"line 1049 re-resolved via _resolve_workspace_id() instead "
+        f"of using the explicit source_workspace_id."
+    )
+    assert "not registered" in diagnostic.lower()
