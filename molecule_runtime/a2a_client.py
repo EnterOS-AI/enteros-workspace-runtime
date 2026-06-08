@@ -1058,7 +1058,7 @@ async def get_peers_with_diagnostic(source_workspace_id: str | None = None) -> t
             )
         if resp.status_code == 404:
             return [], (
-                f"Workspace ID {WORKSPACE_ID} is not registered with the platform (HTTP 404). "
+                f"Workspace ID {src} is not registered with the platform (HTTP 404). "
                 "Re-registration via the platform's /registry/register endpoint is needed."
             )
         if 500 <= resp.status_code < 600:
