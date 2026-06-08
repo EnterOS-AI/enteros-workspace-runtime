@@ -163,9 +163,11 @@ class HeartbeatLoop:
         platform_url: str,
         workspace_id: str,
         interval_seconds: int = HEARTBEAT_INTERVAL,
+        agent_card: dict | None = None,
     ):
         self.platform_url = platform_url
         self.workspace_id = workspace_id
+        self.agent_card = agent_card
         # Per-instance interval — main.py threads ObservabilityConfig.
         # heartbeat_interval_seconds (clamped to [5, 300] at parse time)
         # in here so operators can tune cadence per-workspace via the
@@ -230,7 +232,7 @@ class HeartbeatLoop:
                 while True:
                     # 1. Send heartbeat (Phase 30.1: include auth header if token known)
                     try:
-                        body = {
+                        body: dict = {
                             "workspace_id": self.workspace_id,
                             "error_rate": self.error_rate,
                             "sample_error": self.sample_error,
@@ -238,6 +240,11 @@ class HeartbeatLoop:
                             "current_task": self.current_task,
                             "uptime_seconds": int(time.time() - self.start_time),
                         }
+                        # #2421: backfill agent_card when the initial register failed.
+                        # Only sent when we have a card — the platform handler writes
+                        # it only if the DB row's agent_card is NULL.
+                        if self.agent_card is not None:
+                            body["agent_card"] = self.agent_card
                         # Layer the runtime-wedge fields on top so a
                         # non-empty sample_error from the wedge wins
                         # over the (typically empty) heartbeat
@@ -276,7 +283,7 @@ class HeartbeatLoop:
                             logger.warning("Heartbeat 401 for %s — refreshing token cache and retrying once", self.workspace_id)
                             refresh_cache()
                             try:
-                                retry_body = {
+                                retry_body: dict = {
                                     "workspace_id": self.workspace_id,
                                     "error_rate": self.error_rate,
                                     "sample_error": self.sample_error,
@@ -284,6 +291,8 @@ class HeartbeatLoop:
                                     "current_task": self.current_task,
                                     "uptime_seconds": int(time.time() - self.start_time),
                                 }
+                                if self.agent_card is not None:
+                                    retry_body["agent_card"] = self.agent_card
                                 retry_body.update(_runtime_state_payload())
                                 retry_resp = await client.post(
                                     f"{self.platform_url}/registry/heartbeat",

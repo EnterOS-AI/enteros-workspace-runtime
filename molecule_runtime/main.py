@@ -549,6 +549,8 @@ async def main():  # pragma: no cover
             headers=auth_headers(),
         )
 
+    heartbeat.agent_card = agent_card_dict
+
     # 9. Start heartbeat
     heartbeat.start()
 
