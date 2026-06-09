@@ -451,6 +451,7 @@ class RuntimeA2AExecutor(AgentExecutor):
                     # subprocess registered in the inbox entry — if any
                     # — is terminated so a `bash -c "sleep 600"` doesn't
                     # block the new turn.
+                    _idle_cap = float(os.environ.get("A2A_COMPLETION_IDLE_TIMEOUT_SECONDS", "900"))
                     while True:
                         _astream_iter = self.agent.astream_events(
                             {"messages": messages},
@@ -458,7 +459,22 @@ class RuntimeA2AExecutor(AgentExecutor):
                             version="v2",
                         )
                         _was_interrupted = False
-                        async for event in _astream_iter:
+                        _aiter = _astream_iter.__aiter__()
+                        while True:
+                            try:
+                                event = await asyncio.wait_for(_aiter.__anext__(), _idle_cap)
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                # No runtime event for _idle_cap s: the completion stalled.
+                                # Fail the turn as a NORMAL error (not a wedge) so the
+                                # single-threaded executor returns and serves the next
+                                # request instead of hanging until a watchdog restart.
+                                try:
+                                    await _astream_iter.aclose()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                raise TimeoutError("completion stalled: no runtime event for %ss" % _idle_cap)
                             # Cooperative interrupt check — runs between
                             # every runtime event so even a long
                             # tool-call iteration can be aborted by an
