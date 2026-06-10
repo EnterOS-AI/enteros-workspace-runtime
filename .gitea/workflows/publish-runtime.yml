@@ -32,12 +32,24 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Derive version from tag or pyproject
+      - name: Derive version + stamp pyproject (tag is source of truth)
         id: version
+        # TAG-ONLY auto-release (2026-06-10): the auto-release workflow cannot commit
+        # a pyproject bump to `main` (PR-only branch: enable_push:false +
+        # required_approvals:2), so it now only cuts the `runtime-v<next>` tag. That
+        # means pyproject.toml on `main` LAGS the tag. When this build is triggered by
+        # a `runtime-v*` tag, the TAG is the source of truth: we STAMP the tag's
+        # version into pyproject.toml at build time (ephemeral, in-CI — never
+        # committed) so the wheel carries the correct version by construction. The old
+        # hard-fail on tag!=pyproject is gone (it becomes trivially true after the
+        # stamp). On manual workflow_dispatch (no tag) we fall back to whatever
+        # pyproject already declares.
         run: |
           set -eu
+          STAMP_FROM_TAG=0
           if echo "$GITHUB_REF" | grep -q "^refs/tags/runtime-v"; then
             VERSION="${GITHUB_REF#refs/tags/runtime-v}"
+            STAMP_FROM_TAG=1
           else
             VERSION=$(python - <<'PY'
           import tomllib
@@ -50,14 +62,37 @@ jobs:
             echo "::error::version $VERSION does not look like a PEP 440 release"
             exit 1
           fi
+          if [ "$STAMP_FROM_TAG" = "1" ]; then
+            # Ephemeral, in-CI stamp — NOT committed back to the repo. After this the
+            # built wheel/sdist carry $VERSION regardless of what main's pyproject says.
+            VERSION="$VERSION" python - <<'PY'
+          import os, re
+          version = os.environ["VERSION"]
+          with open("pyproject.toml", "r", encoding="utf-8") as f:
+              text = f.read()
+          new, n = re.subn(
+              r'(?m)^(version\s*=\s*)"[^"]+"',
+              r'\g<1>"' + version + '"',
+              text,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit('could not locate a single version = "..." line in pyproject.toml')
+          with open("pyproject.toml", "w", encoding="utf-8") as f:
+              f.write(new)
+          print(f"stamped pyproject [project].version = {version} (ephemeral build-time)")
+          PY
+          fi
           PYPROJECT_VERSION=$(python - <<'PY'
           import tomllib
           with open("pyproject.toml", "rb") as f:
               print(tomllib.load(f)["project"]["version"])
           PY
           )
+          # After the stamp this is trivially equal; we keep the read as a sanity
+          # assertion (catches a botched stamp) rather than a policy gate on main.
           if [ "$VERSION" != "$PYPROJECT_VERSION" ]; then
-            echo "::error::tag version $VERSION does not match pyproject.toml version $PYPROJECT_VERSION"
+            echo "::error::after stamp, build version $VERSION != pyproject $PYPROJECT_VERSION (stamp failed?)"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
