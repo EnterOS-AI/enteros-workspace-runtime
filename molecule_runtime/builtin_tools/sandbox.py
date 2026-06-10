@@ -23,15 +23,34 @@ e2b
 
 Backend is selected via the SANDBOX_BACKEND env var, which the provisioner
 sets from config.yaml → sandbox.backend. Default: "subprocess".
+
+Bounded tool execution (Agent-Liveness RFC, Layer 1 / A1)
+=========================================================
+Every local subprocess (subprocess + docker backends) runs under a HARD
+per-call timeout (``MOLECULE_TOOL_TIMEOUT_S``, default 300s) and, on
+timeout, the WHOLE process group is killed (SIGTERM → grace → SIGKILL),
+not just the leader — so a ``bash -c 'npx vercel'`` that forks a node
+child and blocks on a TTY prompt can never wedge the agent. On timeout a
+structured ``{"error": "tool_timeout", ...}`` result is returned so the
+agent loop CONTINUES rather than hanging. Shell commands are additionally
+run NON-INTERACTIVE (stdin=/dev/null + flag/env hardening for known
+interactive CLIs) so they fail fast instead of waiting on a prompt.
 """
 
 import asyncio
 import logging
 import os
+import subprocess
 import tempfile
 
 from langchain_core.tools import tool
 
+from molecule_runtime.builtin_tools.command_preprocessing import (
+    NONINTERACTIVE_ENV,
+    make_noninteractive,
+    stdin_should_be_closed,
+)
+from molecule_runtime.builtin_tools.proc_group import terminate_process_group
 from molecule_runtime.runtime_inbox import (
     clear_active_subprocess,
     register_active_subprocess,
@@ -40,9 +59,41 @@ from molecule_runtime.runtime_inbox import (
 logger = logging.getLogger(__name__)
 
 SANDBOX_BACKEND = os.environ.get("SANDBOX_BACKEND", "subprocess")
-SANDBOX_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "30"))
 SANDBOX_MEMORY_LIMIT = os.environ.get("SANDBOX_MEMORY_LIMIT", "256m")
 MAX_OUTPUT = 10_000
+
+# Languages whose code is executed as a shell command line (vs. a source
+# file). These get non-interactive command preprocessing applied.
+_SHELL_LANGUAGES = frozenset({"shell", "bash"})
+
+# Default hard per-tool-call timeout, in seconds (A1). Overridable via env.
+_DEFAULT_TOOL_TIMEOUT_S = 300
+
+
+def _tool_timeout_s() -> int:
+    """Hard per-tool-call timeout in seconds (A1).
+
+    Sourced from ``MOLECULE_TOOL_TIMEOUT_S`` (default 300). A legacy
+    ``SANDBOX_TIMEOUT`` override is still honoured when explicitly set, so
+    existing deployments that tuned it keep their value, but the A1 knob
+    takes precedence when present. Malformed values fall back to the
+    default rather than crashing the tool.
+    """
+    raw = os.environ.get("MOLECULE_TOOL_TIMEOUT_S")
+    if raw is None:
+        raw = os.environ.get("SANDBOX_TIMEOUT")
+    if raw is None:
+        return _DEFAULT_TOOL_TIMEOUT_S
+    try:
+        val = int(raw)
+        return val if val > 0 else _DEFAULT_TOOL_TIMEOUT_S
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid tool timeout %r; falling back to %ds",
+            raw, _DEFAULT_TOOL_TIMEOUT_S,
+        )
+        return _DEFAULT_TOOL_TIMEOUT_S
+
 
 # E2B kernel names differ from internal language names.
 _E2B_KERNEL_MAP = {
@@ -69,8 +120,21 @@ async def run_code(code: str, language: str = "python") -> dict:
         return await _run_subprocess(code, language)
 
 
+def _noninteractive_env() -> dict:
+    """Base env + non-interactive hardening for interactive CLIs (A1)."""
+    env = dict(os.environ)
+    env.update(NONINTERACTIVE_ENV)
+    return env
+
+
 async def _run_subprocess(code: str, language: str) -> dict:
-    """Fallback: run code in a subprocess with timeout."""
+    """Fallback: run code in a subprocess with a hard timeout (A1).
+
+    Spawns the child in its own session (``start_new_session=True``) so a
+    timeout can kill the WHOLE process group, not just the leader. Shell
+    commands are made non-interactive (flag/env hardening + stdin closed)
+    so an interactive CLI can't block forever on a prompt.
+    """
     cmd_map = {
         "python": ["python3", "-c"],
         "javascript": ["node", "-e"],
@@ -82,18 +146,41 @@ async def _run_subprocess(code: str, language: str) -> dict:
     if not cmd_prefix:
         return {"error": f"Unsupported language: {language}", "exit_code": -1}
 
+    timeout_s = _tool_timeout_s()
+
+    # Non-interactive preprocessing for shell/bash command lines: inject
+    # --yes for known CLIs and apply env hardening so prompts fail fast.
+    payload = code
+    env = None
+    if language in _SHELL_LANGUAGES:
+        payload, is_interactive = make_noninteractive(code)
+        if is_interactive:
+            env = _noninteractive_env()
+
+    # Close stdin so anything that reads a TTY prompt sees EOF immediately
+    # rather than blocking. /dev/null is the cheapest universal guard.
+    stdin = subprocess.DEVNULL if stdin_should_be_closed() else None
+
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd_prefix, code,
+            *cmd_prefix, payload,
+            stdin=stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # A1: own session/process-group so the timeout path can reap
+            # the entire descendant tree (npx -> node -> worker), not just
+            # the bash leader.
+            start_new_session=True,
+            env=env,
         )
         # Task #377 — register on the per-context inbox so canvas
         # "Stop All" (A2A tasks/cancel) can SIGTERM us mid-flight.
         register_active_subprocess(proc)
 
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SANDBOX_TIMEOUT)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_s
+        )
 
         return {
             "exit_code": proc.returncode,
@@ -103,12 +190,18 @@ async def _run_subprocess(code: str, language: str) -> dict:
             "backend": "subprocess",
         }
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
-        return {"error": f"Timeout after {SANDBOX_TIMEOUT}s", "exit_code": -1}
+        # A1: kill the whole process group, escalating SIGTERM -> SIGKILL,
+        # so no orphaned child survives. Then return a STRUCTURED result so
+        # the agent loop continues instead of blocking.
+        if proc is not None:
+            await terminate_process_group(proc)
+        return {
+            "error": "tool_timeout",
+            "detail": f"{language} command killed after {timeout_s}s",
+            "exit_code": -1,
+            "language": language,
+            "backend": "subprocess",
+        }
     except Exception as e:
         return {"error": str(e), "exit_code": -1}
     finally:
@@ -133,6 +226,7 @@ async def _run_docker(code: str, language: str) -> dict:
         return {"error": f"Unsupported language: {language}", "exit_code": -1}
 
     image, run_cmd = entry
+    timeout_s = _tool_timeout_s()
     code_file = None
     proc = None
 
@@ -156,15 +250,21 @@ async def _run_docker(code: str, language: str) -> dict:
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # A1: own process-group so a timeout reaps the docker-run
+            # wrapper (and, with --rm, the daemon tears down the container).
+            start_new_session=True,
         )
         # Task #377 — register on the per-context inbox so canvas
         # "Stop All" propagates SIGTERM to the docker-run wrapper
         # (which docker forwards to the container with --init).
         register_active_subprocess(proc)
 
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SANDBOX_TIMEOUT)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_s
+        )
 
         return {
             "exit_code": proc.returncode,
@@ -175,7 +275,15 @@ async def _run_docker(code: str, language: str) -> dict:
             "image": image,
         }
     except asyncio.TimeoutError:
-        return {"error": f"Timeout after {SANDBOX_TIMEOUT}s", "exit_code": -1}
+        if proc is not None:
+            await terminate_process_group(proc)
+        return {
+            "error": "tool_timeout",
+            "detail": f"{language} command (docker) killed after {timeout_s}s",
+            "exit_code": -1,
+            "language": language,
+            "backend": "docker",
+        }
     except Exception as e:
         return {"error": str(e), "exit_code": -1}
     finally:
@@ -193,7 +301,7 @@ async def _run_e2b(code: str, language: str) -> dict:
 
     Requires the e2b-code-interpreter package and an E2B_API_KEY secret.
     Each call creates a fresh sandbox, runs the code, and destroys the sandbox.
-    Sandbox lifetime is bounded by SANDBOX_TIMEOUT seconds.
+    Sandbox lifetime is bounded by MOLECULE_TOOL_TIMEOUT_S seconds.
 
     Supported languages: python, javascript.
     """
@@ -230,6 +338,7 @@ async def _run_e2b(code: str, language: str) -> dict:
             "exit_code": -1,
         }
 
+    timeout_s = _tool_timeout_s()
     sandbox = None
     try:
         # Create a fresh sandbox for this execution.
@@ -237,9 +346,9 @@ async def _run_e2b(code: str, language: str) -> dict:
         sandbox = await asyncio.wait_for(
             asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: Sandbox(api_key=api_key, timeout=SANDBOX_TIMEOUT),
+                lambda: Sandbox(api_key=api_key, timeout=timeout_s),
             ),
-            timeout=SANDBOX_TIMEOUT,
+            timeout=timeout_s,
         )
 
         # Execute code and collect results.
@@ -248,7 +357,7 @@ async def _run_e2b(code: str, language: str) -> dict:
                 None,
                 lambda: sandbox.run_code(code, language=kernel),
             ),
-            timeout=SANDBOX_TIMEOUT,
+            timeout=timeout_s,
         )
 
         # E2B returns a list of Result objects; collect text/error output.
@@ -287,8 +396,14 @@ async def _run_e2b(code: str, language: str) -> dict:
         }
 
     except asyncio.TimeoutError:
-        logger.warning("E2B sandbox timed out after %ds", SANDBOX_TIMEOUT)
-        return {"error": f"Timeout after {SANDBOX_TIMEOUT}s", "exit_code": -1}
+        logger.warning("E2B sandbox timed out after %ds", timeout_s)
+        return {
+            "error": "tool_timeout",
+            "detail": f"{language} code (e2b) killed after {timeout_s}s",
+            "exit_code": -1,
+            "language": language,
+            "backend": "e2b",
+        }
     except Exception as e:
         logger.exception("E2B sandbox error: %s", e)
         return {"error": str(e), "exit_code": -1}
