@@ -39,7 +39,60 @@ jobs:
           pip install -e . pytest pytest-asyncio
 
       - name: Run unit tests
-        run: pytest -q
+        # Exclude the over-the-wire responsiveness e2e (its own job below) —
+        # it boots real uvicorn servers and a 50s busy window, too slow for
+        # the fast unit lane.
+        run: pytest -q --ignore=tests/integration
+
+  responsiveness-e2e:
+    # Deterministic, merge-BLOCKING integration gate for the "busy agent
+    # becomes unreachable / blocks ~300s" regression class (2026-06-10).
+    #
+    # It drives a REAL RuntimeA2AExecutor mounted in REAL a2a-sdk JSON-RPC
+    # Starlette routes served by REAL uvicorn, over REAL HTTP, and asserts:
+    #   (a) a concurrent same-context POST fast-acks (no head-of-line block)
+    #       — locks in the non-blocking flip (#116);
+    #   (b) the agent never goes 'stale' across a busy window that EXCEEDS
+    #       the old 45s stale threshold — locks in the stale-window fix;
+    #   (c) both turns complete + the agent recovers to idle;
+    #   (d) a tool that hangs past the per-turn idle cap is bounded and the
+    #       executor recovers instead of wedging — locks in A1 tool-timeout.
+    #
+    # No external creds / infra (localhost only + a scripted, LLM-free
+    # agent), so it is a deterministic merge gate — NOT a gated-nightly.
+    # The integration conftest LOUD-SKIPS (never silent-passes) if the real
+    # a2a-sdk wheel is somehow absent.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        env:
+          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+        run: |
+          # -e . pulls the REAL a2a-sdk[http-server] + starlette + uvicorn +
+          # httpx so the e2e exercises the production wire, not stubs.
+          pip install -e . pytest pytest-asyncio
+
+      - name: Run agent-responsiveness-under-load e2e
+        # CI-tuned timings: the busy window (50s) still comfortably EXCEEDS
+        # the asserted stale window (20s), so the >45s-stale-window contract
+        # is genuinely exercised, while keeping the job ~1 min. All timings
+        # are env-tunable so a slower runner can widen slack without code
+        # edits.
+        env:
+          RESP_E2E_A_BUSY_SECONDS: "50"
+          RESP_E2E_STALE_WINDOW_SECONDS: "20"
+          RESP_E2E_HEARTBEAT_INTERVAL: "4"
+          RESP_E2E_FAST_ACK_CEILING: "5"
+          RESP_E2E_IDLE_CAP: "3"
+          RESP_E2E_POLL_DEADLINE: "25"
+        run: pytest -q tests/integration
 
   lint:
     runs-on: ubuntu-latest
