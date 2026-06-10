@@ -571,6 +571,21 @@ class HeartbeatLoop:
                 if not source_id or source_id == self.workspace_id:
                     continue
 
+                # Skip non-result rows. A peer send that merely got QUEUED
+                # because we were busy ("queued: target busy"), or a receive
+                # that FAILED (status present and != "ok" — e.g. the 300s
+                # "timeout awaiting response headers"), is not a peer response
+                # with content. Harvesting it as a "completed" result wakes
+                # the agent to "process" transient backpressure, generating
+                # more sends and more backpressure: a self-amplifying replay
+                # storm (observed: one notification wrapping 12x identical
+                # "queued: target busy" echoes). Mark seen so the cursor still
+                # advances; never surface it as a result.
+                row_status = row.get("status") or ""
+                if (row_status and row_status != "ok") or "queued: target busy" in (row.get("summary") or ""):
+                    self._seen_activity_ids.add(activity_id)
+                    continue
+
                 self._seen_activity_ids.add(activity_id)
                 summary = row.get("summary") or ""
                 # Extract response text from request_body if available.

@@ -212,3 +212,68 @@ async def test_heartbeat_no_double_prefix():
     # And the status word is present once via our new format, immediately
     # followed by the de-prefixed peer payload.
     assert msg.startswith("Delegation completed: peer ack ok"), msg
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_skips_queued_busy_and_error_rows():
+    """Bug B (harvester replay storm): ``_check_activity_delegations`` must NOT
+    harvest transient non-result a2a_receive rows — a peer send that got
+    "queued: target busy", or a receive that FAILED (status != "ok", e.g. the
+    300s "timeout awaiting response headers") — as "completed" delegation
+    results. Harvesting them wakes the agent to "process" its own send-
+    backpressure, a self-amplifying replay loop. Only the genuine status=ok
+    peer row may trigger the single A2A self-message; all three rows are still
+    marked seen so the cursor advances and they are never re-evaluated."""
+    hb = HeartbeatLoop("http://test-platform", _WS)
+    posts: list[tuple[str, dict]] = []
+    client = _make_client(
+        get_payloads=[
+            # activity?type=a2a_receive — three peer rows; only the real one
+            # is a genuine result with content.
+            _make_resp([
+                {
+                    "id": "act-ok-1",
+                    "source_id": "peer-real",
+                    "status": "ok",
+                    "summary": "message/send -> Me",
+                    "request_body": {"params": {"message": {"parts": [
+                        {"kind": "text", "text": "Here is the real peer response."}
+                    ]}}},
+                },
+                {
+                    "id": "act-busy-1",
+                    "source_id": "peer-busy",
+                    "status": "ok",
+                    "summary": "message/send -> Me (queued: target busy)",
+                    "request_body": {"params": {"message": {"parts": []}}},
+                },
+                {
+                    "id": "act-err-1",
+                    "source_id": "peer-err",
+                    "status": "error",
+                    "summary": "A2A request failed: timeout awaiting response headers",
+                    "request_body": {"params": {"message": {"parts": []}}},
+                },
+            ]),
+            # parent lookup — no parent.
+            _make_resp({"parent_id": ""}),
+        ],
+        post_recorder=posts,
+    )
+
+    await hb._check_activity_delegations(client)
+
+    a2a_posts = [p for p in posts if p[0].endswith(f"/workspaces/{_WS}/a2a")]
+    assert len(a2a_posts) == 1, (
+        f"expected exactly one self-message for the single real result; got {a2a_posts!r}"
+    )
+    body_str = str(a2a_posts[0][1])
+    assert "queued: target busy" not in body_str, (
+        "busy-backpressure echo must not be harvested into the wake message"
+    )
+    assert "timeout awaiting response headers" not in body_str, (
+        "failed receive must not be harvested into the wake message"
+    )
+    assert "Here is the real peer response" in body_str or "message/send -> Me" in body_str
+    # All three rows marked seen so the cursor advances; non-results never re-fire.
+    assert {"act-ok-1", "act-busy-1", "act-err-1"} <= hb._seen_activity_ids
