@@ -238,8 +238,10 @@ async def test_executor_fast_acks_within_100ms_when_turn_in_flight(monkeypatch):
     )
     assert result == ""
     # The new message must be queued for the in-flight turn to drain
+    # New message is QUEUED for the in-flight turn to drain at completion,
+    # but must NOT interrupt it (queue, don't break — only Stop interrupts).
     assert entry.pending_messages.qsize() == 1
-    assert entry.interrupt_event.is_set() is True
+    assert entry.interrupt_event.is_set() is False
     # A terminal complete() must have been emitted so the SDK returns
     # promptly to the platform
     assert any(name == "complete" for name, _ in fake_updater.events), (
@@ -281,7 +283,10 @@ async def test_executor_drains_inbox_and_restarts_astream(monkeypatch):
             yield {"event": "on_chat_model_start", "run_id": "r1", "data": {}}
             entry = get_inbox().peek(context_id)
             assert entry is not None
-            entry.request_interrupt("second message — please refine")
+            # Queue a second message DURING the turn (defer, no interrupt);
+            # the executor must drain it at NATURAL completion and run a
+            # follow-up turn — without ever breaking this turn.
+            entry.defer_message("second message — please refine")
             # One more yield so the executor's per-event check fires
             yield {"event": "on_chat_model_start", "run_id": "r1", "data": {}}
         else:
@@ -759,3 +764,89 @@ async def test_register_active_subprocess_noop_when_no_context():
     fake_proc = MagicMock()
     # No contextvar set, no inbox entry — must return False without raising.
     assert register_active_subprocess(fake_proc) is False
+
+
+@pytest.mark.asyncio
+async def test_executor_drops_routine_self_ping_while_in_flight(monkeypatch):
+    """A routine self-ping (cron tick / delegation harvester) arriving mid-turn
+    must be fast-acked and DROPPED — NOT queued, NOT interrupting. It recurs and
+    delegation results are file-injected next turn, so nothing is lost and long
+    tasks aren't disturbed."""
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-routine"
+    entry = await get_inbox().get_or_create(context_id)
+    entry.turn_in_flight = True
+
+    async def _hang_astream(*_a, **_k):
+        await asyncio.sleep(60)  # would hang if fast-path fell through
+        yield  # pragma: no cover
+
+    agent = MagicMock()
+    agent.astream_events = _hang_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="t")
+    monkeypatch.setattr("molecule_runtime.a2a_executor.set_current_task", AsyncMock())
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater", lambda *a, **kw: fake_updater
+    )
+
+    ctx = _build_context(
+        "This is your own scheduled work tick (runs every 5 minutes). Treat it as routine.",
+        context_id,
+    )
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    result = await executor._core_execute(ctx, event_queue)
+    assert result == ""
+    # DROPPED: not queued, not interrupting.
+    assert entry.pending_messages.qsize() == 0
+    assert entry.interrupt_event.is_set() is False
+    assert any(name == "complete" for name, _ in fake_updater.events)
+
+
+@pytest.mark.asyncio
+async def test_executor_stop_terminates_without_restart(monkeypatch):
+    """An explicit Stop (interrupt_event set — tasks/cancel / Stop button) mid-turn
+    must TERMINATE the turn: kill subprocess, NO follow-up turn, even if a message
+    was queued (stop means stop)."""
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-stop"
+    calls: list[list] = []
+
+    async def _agent_astream(payload, **_k):
+        calls.append(list(payload["messages"]))
+        if len(calls) == 1:
+            yield {"event": "on_chat_model_start", "run_id": "r1", "data": {}}
+            entry = get_inbox().peek(context_id)
+            assert entry is not None
+            # A message queued during work AND an explicit Stop.
+            entry.defer_message("queued during work")
+            entry.interrupt_event.set()  # Stop button / tasks-cancel
+            yield {"event": "on_chat_model_start", "run_id": "r1", "data": {}}
+        else:  # pragma: no cover
+            yield {"event": "on_chat_model_end", "run_id": "r2", "data": {"output": None}}
+
+    agent = MagicMock()
+    agent.astream_events = _agent_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="t")
+    monkeypatch.setattr("molecule_runtime.a2a_executor.set_current_task", AsyncMock())
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater", lambda *a, **kw: fake_updater
+    )
+
+    ctx = _build_context("first", context_id)
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    await executor._core_execute(ctx, event_queue)
+    # Exactly ONE astream call — Stop terminated; the queued message did NOT
+    # trigger a follow-up turn.
+    assert len(calls) == 1, (
+        f"Stop must terminate without restart; saw {len(calls)} astream calls"
+    )

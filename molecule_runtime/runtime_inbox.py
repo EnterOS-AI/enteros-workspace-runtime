@@ -146,6 +146,17 @@ class InboxEntry:
         self.pending_messages.put_nowait(new_message)
         self.interrupt_event.set()
 
+    def defer_message(self, new_message: Any) -> None:
+        """Queue a new message WITHOUT signalling an interrupt.
+
+        The running turn drains it via ``consume_pending()`` at NATURAL
+        completion and answers it as a follow-up turn — it is never
+        interrupted. This is the "queue, don't break" model: only an
+        explicit Stop (``tasks/cancel`` -> ``interrupt_event``) breaks a
+        turn in flight.
+        """
+        self.pending_messages.put_nowait(new_message)
+
     def consume_pending(self) -> list[Any]:
         """Drain all queued messages without blocking. Clears the interrupt event."""
         out: list[Any] = []
