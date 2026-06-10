@@ -9,7 +9,7 @@ name = "molecule-ai-workspace-runtime"
 # source on 2026-05-20. Prior 0.1.x line was a monorepo-published
 # mirror; 0.1.81 remains valid on PyPI for any consumer still pinned
 # to it (additive release, not a yank).
-version = "0.3.12"
+version = "0.3.13"
 
 description = "Molecule AI workspace runtime — shared infrastructure for all agent adapters"
 requires-python = ">=3.11"
