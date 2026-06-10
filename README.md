@@ -100,13 +100,35 @@ molecule-mcp --help
 
 ## Release process
 
-1. Land changes via reviewed PR (2 non-author approvals + CI green)
-2. Bump `version =` in `pyproject.toml` (semver — patch for fixes, minor for
-   additive features, major for breaking API)
-3. Tag `runtime-vX.Y.Z` on `main` post-merge
-4. `publish-runtime.yml` (Gitea Actions) fires on the tag → builds wheel +
-   sdist → publishes to the Gitea package registry → cascades the version pin
-   to template repos
+Releases are **automatic on a green merge to `main`** (CTO standing directive,
+2026-06-10) — no manual tag or approval gate:
+
+1. Land changes via reviewed PR (2 non-author approvals + CI green).
+2. On merge to `main`, `auto-release.yml` re-runs the merge-blocking gates
+   (`unit-tests` + `responsiveness-e2e`) inline. Gitea has no `workflow_run`
+   trigger, so the release workflow re-runs the gate itself rather than
+   subscribing to the `ci` workflow's success.
+3. On green it computes the **next patch** version from the latest `runtime-v*`
+   tag, bumps `[project].version` in `pyproject.toml` to match (preserving the
+   `pyproject == tag` invariant), commits that bump to `main` and cuts tag
+   `runtime-vX.Y.Z` — all via the Gitea API as the `molecule-runtime-release-bot`
+   identity (`RELEASE_BOT_TOKEN`; no token on disk).
+4. The tag trips `publish-runtime.yml` → builds wheel + sdist → publishes to the
+   Gitea package registry → its `propagate` job opens `.runtime-version` bump PRs
+   on each consumer template. Merging a template bump trips that template's
+   `publish-image.yml`, which bakes the pinned wheel into a fresh image, pushes
+   ECR `:latest` + `:sha-<7>`, and auto-promotes the digest into the
+   control-plane `runtime_image_pins` (prod + staging). Agents boot from the
+   promoted pinned image (runtime baked at build, not pip-installed at boot).
+
+**Loop guard:** the bump commit is authored by the release bot and its message
+carries `[skip-bump]`; `auto-release.yml`'s `guard` job skips when `github.actor`
+is the bot OR the HEAD message contains `[skip-bump]`. The tag push does not match
+`on: push: branches:[main]`, so cutting the tag never re-enters `auto-release.yml`.
+
+**Manual bump (escape hatch):** edit `version =` in `pyproject.toml` in a PR and
+tag `runtime-vX.Y.Z` on `main` post-merge; `publish-runtime.yml` still fires on
+any `runtime-v*` tag.
 
 ## Consumer pinning
 
