@@ -29,6 +29,7 @@ well-tested semantics.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import os
 import signal
@@ -40,6 +41,63 @@ logger = logging.getLogger(__name__)
 # we don't want to add meaningful extra latency, but we do want to give a
 # well-behaved child a chance to clean up.
 SIGTERM_GRACE_S = float(os.environ.get("MOLECULE_TOOL_KILL_GRACE_S", "3"))
+
+# Linux ``prctl`` option: make the calling process a "child subreaper" so
+# that orphaned descendants re-parent to US instead of to PID 1. See
+# :func:`_ensure_child_subreaper`.
+_PR_SET_CHILD_SUBREAPER = 36
+
+# Set once per process (idempotent): True after a successful prctl, False if
+# we tried and it's unavailable (non-Linux / prctl missing) so we don't retry.
+_subreaper_set: bool | None = None
+
+
+def _ensure_child_subreaper() -> None:
+    """Make THIS process a child-subreaper so orphaned grandchildren come to us.
+
+    The whole zombie-drain in :func:`_reap_reparented_zombies` rests on one
+    assumption: when the group leader (``bash -c ...``) is killed, the
+    grandchildren it backgrounded re-parent to *this* process, so we can
+    ``waitpid`` them. That assumption only holds if this process is PID 1 or a
+    *subreaper*. In an agent workspace the runtime often IS PID 1, so it held
+    there — but on a CI runner (and any plain host) pytest is an ordinary,
+    non-PID-1 process, so a killed grandchild re-parents to the *container*
+    PID 1 instead. When that PID 1 is a dumb ``/bin/sleep`` entrypoint that
+    never ``wait()``s, the grandchild lingers as a ZOMBIE forever — and a
+    zombie still answers ``os.kill(pid, 0)`` without ``ProcessLookupError``,
+    i.e. it looks "alive". That is exactly the orphan the timeout path is
+    supposed to eliminate, and it is why the reap loop could not collect it:
+    ``waitpid`` can only reap one's OWN children, and a PID-1-orphaned zombie
+    is not ours.
+
+    ``prctl(PR_SET_CHILD_SUBREAPER, 1)`` fixes the root cause: it marks this
+    process as the reaper for its entire descendant subtree, so when ``bash``
+    dies the backgrounded ``sleep`` re-parents to US (the nearest subreaper),
+    and our ``waitpid`` drain actually collects it. Idempotent, cheap, and a
+    no-op on non-Linux platforms (where there are no POSIX zombies of this
+    shape to worry about anyway). Best-effort: never raises.
+    """
+    global _subreaper_set
+    if _subreaper_set is not None:
+        return
+    _subreaper_set = False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = getattr(libc, "prctl", None)
+        if prctl is None:
+            return
+        rc = prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+        if rc == 0:
+            _subreaper_set = True
+        else:
+            logger.debug(
+                "proc_group: PR_SET_CHILD_SUBREAPER failed rc=%s errno=%s",
+                rc, ctypes.get_errno(),
+            )
+    except (OSError, AttributeError, ValueError) as exc:
+        # No libc / no prctl / non-Linux — orphan-zombie reparenting to us
+        # isn't a concern on those platforms; degrade silently.
+        logger.debug("proc_group: subreaper setup unavailable: %s", exc)
 
 
 def _pgid_for(proc) -> int | None:
@@ -207,6 +265,14 @@ async def terminate_process_group(
     """
     if grace_s is None:
         grace_s = SIGTERM_GRACE_S
+
+    # Become a child-subreaper BEFORE we start killing: the grandchildren we
+    # orphan (by killing their ``bash`` parent) must re-parent to US so our
+    # zombie drain below can ``waitpid`` them. Without this they re-parent to
+    # the container PID 1, which on a CI runner / plain host is a dumb
+    # entrypoint that never reaps — leaving a zombie that still answers
+    # ``os.kill(pid, 0)`` as "alive". Idempotent; no-op off Linux.
+    _ensure_child_subreaper()
 
     # Resolve the process-GROUP id ONCE, up front — while the leader is still
     # alive so ``getpgid`` works. We escalate against this group for the rest
