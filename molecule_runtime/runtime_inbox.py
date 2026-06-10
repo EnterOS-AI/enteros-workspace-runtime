@@ -41,9 +41,12 @@ interrupted by a follow-on message on the same ``context_id``.
 
 Feature flag
 ============
-``MOLECULE_A2A_NONBLOCKING=true`` opts the executor into the interrupt
-path. Default ``false`` for safety during the rollout bake — flip to
-default-on in a follow-up PR after 24h on chloe-dong + agents-team.
+``MOLECULE_A2A_NONBLOCKING`` gates the executor's non-blocking fast-path.
+**Default-ON as of 2026-06-10** — the rollout bake on chloe-dong +
+agents-team completed and PR #112's queue-don't-break path fast-acks the
+inbound POST (<100 ms) instead of blocking ~300s behind the live turn.
+Set ``MOLECULE_A2A_NONBLOCKING=false`` (or ``0``/``no``/``off``) on a
+workspace and restart to roll back to the legacy synchronous handler.
 """
 
 from __future__ import annotations
@@ -70,10 +73,23 @@ current_context_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 
 def is_nonblocking_enabled() -> bool:
-    """Return True when MOLECULE_A2A_NONBLOCKING is set to a truthy value."""
-    return os.environ.get("MOLECULE_A2A_NONBLOCKING", "").lower() in (
-        "1", "true", "yes", "on",
-    )
+    """Return True unless MOLECULE_A2A_NONBLOCKING is explicitly disabled.
+
+    Default-ON as of 2026-06-10 (the rollout bake on chloe-dong +
+    agents-team completed; PR #112 reworked the path from interrupt to
+    queue-don't-break and its fast-ack <100 ms SLA is regression-tested in
+    tests/test_a2a_nonblocking_inbox.py). Unset / empty / any non-falsey
+    value enables the non-blocking fast-path. Only an explicit falsey value
+    disables it:
+
+        MOLECULE_A2A_NONBLOCKING=false   # disable (also accepts 0 / no / off)
+
+    Rollback: set MOLECULE_A2A_NONBLOCKING=false on the affected
+    workspace(s) and restart. This restores the legacy synchronous POST
+    handler with no code change.
+    """
+    val = os.environ.get("MOLECULE_A2A_NONBLOCKING", "true").strip().lower()
+    return val not in ("0", "false", "no", "off")
 
 
 def register_active_subprocess(proc: Any) -> bool:

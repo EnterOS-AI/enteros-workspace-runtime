@@ -850,3 +850,40 @@ async def test_executor_stop_terminates_without_restart(monkeypatch):
     assert len(calls) == 1, (
         f"Stop must terminate without restart; saw {len(calls)} astream calls"
     )
+
+
+# ─── is_nonblocking_enabled() env semantics (default-ON since 2026-06-10) ──
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, True),       # unset -> default-ON
+        ("", True),         # empty string -> default-ON
+        ("   ", True),      # whitespace-only -> default-ON
+        ("true", True),
+        ("True", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("anything", True), # any non-falsey value enables
+        (" TRUE ", True),   # surrounding whitespace tolerated
+        ("false", False),
+        ("False", False),
+        ("FALSE", False),
+        (" false ", False), # whitespace tolerated around the disable value
+        ("0", False),
+        ("no", False),
+        ("off", False),
+    ],
+)
+def test_is_nonblocking_enabled_env_semantics(monkeypatch, value, expected):
+    """Default-ON: unset/empty/non-falsey enable; only explicit false/0/no/off disable."""
+    from molecule_runtime.runtime_inbox import is_nonblocking_enabled
+
+    if value is None:
+        monkeypatch.delenv("MOLECULE_A2A_NONBLOCKING", raising=False)
+    else:
+        monkeypatch.setenv("MOLECULE_A2A_NONBLOCKING", value)
+
+    assert is_nonblocking_enabled() is expected
