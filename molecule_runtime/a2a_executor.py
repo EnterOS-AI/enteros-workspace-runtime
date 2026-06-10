@@ -199,6 +199,24 @@ def _extract_chunk_text(content) -> list[str]:
     return []
 
 
+# Routine self-pings the runtime sends to ITSELF: the platform cron tick and
+# the heartbeat delegation-results harvester. Under the non-blocking fast-path
+# these must NOT queue behind (or interrupt) a long in-flight turn — the cron
+# recurs every cycle and delegation results are injected from
+# DELEGATION_RESULTS_FILE at the next turn, so dropping a mid-turn routine ping
+# loses nothing while avoiding both task-interruption and ping pile-up.
+_ROUTINE_SELF_MESSAGE_PREFIXES = (
+    "This is your own scheduled work tick",  # platform cron self-tick
+    "Delegation results are ready",          # heartbeat delegation harvester
+)
+
+
+def _is_routine_self_message(text: str) -> bool:
+    """True for the agent's own routine self-pings (cron tick / harvester)."""
+    t = (text or "").lstrip()
+    return any(t.startswith(p) for p in _ROUTINE_SELF_MESSAGE_PREFIXES)
+
+
 class RuntimeA2AExecutor(AgentExecutor):
     """Bridges runtime agent to A2A event model with SSE streaming support.
 
@@ -352,24 +370,37 @@ class RuntimeA2AExecutor(AgentExecutor):
             if _nonblocking:
                 _inbox_entry = await _get_runtime_inbox().get_or_create(context_id)
                 if _inbox_entry.turn_in_flight:
-                    logger.info(
-                        "A2A execute: turn already in flight for context_id=%s — "
-                        "requesting interrupt + acking new message",
-                        context_id,
-                    )
-                    _inbox_entry.request_interrupt(
-                        build_user_content_with_files(user_input, _attached_files)
-                    )
-                    # Fast-ack the new POST: complete() with a stub Message
-                    # so the platform proxy gets a prompt 200 response. The
-                    # in-flight turn will deliver the real reply (which it
-                    # composes with the merged history) via its own
-                    # updater.complete() — the canvas already polls for
-                    # subsequent A2A_RESPONSE WebSocket events.
+                    # CTO model: queue, don't break. A new message arriving while a
+                    # turn is in flight is fast-acked (~50ms, no 300s head-of-line
+                    # wedge) and QUEUED; the running turn finishes uninterrupted, then
+                    # drains + answers it as a follow-up turn. Only an explicit Stop
+                    # (tasks/cancel) breaks a turn in flight.
+                    if _is_routine_self_message(user_input):
+                        # Routine self-ping (cron tick / delegation harvester):
+                        # fast-ack and DROP — not queued, not interrupting. The cron
+                        # recurs and delegation results are injected from
+                        # DELEGATION_RESULTS_FILE next turn, so nothing is lost, and
+                        # we avoid stacking identical pings behind a long task.
+                        logger.info(
+                            "A2A execute: routine self-ping while turn in flight for "
+                            "context_id=%s — fast-ack + drop (recurs next cycle)",
+                            context_id,
+                        )
+                    else:
+                        logger.info(
+                            "A2A execute: turn in flight for context_id=%s — deferring "
+                            "new message (process after current turn)",
+                            context_id,
+                        )
+                        _inbox_entry.defer_message(
+                            build_user_content_with_files(user_input, _attached_files)
+                        )
+                    # Fast-ack the POST so the platform proxy gets a prompt 200
+                    # instead of blocking ~300s behind the live turn.
                     await updater.complete(
                         message=new_text_message(
-                            "[Acknowledged — interrupting current turn to "
-                            "process your new message.]",
+                            "[Acknowledged — queued; the agent will respond after it "
+                            "finishes its current step.]",
                             task_id=task_id,
                             context_id=context_id,
                         )
@@ -458,7 +489,7 @@ class RuntimeA2AExecutor(AgentExecutor):
                             config=run_config,
                             version="v2",
                         )
-                        _was_interrupted = False
+                        _stopped = False
                         _aiter = _astream_iter.__aiter__()
                         while True:
                             try:
@@ -483,12 +514,12 @@ class RuntimeA2AExecutor(AgentExecutor):
                             # zero-cost when no interrupt is pending.
                             if _inbox_entry is not None and _inbox_entry.interrupt_event.is_set():
                                 logger.info(
-                                    "A2A execute: interrupt detected for context_id=%s — "
-                                    "draining inbox and restarting astream",
+                                    "A2A execute: STOP requested for context_id=%s — "
+                                    "terminating turn (Stop button / tasks-cancel)",
                                     context_id,
                                 )
                                 _inbox_entry.kill_subprocess()
-                                _was_interrupted = True
+                                _stopped = True
                                 # Close the iterator promptly so any
                                 # pending native runtime coroutines see the
                                 # cancellation and clean up.
@@ -556,20 +587,25 @@ class RuntimeA2AExecutor(AgentExecutor):
                                 if output is not None:
                                     last_ai_message = output
 
-                        if not _was_interrupted:
-                            # Natural completion — exit the outer loop
+                        if _stopped:
+                            # Explicit Stop mid-turn — terminate, do NOT restart. Discard
+                            # any queued messages (stop means stop); cancel() emits the
+                            # terminal CANCELED event.
+                            if _inbox_entry is not None:
+                                _inbox_entry.consume_pending()
                             break
 
-                        # Interrupt path: drain the inbox, snapshot
-                        # accumulated text as an AI message (so the
-                        # new turn knows what was said before being
-                        # cut off), append all queued user messages,
-                        # and re-run astream with the merged history.
+                        if _inbox_entry is None:
+                            # Non-blocking off — single turn, no deferral.
+                            break
+
+                        # Natural completion. Drain messages DEFERRED during this turn
+                        # (queued via defer_message, never interrupting). If any, snapshot
+                        # the accumulated text as an AI message, append the queued user
+                        # messages, and run a follow-up turn with the merged history —
+                        # "queue, don't break": the in-flight turn was never cut off.
                         _pending = _inbox_entry.consume_pending()
                         if not _pending:
-                            # Spurious wakeup (interrupt set with no
-                            # queued message — shouldn't happen but
-                            # defend against the race). Exit cleanly.
                             break
                         _partial = "".join(accumulated).strip()
                         if _partial:
