@@ -887,3 +887,156 @@ def test_is_nonblocking_enabled_env_semantics(monkeypatch, value, expected):
         monkeypatch.setenv("MOLECULE_A2A_NONBLOCKING", value)
 
     assert is_nonblocking_enabled() is expected
+
+
+# ─── SPEC-1 — Bounded inbox queue (DoS-hardening) ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_inbox_bounded_queue_rejects_overflow():
+    """A queue with maxsize=N accepts exactly N items; the (N+1)th is
+    rejected with return value False and no exception."""
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    entry = await get_inbox().get_or_create("ctx-bounded")
+    maxsize = entry.pending_messages.maxsize
+    assert maxsize >= 1
+
+    accepted = 0
+    for i in range(maxsize + 5):
+        if entry.request_interrupt(f"msg-{i}"):
+            accepted += 1
+        else:
+            break
+
+    assert accepted == maxsize
+    assert entry.pending_messages.qsize() == maxsize
+    # Overflow must NOT set the interrupt event (only successful enqueue does)
+    # The first N-1 successful puts + the Nth put all set the event; clearing
+    # doesn't matter because the event is already set.
+    assert entry.interrupt_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_inbox_request_interrupt_returns_bool_no_exception():
+    """request_interrupt returns True on acceptance, False on rejection.
+    Never raises."""
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    entry = await get_inbox().get_or_create("ctx-bool")
+    # Force a tiny queue so we can fill it quickly
+    entry.pending_messages = asyncio.Queue(maxsize=1)
+
+    assert entry.request_interrupt("first") is True
+    assert entry.request_interrupt("second") is False
+    # No exception on overflow
+
+
+@pytest.mark.asyncio
+async def test_inbox_defer_message_returns_bool_no_exception():
+    """defer_message returns True on acceptance, False on rejection.
+    Never raises."""
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    entry = await get_inbox().get_or_create("ctx-defer-bool")
+    entry.pending_messages = asyncio.Queue(maxsize=1)
+
+    assert entry.defer_message("first") is True
+    assert entry.defer_message("second") is False
+    # No exception on overflow
+
+
+@pytest.mark.asyncio
+async def test_inbox_maxsize_env_parsing(monkeypatch):
+    """_inbox_maxsize respects env var, clamps invalid values, and never
+    returns < 1."""
+    from molecule_runtime.runtime_inbox import _inbox_maxsize
+
+    # Valid explicit value
+    monkeypatch.setenv("MOLECULE_A2A_INBOX_MAXSIZE", "4")
+    assert _inbox_maxsize() == 4
+
+    # Unset → default 32
+    monkeypatch.delenv("MOLECULE_A2A_INBOX_MAXSIZE", raising=False)
+    assert _inbox_maxsize() == 32
+
+    # Zero → clamp to 1
+    monkeypatch.setenv("MOLECULE_A2A_INBOX_MAXSIZE", "0")
+    assert _inbox_maxsize() == 1
+
+    # Negative → clamp to 1
+    monkeypatch.setenv("MOLECULE_A2A_INBOX_MAXSIZE", "-3")
+    assert _inbox_maxsize() == 1
+
+    # Non-numeric → default 32
+    monkeypatch.setenv("MOLECULE_A2A_INBOX_MAXSIZE", "x")
+    assert _inbox_maxsize() == 32
+
+
+@pytest.mark.asyncio
+async def test_executor_busy_fast_ack_when_defer_full(monkeypatch):
+    """When the inbox is at capacity, the executor emits a structured
+    busy response instead of the normal ack."""
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-busy"
+    entry = await get_inbox().get_or_create(context_id)
+    entry.turn_in_flight = True
+    # Fill the queue to capacity
+    entry.pending_messages = asyncio.Queue(maxsize=1)
+    entry.defer_message("already-queued")
+
+    async def _hang_astream(*_args, **_kwargs):
+        await asyncio.sleep(60)
+        yield  # pragma: no cover
+
+    agent = MagicMock()
+    agent.astream_events = _hang_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test-model")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater",
+        lambda *a, **kw: fake_updater,
+    )
+
+    ctx = _build_context("flood message", context_id)
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    result = await executor._core_execute(ctx, event_queue)
+
+    assert result == ""
+    complete_events = [
+        msg for name, msg in fake_updater.events if name == "complete"
+    ]
+    assert len(complete_events) == 1
+    busy_text = complete_events[0].parts[0].text
+    assert '"status":"busy"' in busy_text
+    assert '"retry":true' in busy_text
+    # Security: must NOT leak internal state (qsize, context_id)
+    assert "qsize" not in busy_text
+    assert context_id not in busy_text
+
+
+@pytest.mark.asyncio
+async def test_inbox_bounded_with_multimodal_attachments(monkeypatch):
+    """Attachments are held by-reference (list of dicts) in the queue,
+    so maxsize bounds the number of entries regardless of attachment
+    payload size."""
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    entry = await get_inbox().get_or_create("ctx-attachments")
+    entry.pending_messages = asyncio.Queue(maxsize=2)
+
+    # Large attachment payload — but it's a list of dicts (by-ref),
+    # so queue memory stays bounded by entry count
+    big_attachment = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 10_000_000}}]
+    assert entry.request_interrupt(big_attachment) is True
+    assert entry.request_interrupt(big_attachment) is True
+    # Third entry must be rejected
+    assert entry.request_interrupt(big_attachment) is False
+    assert entry.pending_messages.qsize() == 2

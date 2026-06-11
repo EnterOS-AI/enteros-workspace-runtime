@@ -392,9 +392,20 @@ class RuntimeA2AExecutor(AgentExecutor):
                             "new message (process after current turn)",
                             context_id,
                         )
-                        _inbox_entry.defer_message(
+                        _accepted = _inbox_entry.defer_message(
                             build_user_content_with_files(user_input, _attached_files)
                         )
+                        if not _accepted:
+                            # Inbox at capacity — emit structured backpressure so
+                            # the caller can retry rather than silently dropping.
+                            await updater.complete(
+                                message=new_text_message(
+                                    '{"status":"busy","retry":true}',
+                                    task_id=task_id,
+                                    context_id=context_id,
+                                )
+                            )
+                            return ""
                     # Fast-ack the POST so the platform proxy gets a prompt 200
                     # instead of blocking ~300s behind the live turn.
                     await updater.complete(
