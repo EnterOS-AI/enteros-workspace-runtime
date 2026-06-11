@@ -92,6 +92,40 @@ def is_nonblocking_enabled() -> bool:
     return val not in ("0", "false", "no", "off")
 
 
+def _inbox_maxsize() -> int:
+    """Return the maxsize for per-context pending-messages queues.
+
+    Reads ``MOLECULE_A2A_INBOX_MAXSIZE``.  Default 32.  Invalid or
+    non-positive values clamp to the default (never unbounded).
+    """
+    raw = os.environ.get("MOLECULE_A2A_INBOX_MAXSIZE", "")
+    if not raw:
+        return 32
+    try:
+        n = int(raw)
+    except ValueError:
+        logger.warning(
+            "MOLECULE_A2A_INBOX_MAXSIZE=%r is not an integer; using default 32",
+            raw,
+        )
+        return 32
+    if n < 1:
+        logger.warning(
+            "MOLECULE_A2A_INBOX_MAXSIZE=%d is < 1; clamping to 1", n,
+        )
+        return 1
+    return n
+
+
+class InboxFull(Exception):
+    """Raised when a message cannot be queued because the inbox is at capacity.
+
+    The executor catches this and emits a structured busy response so the
+    caller can retry.  Never silently dropped.
+    """
+    pass
+
+
 def register_active_subprocess(proc: Any) -> bool:
     """Register ``proc`` as the current_subprocess for the active context_id.
 
@@ -136,7 +170,9 @@ class InboxEntry:
     """State for a single ``context_id`` — see module docstring."""
 
     context_id: str
-    pending_messages: asyncio.Queue = field(default_factory=asyncio.Queue)
+    pending_messages: asyncio.Queue = field(
+        default_factory=lambda: asyncio.Queue(maxsize=_inbox_maxsize())
+    )
     interrupt_event: asyncio.Event = field(default_factory=asyncio.Event)
     current_subprocess: Any = None
     last_accumulated: str = ""
@@ -149,20 +185,34 @@ class InboxEntry:
     # (fresh turn).
     turn_in_flight: bool = False
 
-    def request_interrupt(self, new_message: Any) -> None:
+    def request_interrupt(self, new_message: Any) -> bool:
         """Queue a new message and signal the running turn to interrupt.
 
         Idempotent — calling twice in rapid succession just enqueues both
         messages; the running turn drains them in order on its next
         interrupt check.
+
+        Returns ``True`` when the message was accepted, ``False`` when the
+        inbox is at capacity (caller should emit a busy backpressure
+        response).  NEVER silently drops.
         """
         # Queue first, THEN set the event — guarantees the interrupted
         # turn always sees at least one pending message when it wakes
         # (no lost-wakeup race between the event-set and the queue-put).
-        self.pending_messages.put_nowait(new_message)
+        try:
+            self.pending_messages.put_nowait(new_message)
+        except asyncio.QueueFull:
+            logger.warning(
+                "runtime_inbox: inbox full for context_id=%s "
+                "(maxsize=%d) — rejecting message",
+                self.context_id,
+                self.pending_messages.maxsize,
+            )
+            return False
         self.interrupt_event.set()
+        return True
 
-    def defer_message(self, new_message: Any) -> None:
+    def defer_message(self, new_message: Any) -> bool:
         """Queue a new message WITHOUT signalling an interrupt.
 
         The running turn drains it via ``consume_pending()`` at NATURAL
@@ -170,8 +220,22 @@ class InboxEntry:
         interrupted. This is the "queue, don't break" model: only an
         explicit Stop (``tasks/cancel`` -> ``interrupt_event``) breaks a
         turn in flight.
+
+        Returns ``True`` when the message was accepted, ``False`` when the
+        inbox is at capacity (caller should emit a busy backpressure
+        response).  NEVER silently drops.
         """
-        self.pending_messages.put_nowait(new_message)
+        try:
+            self.pending_messages.put_nowait(new_message)
+        except asyncio.QueueFull:
+            logger.warning(
+                "runtime_inbox: inbox full for context_id=%s "
+                "(maxsize=%d) — rejecting deferred message",
+                self.context_id,
+                self.pending_messages.maxsize,
+            )
+            return False
+        return True
 
     def consume_pending(self) -> list[Any]:
         """Drain all queued messages without blocking. Clears the interrupt event."""
