@@ -1,38 +1,48 @@
 name: auto-release
 
-# CTO standing directive (2026-06-10): a GREEN merge to `main` must AUTO-bump the
-# runtime version and publish to prod — no manual `runtime-v*` tag / approval gate.
+# CTO standing directive (2026-06-10): a GREEN merge to `main` must AUTO-release the
+# runtime and publish to prod — no manual `runtime-v*` tag / approval gate.
+#
+# TAG-ONLY design (root cause, 2026-06-10): `main` is strictly PR-only — branch
+# protection sets `enable_push: false` + `required_approvals: 2`, so NO identity (not
+# even the release bot) may push a commit directly to `main`. The previous design
+# committed a `pyproject.toml` version bump to `main` via the contents API; that PUT
+# is a direct push to a protected branch and FAILED every run (~17s). So this
+# workflow now does NOT touch `main` at all: on a green merge it only CUTS THE TAG
+# `runtime-v<next>` at `main` HEAD via the Gitea tags API. Tag creation targets the
+# TAG ref, not the branch ref, so branch push protection does not block it (proven:
+# the manual `runtime-v0.3.14` cut returned HTTP 201 with this same release token).
+#
+# `pyproject.toml` on `main` LAGS the tag by design — publish-runtime.yml writes the
+# tag's version into pyproject at build time (ephemeral, in-CI) before `python -m
+# build`, so the wheel carries the correct version by construction. The lag is
+# cosmetic.
 #
 # Release → prod chain this kicks off (mapped in the SOP PR body):
 #   merge to main → THIS workflow re-runs the merge-blocking gates inline and, on
-#   green, bumps pyproject + pushes tag runtime-v<next> → publish-runtime.yml
-#   (existing, tag-triggered) builds+publishes the wheel to the Gitea PyPI
-#   registry and its `propagate` job opens `.runtime-version` bump PRs on each
-#   consumer template → merging a template bump trips that template's
-#   publish-image.yml (on: push main) which pip-installs the pinned wheel into a
-#   fresh image, pushes ECR :latest + :sha-<7>, and auto-promotes the digest into
-#   the control-plane `runtime_image_pins` (prod + staging). Agents boot from the
-#   promoted pinned image — the runtime is baked at image-build, NOT pip-installed
-#   at boot — so the auto-bump is only fully "in prod" once the template image
-#   rebuilds + the pin promotes.
+#   green, pushes tag runtime-v<next> at main HEAD → publish-runtime.yml (existing,
+#   tag-triggered) writes the tag version into pyproject + builds+publishes the wheel
+#   to the Gitea PyPI registry, and its `propagate` job opens `.runtime-version` bump
+#   PRs on each consumer template → merging a template bump trips that template's
+#   publish-image.yml (on: push main) which pip-installs the pinned wheel into a fresh
+#   image, pushes ECR :latest + :sha-<7>, and auto-promotes the digest into the
+#   control-plane `runtime_image_pins` (prod + staging). Agents boot from the promoted
+#   pinned image — the runtime is baked at image-build, NOT pip-installed at boot — so
+#   the auto-release is only fully "in prod" once the template image rebuilds + the pin
+#   promotes.
 #
-# WHY re-run the gate here instead of `on: workflow_run`: Gitea (1.22.x..1.26.2)
-# has NO `workflow_run` trigger (same limitation that forced publish-image.yml's
-# promote-pin to be an in-workflow job). So a release workflow cannot subscribe to
-# the `ci` workflow's success. We re-run the two merge-BLOCKING gates
-# (unit-tests + responsiveness-e2e) inline and only release if BOTH pass — making
-# "release on green" self-contained and not dependent on an unavailable event.
+# WHY re-run the gate here instead of `on: workflow_run`: Gitea (1.22.x..1.26.2) has
+# NO `workflow_run` trigger (same limitation that forced publish-image.yml's
+# promote-pin to be an in-workflow job). So a release workflow cannot subscribe to the
+# `ci` workflow's success. We re-run the two merge-BLOCKING gates (unit-tests +
+# responsiveness-e2e) inline and only release if BOTH pass — making "release on green"
+# self-contained and not dependent on an unavailable event.
 #
-# LOOP GUARD (dual, documented):
-#   1. Bot-actor skip: the bump commit + tag are created by the
-#      molecule-runtime-release-bot identity (RELEASE_BOT_TOKEN) via the Gitea
-#      contents/tags API. The very next `push: main` event therefore has
-#      github.actor == that bot → the `guard` job below short-circuits.
-#   2. Message skip: the bump commit message carries `[skip-bump]`; the guard also
-#      skips when HEAD's message contains it. Belt-and-suspenders in case the bot
-#      actor name ever changes.
-#   3. The TAG push does NOT match `on: push: branches:[main]`, so cutting the tag
-#      never re-enters this workflow at all — only publish-runtime.yml.
+# LOOP SAFETY (structural): this workflow makes NO commit to `main`, and the only
+# write it performs is the TAG push. A tag push does NOT match `on: push:
+# branches:[main]`, so cutting the tag never re-enters this workflow at all — it only
+# trips publish-runtime.yml. No bot-actor / `[skip-bump]` commit guard is needed
+# anymore (there is no commit to guard against).
 
 on:
   push:
@@ -43,49 +53,18 @@ permissions:
   contents: read
 
 concurrency:
-  # Serialize releases; never cancel an in-flight release (a cancelled tag-cut
-  # could strand a half-bumped pyproject).
+  # Serialize releases; never cancel an in-flight release.
   group: auto-release
   cancel-in-progress: false
 
 env:
   GITEA_URL: https://git.moleculesai.app
-  # The bot whose name we skip on, kept in one place for the guard + the docs.
-  RELEASE_BOT_LOGIN: molecule-runtime-release-bot
 
 jobs:
-  guard:
-    name: Loop guard (skip bot / [skip-bump] commits)
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      proceed: ${{ steps.decide.outputs.proceed }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - id: decide
-        shell: bash
-        env:
-          ACTOR: ${{ github.actor }}
-        run: |
-          set -eu
-          MSG="$(git log -1 --pretty=%B || true)"
-          proceed=true
-          if [ "${ACTOR}" = "${RELEASE_BOT_LOGIN}" ]; then
-            echo "::notice::actor is ${RELEASE_BOT_LOGIN} (release bot) — skip to avoid loop"
-            proceed=false
-          fi
-          if printf '%s' "$MSG" | grep -qF '[skip-bump]'; then
-            echo "::notice::HEAD commit carries [skip-bump] — skip to avoid loop"
-            proceed=false
-          fi
-          echo "proceed=${proceed}" >> "$GITHUB_OUTPUT"
-
   # Re-run the two merge-BLOCKING gates inline so we release ONLY on green.
   # (Mirrors ci.yml's unit-tests + responsiveness-e2e jobs verbatim.)
   unit-tests:
     name: Gate — unit-tests
-    needs: guard
-    if: ${{ needs.guard.outputs.proceed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -102,8 +81,6 @@ jobs:
 
   responsiveness-e2e:
     name: Gate — responsiveness-e2e
-    needs: guard
-    if: ${{ needs.guard.outputs.proceed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -126,25 +103,26 @@ jobs:
         run: pytest -q tests/integration
 
   release:
-    name: Bump pyproject + cut runtime-v<next> tag
-    needs: [guard, unit-tests, responsiveness-e2e]
-    if: ${{ needs.guard.outputs.proceed == 'true' && success() }}
+    name: Cut runtime-v<next> tag at main HEAD
+    needs: [unit-tests, responsiveness-e2e]
+    if: ${{ success() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read   # all writes go through the API + RELEASE_BOT_TOKEN
+      contents: read   # the only write is the TAG, via the API + RELEASE_BOT_TOKEN
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
-      - name: Compute next version, bump pyproject, cut tag
+      - name: Compute next version + cut tag at main HEAD
         env:
           # molecule-runtime-release-bot identity with write on this repo.
           # The SAME bot used by publish-runtime.yml's propagate job
           # (DISPATCH_TOKEN). Provision RELEASE_BOT_TOKEN as a repo/org secret
           # holding that bot's token (NOT a founder PAT —
-          # feedback_per_agent_gitea_identity_default).
+          # feedback_per_agent_gitea_identity_default). The token only needs
+          # repository Read+Write to create a tag; it never pushes to main.
           RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: |
           set -eu
