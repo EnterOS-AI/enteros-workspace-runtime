@@ -51,8 +51,8 @@ class DriftFinding:
     reason: str
 
 
-def current_runtime_version(runtime_root: Path) -> str:
-    """Read the SSOT runtime version from runtime_root/pyproject.toml."""
+def _pyproject_version(runtime_root: Path) -> str:
+    """Dev-tree version floor from pyproject.toml (stale after tag-stamped releases)."""
     pyproject = runtime_root / "pyproject.toml"
     if not pyproject.is_file():
         return ""
@@ -67,6 +67,49 @@ def current_runtime_version(runtime_root: Path) -> str:
             if line.strip().startswith("version"):
                 return line.split("=")[1].strip().strip('"').strip("'")
         return ""
+
+
+def _latest_release_version() -> str:
+    """Highest published runtime-v<semver> tag, via the Gitea API.
+
+    Releases are TAG-stamped: auto-release computes the next version from
+    tags and the publish workflow stamps it into the BUILD checkout only --
+    pyproject.toml on main is a stale floor (it said 0.3.15 while v0.3.20
+    was published). Comparing consumer pins to pyproject made this lane go
+    permanently red the moment propagation started WORKING (consumers
+    correctly pinned 0.3.19+ and read as drifted from 0.3.15).
+    """
+    import json
+    import os
+    import urllib.request
+
+    token = os.environ.get("GITEA_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+    url = "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-workspace-runtime/tags?limit=50"
+    headers = {"Authorization": f"token {token}"} if token else {}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            tags = json.load(resp)
+    except Exception:
+        return ""
+    best = None
+    for t in tags if isinstance(tags, list) else []:
+        name = t.get("name", "")
+        if not name.startswith("runtime-v"):
+            continue
+        try:
+            ver = tuple(int(x) for x in name[len("runtime-v"):].split("."))
+        except ValueError:
+            continue
+        if best is None or ver > best:
+            best = ver
+    return ".".join(str(x) for x in best) if best else ""
+
+
+def current_runtime_version(runtime_root: Path) -> str:
+    """The SSOT version consumers should pin: the latest PUBLISHED release
+    tag, falling back to pyproject.toml (pre-first-release or offline)."""
+    return _latest_release_version() or _pyproject_version(runtime_root)
 
 
 def find_runtime_drift(repo_name: str, repo_path: Path, runtime_root: Path | None = None) -> list[DriftFinding]:
