@@ -191,7 +191,11 @@ def open_bump_pr(plan: ConsumerPlan, target: str, *, gitea_url: str, token: str)
     content_b64 = base64.b64encode(f"{target}\n".encode()).decode()
     put_url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/contents/.runtime-version"
     put_payload = {
-        "branch": plan.branch,
+        # Gitea contents-API semantics: `branch` is the branch to START from
+        # (must already exist); `new_branch` is the branch to CREATE with this
+        # commit. Passing the bump branch as `branch` 404s with "branch does
+        # not exist" on every consumer (the 0.3.15/0.3.16 propagate failures).
+        "branch": base,
         "new_branch": plan.branch,
         "sha": sha,
         "content": content_b64,
