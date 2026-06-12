@@ -124,7 +124,12 @@ jobs:
             echo "::error::Gitea package registry publisher secrets are not set"
             exit 1
           fi
+          # --skip-existing: a re-run of this workflow (e.g. to re-execute the
+          # downstream propagate job after a transient failure) must not hard-fail
+          # on the already-published version (Gitea registry 409s on re-upload of
+          # the same file). Already-uploaded == success for a tag-pinned release.
           python -m twine upload \
+            --skip-existing \
             --repository-url "$GITEA_PYPI_UPLOAD_URL" \
             --username "$MOLECULE_PYPI_GITEA_PUBLISHER_USER" \
             --password "$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" \
