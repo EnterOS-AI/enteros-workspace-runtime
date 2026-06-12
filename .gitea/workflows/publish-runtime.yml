@@ -124,16 +124,33 @@ jobs:
             echo "::error::Gitea package registry publisher secrets are not set"
             exit 1
           fi
-          # --skip-existing: a re-run of this workflow (e.g. to re-execute the
-          # downstream propagate job after a transient failure) must not hard-fail
-          # on the already-published version (Gitea registry 409s on re-upload of
-          # the same file). Already-uploaded == success for a tag-pinned release.
-          python -m twine upload \
-            --skip-existing \
-            --repository-url "$GITEA_PYPI_UPLOAD_URL" \
-            --username "$MOLECULE_PYPI_GITEA_PUBLISHER_USER" \
-            --password "$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" \
-            dist/*
+          # Idempotent publish: a re-run of this workflow (e.g. to re-execute the
+          # downstream propagate job) must not hard-fail on the already-published
+          # version. twine --skip-existing is NOT usable here -- twine hard-rejects
+          # it for the Gitea registry ("UnsupportedConfiguration", broke v0.3.18).
+          # Instead pre-check the registry simple index for every dist file and
+          # skip the upload when all are already present.
+          SIMPLE_BASE="${GITEA_PYPI_UPLOAD_URL%/}/simple"
+          missing=0
+          for f in dist/*; do
+            base=$(basename "$f")
+            pkg=$(printf %s "$base" | cut -d- -f1 | tr _ -)
+            if curl -fsS -u "$MOLECULE_PYPI_GITEA_PUBLISHER_USER:$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" \
+                 "$SIMPLE_BASE/$pkg/" 2>/dev/null | grep -qF "$base"; then
+              echo "::notice::$base already in registry"
+            else
+              missing=1
+            fi
+          done
+          if [ "$missing" = "0" ]; then
+            echo "::notice::all dist files already published (re-run) -- skipping upload"
+          else
+            python -m twine upload \
+              --repository-url "$GITEA_PYPI_UPLOAD_URL" \
+              --username "$MOLECULE_PYPI_GITEA_PUBLISHER_USER" \
+              --password "$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" \
+              dist/*
+          fi
 
       - name: Verify install from Gitea registry
         env:
