@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -87,3 +89,42 @@ def test_main_dry_run_reports_plan(monkeypatch: pytest.MonkeyPatch, capsys) -> N
     assert rc == 0
     assert "WOULD open PR" in out.out
     assert "dry_run=True" in out.out
+
+
+def test_open_bump_pr_contents_payload_uses_default_branch_as_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CP#752/RCA: creating a NEW bump branch requires branch=default (source) and
+    new_branch=plan.branch. Using plan.branch for both makes Gitea 404 because the
+    bump branch does not exist yet."""
+    calls: list[tuple[str, str, dict]] = []
+
+    def fake_http(url: str, *, token=None, method: str = "GET", payload=None, timeout=30):
+        calls.append((method, url, payload or {}))
+        if method == "GET" and "/repos/molecule-ai/tpl" in url and url.endswith("/tpl"):
+            return 200, json.dumps({"default_branch": "staging"})
+        if method == "GET" and "/contents/.runtime-version" in url:
+            return 200, json.dumps({"sha": "abc123"})
+        if method == "PUT" and "/contents/.runtime-version" in url:
+            return 201, json.dumps({"content": {"html_url": "https://x/tpl/blob/bump/runtime-0.3.9/.runtime-version"}})
+        if method == "POST" and "/pulls" in url:
+            return 201, json.dumps({"html_url": "https://x/pulls/42"})
+        return 404, "{}"
+
+    monkeypatch.setattr(prop, "_http", fake_http)
+    plan = prop.ConsumerPlan(
+        repo="tpl",
+        pinned="0.3.8",
+        action="open-pr",
+        branch="bump/runtime-0.3.9",
+        detail="would bump 0.3.8 -> 0.3.9",
+    )
+    url = prop.open_bump_pr(plan, "0.3.9", gitea_url="https://x", token="t")
+    assert url == "https://x/pulls/42"
+
+    put_calls = [c for c in calls if c[0] == "PUT" and "/contents/.runtime-version" in c[1]]
+    assert len(put_calls) == 1
+    payload = put_calls[0][2]
+    assert payload["branch"] == "staging", f"expected source branch 'staging', got {payload['branch']!r}"
+    assert payload["new_branch"] == "bump/runtime-0.3.9", f"expected new branch 'bump/runtime-0.3.9', got {payload['new_branch']!r}"
+    assert payload["sha"] == "abc123"
+    decoded = base64.b64decode(payload["content"]).decode()
+    assert decoded == "0.3.9\n"
