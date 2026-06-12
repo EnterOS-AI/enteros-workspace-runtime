@@ -20,6 +20,8 @@ def test_mcp_tools_export_matches_runtime_server():
         "update_agent_card",
         "broadcast_message",
         "send_message_to_user",
+        "create_request",
+        "create_approval",
         "desktop_status",
         "desktop_screenshot",
         "desktop_click",

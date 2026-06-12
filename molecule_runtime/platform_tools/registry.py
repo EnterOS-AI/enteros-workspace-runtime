@@ -55,6 +55,8 @@ from molecule_runtime.a2a_tools import (
     tool_chat_history,
     tool_check_task_status,
     tool_commit_memory,
+    tool_create_approval,
+    tool_create_request,
     tool_delegate_task,
     tool_delegate_task_async,
     tool_get_runtime_identity,
@@ -487,6 +489,62 @@ _SEND_MESSAGE_TO_USER = ToolSpec(
 )
 
 
+_CREATE_REQUEST = ToolSpec(
+    name="create_request",
+    short=(
+        "Raise a request (a task or an approval) into the user's inbox — it "
+        "appears in the canvas Tasks/Approvals tab and the user can act on it."
+    ),
+    when_to_use=(
+        "Use when you need the USER to DO something (kind='task') or to "
+        "APPROVE something (kind='approval') as a tracked inbox item — not a "
+        "passing chat note (use send_message_to_user for that). You are NOT "
+        "blocked: the request is async; the user's decision returns to you as "
+        "an inbound turn. For a pure approval, create_approval is the shorthand."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["task", "approval"],
+                "description": "task = please DO something; approval = please APPROVE something.",
+            },
+            "title": {"type": "string", "description": "One-line summary shown in the user's inbox tab."},
+            "detail": {"type": "string", "description": "Optional fuller context / reason."},
+            "priority": {"type": "integer", "description": "Optional integer priority (higher = more urgent)."},
+        },
+        "required": ["kind", "title"],
+    },
+    impl=tool_create_request,
+    section=A2A_SECTION,
+)
+
+_CREATE_APPROVAL = ToolSpec(
+    name="create_approval",
+    short=(
+        "Ask the user to APPROVE an action — appears in the canvas Approvals "
+        "tab; the approval-kind shorthand for create_request."
+    ),
+    when_to_use=(
+        "Use before a destructive, expensive, or out-of-scope action when you "
+        "want an explicit human decision tracked in the Approvals tab. Async — "
+        "the user's approve/reject comes back to you as an inbound turn. Never "
+        "improvise an approval demo with a real state-changing operation."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "description": "What needs approval (becomes the request title)."},
+            "reason": {"type": "string", "description": "Optional why-it's-needed (becomes the detail)."},
+        },
+        "required": ["action"],
+    },
+    impl=tool_create_approval,
+    section=A2A_SECTION,
+)
+
+
 # ---------------------------------------------------------------------------
 # Desktop display — native computer control for display-enabled workspaces
 # ---------------------------------------------------------------------------
@@ -845,6 +903,8 @@ TOOLS: list[ToolSpec] = [
     _UPDATE_AGENT_CARD,
     _BROADCAST_MESSAGE,
     _SEND_MESSAGE_TO_USER,
+    _CREATE_REQUEST,
+    _CREATE_APPROVAL,
     # Desktop display
     _DESKTOP_STATUS,
     _DESKTOP_SCREENSHOT,

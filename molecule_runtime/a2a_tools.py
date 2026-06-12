@@ -138,6 +138,13 @@ from molecule_runtime.a2a_tools_messaging import (  # noqa: E402  (import after 
     tool_send_message_to_user,
 )
 
+# Unified user-facing request tools (core#2606) — re-exported so the
+# registry + tests resolve them via a2a_tools like the rest.
+from molecule_runtime.a2a_tools_requests import (  # noqa: E402
+    tool_create_approval,
+    tool_create_request,
+)
+
 
 # Memory tool handlers — extracted to a2a_tools_memory (RFC #2873 iter 4c).
 # Re-imported here so call sites + tests that reference
