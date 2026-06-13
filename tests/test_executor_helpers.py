@@ -1846,3 +1846,23 @@ def test_coerce_str_helper_passes_strings_filters_non_strings():
     assert _coerce_str(MagicMock(name="x")) == ""
     # Non-empty MagicMock also → "" (truthy non-string).
     assert _coerce_str(MagicMock()) == ""
+
+
+# core#2697 — ack-first responsiveness directive. The MCP capabilities
+# preamble must instruct agents to acknowledge a long request before
+# starting work, so the user doesn't sit through a silent multi-minute
+# turn ("feels cold / agent looks stuck"). Placed in the preamble on
+# purpose because agents read top-down and commit to a plan early.
+def test_capabilities_preamble_has_ack_first_directive():
+    preamble = eh.get_capabilities_preamble(mcp=True)
+    assert "acknowledge first" in preamble.lower()
+    assert "send_message_to_user" in preamble
+    # The core instruction: ack BEFORE doing the work.
+    assert "before" in preamble.lower() or "first" in preamble.lower()
+
+
+def test_capabilities_preamble_empty_for_cli_runtime():
+    # mcp=False (CLI runtimes) returns "" by contract — the ack-first
+    # directive rides the MCP preamble; CLI agents get their own prompt
+    # shape and must not be handed MCP tool-name vocabulary.
+    assert eh.get_capabilities_preamble(mcp=False) == ""

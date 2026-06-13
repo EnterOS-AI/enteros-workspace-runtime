@@ -457,6 +457,20 @@ def get_capabilities_preamble(mcp: bool = True) -> str:
             "sections below; this preamble is just the inventory."
         ),
         "",
+        # Responsiveness rule (core#2697). The user is watching a chat; a
+        # silent multi-minute turn feels broken even when you're working.
+        # Placed in the preamble on purpose — agents read top-down and commit
+        # to a plan before reaching the detailed sections.
+        "**Stay responsive — acknowledge first:**",
+        (
+            "The moment you pick up a request that will take more than a few "
+            "seconds, FIRST send a one-line acknowledgement + your plan with "
+            "`send_message_to_user` (e.g. \"On it — I'll do X then Y, back "
+            "shortly\"), THEN start the work. For long tasks, drop a brief "
+            "progress note when a phase finishes. Never go silent for minutes "
+            "— a user with no acknowledgement assumes the agent is stuck."
+        ),
+        "",
         "**Inter-agent collaboration (A2A):**",
     ]
     for spec in a2a_tools():
