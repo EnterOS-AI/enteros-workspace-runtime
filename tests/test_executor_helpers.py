@@ -806,6 +806,83 @@ def test_sanitize_agent_error_stderr_combined_with_existing_tests():
     assert "workspace logs" in out
 
 
+# ======================================================================
+# _sanitize_for_external — standalone provider-token redaction
+# (regression for #132 SECURITY REQUEST_CHANGES: a BARE ``sk-`` value with
+# no preceding label/separator, and the space "api key" label form, were
+# returned verbatim — only the labeled ``bearer`` arm was actually covered.)
+# ======================================================================
+
+# A real-shaped (fake) OpenAI-style token: ``sk-`` + a 36-char body so the
+# {20,} length floor is comfortably met.
+_LONG_TOKEN_BODY = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def test_sanitize_for_external_redacts_bare_sk_token():
+    """A bare ``sk-<value>`` with NO preceding label/separator is redacted.
+
+    This is the core bug the reviewer flagged: the labeled regex treats
+    ``sk-`` as a prefix that must be followed by ``[ :=]+``, so a standalone
+    key value slipped through unredacted.
+    """
+    raw = f"sk-{_LONG_TOKEN_BODY}"
+    out = eh._sanitize_for_external(raw)
+    assert raw not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_for_external_redacts_sk_token_after_plain_words():
+    """``invalid key sk-<value>`` — the words before are not a recognised
+    label/separator, so only the standalone pass can catch the token."""
+    raw = f"sk-{_LONG_TOKEN_BODY}"
+    out = eh._sanitize_for_external(f"invalid key {raw}")
+    assert raw not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_for_external_redacts_api_key_space_form():
+    r"""``API key sk-<value>`` — the space label form (not api_key/api-key).
+
+    Both the new standalone ``sk-`` pass AND the widened ``api[\s_-]?key``
+    label alternation make this safe; either way the token must not survive.
+    """
+    raw = f"sk-{_LONG_TOKEN_BODY}"
+    out = eh._sanitize_for_external(f"API key {raw}")
+    assert raw not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_for_external_redacts_labeled_token_equals_form():
+    """Existing behaviour preserved: ``TOKEN=<value>`` is still redacted."""
+    raw = _LONG_TOKEN_BODY
+    out = eh._sanitize_for_external(f"TOKEN={raw}")
+    assert raw not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_for_external_redacts_authorization_bearer_sk():
+    """Existing behaviour preserved: ``Authorization: Bearer sk-<value>``.
+
+    The raw token value must be gone and ``[REDACTED]`` present (whether the
+    bearer arm or the standalone sk- pass does the scrubbing).
+    """
+    raw = f"sk-{_LONG_TOKEN_BODY}"
+    out = eh._sanitize_for_external(f"Authorization: Bearer {raw}")
+    assert _LONG_TOKEN_BODY not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_for_external_does_not_over_redact_normal_prose():
+    """NEGATIVE guard: a short 3-char ``sk-`` with no 20+ char suffix, and
+    ordinary words that merely CONTAIN the substring ``sk-`` (e.g.
+    "disk-usage"), must pass through untouched. This proves the {20,} floor
+    keeps the standalone pattern from eating normal error text."""
+    benign = "disk-usage is high; task-12345 sk- (truncated) — see api key docs"
+    out = eh._sanitize_for_external(benign)
+    assert out == benign
+    assert "[REDACTED]" not in out
+
+
 
 # ======================================================================
 # error_detail_for_external

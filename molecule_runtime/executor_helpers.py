@@ -639,7 +639,19 @@ def _sanitize_for_external(msg: str) -> str:
     # the value, to avoid false-positives in normal text.
     import re as _re
 
-    msg = _re.sub(r"(?i)(?:bearer|token|api[_-]?key|sk-)[ :=]+[A-Za-z0-9_/.-]{20,}", "[REDACTED]", msg)
+    # Standalone provider-token shapes (e.g. a bare OpenAI-style key) that
+    # appear with NO preceding label/separator. The labeled pattern below
+    # only fires when a "bearer"/"token"/"api_key" prefix + separator is
+    # present, so a value like ``sk-XXXX...`` on its own would otherwise
+    # leak verbatim. The ``sk-`` prefix + 20-char minimum keeps this narrow
+    # enough to avoid eating normal prose (e.g. "disk-usage", "task sk-").
+    msg = _re.sub(r"(?i)sk-[A-Za-z0-9_/.-]{20,}", "[REDACTED]", msg)
+    # Labeled auth values: a known auth-header / key name, a separator,
+    # then a 20+ char value. ``api[\s_-]?key`` matches "api_key",
+    # "api-key" AND the space form "api key". Run after the standalone
+    # pass so the value in ``Authorization: Bearer sk-...`` is scrubbed
+    # regardless of which arm matches.
+    msg = _re.sub(r"(?i)(?:bearer|token|api[\s_-]?key|sk-)[ :=]+[A-Za-z0-9_/.-]{20,}", "[REDACTED]", msg)
     # Absolute paths: /etc/shadow, /home/user/.aws/credentials, etc.
     msg = _re.sub(r"(?:/[^/\s]+){2,}", lambda m: m.group(0) if len(m.group(0)) < 60 else "[REDACTED_PATH]", msg)
     return msg
