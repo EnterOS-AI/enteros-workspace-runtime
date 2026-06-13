@@ -93,6 +93,35 @@ class _CapturingClient:
         return None
 
 
+class _CapturingSyncClient:
+    """httpx.Client stand-in capturing the first POST json body.
+
+    The alive-signal heartbeat POST now runs on a dedicated OS thread via
+    HeartbeatLoop._send_heartbeat(client), which uses a SYNCHRONOUS
+    httpx.Client (not the async loop). This mirror of _CapturingClient
+    captures that sync POST so the payload-contract assertions exercise the
+    real, thread-based heartbeat path.
+    """
+
+    def __init__(self, captured: dict):
+        self._captured = captured
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self._captured.setdefault("url", url)
+        self._captured.setdefault("json", json)
+
+        class _Resp:
+            status_code = 200
+
+            def json(self_inner):
+                return {}
+
+        return _Resp()
+
+    def close(self):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 1. The register body the runtime emits carries every core-required key.
 # ---------------------------------------------------------------------------
@@ -161,45 +190,25 @@ def test_register_required_set_catches_dropped_id_regression():
 # 2. The heartbeat body the runtime emits carries `workspace_id`.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_heartbeat_body_satisfies_core_required_fields(monkeypatch):
-    """Drive HeartbeatLoop._loop for exactly one cycle and capture the real
-    /registry/heartbeat POST body, then assert it carries every key the
-    core HeartbeatPayload marks binding:"required"."""
+def test_heartbeat_body_satisfies_core_required_fields(monkeypatch):
+    """Invoke the alive-signal heartbeat POST and capture the real
+    /registry/heartbeat body, then assert it carries every key the core
+    HeartbeatPayload marks binding:"required".
+
+    #2723: the alive-signal POST moved off the async _loop onto a dedicated
+    OS thread (HeartbeatLoop._send_heartbeat, which uses a SYNC httpx.Client).
+    We drive that extracted method directly with a capturing sync client —
+    the exact body the thread puts on the wire — instead of running _loop.
+    """
     _WS = "00000000-0000-0000-0000-000000000688"
     captured: dict = {}
 
-    # The loop builds its own httpx.AsyncClient; hand it our capturing one.
-    monkeypatch.setattr(
-        hb_mod.httpx, "AsyncClient", lambda *a, **kw: _CapturingClient(captured)
-    )
     monkeypatch.setattr(hb_mod, "auth_headers", lambda *a, **kw: {})
 
-    # Break out of the infinite loop after the first heartbeat POST: the
-    # loop calls asyncio.sleep(interval) once per cycle, so raise there.
-    sleeps = {"n": 0}
-
-    async def _sleep_then_cancel(_seconds):
-        sleeps["n"] += 1
-        import asyncio
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(hb_mod.asyncio, "sleep", _sleep_then_cancel)
-
-    # The delegation checks fire their own GETs against the (post-only)
-    # capturing client; no-op them so the cycle reaches the sleep cleanly.
-    async def _noop(self, client):  # noqa: ANN001
-        return None
-
-    monkeypatch.setattr(hb_mod.HeartbeatLoop, "_check_delegations", _noop)
-    monkeypatch.setattr(hb_mod.HeartbeatLoop, "_check_activity_delegations", _noop)
-
     hb = hb_mod.HeartbeatLoop("https://platform.example", _WS)
-    import asyncio
-    with pytest.raises(asyncio.CancelledError):
-        await hb._loop()
+    hb._send_heartbeat(_CapturingSyncClient(captured))
 
-    assert "json" in captured, "heartbeat loop did not emit a POST"
+    assert "json" in captured, "heartbeat did not emit a POST"
     body = captured["json"]
     assert captured["url"].endswith("/registry/heartbeat")
     missing = CORE_HEARTBEAT_REQUIRED - set(body)
@@ -212,36 +221,23 @@ async def test_heartbeat_body_satisfies_core_required_fields(monkeypatch):
     )
 
 
-@pytest.mark.asyncio
-async def test_heartbeat_body_carries_agent_card_when_set(monkeypatch):
+def test_heartbeat_body_carries_agent_card_when_set(monkeypatch):
     """#2421: when the initial register failed, the heartbeat must carry
-    agent_card so the platform handler can backfill the NULL DB row."""
+    agent_card so the platform handler can backfill the NULL DB row.
+
+    #2723: driven through the extracted _send_heartbeat (dedicated-thread
+    sync path) with a capturing sync client, same as the required-fields
+    test above.
+    """
     _WS = "00000000-0000-0000-0000-000000000242"
     captured: dict = {}
 
-    monkeypatch.setattr(
-        hb_mod.httpx, "AsyncClient", lambda *a, **kw: _CapturingClient(captured)
-    )
     monkeypatch.setattr(hb_mod, "auth_headers", lambda *a, **kw: {})
 
-    async def _sleep_then_cancel(_seconds):
-        import asyncio
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(hb_mod.asyncio, "sleep", _sleep_then_cancel)
-
-    async def _noop(self, client):  # noqa: ANN001
-        return None
-
-    monkeypatch.setattr(hb_mod.HeartbeatLoop, "_check_delegations", _noop)
-    monkeypatch.setattr(hb_mod.HeartbeatLoop, "_check_activity_delegations", _noop)
-
     hb = hb_mod.HeartbeatLoop("https://platform.example", _WS, agent_card={"name": "test-agent"})
-    import asyncio
-    with pytest.raises(asyncio.CancelledError):
-        await hb._loop()
+    hb._send_heartbeat(_CapturingSyncClient(captured))
 
-    assert "json" in captured, "heartbeat loop did not emit a POST"
+    assert "json" in captured, "heartbeat did not emit a POST"
     body = captured["json"]
     assert body.get("agent_card") == {"name": "test-agent"}
 

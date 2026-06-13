@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import httpx
 
@@ -184,6 +185,23 @@ class HeartbeatLoop:
         self.sample_error = ""
         self._task = None
         self._consecutive_failures = 0
+        # #2723 (300s tool-chain-lost): the alive-signal heartbeat POST runs
+        # on a DEDICATED OS THREAD, not the agent's shared asyncio event
+        # loop. A long synchronous/CPU-bound tool step (bulk file
+        # download/upload via a sync client, big inline subprocess, image
+        # processing) blocks the event loop and starves an asyncio-task
+        # heartbeat → no /heartbeat for minutes → the platform's canvas
+        # idle watchdog (workspace-server applyIdleTimeout) sees broadcaster
+        # silence and kills the turn. A real OS thread keeps POSTing
+        # regardless of what the event loop is doing.
+        #
+        # Only the alive signal moves to the thread. Delegation/activity
+        # polling (which itself fires async A2A self-message POSTs and disk
+        # writes) stays on the async _loop — it is not what the idle
+        # watchdog keys on, and keeping it async avoids cross-thread sharing
+        # of the httpx.AsyncClient / asyncio primitives those POSTs use.
+        self._hb_thread: threading.Thread | None = None
+        self._hb_stop = threading.Event()
         self._seen_delegation_ids: set[str] = set()
         self._last_self_message_time = 0.0
         self._parent_name: str | None = None  # Cached after first lookup
@@ -207,6 +225,16 @@ class HeartbeatLoop:
         self.request_count += 1
 
     def start(self) -> None:
+        # #2723: alive-signal heartbeat on a dedicated daemon OS thread so it
+        # survives a blocked asyncio event loop. The async _loop continues to
+        # own delegation/activity polling.
+        self._hb_stop.clear()
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_thread_loop,
+            name="heartbeat-alive",
+            daemon=True,
+        )
+        self._hb_thread.start()
         self._task = asyncio.create_task(self._loop())
         self._task.add_done_callback(self._on_done)
 
@@ -216,7 +244,131 @@ class HeartbeatLoop:
             self._task = asyncio.create_task(self._loop())
             self._task.add_done_callback(self._on_done)
 
+    def _send_heartbeat(self, client: httpx.Client) -> None:
+        """Send one alive-signal heartbeat POST (sync). Runs on the dedicated
+        OS thread. Mirrors the original async POST: same /registry/heartbeat
+        URL, same payload, same 401-refresh-and-retry-once, same
+        platform_inbound_secret persistence. Raises on transport/HTTP error
+        so the caller can track consecutive failures."""
+        body: dict = {
+            "workspace_id": self.workspace_id,
+            "error_rate": self.error_rate,
+            "sample_error": self.sample_error,
+            "active_tasks": self.active_tasks,
+            "current_task": self.current_task,
+            "uptime_seconds": int(time.time() - self.start_time),
+        }
+        # #2421: backfill agent_card when the initial register failed. Only
+        # sent when we have a card — the platform writes it only if the DB
+        # row's agent_card is NULL.
+        if self.agent_card is not None:
+            body["agent_card"] = self.agent_card
+        # Layer the runtime-wedge + metadata fields on top (status→degraded,
+        # capability routing). Identical to the original async path.
+        body.update(_runtime_state_payload())
+        body.update(_runtime_metadata_payload())
+        try:
+            resp = client.post(
+                f"{self.platform_url}/registry/heartbeat",
+                json=body,
+                headers=auth_headers(),
+            )
+            self.error_count = 0
+            self.request_count = 0
+            self._consecutive_failures = 0
+            _persist_inbound_secret_from_heartbeat(resp)
+            return
+        except Exception as e:
+            # Issue #1877: on 401, re-read the token from disk and retry once.
+            is_401 = (
+                isinstance(e, httpx.HTTPStatusError)
+                and e.response.status_code == 401
+            )
+            if not is_401:
+                raise
+            logger.warning(
+                "Heartbeat 401 for %s — refreshing token cache and retrying once",
+                self.workspace_id,
+            )
+            refresh_cache()
+            retry_body: dict = {
+                "workspace_id": self.workspace_id,
+                "error_rate": self.error_rate,
+                "sample_error": self.sample_error,
+                "active_tasks": self.active_tasks,
+                "current_task": self.current_task,
+                "uptime_seconds": int(time.time() - self.start_time),
+            }
+            if self.agent_card is not None:
+                retry_body["agent_card"] = self.agent_card
+            retry_body.update(_runtime_state_payload())
+            retry_resp = client.post(
+                f"{self.platform_url}/registry/heartbeat",
+                json=retry_body,
+                headers=auth_headers(),
+            )
+            self._consecutive_failures = 0
+            self.request_count += 1
+            _persist_inbound_secret_from_heartbeat(retry_resp)
+
+    def _heartbeat_thread_loop(self) -> None:
+        """Dedicated-OS-thread alive-signal loop (#2723). Keeps POSTing
+        /registry/heartbeat on a plain time.sleep cadence using a SYNC
+        httpx.Client, fully independent of the agent's asyncio event loop —
+        so it does not stop when a long synchronous tool step blocks that
+        loop. Recreates the client after a run of consecutive failures,
+        mirroring the async loop's resilience."""
+        while not self._hb_stop.is_set():
+            client = None
+            try:
+                client = httpx.Client(timeout=10.0)
+                while not self._hb_stop.is_set():
+                    try:
+                        self._send_heartbeat(client)
+                    except Exception as e:
+                        self._consecutive_failures += 1
+                        if (
+                            self._consecutive_failures <= 3
+                            or self._consecutive_failures % MAX_CONSECUTIVE_FAILURES == 0
+                        ):
+                            logger.warning(
+                                "Heartbeat failed (%d consecutive): %s",
+                                self._consecutive_failures,
+                                e,
+                            )
+                        if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            logger.info(
+                                "Heartbeat: recreating HTTP client after %d failures",
+                                self._consecutive_failures,
+                            )
+                            break  # drop to outer loop → recreate client
+                    # Interruptible sleep: wake immediately on stop() so the
+                    # thread joins promptly during shutdown.
+                    self._hb_stop.wait(self._interval_seconds)
+            except Exception as e:
+                logger.error(
+                    "Heartbeat thread error: %s — retrying in %ds",
+                    e,
+                    self._interval_seconds,
+                )
+                self._hb_stop.wait(self._interval_seconds)
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
     async def stop(self):
+        # Stop the dedicated heartbeat thread first (signal + join), then
+        # cancel the async delegation loop.
+        self._hb_stop.set()
+        if self._hb_thread is not None:
+            # Join off the event loop so a blocked/slow thread shutdown does
+            # not stall the async caller. Interval is small (<=300s) and the
+            # stop Event interrupts the sleep, so this returns quickly.
+            await asyncio.to_thread(self._hb_thread.join, 10.0)
+            self._hb_thread = None
         if self._task:
             self._task.cancel()
             try:
@@ -225,104 +377,23 @@ class HeartbeatLoop:
                 pass
 
     async def _loop(self):
+        # #2723: the alive-signal /registry/heartbeat POST moved to the
+        # dedicated OS thread (_heartbeat_thread_loop) so it survives a
+        # blocked event loop. This async loop now owns ONLY delegation /
+        # activity polling — work that itself fires async A2A self-message
+        # POSTs and is, by nature, event-loop-bound.
         while True:
             client = None
             try:
                 client = httpx.AsyncClient(timeout=10.0)
                 while True:
-                    # 1. Send heartbeat (Phase 30.1: include auth header if token known)
-                    try:
-                        body: dict = {
-                            "workspace_id": self.workspace_id,
-                            "error_rate": self.error_rate,
-                            "sample_error": self.sample_error,
-                            "active_tasks": self.active_tasks,
-                            "current_task": self.current_task,
-                            "uptime_seconds": int(time.time() - self.start_time),
-                        }
-                        # #2421: backfill agent_card when the initial register failed.
-                        # Only sent when we have a card — the platform handler writes
-                        # it only if the DB row's agent_card is NULL.
-                        if self.agent_card is not None:
-                            body["agent_card"] = self.agent_card
-                        # Layer the runtime-wedge fields on top so a
-                        # non-empty sample_error from the wedge wins
-                        # over the (typically empty) heartbeat
-                        # sample_error field. The platform reads
-                        # runtime_state to flip status → degraded.
-                        body.update(_runtime_state_payload())
-                        body.update(_runtime_metadata_payload())
-                        resp = await client.post(
-                            f"{self.platform_url}/registry/heartbeat",
-                            json=body,
-                            headers=auth_headers(),
-                        )
-                        self.error_count = 0
-                        self.request_count = 0
-                        self._consecutive_failures = 0
-                        # 2026-04-30: persist the platform_inbound_secret
-                        # if the heartbeat response carries one. Mirrors
-                        # the cold-start register flow in main.py:319-323
-                        # and closes the recovery path for workspaces
-                        # whose secret was lazy-healed on the platform
-                        # side after register-time. Without this, the
-                        # workspace stays 401-forever on chat upload
-                        # until restart. See workspace-server PR #2421
-                        # for the server-side delivery change.
-                        _persist_inbound_secret_from_heartbeat(resp)
-                    except Exception as e:
-                        self._consecutive_failures += 1
-                        # Issue #1877: if heartbeat 401'd, re-read the token from disk
-                        # and retry once. This handles the platform's token-rotation race
-                        # where WriteFilesToContainer hasn't finished writing the new
-                        # token before the runtime boots and caches the old value.
-                        is_401 = False
-                        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 401:
-                            is_401 = True
-                        if is_401:
-                            logger.warning("Heartbeat 401 for %s — refreshing token cache and retrying once", self.workspace_id)
-                            refresh_cache()
-                            try:
-                                retry_body: dict = {
-                                    "workspace_id": self.workspace_id,
-                                    "error_rate": self.error_rate,
-                                    "sample_error": self.sample_error,
-                                    "active_tasks": self.active_tasks,
-                                    "current_task": self.current_task,
-                                    "uptime_seconds": int(time.time() - self.start_time),
-                                }
-                                if self.agent_card is not None:
-                                    retry_body["agent_card"] = self.agent_card
-                                retry_body.update(_runtime_state_payload())
-                                retry_resp = await client.post(
-                                    f"{self.platform_url}/registry/heartbeat",
-                                    json=retry_body,
-                                    headers=auth_headers(),
-                                )
-                                self._consecutive_failures = 0
-                                self.request_count += 1
-                                _persist_inbound_secret_from_heartbeat(retry_resp)
-                            except Exception:
-                                # Retry also failed — fall through to the normal
-                                # failure tracking below.
-                                pass
-                        if self._consecutive_failures <= 3 or self._consecutive_failures % MAX_CONSECUTIVE_FAILURES == 0:
-                            logger.warning("Heartbeat failed (%d consecutive): %s", self._consecutive_failures, e)
-                        if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                            logger.info("Heartbeat: recreating HTTP client after %d failures", self._consecutive_failures)
-                            try:
-                                await client.aclose()
-                            except Exception:
-                                pass
-                            break
-
-                    # 2. Check delegation status
+                    # 1. Check delegation status
                     try:
                         await self._check_delegations(client)
                     except Exception as e:
                         logger.debug("Delegation check failed: %s", e)
 
-                    # 3. Check activity_logs for delegation results that arrived via
+                    # 2. Check activity_logs for delegation results that arrived via
                     # the POST /a2a proxy path (tool_delegate_task → send_a2a_message).
                     # These are NOT written to the delegations table, so
                     # _check_delegations misses them. See issue #354.
