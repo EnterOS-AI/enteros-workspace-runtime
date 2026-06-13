@@ -61,6 +61,7 @@ from molecule_runtime.shared_runtime import (
 from molecule_runtime.executor_helpers import (
     build_user_content_with_files,
     collect_outbound_files,
+    error_detail_for_external,
     extract_attached_files,
     read_delegation_results,
     sanitize_agent_error,
@@ -750,7 +751,9 @@ class RuntimeA2AExecutor(AgentExecutor):
                 # receive the error and stop polling.
                 await updater.failed(
                     message=new_text_message(
-                        sanitize_agent_error(exc=e), task_id=task_id, context_id=context_id
+                        sanitize_agent_error(exc=e, stderr=error_detail_for_external(e)),
+                        task_id=task_id,
+                        context_id=context_id,
                     )
                 )
             finally:

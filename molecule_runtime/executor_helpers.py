@@ -639,7 +639,19 @@ def _sanitize_for_external(msg: str) -> str:
     # the value, to avoid false-positives in normal text.
     import re as _re
 
-    msg = _re.sub(r"(?i)(?:bearer|token|api[_-]?key|sk-)[ :=]+[A-Za-z0-9_/.-]{20,}", "[REDACTED]", msg)
+    # Standalone provider-token shapes (e.g. a bare OpenAI-style key) that
+    # appear with NO preceding label/separator. The labeled pattern below
+    # only fires when a "bearer"/"token"/"api_key" prefix + separator is
+    # present, so a value like ``sk-XXXX...`` on its own would otherwise
+    # leak verbatim. The ``sk-`` prefix + 20-char minimum keeps this narrow
+    # enough to avoid eating normal prose (e.g. "disk-usage", "task sk-").
+    msg = _re.sub(r"(?i)sk-[A-Za-z0-9_/.-]{20,}", "[REDACTED]", msg)
+    # Labeled auth values: a known auth-header / key name, a separator,
+    # then a 20+ char value. ``api[\s_-]?key`` matches "api_key",
+    # "api-key" AND the space form "api key". Run after the standalone
+    # pass so the value in ``Authorization: Bearer sk-...`` is scrubbed
+    # regardless of which arm matches.
+    msg = _re.sub(r"(?i)(?:bearer|token|api[\s_-]?key|sk-)[ :=]+[A-Za-z0-9_/.-]{20,}", "[REDACTED]", msg)
     # Absolute paths: /etc/shadow, /home/user/.aws/credentials, etc.
     msg = _re.sub(r"(?:/[^/\s]+){2,}", lambda m: m.group(0) if len(m.group(0)) < 60 else "[REDACTED_PATH]", msg)
     return msg
@@ -677,6 +689,33 @@ def sanitize_agent_error(
         detail = _sanitize_for_external(stderr[:_MAX_STDERR_PREVIEW])
         return f"Agent error ({tag}): {detail}"
     return f"Agent error ({tag}) — see workspace logs for details."
+
+
+def error_detail_for_external(exc: BaseException) -> str | None:
+    """Best-effort actionable detail from an exception for the A2A error
+    response.
+
+    Prefers a subprocess/HTTP ``.stderr`` attribute (decoded if bytes),
+    else falls back to ``str(exc)``. The returned text is meant to be passed
+    straight to :func:`sanitize_agent_error` as ``stderr=`` -- which truncates
+    it to 1 KB (``_MAX_STDERR_PREVIEW``) and scrubs secrets / long paths via
+    :func:`_sanitize_for_external` -- so it stays safe for the canvas / peer
+    facing response. Returns ``None`` when there is no usable detail, in which
+    case ``sanitize_agent_error`` keeps its existing "see workspace logs" form.
+
+    Deliberately surfaces only the message / stderr -- never a stack trace or
+    ``exc_info`` (that full detail still goes to the owner-gated workspace logs
+    via ``logger.error(..., exc_info=True)``).
+    """
+    detail: Any = getattr(exc, "stderr", None)
+    if isinstance(detail, (bytes, bytearray)):
+        try:
+            detail = detail.decode("utf-8", "replace")
+        except Exception:
+            detail = None
+    if not detail:
+        detail = str(exc) or None
+    return detail or None
 
 
 # ========================================================================
