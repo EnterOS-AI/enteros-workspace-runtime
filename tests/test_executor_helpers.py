@@ -37,6 +37,7 @@ from molecule_runtime.executor_helpers import (
     brief_summary,
     classify_subprocess_error,
     commit_memory,
+    error_detail_for_external,
     extract_message_text,
     get_a2a_instructions,
     get_display_instructions,
@@ -804,6 +805,73 @@ def test_sanitize_agent_error_stderr_combined_with_existing_tests():
     assert "abc-123-XYZ" not in out
     assert "workspace logs" in out
 
+
+
+# ======================================================================
+# error_detail_for_external
+# ======================================================================
+
+
+def test_error_detail_for_external_stderr_bytes_decoded():
+    """A `.stderr` attribute carrying bytes is decoded to a string."""
+    exc = SimpleNamespace(stderr=b"boom from subprocess")
+    assert error_detail_for_external(exc) == "boom from subprocess"
+
+
+def test_error_detail_for_external_stderr_str_returned():
+    """A `.stderr` attribute that is already a str is returned as-is."""
+    exc = SimpleNamespace(stderr="rate limit exceeded")
+    assert error_detail_for_external(exc) == "rate limit exceeded"
+
+
+def test_error_detail_for_external_stderr_blank_falls_back_to_str():
+    """Empty/blank `.stderr` is ignored; falls back to str(exc)."""
+    # An exception object whose stderr is empty but whose str() is useful.
+    err = ValueError("useful message")
+    err.stderr = ""
+    assert error_detail_for_external(err) == "useful message"
+
+
+def test_error_detail_for_external_plain_exception_uses_str():
+    """A plain exception with no `.stderr` uses its str() message."""
+    assert error_detail_for_external(ValueError("boom")) == "boom"
+
+
+def test_error_detail_for_external_no_detail_returns_none():
+    """No `.stderr` and an empty str() yields None (→ generic fallback)."""
+    class _Silent(Exception):
+        def __str__(self):
+            return ""
+
+    assert error_detail_for_external(_Silent()) is None
+
+
+def test_error_detail_for_external_decode_error_falls_back_to_str():
+    """If `.stderr` is bytes that can't be the detail, str(exc) is used.
+
+    `errors="replace"` makes utf-8 decoding non-raising, so this also
+    documents that invalid bytes still produce a (replacement-char) string
+    rather than crashing.
+    """
+    out = error_detail_for_external(SimpleNamespace(stderr=b"\xff\xfe bad"))
+    # Non-empty: decoded with replacement chars, not None.
+    assert out
+
+
+def test_error_detail_for_external_threaded_into_sanitizer_redacts_secrets():
+    """End-to-end: an exception whose message embeds a bearer token, passed
+    through sanitize_agent_error(stderr=error_detail_for_external(exc)),
+    yields a tagged detail string with the token REDACTED — proving the
+    secret-scrub still applies to the surfaced detail."""
+    fake = "Authorization: Bearer sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    exc = RuntimeError(f"auth failed: {fake}")
+    out = sanitize_agent_error(exc=exc, stderr=error_detail_for_external(exc))
+    # Tag from the exc class is present (stderr form, not the generic form).
+    assert "RuntimeError" in out
+    assert "workspace logs" not in out
+    # The 20+ char token value is scrubbed.
+    assert "REDACTED" in out
+    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in out
 
 
 # ======================================================================

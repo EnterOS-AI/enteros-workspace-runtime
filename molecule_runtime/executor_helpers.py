@@ -679,6 +679,33 @@ def sanitize_agent_error(
     return f"Agent error ({tag}) — see workspace logs for details."
 
 
+def error_detail_for_external(exc: BaseException) -> str | None:
+    """Best-effort actionable detail from an exception for the A2A error
+    response.
+
+    Prefers a subprocess/HTTP ``.stderr`` attribute (decoded if bytes),
+    else falls back to ``str(exc)``. The returned text is meant to be passed
+    straight to :func:`sanitize_agent_error` as ``stderr=`` -- which truncates
+    it to 1 KB (``_MAX_STDERR_PREVIEW``) and scrubs secrets / long paths via
+    :func:`_sanitize_for_external` -- so it stays safe for the canvas / peer
+    facing response. Returns ``None`` when there is no usable detail, in which
+    case ``sanitize_agent_error`` keeps its existing "see workspace logs" form.
+
+    Deliberately surfaces only the message / stderr -- never a stack trace or
+    ``exc_info`` (that full detail still goes to the owner-gated workspace logs
+    via ``logger.error(..., exc_info=True)``).
+    """
+    detail: Any = getattr(exc, "stderr", None)
+    if isinstance(detail, (bytes, bytearray)):
+        try:
+            detail = detail.decode("utf-8", "replace")
+        except Exception:
+            detail = None
+    if not detail:
+        detail = str(exc) or None
+    return detail or None
+
+
 # ========================================================================
 # Auto-push hook — push unpushed commits and open PR after task completion
 # ========================================================================
