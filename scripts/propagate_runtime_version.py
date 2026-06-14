@@ -7,9 +7,12 @@ version, never ``latest``). On every ``runtime-v*`` release the pins drift until
 human hand-bumps them, leaving re-provisioned workspaces on a stale runtime.
 
 This script closes that loop: for each consumer template whose ``.runtime-version``
-is behind the released version, it opens a PR bumping the pin. It does NOT merge —
-each template's normal CI + 1-approval gate still applies; the automation removes
-the discovery + hand-authoring toil, not the human review.
+is behind the released version, it opens a PR bumping the pin. Templates that also
+pin the runtime in ``requirements.txt`` (e.g., codex-style templates) get BOTH
+files bumped atomically so publish-image's cross-check stays green.
+
+It does NOT merge — each template's normal CI + 1-approval gate still applies;
+the automation removes the discovery + hand-authoring toil, not the human review.
 
 Idempotent: skips a consumer that is already pinned to the target, or that already
 has the bump branch / an open bump PR.
@@ -24,12 +27,14 @@ token and without mutating anything.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # SSOT for the set of template repos that pin .runtime-version. This is the
 # template subset of check_consumer_runtime_drift.DEFAULT_CONSUMERS (which also
@@ -45,6 +50,13 @@ TEMPLATE_CONSUMERS = (
 
 ORG = "molecule-ai"
 
+# Regex for the runtime pin line in requirements.txt. Matches lines like:
+#   molecule-ai-workspace-runtime==0.3.26
+RUNTIME_PIN_RE = re.compile(
+    r"^(molecule-ai-workspace-runtime==)([0-9]+\.[0-9]+\.[0-9]+(?:[a-zA-Z0-9.-]*))",
+    re.MULTILINE,
+)
+
 
 @dataclass(frozen=True)
 class ConsumerPlan:
@@ -53,6 +65,7 @@ class ConsumerPlan:
     action: str  # "open-pr" | "already-pinned" | "pr-exists" | "ahead" | "no-pin"
     branch: str
     detail: str
+    req_pin: str | None = None  # requirements.txt pin, if present
 
 
 def _http(
@@ -88,6 +101,23 @@ def read_pinned_version(repo: str, *, gitea_url: str, token: str | None = None) 
     raise RuntimeError(f"{repo}: unexpected HTTP {status} reading .runtime-version: {body[:200]}")
 
 
+def read_requirements_pin(repo: str, *, gitea_url: str, token: str | None = None) -> str | None:
+    """Read a consumer's requirements.txt runtime pin, if any.
+
+    Returns the pinned version string (e.g. "0.3.26") if a
+    ``molecule-ai-workspace-runtime==<ver>`` line exists, else None.
+    Returns None on 404 (no requirements.txt).
+    """
+    url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/raw/requirements.txt"
+    status, body = _http(url, token=token)
+    if status == 200:
+        match = RUNTIME_PIN_RE.search(body)
+        return match.group(2) if match else None
+    if status == 404:
+        return None
+    raise RuntimeError(f"{repo}: unexpected HTTP {status} reading requirements.txt: {body[:200]}")
+
+
 def _version_tuple(v: str) -> tuple[int, ...]:
     """Parse a release version into a comparable tuple. Pre-release suffixes are
     dropped to the numeric core (best-effort; pins are always plain releases)."""
@@ -118,16 +148,21 @@ def plan_consumer(repo: str, target: str, *, gitea_url: str, token: str | None =
             f"pinned {pinned} is ahead of release {target}; not downgrading",
         )
 
+    req_pin = read_requirements_pin(repo, gitea_url=gitea_url, token=token)
+    detail = f"would bump .runtime-version {pinned} -> {target}"
+    if req_pin:
+        detail += f"; requirements.txt pin {req_pin} -> {target}"
+
     # Behind: would open a PR. Check idempotency only when we can authenticate
     # (the branch/PR list endpoints need the token for these repos).
     if token:
         if _branch_exists(repo, branch, gitea_url=gitea_url, token=token):
-            return ConsumerPlan(repo, pinned, "pr-exists", branch, f"branch {branch} already exists")
+            return ConsumerPlan(repo, pinned, "pr-exists", branch, f"branch {branch} already exists", req_pin=req_pin)
         existing = _open_pr_for_branch(repo, branch, gitea_url=gitea_url, token=token)
         if existing:
-            return ConsumerPlan(repo, pinned, "pr-exists", branch, f"open PR already exists: {existing}")
+            return ConsumerPlan(repo, pinned, "pr-exists", branch, f"open PR already exists: {existing}", req_pin=req_pin)
 
-    return ConsumerPlan(repo, pinned, "open-pr", branch, f"would bump {pinned} -> {target}")
+    return ConsumerPlan(repo, pinned, "open-pr", branch, detail, req_pin=req_pin)
 
 
 def _branch_exists(repo: str, branch: str, *, gitea_url: str, token: str) -> bool:
@@ -162,8 +197,8 @@ def _get_default_branch(repo: str, *, gitea_url: str, token: str) -> str:
     return "main"
 
 
-def _get_file_sha(repo: str, base: str, *, gitea_url: str, token: str) -> str | None:
-    url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/contents/.runtime-version?ref={base}"
+def _get_file_sha(repo: str, path: str, base: str, *, gitea_url: str, token: str) -> str | None:
+    url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/contents/{path}?ref={base}"
     status, body = _http(url, token=token)
     if status == 200:
         try:
@@ -173,44 +208,107 @@ def _get_file_sha(repo: str, base: str, *, gitea_url: str, token: str) -> str | 
     return None
 
 
+def _commit_file(
+    repo: str,
+    path: str,
+    content: str,
+    message: str,
+    *,
+    branch: str,
+    base: str,
+    create_branch: bool,
+    gitea_url: str,
+    token: str,
+) -> None:
+    """Write one file to a branch via the Gitea contents API.
+
+    If ``create_branch`` is True, the commit is made on ``base`` and ``branch``
+    is created. Otherwise the commit is made on the existing ``branch``.
+    """
+    sha = _get_file_sha(repo, path, base if create_branch else branch, gitea_url=gitea_url, token=token)
+    if sha is None and not create_branch:
+        # File may not exist on the bump branch yet; try base.
+        sha = _get_file_sha(repo, path, base, gitea_url=gitea_url, token=token)
+
+    content_b64 = base64.b64encode(content.encode()).decode()
+    put_url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/contents/{path}"
+    put_payload: dict = {
+        "branch": base if create_branch else branch,
+        "content": content_b64,
+        "message": message,
+    }
+    if create_branch:
+        put_payload["new_branch"] = branch
+    if sha is not None:
+        put_payload["sha"] = sha
+
+    status, body = _http(put_url, token=token, method="PUT", payload=put_payload)
+    if status not in (200, 201):
+        raise RuntimeError(f"{repo}: failed to write {path} (HTTP {status}): {body[:300]}")
+
+
+def _update_requirements_content(content: str, target: str) -> str | None:
+    """Return requirements.txt content with the runtime pin bumped to target.
+
+    Returns None if no runtime pin is present (nothing to update).
+    """
+    def repl(match: re.Match) -> str:
+        return f"{match.group(1)}{target}"
+
+    new_content, n = RUNTIME_PIN_RE.subn(repl, content)
+    return new_content if n > 0 else None
+
+
 def open_bump_pr(plan: ConsumerPlan, target: str, *, gitea_url: str, token: str) -> str:
-    """Create branch + commit the .runtime-version bump + open a PR. Returns html_url.
+    """Create branch + commit the .runtime-version bump (+ requirements.txt if
+    dual-pinned) + open a PR. Returns html_url.
 
     Uses the Gitea contents + pulls API only (no git clone), so no token ever
     lands in a clone URL on disk.
     """
     repo = plan.repo
     base = _get_default_branch(repo, gitea_url=gitea_url, token=token)
-    sha = _get_file_sha(repo, base, gitea_url=gitea_url, token=token)
-    if sha is None:
-        raise RuntimeError(f"{repo}: could not read .runtime-version sha on {base}")
 
-    # Commit the bump onto the new branch via the contents API (creates the branch).
-    import base64
+    # 1. Commit .runtime-version bump; this creates the branch.
+    _commit_file(
+        repo,
+        ".runtime-version",
+        f"{target}\n",
+        f"chore(runtime): bump .runtime-version to {target}",
+        branch=plan.branch,
+        base=base,
+        create_branch=True,
+        gitea_url=gitea_url,
+        token=token,
+    )
 
-    content_b64 = base64.b64encode(f"{target}\n".encode()).decode()
-    put_url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/contents/.runtime-version"
-    put_payload = {
-        # Gitea contents-API semantics: `branch` is the branch to START from
-        # (must already exist); `new_branch` is the branch to CREATE with this
-        # commit. Passing the bump branch as `branch` 404s with "branch does
-        # not exist" on every consumer (the 0.3.15/0.3.16 propagate failures).
-        "branch": base,
-        "new_branch": plan.branch,
-        "sha": sha,
-        "content": content_b64,
-        "message": f"chore(runtime): bump .runtime-version to {target}",
-    }
-    status, body = _http(put_url, token=token, method="PUT", payload=put_payload)
-    if status not in (200, 201):
-        raise RuntimeError(f"{repo}: failed to write bump commit (HTTP {status}): {body[:300]}")
+    # 2. If requirements.txt also pins the runtime, bump it on the same branch.
+    updated_paths = [".runtime-version"]
+    if plan.req_pin:
+        req_url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/raw/requirements.txt?ref={base}"
+        status, req_body = _http(req_url, token=token)
+        if status == 200:
+            new_req = _update_requirements_content(req_body, target)
+            if new_req is not None and new_req != req_body:
+                _commit_file(
+                    repo,
+                    "requirements.txt",
+                    new_req,
+                    f"chore(runtime): bump requirements.txt runtime pin to {target}",
+                    branch=plan.branch,
+                    base=base,
+                    create_branch=False,
+                    gitea_url=gitea_url,
+                    token=token,
+                )
+                updated_paths.append("requirements.txt")
 
     title = f"chore(runtime): bump .runtime-version to {target}"
+    files_clause = " and ".join(f"`{p}`" for p in updated_paths)
     body_md = (
         f"Automated runtime SSOT propagation from "
         f"`molecule-ai-workspace-runtime` release `runtime-v{target}` (runtime#91).\n\n"
-        f"Bumps `.runtime-version` `{plan.pinned}` -> `{target}` so re-provisioned "
-        f"workspaces pick up the new runtime wheel.\n\n"
+        f"Bumps {files_clause} so re-provisioned workspaces pick up the new runtime wheel.\n\n"
         f"This PR runs this template's normal CI and requires the normal approval — "
         f"a human still gates the merge. Close it if this template is intentionally "
         f"held back; `consumer-drift` will then flag it as an intentional pin."
