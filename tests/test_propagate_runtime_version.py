@@ -26,6 +26,9 @@ def test_version_tuple_orders_releases() -> None:
 
 def _patch_pin(monkeypatch: pytest.MonkeyPatch, pinned: str | None) -> None:
     monkeypatch.setattr(prop, "read_pinned_version", lambda *a, **k: pinned)
+    # plan_consumer now also reads requirements.txt for dual-pin templates; keep
+    # these plan tests isolated from the network.
+    monkeypatch.setattr(prop, "read_requirements_pin", lambda *a, **k: None)
     # No token path is exercised in these plan tests, so branch/PR lookups are inert.
 
 
