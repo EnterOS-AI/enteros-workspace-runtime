@@ -516,8 +516,23 @@ def get_hma_instructions() -> str:
         memory_tools(),
         footer=(
             "Memory is automatically recalled at the start of each new "
-            "session. Use commit_memory proactively during work so future "
-            "sessions and teammates can recall what you learned."
+            "session — including after a context-overflow auto-heal/reset. "
+            "Your conversation context is EPHEMERAL and can be reset at any "
+            "time; never rely on it for anything you must not forget.\n\n"
+            "PERSISTENCE DISCIPLINE (required):\n"
+            "- The moment the user asks you to remember something — or your "
+            "work produces a durable fact (a preference, an identity/persona, "
+            "an account, a decision, or WHERE a credential/token lives) — "
+            "persist it IMMEDIATELY: call commit_memory AND append it to your "
+            "durable memory file (MEMORY.md, or your framework's "
+            "CLAUDE.md/AGENTS.md), THEN confirm. Never reply \"remembered\" "
+            "based on conversation context alone.\n"
+            "- Store SECRETS (tokens, DB connection strings, API keys) ONLY "
+            "via set_secret, which auto-injects them as env every session — "
+            "never in a local .env file or a chat message. In MEMORY.md record "
+            "only the secret's NAME, never its value.\n"
+            "- Treat MEMORY.md as your durable index of facts + where things "
+            "live, so a fresh/reset session resumes exactly where you left off."
         ),
     )
 
