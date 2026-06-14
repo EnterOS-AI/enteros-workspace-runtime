@@ -14,7 +14,26 @@ from molecule_runtime.shared_runtime import build_peer_section
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MEMORY_SNAPSHOT_FILES = ("MEMORY.md", "USER.md")
+# Durable memory-snapshot files auto-loaded into the system prompt every
+# session if present in config_path (loaded only when they exist, and skipped
+# when already listed in prompt_files to avoid duplication). MEMORY.md/USER.md
+# are the platform-agnostic canonical store the persistence discipline writes
+# to; the rest are each framework's NATIVE durable-context convention so an
+# agent that writes its framework's file (claude-code → CLAUDE.md; codex /
+# many tools → AGENTS.md; gemini/adk → GEMINI.md; openclaw → SOUL.md) also has
+# it injected. Loading-if-present makes this safe across all runtimes without
+# threading a per-runtime param through every caller — an agent only ever has
+# the file(s) its framework uses. This is the "memory survives a context reset"
+# leg: these files live on the persistent volume, so a fresh/auto-healed
+# session re-injects them via the system prompt.
+DEFAULT_MEMORY_SNAPSHOT_FILES = (
+    "MEMORY.md",
+    "USER.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "GEMINI.md",
+    "SOUL.md",
+)
 
 
 async def get_peer_capabilities(platform_url: str, workspace_id: str) -> list[dict]:
