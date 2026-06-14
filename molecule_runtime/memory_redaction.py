@@ -44,14 +44,14 @@ _PRIVATE_KEY_RE = re.compile(
 )
 
 # Connection strings / DATABASE_URL-style values with embedded password.
+# Captures the whole authority (user:password@host:port) so the replacer can
+# split on the LAST '@' and the FIRST ':' in the userinfo. This correctly
+# handles passwords that contain '@' or ':'.
 _CONNECTION_STRING_RE = re.compile(
     r"(?i)"
     r"((?:postgresql|postgres|mysql|mongodb\+srv|mongodb|redis|"
     r"http|https|ftp|sftp|amqp|sqlite|mssql|oracle)://)"
-    r"([^:\s]+)"
-    r":"
-    r"([^@\s]+)"
-    r"(@[^\s]+)"
+    r"([^/\s]+)"
 )
 
 # Env-style credential assignments.
@@ -128,12 +128,22 @@ def _bearer_token_repl(m: re.Match[str]) -> str:
 
 
 def _connection_string_repl(m: re.Match[str]) -> str:
-    # Preserve scheme://user:@host so debugging knows *which* service, but
-    # drop the password. Skip already-redacted or trivial passwords.
-    password = m.group(3)
+    # The authority is everything between // and the path (or whitespace).
+    # It may be user:password@host:port, user@host:port, or just host:port.
+    # Split on the LAST '@' to separate userinfo from host, then split the
+    # userinfo on the FIRST ':' to separate user from password. This correctly
+    # redacts passwords containing '@' and/or ':'.
+    scheme = m.group(1)
+    authority = m.group(2)
+    if "@" not in authority:
+        return m.group(0)
+    userinfo, _, host = authority.rpartition("@")
+    if ":" not in userinfo:
+        return m.group(0)
+    user, _, password = userinfo.partition(":")
     if _too_short_or_placeholder(password):
         return m.group(0)
-    return f"{m.group(1)}{m.group(2)}:{_placeholder_for('connection_password')}{m.group(4)}"
+    return f"{scheme}{user}:{_placeholder_for('connection_password')}@{host}"
 
 
 def _too_short_or_placeholder(value: str) -> bool:

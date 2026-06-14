@@ -56,6 +56,39 @@ class TestPositiveMatches:
         assert "@db.example.com:5432/appdb" in out
         assert meta.get("connection_string") == 1
 
+    def test_database_url_password_with_at_sign(self):
+        # Regression: old regex stopped at the first '@' and left a fragment.
+        text = "DATABASE_URL=postgresql://app:my@secret@db.example.com:5432/appdb"
+        out, meta = redact_credentials(text)
+        assert "my@secret" not in out
+        assert "secret" not in out
+        assert "[REDACTED:connection_password]" in out
+        assert "postgresql://app:" in out
+        assert "@db.example.com:5432/appdb" in out
+        assert meta.get("connection_string") == 1
+
+    def test_database_url_password_with_colon(self):
+        text = "DATABASE_URL=postgresql://app:p:ssw0rd@db.example.com/appdb"
+        out, meta = redact_credentials(text)
+        assert "p:ssw0rd" not in out
+        assert "ssw0rd" not in out
+        assert "[REDACTED:connection_password]" in out
+        assert "postgresql://app:" in out
+        assert "@db.example.com/appdb" in out
+        assert meta.get("connection_string") == 1
+
+    def test_database_url_password_with_at_and_colon(self):
+        text = "DATABASE_URL=postgresql://app:my@secret:value@db.example.com/appdb"
+        out, meta = redact_credentials(text)
+        assert "my@secret:value" not in out
+        assert "my@secret" not in out
+        assert "secret:value" not in out
+        assert "value" not in out
+        assert "[REDACTED:connection_password]" in out
+        assert "postgresql://app:" in out
+        assert "@db.example.com/appdb" in out
+        assert meta.get("connection_string") == 1
+
     def test_private_key(self):
         text = (
             "-----BEGIN OPENSSH PRIVATE KEY-----\n"
