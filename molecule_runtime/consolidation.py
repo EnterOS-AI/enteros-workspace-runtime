@@ -14,6 +14,7 @@ import os
 
 import httpx
 
+from molecule_runtime.memory_redaction import redact_credentials_text
 from molecule_runtime.platform_auth import auth_headers
 from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
 
@@ -106,6 +107,7 @@ class ConsolidationLoop:
                                 break
 
                     if summary:
+                        summary = redact_credentials_text(summary)
                         # Store consolidated summary as a TEAM memory — only delete originals if POST succeeds
                         resp = await client.post(
                             f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
@@ -132,6 +134,7 @@ class ConsolidationLoop:
             # Fallback: concatenate without agent summarization
             if not (self.agent and summary):
                 combined = " | ".join(contents[:20])
+                combined = redact_credentials_text(combined)
                 resp = await client.post(
                     f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
                     json={"content": f"[Consolidated] {combined}", "scope": "TEAM"},
