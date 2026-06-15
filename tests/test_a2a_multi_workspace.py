@@ -158,6 +158,7 @@ class TestSendA2AMessageSourceRouting:
 
         class _Resp:
             status_code = 200
+            headers = {"content-type": "application/json"}
             def json(self):
                 return {"jsonrpc": "2.0", "result": {"parts": [{"text": "PONG"}]}}
 
@@ -181,6 +182,64 @@ class TestSendA2AMessageSourceRouting:
         assert result == "PONG"
         assert captured["headers"]["X-Workspace-ID"] == "cccc3333-cccc-cccc-cccc-cccccccccccc"
         assert captured["headers"]["Authorization"] == "Bearer token-C"
+
+
+class TestSendA2AMessageNonJsonResponse:
+    """core#143: proxy/gateway errors that return HTML or non-JSON bodies
+    must surface as structured errors, not JSONDecodeError."""
+
+    @pytest.mark.asyncio
+    async def test_returns_structured_error_on_5xx_html(self, monkeypatch):
+        import molecule_runtime.a2a_client as a2a_client
+
+        class _Resp:
+            status_code = 502
+            headers = {"content-type": "text/html"}
+            text = "<html><body>Bad Gateway</body></html>"
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return None
+            async def post(self, url, headers, json):
+                return _Resp()
+
+        monkeypatch.setattr(a2a_client.httpx, "AsyncClient", lambda timeout: _Client())
+
+        result = await a2a_client.send_a2a_message(
+            "dddd4444-dddd-dddd-dddd-dddddddddddd", "ping"
+        )
+        assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
+        assert "HTTP 502" in result
+        assert "Bad Gateway" in result
+        assert "may have been delivered" in result
+
+    @pytest.mark.asyncio
+    async def test_returns_structured_error_on_non_json_2xx(self, monkeypatch):
+        import molecule_runtime.a2a_client as a2a_client
+
+        class _Resp:
+            status_code = 200
+            headers = {"content-type": "text/plain"}
+            text = "this is not json"
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return None
+            async def post(self, url, headers, json):
+                return _Resp()
+
+        monkeypatch.setattr(a2a_client.httpx, "AsyncClient", lambda timeout: _Client())
+
+        result = await a2a_client.send_a2a_message(
+            "dddd4444-dddd-dddd-dddd-dddddddddddd", "ping"
+        )
+        assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
+        assert "non-JSON response" in result
+        assert "text/plain" in result
 
 
 class TestGetPeersSourceRouting:
