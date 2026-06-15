@@ -277,3 +277,85 @@ async def test_heartbeat_skips_queued_busy_and_error_rows():
     assert "Here is the real peer response" in body_str or "message/send -> Me" in body_str
     # All three rows marked seen so the cursor advances; non-results never re-fire.
     assert {"act-ok-1", "act-busy-1", "act-err-1"} <= hb._seen_activity_ids
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_skips_queued_busy_by_typed_marker():
+    """Issue #138: activity rows carrying message_type=backpressure must be
+    skipped even if the summary wording no longer contains the legacy
+    'queued: target busy' substring."""
+    from molecule_runtime.heartbeat import ACTIVITY_MESSAGE_TYPE_BACKPRESSURE
+
+    hb = HeartbeatLoop("http://test-platform", _WS)
+    posts: list[tuple[str, dict]] = []
+    client = _make_client(
+        get_payloads=[
+            _make_resp([
+                {
+                    "id": "act-ok-2",
+                    "source_id": "peer-real",
+                    "status": "ok",
+                    "summary": "message/send -> Me",
+                    "request_body": {"params": {"message": {"parts": [
+                        {"kind": "text", "text": "Here is the real peer response."}
+                    ]}}},
+                },
+                {
+                    "id": "act-busy-typed",
+                    "source_id": "peer-busy",
+                    "status": "ok",
+                    # Legacy substring deliberately absent.
+                    "summary": "Target workspace busy; request queued",
+                    "message_type": ACTIVITY_MESSAGE_TYPE_BACKPRESSURE,
+                    "request_body": {"params": {"message": {"parts": []}}},
+                },
+            ]),
+            _make_resp({"parent_id": ""}),
+        ],
+        post_recorder=posts,
+    )
+
+    await hb._check_activity_delegations(client)
+
+    a2a_posts = [p for p in posts if p[0].endswith(f"/workspaces/{_WS}/a2a")]
+    assert len(a2a_posts) == 1, (
+        f"expected exactly one self-message for the real result; got {a2a_posts!r}"
+    )
+    body_str = str(a2a_posts[0][1])
+    assert "Target workspace busy" not in body_str, (
+        "typed backpressure row must not be harvested into the wake message"
+    )
+    assert "Here is the real peer response" in body_str or "message/send -> Me" in body_str
+    assert {"act-ok-2", "act-busy-typed"} <= hb._seen_activity_ids
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_self_message_stamps_typed_marker():
+    """Issue #138: the delegation-harvester self-message must carry
+    source_type=self-harvester so the executor's drop/queue decision keys off
+    the typed marker rather than text wording."""
+    hb = HeartbeatLoop("http://test-platform", _WS)
+    posts: list[tuple[str, dict]] = []
+    client = _make_client(
+        get_payloads=[
+            _make_resp([
+                {
+                    "delegation_id": "deleg-success-138",
+                    "target_id": "peer-A",
+                    "source_id": _WS,
+                    "status": "completed",
+                    "summary": "Built the report",
+                    "response_preview": "Report body here.",
+                    "error": "",
+                },
+            ]),
+        ],
+        post_recorder=posts,
+    )
+
+    await hb._check_delegations(client)
+
+    a2a_posts = [p for p in posts if p[0].endswith(f"/workspaces/{_WS}/a2a")]
+    assert len(a2a_posts) == 1
+    params = a2a_posts[0][1]["params"]
+    assert params["metadata"]["source_type"] == "self-harvester"

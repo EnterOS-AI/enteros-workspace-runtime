@@ -60,10 +60,10 @@ class _FakeUpdater:
         self.events.append(("failed", message))
 
 
-def _build_context(text: str, context_id: str, task_id: str = "task-1"):
+def _build_context(text: str, context_id: str, *, task_id: str = "task-1", metadata: dict | None = None):
     """Return a SimpleNamespace shaped like a2a-sdk's RequestContext."""
     part = SimpleNamespace(text=text, root=None)
-    msg = SimpleNamespace(parts=[part])
+    msg = SimpleNamespace(parts=[part], metadata=metadata)
     return SimpleNamespace(
         message=msg,
         task_id=task_id,
@@ -84,7 +84,7 @@ def _build_context_with_file(
     text_part = SimpleNamespace(text=text, root=None)
     file_obj = SimpleNamespace(uri=f"file://{path}", name=name, mimeType=mime_type)
     file_part = SimpleNamespace(kind="file", file=file_obj)
-    msg = SimpleNamespace(parts=[text_part, file_part])
+    msg = SimpleNamespace(parts=[text_part, file_part], metadata=None)
     return SimpleNamespace(
         message=msg,
         task_id=task_id,
@@ -1040,3 +1040,100 @@ async def test_inbox_bounded_with_multimodal_attachments(monkeypatch):
     # Third entry must be rejected
     assert entry.request_interrupt(big_attachment) is False
     assert entry.pending_messages.qsize() == 2
+
+
+# ─── Issue #138 — typed self-message marker regression tests ─────────────
+
+
+def test_is_routine_self_message_prefers_typed_marker():
+    """When the inbound message carries source_type=self-cron, the drop/queue
+    decision must be True even if the text wording has drifted away from the
+    legacy prefix."""
+    from molecule_runtime.a2a_executor import (
+        A2A_MESSAGE_SOURCE_TYPE,
+        A2A_SOURCE_SELF_CRON,
+        A2A_SOURCE_SELF_HARVESTER,
+        _is_routine_self_message,
+    )
+
+    ctx_cron = _build_context(
+        "AUTONOMOUS TICK — Root-Cause Researcher (drifted wording)",
+        "ctx-138-cron",
+        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_CRON},
+    )
+    assert _is_routine_self_message(ctx_cron, ctx_cron.message.parts[0].text) is True
+
+    ctx_harv = _build_context(
+        "Delegation results are ready (from a2a_receive via activity_logs).",
+        "ctx-138-harv",
+        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_HARVESTER},
+    )
+    assert _is_routine_self_message(ctx_harv, ctx_harv.message.parts[0].text) is True
+
+
+def test_is_routine_self_message_non_routine_marker():
+    """A present but non-routine marker must NOT fall back to text matching;
+    otherwise an adversarial/accidental marker could revive the prefix check."""
+    from molecule_runtime.a2a_executor import (
+        A2A_MESSAGE_SOURCE_TYPE,
+        _is_routine_self_message,
+    )
+
+    ctx = _build_context(
+        "This is your own scheduled work tick (impersonated)",
+        "ctx-138-user",
+        metadata={A2A_MESSAGE_SOURCE_TYPE: "user-canvas"},
+    )
+    assert _is_routine_self_message(ctx, ctx.message.parts[0].text) is False
+
+
+def test_is_routine_self_message_text_fallback_and_drift():
+    """Legacy text-prefix matching still works for platforms without the typed
+    marker, but drifted wording without a marker returns False."""
+    from molecule_runtime.a2a_executor import _is_routine_self_message
+
+    ctx_legacy = _build_context(
+        "This is your own scheduled work tick (runs every 5 minutes).",
+        "ctx-138-legacy",
+    )
+    assert _is_routine_self_message(ctx_legacy, ctx_legacy.message.parts[0].text) is True
+
+    ctx_drift = _build_context(
+        "AUTONOMOUS TICK — Root-Cause Researcher (drifted, no marker)",
+        "ctx-138-drift",
+    )
+    assert _is_routine_self_message(ctx_drift, ctx_drift.message.parts[0].text) is False
+
+
+@pytest.mark.asyncio
+async def test_inbox_drops_mid_turn_self_cron_by_typed_marker(monkeypatch):
+    """Mid-turn self-cron message with source_type=self-cron is dropped, not
+    queued, even when the legacy prefix is absent (#138)."""
+    from molecule_runtime.runtime_inbox import get_inbox
+    from molecule_runtime.a2a_executor import (
+        A2A_MESSAGE_SOURCE_TYPE,
+        A2A_SOURCE_SELF_CRON,
+    )
+
+    monkeypatch.setenv("MOLECULE_A2A_NONBLOCKING", "true")
+    get_inbox().reset_for_tests()
+
+    context_id = "ctx-138-midturn-cron"
+    entry = await get_inbox().get_or_create(context_id)
+    entry.turn_in_flight = True
+
+    from molecule_runtime import a2a_executor as executor_mod
+
+    executor = executor_mod.RuntimeA2AExecutor(agent=MagicMock())
+    ctx = _build_context(
+        "AUTONOMOUS TICK — Root-Cause Researcher",
+        context_id,
+        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_CRON},
+    )
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    result = await executor._core_execute(ctx, event_queue)
+
+    assert result == ""
+    assert entry.pending_messages.qsize() == 0, "routine self-ping must be dropped, not queued"

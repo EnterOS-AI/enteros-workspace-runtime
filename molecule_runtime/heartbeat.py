@@ -17,7 +17,16 @@ import time
 import httpx
 
 from molecule_runtime.a2a_client import build_message_send_params
+from molecule_runtime.a2a_executor import (
+    A2A_MESSAGE_SOURCE_TYPE,
+    A2A_SOURCE_SELF_HARVESTER,
+)
 from molecule_runtime.platform_auth import auth_headers, refresh_cache, self_source_headers
+
+# Typed marker for activity-log rows that represent backpressure echoes rather
+# than genuine peer results. The platform sets this on "queued: target busy"
+# rows; the harvester also skips on the legacy substring as a fallback.
+ACTIVITY_MESSAGE_TYPE_BACKPRESSURE = "backpressure"
 
 
 def _runtime_state_payload() -> dict:
@@ -551,7 +560,10 @@ class HeartbeatLoop:
                                 # #2251: single model-based builder — params
                                 # generated FROM the receiver's a2a-sdk v0.3
                                 # SendMessageRequest schema.
-                                "params": build_message_send_params(trigger_msg),
+                                "params": build_message_send_params(
+                                    trigger_msg,
+                                    metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_HARVESTER},
+                                ),
                             },
                             headers=self_source_headers(self.workspace_id),
                             timeout=120.0,
@@ -653,7 +665,12 @@ class HeartbeatLoop:
                 # "queued: target busy" echoes). Mark seen so the cursor still
                 # advances; never surface it as a result.
                 row_status = row.get("status") or ""
-                if (row_status and row_status != "ok") or "queued: target busy" in (row.get("summary") or ""):
+                row_message_type = row.get("message_type") or ""
+                is_backpressure = (
+                    row_message_type == ACTIVITY_MESSAGE_TYPE_BACKPRESSURE
+                    or "queued: target busy" in (row.get("summary") or "")
+                )
+                if (row_status and row_status != "ok") or is_backpressure:
                     self._seen_activity_ids.add(activity_id)
                     continue
 
@@ -782,7 +799,10 @@ class HeartbeatLoop:
                             # #2251: single model-based builder — params
                             # generated FROM the receiver's a2a-sdk v0.3
                             # SendMessageRequest schema.
-                            "params": build_message_send_params(trigger_msg),
+                            "params": build_message_send_params(
+                                trigger_msg,
+                                metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_HARVESTER},
+                            ),
                         },
                         headers=self_source_headers(self.workspace_id),
                         timeout=120.0,
