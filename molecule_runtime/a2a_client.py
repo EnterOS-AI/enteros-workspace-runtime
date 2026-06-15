@@ -896,7 +896,36 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
                         "params": build_message_send_params(message),
                     },
                 )
-                data = resp.json()
+                # core#143: guard resp.json() — proxy/gateway 5xx responses can
+                # return HTML/text bodies, and a partial body can also be
+                # non-JSON. Swallowing these as JSONDecodeError produced the
+                # opaque "proxy a2a error" that masked the real signal.
+                # Surface the HTTP status + a body snippet instead, and do not
+                # retry (a non-2xx from the proxy is not a transport-layer
+                # transient; a 5xx may even have delivered the message).
+                if resp.status_code < 200 or resp.status_code >= 300:
+                    body = resp.text[:200]
+                    return (
+                        f"{_A2A_ERROR_PREFIX}A2A proxy returned HTTP "
+                        f"{resp.status_code} (message may have been delivered); "
+                        f"body={body!r} [target={target_url}]"
+                    )
+                content_type = resp.headers.get("content-type", "")
+                if "application/json" not in content_type:
+                    body = resp.text[:200]
+                    return (
+                        f"{_A2A_ERROR_PREFIX}A2A proxy returned non-JSON response "
+                        f"(content-type={content_type!r}); body={body!r} "
+                        f"[target={target_url}]"
+                    )
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    body = resp.text[:200]
+                    return (
+                        f"{_A2A_ERROR_PREFIX}A2A proxy response was not valid JSON "
+                        f"({e}); body={body!r} [target={target_url}]"
+                    )
                 # Dispatch via the SSOT response model (a2a_response.py).
                 # All shape detection lives in one place — the parser
                 # never raises and routes unknown shapes to Malformed
