@@ -84,7 +84,13 @@ def _load_workspace_config():
         from molecule_runtime.config import load_config  # local import avoids circular deps
         return load_config()
     except Exception as exc:
-        logger.warning("audit: could not load workspace config for RBAC: %s", exc)
+        logger.error(
+            "audit: could not load workspace config for RBAC; "
+            "fail-securing to read-only. Set WORKSPACE_CONFIG_PATH to a "
+            "directory containing config.yaml, or unset it to use the "
+            "built-in configs_dir fallback. Error: %s",
+            exc,
+        )
         return None
 
 

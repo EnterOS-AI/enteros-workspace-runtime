@@ -480,7 +480,10 @@ def _clamp_heartbeat(value: object) -> int:
 def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
     """Load config from WORKSPACE_CONFIG_PATH or the given path."""
     if config_path is None:
-        config_path = os.environ.get("WORKSPACE_CONFIG_PATH")
+        # issue #118: an empty-or-whitespace-only WORKSPACE_CONFIG_PATH must be
+        # treated as unset, otherwise the loader looks for config.yaml relative
+        # to "" and fails while the fallback configs_dir path is silently ignored.
+        config_path = os.environ.get("WORKSPACE_CONFIG_PATH", "").strip() or None
         if config_path is None:
             from molecule_runtime.configs_dir import resolve as resolve_configs_dir
 
