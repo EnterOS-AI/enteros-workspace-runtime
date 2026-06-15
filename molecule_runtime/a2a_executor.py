@@ -200,20 +200,57 @@ def _extract_chunk_text(content) -> list[str]:
     return []
 
 
+# Typed source marker for outbound/inbound A2A messages. Carried in
+# params.metadata (sender) and surfaced on the received Message (receiver).
+A2A_MESSAGE_SOURCE_TYPE = "source_type"
+A2A_SOURCE_SELF_CRON = "self-cron"
+A2A_SOURCE_SELF_HARVESTER = "self-harvester"
+
 # Routine self-pings the runtime sends to ITSELF: the platform cron tick and
 # the heartbeat delegation-results harvester. Under the non-blocking fast-path
 # these must NOT queue behind (or interrupt) a long in-flight turn — the cron
 # recurs every cycle and delegation results are injected from
 # DELEGATION_RESULTS_FILE at the next turn, so dropping a mid-turn routine ping
 # loses nothing while avoiding both task-interruption and ping pile-up.
+_ROUTINE_SELF_SOURCE_TYPES = (A2A_SOURCE_SELF_CRON, A2A_SOURCE_SELF_HARVESTER)
+
+# Deprecated text-prefix fallback. Wording drift has already been observed
+# (cron ticks no longer start with the registered literal), so new senders
+# MUST stamp A2A_MESSAGE_SOURCE_TYPE. The prefix list is retained only for
+# backward compatibility with platform versions that have not yet adopted the
+# typed marker.
 _ROUTINE_SELF_MESSAGE_PREFIXES = (
     "This is your own scheduled work tick",  # platform cron self-tick
     "Delegation results are ready",          # heartbeat delegation harvester
 )
 
 
-def _is_routine_self_message(text: str) -> bool:
-    """True for the agent's own routine self-pings (cron tick / harvester)."""
+def _get_message_source_type(context: RequestContext) -> str | None:
+    """Return the typed source_type marker from the inbound A2A envelope, if any."""
+    metadata = None
+    message = getattr(context, "message", None)
+    if message is not None:
+        metadata = getattr(message, "metadata", None)
+    if metadata is None:
+        metadata = getattr(context, "metadata", None)
+    if isinstance(metadata, dict):
+        return metadata.get(A2A_MESSAGE_SOURCE_TYPE)
+    return None
+
+
+def _is_routine_self_message(context: RequestContext, text: str) -> bool:
+    """True for the agent's own routine self-pings (cron tick / harvester).
+
+    Prefers the typed source_type marker; falls back to the legacy text-prefix
+    list only when no marker is present. This prevents wording drift from
+    silently breaking the drop-vs-queue decision (issue #138).
+    """
+    source_type = _get_message_source_type(context)
+    if source_type in _ROUTINE_SELF_SOURCE_TYPES:
+        return True
+    if source_type is not None:
+        # A marker exists but it is not one of the routine self-ping types.
+        return False
     t = (text or "").lstrip()
     return any(t.startswith(p) for p in _ROUTINE_SELF_MESSAGE_PREFIXES)
 
@@ -376,7 +413,7 @@ class RuntimeA2AExecutor(AgentExecutor):
                     # wedge) and QUEUED; the running turn finishes uninterrupted, then
                     # drains + answers it as a follow-up turn. Only an explicit Stop
                     # (tasks/cancel) breaks a turn in flight.
-                    if _is_routine_self_message(user_input):
+                    if _is_routine_self_message(context, user_input):
                         # Routine self-ping (cron tick / delegation harvester):
                         # fast-ack and DROP — not queued, not interrupting. The cron
                         # recurs and delegation results are injected from
