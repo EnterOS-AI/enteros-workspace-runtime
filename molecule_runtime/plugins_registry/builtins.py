@@ -59,6 +59,14 @@ _SCRUB_KEYS = frozenset((
     "WORKSPACE_AUTH_TOKEN",
     "GITHUB_TOKEN",
     "GH_TOKEN",
+    # RFC#2843 #32 hardening: the read-only Gitea template PAT and the CP admin
+    # token are present in the workspace container env (InjectTemplateRepoCreds /
+    # boot-event wiring). A malicious plugin's setup.sh must not inherit + exfil
+    # them. The agent can still read its own env directly — this only closes the
+    # third-party-plugin setup.sh vector (the agent-itself vector is inherent to
+    # the interim single-token model, retired by the marketplace broker #31).
+    "MOLECULE_TEMPLATE_REPO_TOKEN",
+    "MOLECULE_ADMIN_TOKEN",
 ))
 
 
@@ -180,10 +188,15 @@ class AgentskillsAdaptor:
                 if dst.exists():
                     ctx.logger.debug("%s: skill %s already present, skipping", self.plugin_name, entry.name)
                     continue
-                shutil.copytree(entry, dst)
+                # symlinks=True: copy links AS links, never dereference. A skill
+                # tree carrying e.g. `x -> /etc/molecule.env` or `-> /proc/self/
+                # environ` must NOT have its target's contents copied into the
+                # agent-readable /configs/skills/ (arbitrary-file-read). RFC#2843
+                # #32 hardening — load-bearing once #31 admits third-party skills.
+                shutil.copytree(entry, dst, symlinks=True)
                 copied += 1
                 for p in dst.rglob("*"):
-                    if p.is_file():
+                    if p.is_file() and not p.is_symlink():
                         result.files_written.append(str(p.relative_to(ctx.configs_dir)))
             if copied:
                 ctx.logger.info("%s: copied %d skill dir(s) to %s", self.plugin_name, copied, dst_skills_root)
@@ -200,12 +213,15 @@ class AgentskillsAdaptor:
             if dst.exists():
                 ctx.logger.debug("%s: skill %s already present, skipping", self.plugin_name, self.plugin_name)
             else:
+                # symlinks=True: never dereference a symlink in the skill tree
+                # into the agent-readable /configs/skills/ (arbitrary-file-read).
                 shutil.copytree(
                     ctx.plugin_root, dst,
                     ignore=shutil.ignore_patterns(".git", "__pycache__", "adapters"),
+                    symlinks=True,
                 )
                 for p in dst.rglob("*"):
-                    if p.is_file():
+                    if p.is_file() and not p.is_symlink():
                         result.files_written.append(str(p.relative_to(ctx.configs_dir)))
                 ctx.logger.info("%s: copied root SKILL.md skill to %s", self.plugin_name, dst)
 

@@ -53,3 +53,31 @@ def test_plain_plugin_still_falls_to_rawdrop(tmp_path):
     (root / "data.txt").write_text("x")
     _, source = resolve("thing", "claude_code", root)
     assert source == AdaptorSource.RAW_DROP, source
+
+
+def test_symlink_in_skill_tree_not_dereferenced(tmp_path):
+    """RFC#2843 #32 hardening: a symlink in the skill tree must NOT be
+    dereferenced into the agent-readable /configs/skills/ (arbitrary-file-read).
+    """
+    import asyncio
+    from molecule_runtime.plugins_registry import resolve
+    from molecule_runtime.plugins_registry.protocol import InstallContext
+    secret = tmp_path / "SECRET.txt"
+    secret.write_text("TOP-SECRET")
+    root = tmp_path / "plugins" / "evil"
+    root.mkdir(parents=True)
+    (root / "SKILL.md").write_text("---\nname: evil\n---\n")
+    (root / "leak.txt").symlink_to(secret)  # link -> outside the tree
+    configs = tmp_path / "configs"; configs.mkdir()
+    adaptor, _ = resolve("evil", "claude_code", root)
+    asyncio.run(adaptor.install(InstallContext(configs_dir=configs, runtime="claude_code", plugin_root=root, workspace_id="ws")))
+    leaked = configs / "skills" / "evil" / "leak.txt"
+    # The link may be copied AS a (dangling) link, but its TARGET content must NOT appear.
+    if leaked.exists() and not leaked.is_symlink():
+        assert leaked.read_text() != "TOP-SECRET", "symlink target content leaked into /configs/skills"
+
+
+def test_scrub_keys_includes_template_token():
+    from molecule_runtime.plugins_registry.builtins import _SCRUB_KEYS
+    assert "MOLECULE_TEMPLATE_REPO_TOKEN" in _SCRUB_KEYS
+    assert "MOLECULE_ADMIN_TOKEN" in _SCRUB_KEYS
