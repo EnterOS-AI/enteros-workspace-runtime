@@ -46,6 +46,7 @@ __all__ = [
 class AdaptorSource:
     REGISTRY = "registry"
     PLUGIN = "plugin"
+    AGENTSKILLS = "agentskills_default"
     RAW_DROP = "raw_drop"
 
 
@@ -148,4 +149,38 @@ def resolve(
     if adaptor is not None:
         return adaptor, AdaptorSource.PLUGIN
 
+    adaptor = _resolve_agentskills_default(plugin_root, plugin_name, runtime)
+    if adaptor is not None:
+        return adaptor, AdaptorSource.AGENTSKILLS
+
     return RawDropAdaptor(plugin_name, runtime), AdaptorSource.RAW_DROP
+
+
+def _resolve_agentskills_default(
+    plugin_root: Path, plugin_name: str, runtime: str
+) -> Optional[PluginAdaptor]:
+    """Default skill-shaped plugins to :class:`AgentskillsAdaptor` (RFC#2843 #32).
+
+    ``AgentskillsAdaptor`` is documented as "the default adapter for the skills
+    shape", but ``resolve()`` only ever checked the name-registry and a
+    plugin-shipped ``adapters/<runtime>.py``, then fell straight to RawDrop — so
+    a skill plugin with no hand-written adapter (the common case, e.g. the
+    seo-all skill) was dropped to ``/configs/plugins/<name>`` but NEVER activated
+    into ``/configs/skills/`` where Claude Code reads. That left AgentskillsAdaptor
+    effectively dead code and skill-plugins functionally uninstalled.
+
+    Treat a plugin as agentskills-shaped when it carries a ``skills/`` subdir OR a
+    root ``SKILL.md`` (the single-skill-at-root shape). AgentskillsAdaptor's
+    install() handles both. Anything else still falls through to RawDrop.
+    """
+    try:
+        has_skills_dir = (plugin_root / "skills").is_dir()
+        has_root_skill = (plugin_root / "SKILL.md").is_file()
+    except OSError:
+        return None
+    if not (has_skills_dir or has_root_skill):
+        return None
+    # Local import avoids a top-level cycle (builtins imports from .protocol only).
+    from .builtins import AgentskillsAdaptor
+
+    return AgentskillsAdaptor(plugin_name, runtime)

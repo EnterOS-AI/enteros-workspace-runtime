@@ -75,7 +75,10 @@ def _setup_shell() -> str:
 # Files at the plugin root that are never treated as prompt fragments,
 # even if they're markdown. Module-level so tests and other adapters can
 # import the set rather than re-declaring it.
-SKIP_ROOT_MD = frozenset({"readme.md", "changelog.md", "license.md", "contributing.md"})
+# skill.md is the skill spec file (handled by the skills-copy step), never a
+# memory fragment — exclude it from the root-*.md memory append (RFC#2843 #32,
+# SKILL.md-at-root shape).
+SKIP_ROOT_MD = frozenset({"readme.md", "changelog.md", "license.md", "contributing.md", "skill.md"})
 
 
 def _read_md_files(directory: Path) -> list[tuple[str, str]]:
@@ -184,6 +187,27 @@ class AgentskillsAdaptor:
                         result.files_written.append(str(p.relative_to(ctx.configs_dir)))
             if copied:
                 ctx.logger.info("%s: copied %d skill dir(s) to %s", self.plugin_name, copied, dst_skills_root)
+        elif (ctx.plugin_root / "SKILL.md").is_file():
+            # SKILL.md-at-root shape (RFC#2843 #32): the plugin root IS a single
+            # agentskills unit (no skills/<name>/ subdir) — e.g. the seo-all skill
+            # fetched to /configs/plugins/seo-all/. Copy the whole plugin dir to
+            # /configs/skills/<plugin_name>/ so Claude Code's native skill
+            # discovery picks it up. Excludes packaging-only dirs that aren't part
+            # of the skill payload.
+            dst_skills_root = ctx.configs_dir / SKILLS_SUBDIR
+            dst_skills_root.mkdir(parents=True, exist_ok=True)
+            dst = dst_skills_root / self.plugin_name
+            if dst.exists():
+                ctx.logger.debug("%s: skill %s already present, skipping", self.plugin_name, self.plugin_name)
+            else:
+                shutil.copytree(
+                    ctx.plugin_root, dst,
+                    ignore=shutil.ignore_patterns(".git", "__pycache__", "adapters"),
+                )
+                for p in dst.rglob("*"):
+                    if p.is_file():
+                        result.files_written.append(str(p.relative_to(ctx.configs_dir)))
+                ctx.logger.info("%s: copied root SKILL.md skill to %s", self.plugin_name, dst)
 
         # 4. Setup script — run setup.sh if present (for npm/pip dependencies).
         # Mirrors sdk/python/molecule_plugin/builtins.py — must stay in sync
@@ -230,6 +254,12 @@ class AgentskillsAdaptor:
                 if dst.exists() and dst.is_dir():
                     shutil.rmtree(dst)
                     ctx.logger.info("%s: removed %s", self.plugin_name, dst)
+        elif (ctx.plugin_root / "SKILL.md").is_file():
+            # Mirror the SKILL.md-at-root install (RFC#2843 #32).
+            dst = ctx.configs_dir / SKILLS_SUBDIR / self.plugin_name
+            if dst.exists() and dst.is_dir():
+                shutil.rmtree(dst)
+                ctx.logger.info("%s: removed %s", self.plugin_name, dst)
 
         # Best-effort strip of our markers from CLAUDE.md. Users can always
         # edit manually; we only guarantee the injected block's first line
