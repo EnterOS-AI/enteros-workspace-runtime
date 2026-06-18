@@ -17,6 +17,7 @@ import time
 import httpx
 
 from molecule_runtime.a2a_client import build_message_send_params
+from molecule_runtime.platform_agent_identity import mcp_server_present
 from molecule_runtime.a2a_executor import (
     A2A_MESSAGE_SOURCE_TYPE,
     A2A_SOURCE_SELF_HARVESTER,
@@ -266,6 +267,7 @@ class HeartbeatLoop:
             "active_tasks": self.active_tasks,
             "current_task": self.current_task,
             "uptime_seconds": int(time.time() - self.start_time),
+            "mcp_server_present": mcp_server_present(),
         }
         # #2421: backfill agent_card when the initial register failed. Only
         # sent when we have a card — the platform writes it only if the DB
@@ -307,6 +309,7 @@ class HeartbeatLoop:
                 "active_tasks": self.active_tasks,
                 "current_task": self.current_task,
                 "uptime_seconds": int(time.time() - self.start_time),
+                "mcp_server_present": mcp_server_present(),
             }
             if self.agent_card is not None:
                 retry_body["agent_card"] = self.agent_card
