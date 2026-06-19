@@ -4,6 +4,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "check_consumer_runtime_drift.py"
 SPEC = importlib.util.spec_from_file_location("check_consumer_runtime_drift", SCRIPT_PATH)
@@ -104,3 +106,81 @@ def test_clone_consumers_retries_on_transient_failure(monkeypatch: pytest.Monkey
     import check_consumer_runtime_drift as guard
     guard.clone_consumers(workdir, ("molecule-core",), gitea_url="https://git.moleculesai.app", token="fake-token")
     assert call_count == 3, f"expected 3 attempts, got {call_count}"
+
+
+def test_seo_agent_is_exempt_not_enumerated() -> None:
+    """seo-agent must be explicitly EXEMPT (config/prompts template, no wheel),
+    never silently dropped from the consumer set (runtime drift blind-spot fix)."""
+    import check_consumer_runtime_drift as guard
+
+    assert "molecule-ai-workspace-template-seo-agent" in guard.EXEMPT_CONSUMERS
+    assert "molecule-ai-workspace-template-seo-agent" not in guard.DEFAULT_CONSUMERS
+
+
+def test_default_consumers_cover_all_shipping_templates() -> None:
+    """The shipping wheel-consumer templates that were the silent blind spot are
+    now enumerated, so their .runtime-version pin drift is actually checked."""
+    import check_consumer_runtime_drift as guard
+
+    for repo in (
+        "molecule-ai-workspace-template-langgraph",
+        "molecule-ai-workspace-template-autogen",
+        "molecule-ai-workspace-template-google-adk",
+        "molecule-ai-workspace-template-crewai",
+        "molecule-ai-workspace-template-deepagents",
+        "molecule-ai-workspace-template-gemini-cli",
+    ):
+        assert repo in guard.DEFAULT_CONSUMERS, f"{repo} missing from DEFAULT_CONSUMERS"
+
+
+def test_reconcile_flags_unenumerated_pinned_template(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A template repo that carries .runtime-version but is neither enumerated
+    nor exempt is surfaced as unaccounted-for (the loud blind-spot tripwire)."""
+    import check_consumer_runtime_drift as guard
+
+    monkeypatch.setattr(
+        guard,
+        "_org_template_repos",
+        lambda gitea_url, token, org="molecule-ai": [
+            "molecule-ai-workspace-template-langgraph",  # enumerated -> ok
+            "molecule-ai-workspace-template-seo-agent",  # exempt -> ok
+            "molecule-ai-workspace-template-newruntime",  # NOT accounted for
+        ],
+    )
+    monkeypatch.setattr(
+        guard,
+        "_repo_has_runtime_version",
+        lambda repo, gitea_url, token, org="molecule-ai": repo
+        == "molecule-ai-workspace-template-newruntime",
+    )
+
+    unaccounted = guard.reconcile_org_consumers(
+        guard.DEFAULT_CONSUMERS, gitea_url="https://git.moleculesai.app", token="fake-token"
+    )
+    assert unaccounted == ["molecule-ai-workspace-template-newruntime"]
+
+
+def test_reconcile_clean_when_all_accounted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No unaccounted repos when every pinned template is enumerated or exempt."""
+    import check_consumer_runtime_drift as guard
+
+    monkeypatch.setattr(
+        guard,
+        "_org_template_repos",
+        lambda gitea_url, token, org="molecule-ai": [
+            "molecule-ai-workspace-template-langgraph",
+            "molecule-ai-workspace-template-seo-agent",
+        ],
+    )
+    monkeypatch.setattr(
+        guard,
+        "_repo_has_runtime_version",
+        lambda repo, gitea_url, token, org="molecule-ai": True,
+    )
+
+    assert (
+        guard.reconcile_org_consumers(
+            guard.DEFAULT_CONSUMERS, gitea_url="https://git.moleculesai.app", token="fake-token"
+        )
+        == []
+    )

@@ -21,13 +21,50 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 
+# SSOT for the set of repos that pin/install the runtime and MUST stay current
+# with the latest published runtime-v<semver> tag. Every workspace template whose
+# Dockerfile installs ``molecule-ai-workspace-runtime==${RUNTIME_VERSION}`` (where
+# RUNTIME_VERSION is read from its ``.runtime-version`` file) belongs here, plus
+# molecule-core (installs the wheel; carries no .runtime-version pin but must not
+# vendor the source). This list was previously only the four templates the
+# runtime#91 propagation bot bumps + molecule-core, which created a SILENT BLIND
+# SPOT: langgraph/autogen/google-adk/crewai/deepagents/gemini-cli all pin
+# .runtime-version and build images from it, but were omitted here, so the guard
+# stayed green while those pins drifted (16-26 releases behind). The
+# ``reconcile_org_consumers`` check below now makes any future omission LOUD.
 DEFAULT_CONSUMERS = (
     "molecule-ai-workspace-template-claude-code",
     "molecule-ai-workspace-template-hermes",
     "molecule-ai-workspace-template-openclaw",
     "molecule-ai-workspace-template-codex",
+    "molecule-ai-workspace-template-langgraph",
+    "molecule-ai-workspace-template-autogen",
+    "molecule-ai-workspace-template-google-adk",
+    "molecule-ai-workspace-template-crewai",
+    "molecule-ai-workspace-template-deepagents",
+    "molecule-ai-workspace-template-gemini-cli",
     "molecule-core",
 )
+
+# Org template repos that are intentionally NOT runtime-wheel consumers and must
+# be EXPLICITLY exempted (not silently omitted) from the drift check. Keeping
+# them here — rather than dropping them on the floor — is what makes
+# ``reconcile_org_consumers`` able to assert "every template repo is either
+# enumerated or deliberately exempt".
+#
+#   molecule-ai-workspace-template-seo-agent — a Claude-Code config/prompts
+#     template (config.yaml + prompts/ transported through the control plane).
+#     It has no Dockerfile, no publish-image pipeline, and does not install the
+#     molecule_runtime wheel, so it carries no .runtime-version and there is
+#     nothing to keep in sync. If it ever adopts a .runtime-version (i.e. becomes
+#     a wheel consumer), remove it here and add it to DEFAULT_CONSUMERS — the
+#     reconcile check will force that decision.
+EXEMPT_CONSUMERS = {
+    "molecule-ai-workspace-template-seo-agent": (
+        "config/prompts-only Claude-Code template; no Dockerfile / runtime wheel "
+        "install / .runtime-version pin"
+    ),
+}
 
 SKIP_DIRS = {
     ".git",
@@ -155,6 +192,81 @@ def find_runtime_drift(repo_name: str, repo_path: Path, runtime_root: Path | Non
     return findings
 
 
+def _org_template_repos(gitea_url: str, token: str, *, org: str = "molecule-ai") -> list[str]:
+    """Enumerate ``molecule-ai-workspace-template-*`` repos in the org via the
+    Gitea API (paginated). Returns repo names. Raises on a hard API failure."""
+    import json
+    import urllib.request
+    import urllib.error
+
+    names: list[str] = []
+    page = 1
+    while True:
+        url = f"{gitea_url}/api/v1/orgs/{org}/repos?limit=50&page={page}"
+        req = urllib.request.Request(url, headers={"Authorization": f"token {token}"} if token else {})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                batch = json.load(resp)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"org repo listing failed (HTTP {exc.code}): {exc.read().decode()[:200]}")
+        except Exception as exc:  # pragma: no cover - network errors
+            raise RuntimeError(f"org repo listing failed: {exc}")
+        if not isinstance(batch, list) or not batch:
+            break
+        for repo in batch:
+            name = repo.get("name", "")
+            if name.startswith("molecule-ai-workspace-template-"):
+                names.append(name)
+        if len(batch) < 50:
+            break
+        page += 1
+    return names
+
+
+def _repo_has_runtime_version(repo: str, gitea_url: str, token: str, *, org: str = "molecule-ai") -> bool:
+    """True if the repo's default branch carries a ``.runtime-version`` file."""
+    import urllib.request
+    import urllib.error
+
+    url = f"{gitea_url}/api/v1/repos/{org}/{repo}/raw/.runtime-version"
+    req = urllib.request.Request(url, headers={"Authorization": f"token {token}"} if token else {})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise RuntimeError(f"{repo}: unexpected HTTP {exc.code} probing .runtime-version")
+    except Exception as exc:  # pragma: no cover - network errors
+        raise RuntimeError(f"{repo}: error probing .runtime-version: {exc}")
+
+
+def reconcile_org_consumers(
+    enumerated: tuple[str, ...],
+    *,
+    gitea_url: str,
+    token: str,
+    org: str = "molecule-ai",
+) -> list[str]:
+    """Close the DEFAULT_CONSUMERS blind spot dynamically.
+
+    Scan every ``molecule-ai-workspace-template-*`` repo in the org; any repo
+    that carries a ``.runtime-version`` pin (i.e. is a real runtime-wheel
+    consumer) MUST be either enumerated in ``DEFAULT_CONSUMERS`` or explicitly
+    listed in ``EXEMPT_CONSUMERS``. Returns the list of un-accounted-for repos
+    (empty == reconciled). This is what turns "someone forgot to add the new
+    template to the guard list" from a silent green into a loud red.
+    """
+    enumerated_set = set(enumerated)
+    unaccounted: list[str] = []
+    for repo in _org_template_repos(gitea_url, token, org=org):
+        if repo in enumerated_set or repo in EXEMPT_CONSUMERS:
+            continue
+        if _repo_has_runtime_version(repo, gitea_url, token, org=org):
+            unaccounted.append(repo)
+    return unaccounted
+
+
 def clone_consumers(
     workdir: Path,
     repos: tuple[str, ...],
@@ -239,6 +351,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="GITEA_TOKEN",
         help="Environment variable containing a read token for cloning.",
     )
+    parser.add_argument(
+        "--no-reconcile",
+        action="store_true",
+        help=(
+            "Skip the org-scan reconciliation that fails when a "
+            "molecule-ai-workspace-template-* repo carries a .runtime-version pin "
+            "but is neither in DEFAULT_CONSUMERS nor EXEMPT_CONSUMERS. Reconcile "
+            "is skipped automatically when --root or an explicit --repo set is used."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -246,8 +368,36 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     repos = tuple(args.repos or DEFAULT_CONSUMERS)
 
+    token = os.environ.get(args.token_env, "")
+    # Reconcile only when checking the full canonical set from a live org (token
+    # present, no offline --root, no hand-picked --repo subset). Under --root or
+    # an explicit --repo list there is no org to scan against.
+    do_reconcile = (
+        not args.no_reconcile
+        and not args.root
+        and not args.repos
+        and bool(token)
+    )
+
     tempdir: Path | None = None
     try:
+        if do_reconcile:
+            unaccounted = reconcile_org_consumers(
+                DEFAULT_CONSUMERS, gitea_url=args.gitea_url, token=token
+            )
+            if unaccounted:
+                print(
+                    "Runtime SSOT drift guard blind spot: these "
+                    "molecule-ai-workspace-template-* repos carry a .runtime-version "
+                    "pin but are NOT in DEFAULT_CONSUMERS or EXEMPT_CONSUMERS, so "
+                    "their pin drift would go unchecked:\n"
+                    + "\n".join(f"- {r}" for r in unaccounted)
+                    + "\nAdd each to DEFAULT_CONSUMERS (real consumer) or "
+                    "EXEMPT_CONSUMERS (with a reason).",
+                    file=sys.stderr,
+                )
+                return 1
+
         if args.root:
             paths = consumer_paths_from_root(args.root, repos)
         else:
@@ -256,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
                 tempdir,
                 repos,
                 gitea_url=args.gitea_url,
-                token=os.environ.get(args.token_env, ""),
+                token=token,
             )
 
         findings: list[DriftFinding] = []
