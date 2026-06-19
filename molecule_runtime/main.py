@@ -304,6 +304,19 @@ async def main():  # pragma: no cover
 
     # 1. Load config
     config = load_config(config_path)
+    # 1.0  Adopt the resolved config base. When the asset-fetcher fails to
+    # deliver /configs/config.yaml, load_config() falls back to the image-baked
+    # /opt/molecule-platform-agent-template/ identity and reassigns
+    # WorkspaceConfig.config_path to that directory. We MUST follow the
+    # reassignment here — every downstream consumer in main() (run_preflight,
+    # generate_agents_md, AdapterConfig, build_system_prompt, ExecRead,
+    # load_skills, mcp_servers) resolves config-relative paths from the local
+    # `config_path` variable. If we kept the pre-load value, the runtime
+    # would boot with the right model but an EMPTY system prompt and missing
+    # skills/plugins — silently identity-less, the exact failure mode core
+    # #2919 risk-2 is meant to prevent. Researcher RC 12052 + reviewer
+    # REQUEST_CHANGES 12447/12448 finding.
+    config_path = config.config_path
     # 0.1b Normalise LLM auth env vars now that the resolved provider is
     # known. Platform stores tokens as ANTHROPIC_AUTH_TOKEN, but the Claude
     # SDK/CLI expects different env vars per token kind (OAuth vs API key vs

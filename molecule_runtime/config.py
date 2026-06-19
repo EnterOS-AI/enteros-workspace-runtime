@@ -350,6 +350,14 @@ class WorkspaceConfig:
     plugins: list[str] = field(default_factory=list)  # installed plugin names
     tools: list[str] = field(default_factory=list)
     prompt_files: list[str] = field(default_factory=list)
+    config_path: str = ""
+    """Directory the active config was loaded from. After the /opt fallback
+    fires, this is REASSIGNED to the baked template's directory so every
+    downstream consumer (prompts, skills, plugins, ExecRead) cascades
+    through to the same base. Researcher RC 12052 — without this
+    reassignment the concierge boots with the right model but an
+    empty system prompt (silently identity-less).
+    """
     a2a: A2AConfig = field(default_factory=A2AConfig)
     delegation: DelegationConfig = field(default_factory=DelegationConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
@@ -490,8 +498,63 @@ def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
             config_path = str(resolve_configs_dir())
 
     config_file = Path(config_path) / "config.yaml"
+    # opt_fallback_fired is True ONLY when the /opt fallback above (for
+    # config.yaml) actually replaced the config_file. It is the gate for
+    # the prompt-file defaulting below — a delivered /configs template
+    # that has an EMPTY initial_prompt_file field is a config bug, not
+    # a /opt fallback case, and we MUST NOT paper over it with a baked
+    # file (delivery-wins / fill-absent-only semantics).
+    opt_fallback_fired = False
     if not config_file.exists():
-        raise FileNotFoundError(f"Config file not found: {config_file}")
+        # /opt fallback for the concierge self-host/no-token safety path
+        # (core#2919 risk-2: concierge must never boot identity-less).
+        #
+        # When the asset-fetcher can't deliver a template (self-host with
+        # no token, partial template without config.yaml, etc.), /configs is
+        # empty and the runtime would MISSING_MODEL fail. If the image bakes
+        # the concierge identity at /opt/molecule-platform-agent-template/
+        # (the platform-agent image's baked content), fall back to it so a
+        # no-fetch concierge still boots with config.yaml + the declared
+        # model (moonshot/kimi-k2.6).
+        #
+        # Per-file / fill-absent-only semantics:
+        #   - This is a READ fallback, not a copy. The runtime reads /opt
+        #     directly; /configs is unchanged (the in-core
+        #     applyConciergeProvisionConfig hook reads /configs via ExecRead
+        #     and will see it as empty — that's a separate concern addressed
+        #     by the entrypoint per-file copy in the platform-agent image).
+        #   - Fires ONLY when /configs/config.yaml is missing. A delivered
+        #     /configs/config.yaml always wins (the asset-fetcher's delivery
+        #     is authoritative; the /opt fallback is a safety net, not a
+        #     primary path).
+        #   - If /opt/molecule-platform-agent-template/config.yaml is also
+        #     missing (image wasn't baked), the FileNotFoundError fires as
+        #     before — fail-closed.
+        opt_fallback = Path("/opt/molecule-platform-agent-template/config.yaml")
+        if opt_fallback.exists():
+            logger.info(
+                "load_config: /configs/config.yaml missing; using /opt baked fallback "
+                "(%s) — concierge self-host/no-token safety path (core#2919 risk-2)",
+                opt_fallback,
+            )
+            config_file = opt_fallback
+            opt_fallback_fired = True
+        else:
+            raise FileNotFoundError(f"Config file not found: {config_file}")
+
+    # The /opt fallback fires only for config.yaml above; the PROMPT
+    # files (initial_prompt / idle_prompt / concierge.md), the SKILLS
+    # directory, the PLUGINS directory, the in-core ExecRead hooks, and
+    # the system-prompt.md loader all live ALONGSIDE config.yaml in the
+    # template. If we kept `config_path` at /configs and only the config
+    # file moved, every other resolver would silently miss (the /configs
+    # is empty in the no-fetch case) and the concierge would boot
+    # identity-less BEHAVIORALLY (right model, empty system prompt,
+    # missing skills, missing plugins). Researcher RC 12052 finding.
+    # Reassign config_path to the actual loaded config's directory so
+    # every downstream consumer (ExecRead, load_skills, build_system_prompt,
+    # workspace_plugins_dir, ...) cascades through to the same base.
+    config_path = str(config_file.parent)
 
     with open(config_file) as f:
         raw = yaml.safe_load(f) or {}
@@ -541,6 +604,30 @@ def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
         prompt_path = Path(config_path) / initial_prompt_file
         if prompt_path.exists():
             initial_prompt = prompt_path.read_text().strip()
+    elif not initial_prompt and not initial_prompt_file and opt_fallback_fired:
+        # /opt fallback cascade — the YAML may not declare
+        # initial_prompt_file (the asset-fetcher never delivered a
+        # template in the no-fetch case), so resolve the prompt from
+        # the baked template's conventional locations. Order matters:
+        # the concierge template bakes `prompts/concierge.md`; the
+        # runtime's general convention is `system-prompt.md`; we fall
+        # back through both. Delivery-wins is preserved: this branch
+        # only fires when opt_fallback_fired is True (a delivered
+        # /configs template with an empty initial_prompt_file is a
+        # config bug, NOT a no-fetch case, and we MUST NOT paper over
+        # it). Researcher RC 12052 — without this default, the
+        # concierge boots with the right model but an EMPTY system
+        # prompt = silently identity-less.
+        for candidate in ("prompts/concierge.md", "system-prompt.md"):
+            prompt_path = Path(config_path) / candidate
+            if prompt_path.exists():
+                initial_prompt = prompt_path.read_text().strip()
+                logger.info(
+                    "load_config: /opt fallback fired and YAML has no "
+                    "initial_prompt_file; loaded from baked %s",
+                    prompt_path,
+                )
+                break
 
     # Resolve idle_prompt: same pattern as initial_prompt
     idle_prompt = raw.get("idle_prompt", "")
@@ -549,10 +636,22 @@ def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
         idle_path = Path(config_path) / idle_prompt_file
         if idle_path.exists():
             idle_prompt = idle_path.read_text().strip()
+    elif not idle_prompt and not idle_prompt_file and opt_fallback_fired:
+        for candidate in ("prompts/idle.md", "idle-prompt.md", "system-prompt.md"):
+            idle_path = Path(config_path) / candidate
+            if idle_path.exists():
+                idle_prompt = idle_path.read_text().strip()
+                logger.info(
+                    "load_config: /opt fallback fired and YAML has no "
+                    "idle_prompt_file; loaded from baked %s",
+                    idle_path,
+                )
+                break
     idle_interval_seconds = int(raw.get("idle_interval_seconds", 600))
 
     return WorkspaceConfig(
         name=raw.get("name", "Workspace"),
+        config_path=config_path,
         description=raw.get("description", ""),
         role=raw.get("role", ""),
         version=raw.get("version", "1.0.0"),
