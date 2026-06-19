@@ -26,6 +26,22 @@ from molecule_runtime.builtin_tools.telemetry import setup_telemetry, make_trace
 from molecule_runtime.policies.namespaces import resolve_awareness_namespace
 
 
+def _is_privileged_setup_failure(setup_err: BaseException) -> bool:
+    """Return True when *setup_err* is a privileged-plugin install failure.
+
+    Privileged-plugin setup failures (currently ``molecule-platform-mcp``) must
+    abort the runtime boot loudly rather than degrading to
+    "reachable-but-misconfigured". The dedicated ``PrivilegedPluginInstallError``
+    subclass (from ``adapter_base``) is the discriminator.
+
+    Extracted as a pure function so ``tests/test_main_privileged_plugin_failure.py``
+    can exercise the exact rule ``main.py`` uses without duplicating it.
+    """
+    from molecule_runtime.adapter_base import PrivilegedPluginInstallError
+
+    return isinstance(setup_err, PrivilegedPluginInstallError)
+
+
 from molecule_runtime.initial_prompt import (
     mark_initial_prompt_attempted,
     resolve_initial_prompt_marker,
@@ -475,6 +491,19 @@ async def main():  # pragma: no cover
         # Smoke-mode exit signal — propagate untouched.
         raise
     except Exception as setup_err:  # noqa: BLE001
+        # Privileged-plugin setup failures (currently molecule-platform-mcp)
+        # must abort the runtime setup loudly — not degrade to
+        # "reachable-but-misconfigured", which would leave the concierge
+        # with a configured-but-missing privileged binary and no loud
+        # failure signal. The dedicated PrivilegedPluginInstallError
+        # subclass (from adapter_base) is the discriminator.
+        if _is_privileged_setup_failure(setup_err):
+            print(
+                f"FATAL: privileged plugin setup failed — aborting runtime boot. "
+                f"Reason: {type(setup_err).__name__}: {setup_err}",
+                flush=True,
+            )
+            raise
         adapter_error = f"{type(setup_err).__name__}: {setup_err}"
         print(
             f"WARNING: adapter.setup() failed — workspace will serve agent-card "

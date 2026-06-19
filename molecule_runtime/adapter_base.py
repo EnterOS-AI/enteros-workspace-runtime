@@ -12,6 +12,27 @@ from a2a.server.agent_execution import AgentExecutor
 from molecule_runtime.event_log import DisabledEventLog, EventLogBackend
 
 # ---------------------------------------------------------------------------
+# Exception types
+# ---------------------------------------------------------------------------
+
+
+class PrivilegedPluginInstallError(RuntimeError):
+    """Raised when a *privileged* plugin (currently: ``molecule-platform-mcp``)
+    fails to install.
+
+    Subclasses :class:`RuntimeError` so existing ``except RuntimeError`` /
+    ``pytest.raises(RuntimeError)`` call sites keep working. The dedicated
+    type exists so :class:`BaseAdapter.install_plugins_via_registry` and the
+    outer boot-time try/except in ``main.py`` can distinguish
+    "privileged-plugin setup failed" from "ordinary plugin hiccup", and so
+    the privileged case can abort the runtime setup loudly rather than
+    degrading to a reachable-but-misconfigured boot (which would leave the
+    concierge with a configured-but-missing privileged binary and no loud
+    failure signal).
+    """
+
+
+# ---------------------------------------------------------------------------
 # Provider routing — type alias + resolver used by individual adapters.
 # Each adapter defines its own ProviderRegistry with the providers it accepts.
 # ---------------------------------------------------------------------------
@@ -447,6 +468,7 @@ class BaseAdapter(ABC):
         """
         from pathlib import Path
         from molecule_runtime.plugins_registry import InstallContext, resolve
+        from molecule_runtime.plugins_registry.builtins import _PRIVILEGED_MCP_PLUGIN
 
         results = []
         runtime = self.name().replace("-", "_")  # e.g. "claude-code" -> "claude_code"
@@ -466,12 +488,31 @@ class BaseAdapter(ABC):
             try:
                 result = await adaptor.install(ctx)
                 results.append(result)
+                if result.errors:
+                    logger.error(
+                        "Plugin %s installed via %s with %d error(s): %s",
+                        plugin.name, source, len(result.errors), "; ".join(result.errors),
+                    )
                 logger.info(
-                    "Plugin %s installed via %s adaptor (warnings: %d)",
-                    plugin.name, source, len(result.warnings),
+                    "Plugin %s installed via %s (warnings: %d, errors: %d)",
+                    plugin.name, source, len(result.warnings), len(result.errors),
                 )
+            except PrivilegedPluginInstallError:
+                # Privileged plugin setup failed — re-raise so the runtime
+                # boot fails loudly (caller in main.py checks the type and
+                # aborts rather than degrading to a "reachable-but-misconfigured"
+                # workspace, which would leave the concierge with a
+                # configured-but-missing privileged binary and no loud signal).
+                raise
             except Exception as exc:
                 logger.exception("Plugin %s install via %s failed: %s", plugin.name, source, exc)
+                if plugin.name == _PRIVILEGED_MCP_PLUGIN:
+                    # Defensive: if a non-PrivilegedPluginInstallError exception
+                    # still comes from the privileged plugin, re-raise it
+                    # anyway. The spec (#151) is "fail loudly when the privileged
+                    # plugin's setup.sh fails" — a swallowed Exception on that
+                    # path is the regression we are guarding against.
+                    raise
 
         return results
 

@@ -48,6 +48,14 @@ from pathlib import Path
 
 from .protocol import SKILLS_SUBDIR, InstallContext, InstallResult
 
+# Import the dedicated exception type so we can distinguish a
+# privileged-plugin install failure from an ordinary-plugin hiccup.
+# adapter_base defines PrivilegedPluginInstallError as a RuntimeError
+# subclass, so existing `pytest.raises(RuntimeError, ...)` / `except
+# RuntimeError` call sites still match (we use the dedicated type
+# only at the throw site and at the discriminator site in main.py).
+from molecule_runtime.adapter_base import PrivilegedPluginInstallError
+
 # Keys scrubbed from plugin setup.sh env — matches skill_loader/loader.py's
 # _SCRUB_KEYS so a malicious plugin's setup.sh cannot exfiltrate credentials
 # that are available to the parent process. Fixes issue #19 (CWE-C-312).
@@ -87,6 +95,11 @@ def _setup_shell() -> str:
 # memory fragment — exclude it from the root-*.md memory append (RFC#2843 #32,
 # SKILL.md-at-root shape).
 SKIP_ROOT_MD = frozenset({"readme.md", "changelog.md", "license.md", "contributing.md", "skill.md"})
+
+# Privileged org-management MCP plugin. A failed setup.sh here must fail the
+# install loudly rather than leaving a configured-but-missing MCP binary.
+# See molecule-ai-workspace-runtime#151.
+_PRIVILEGED_MCP_PLUGIN = "molecule-platform-mcp"
 
 
 def _read_md_files(directory: Path) -> list[tuple[str, str]]:
@@ -241,11 +254,19 @@ class AgentskillsAdaptor:
                 if proc.returncode == 0:
                     ctx.logger.info("%s: setup.sh completed successfully", self.plugin_name)
                 else:
-                    result.warnings.append(f"setup.sh exited {proc.returncode}: {proc.stderr[:200]}")
-                    ctx.logger.warning("%s: setup.sh failed: %s", self.plugin_name, proc.stderr[:200])
+                    err = f"setup.sh exited {proc.returncode}: {proc.stderr[:200]}"
+                    result.warnings.append(err)
+                    result.errors.append(err)
+                    ctx.logger.error("%s: setup.sh failed: %s", self.plugin_name, proc.stderr[:200])
+                    if self.plugin_name == _PRIVILEGED_MCP_PLUGIN:
+                        raise PrivilegedPluginInstallError(err)
             except subprocess.TimeoutExpired:
-                result.warnings.append("setup.sh timed out (120s)")
-                ctx.logger.warning("%s: setup.sh timed out", self.plugin_name)
+                err = "setup.sh timed out (120s)"
+                result.warnings.append(err)
+                result.errors.append(err)
+                ctx.logger.error("%s: setup.sh timed out", self.plugin_name)
+                if self.plugin_name == _PRIVILEGED_MCP_PLUGIN:
+                    raise PrivilegedPluginInstallError(err)
 
         # 5. Hooks — copy hooks/* into <configs>/.claude/hooks/ (Claude Code-
         #    style harness hooks). No-op when the plugin doesn't ship any.

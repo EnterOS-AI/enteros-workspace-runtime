@@ -88,6 +88,7 @@ class InstallResult:
     tools_registered: list[str] = field(default_factory=list)
     subagents_registered: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 @runtime_checkable
