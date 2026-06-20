@@ -19,15 +19,25 @@ runtime-side signal therefore proves the MCP is *wired in* by whatever delivery
 mechanism. Absence of BOTH stays fail-closed: a generic runtime that declares
 neither cannot be trusted as a platform agent.
 
-SSOT — the literals below (``SETTINGS_PATH``, the ``mcpServers`` key, and the
-``MANAGEMENT_MCP_NAME`` entry) are NOT free to drift. They are governed by the
-cross-repo contract ``contracts/mcp-plugin-delivery.contract.json`` in
-molecule-core, enforced by ``.gitea/workflows/mcp-plugin-delivery-contract-drift.yml``.
-The same path/key/name are produced by the MCPServerAdaptor plugin and consumed
-by ``claude_sdk_executor._load_settings_mcp`` — this module is a THIRD consumer.
-If you change any literal here, update the contract (and vice-versa) or the
-drift gate fails. This drift between producer and consumers is the exact bug
-this file was changed to fix; the contract is what keeps it from recurring.
+SSOT — the literals below (``SETTINGS_PATH``, ``MCPSERVERS_KEY``, and
+``MANAGEMENT_MCP_NAME``) are NOT free to drift. They are declared in the
+cross-repo contract ``contracts/mcp-plugin-delivery.contract.json``. The same
+path/key/name are produced by the MCPServerAdaptor plugin and consumed by
+``claude_sdk_executor._load_settings_mcp`` — this module is a THIRD consumer.
+
+Enforcement is layered, and honestly scoped:
+  * RUNTIME-LOCAL (this repo, active): ``tests/test_mcp_plugin_delivery_contract.py``
+    pins every literal used here to this repo's vendored copy of the contract,
+    so an in-repo edit that changes a literal without the contract (or vice
+    versa) fails ``unit-tests`` before any image ships.
+  * CROSS-REPO (byte-identical core/template/runtime copies): enforced by
+    ``mcp-plugin-delivery-contract-drift`` in molecule-core. Adding this repo's
+    copy to that byte-compare set is a tracked follow-up — until it lands, the
+    cross-repo guarantee covers core<->template only, not yet the runtime copy.
+
+Literal drift between producer and consumers is the exact bug this file was
+changed to fix; the contract + the runtime-local gate keep it from recurring
+in this repo.
 """
 
 import json
@@ -41,6 +51,10 @@ MCPSERVER_PATH = "/opt/molecule-mcp-server"
 # into the Claude settings.json ``mcpServers`` map. Mirrors the location the
 # claude-code executor loads from (runtime #149 ``_load_settings_mcp``).
 SETTINGS_PATH = "/configs/.claude/settings.json"
+
+# The settings.json map under which MCP servers are declared. Tied to the
+# contract ``key`` so the gate catches a source-side rename of this literal.
+MCPSERVERS_KEY = "mcpServers"
 
 # The ``mcpServers`` entry name the management plugin registers under.
 MANAGEMENT_MCP_NAME = "molecule-platform"
@@ -57,7 +71,7 @@ def _settings_has_management_mcp() -> bool:
             data = json.load(fh)
     except (OSError, ValueError):
         return False
-    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    servers = data.get(MCPSERVERS_KEY) if isinstance(data, dict) else None
     return isinstance(servers, dict) and MANAGEMENT_MCP_NAME in servers
 
 
