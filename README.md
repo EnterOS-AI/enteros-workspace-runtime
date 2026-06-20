@@ -28,6 +28,32 @@ This package provides the core machinery every Molecule AI workspace container n
   process serve N workspaces concurrently (introduced in the multi-WS PR
   series, finalised in 0.2.0)
 
+## MCP SSOT public surface (issue #38)
+
+Adapters (a2a_mcp_server, langchain integrations, future SDKs) consume
+the universal Molecule tool + target-resolution contract via the SSOT
+modules in `molecule_runtime`. **Adapters are shims; base
+MCP/runtime is the source of truth.** The drift is one of the failure
+modes the SSOT was created to prevent (a previous refactor split the
+universal Molecule contract across multiple modules, which made it
+easy for a future adapter to silently fork it).
+
+* `molecule_runtime.mcp_schemas` — `MOLECULE_MCP_TOOLS`,
+  `openai_function_tools()`, `PERMISSION_MAP`, `get_tool_schema(name)`,
+  `validate_adapter_schemas(adapter_tools)`. Adapters import tool
+  lists and per-tool schemas from here, NOT from
+  `molecule_runtime.mcp_tools` or `platform_tools.registry` directly.
+* `molecule_runtime.mcp_target_resolution` — `resolve_workspaces()`,
+  `read_token_file()`, `print_missing_env_help()`,
+  `resolve_target_for_adapter()`. Adapters parse workspace env vars via
+  this, NOT directly from `os.environ`.
+
+`tests/test_mcp_ssot.py` pins the SSOT public surface (drift tests):
+the in-tree `a2a_mcp_server` adapter's `TOOLS` list is asserted to be
+the same object as the SSOT, and the env-driven workspace resolution
+contract is tested across the legacy single-workspace,
+single-workspace-token-file, and multi-workspace-JSON shapes.
+
 ## Multiple External Workspaces
 
 `molecule-mcp` can serve more than one external workspace from the same local
