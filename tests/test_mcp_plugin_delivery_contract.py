@@ -6,11 +6,13 @@ This is the check that would have caught the RCA#2970 concierge-online bug:
 management MCP is actually delivered (plugin -> settings.json), so a healthy
 concierge self-reported false and the server gate refused to mark it online.
 
-``contracts/mcp-plugin-delivery.contract.json`` is the single source of truth,
-held byte-identical here, in molecule-core, and in the claude-code template
-(cross-repo drift enforced by the mcp-plugin-delivery-contract-drift workflow).
-If you change a literal in platform_agent_identity.py, update the contract (and
-all copies) — or this gate fails loudly, in-repo, before any image ships.
+Scope (honest): this is the RUNTIME-LOCAL gate. It pins this repo's literals to
+this repo's vendored copy of ``contracts/mcp-plugin-delivery.contract.json`` —
+so an in-repo edit that changes a literal without the contract (or vice versa)
+fails ``unit-tests`` before any image ships. The CROSS-REPO guarantee that the
+core/template/runtime copies stay byte-identical is enforced separately by the
+``mcp-plugin-delivery-contract-drift`` workflow in molecule-core; wiring this
+repo's copy into that byte-compare set is a tracked follow-up.
 """
 
 import json
@@ -40,10 +42,11 @@ def test_legacy_binary_path_matches_contract():
     assert pai.MCPSERVER_PATH == CONTRACT["legacy_binary_path"]
 
 
-def test_settings_key_is_mcpservers():
-    # platform_agent_identity._settings_has_management_mcp() and the executor
-    # both look under contract["key"] in settings.json.
-    assert CONTRACT["key"] == "mcpServers"
+def test_settings_key_matches_contract():
+    # Tie the SOURCE constant (used by _settings_has_management_mcp) to the
+    # contract — not a bare literal — so a source-side rename of the settings
+    # map key is caught here too.
+    assert pai.MCPSERVERS_KEY == CONTRACT["key"]
 
 
 def test_present_field_name_matches_contract():
