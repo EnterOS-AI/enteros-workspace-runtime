@@ -1,9 +1,11 @@
+import json
 import os
 from unittest.mock import patch
 
 import pytest
 
 from molecule_runtime.platform_agent_identity import (
+    MANAGEMENT_MCP_NAME,
     MCPSERVER_PATH,
     identity_gate_payload,
     mcp_server_present,
@@ -17,17 +19,97 @@ class TestMCPServerPresent:
         monkeypatch.setattr(
             "molecule_runtime.platform_agent_identity.MCPSERVER_PATH", str(fake)
         )
+        # No settings file in play — binary alone must satisfy.
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.SETTINGS_PATH",
+            str(tmp_path / "no-settings.json"),
+        )
         assert mcp_server_present() is True
 
-    def test_false_when_binary_missing(self, tmp_path, monkeypatch):
-        missing = tmp_path / "not-there"
+    def test_false_when_binary_missing_and_no_settings(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "molecule_runtime.platform_agent_identity.MCPSERVER_PATH", str(missing)
+            "molecule_runtime.platform_agent_identity.MCPSERVER_PATH",
+            str(tmp_path / "not-there"),
+        )
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.SETTINGS_PATH",
+            str(tmp_path / "no-settings.json"),
+        )
+        assert mcp_server_present() is False
+
+    def test_true_when_plugin_wired_settings(self, tmp_path, monkeypatch):
+        """The claude-code + plugin concierge has no baked binary; the management
+        MCP arrives via settings.json mcpServers."""
+        settings = tmp_path / "settings.json"
+        settings.write_text(
+            json.dumps({"mcpServers": {MANAGEMENT_MCP_NAME: {"command": "npx"}}})
+        )
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.MCPSERVER_PATH",
+            str(tmp_path / "not-there"),
+        )
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.SETTINGS_PATH", str(settings)
+        )
+        assert mcp_server_present() is True
+
+    def test_false_when_settings_has_other_mcp_only(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        settings.write_text(json.dumps({"mcpServers": {"a2a": {"command": "x"}}}))
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.MCPSERVER_PATH",
+            str(tmp_path / "not-there"),
+        )
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.SETTINGS_PATH", str(settings)
+        )
+        assert mcp_server_present() is False
+
+    def test_false_when_settings_malformed(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        settings.write_text("{ not json")
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.MCPSERVER_PATH",
+            str(tmp_path / "not-there"),
+        )
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.SETTINGS_PATH", str(settings)
+        )
+        assert mcp_server_present() is False
+
+    def test_false_when_top_level_not_dict(self, tmp_path, monkeypatch):
+        # A bare JSON list/scalar must not crash the isinstance(data, dict) guard.
+        settings = tmp_path / "settings.json"
+        settings.write_text(json.dumps([MANAGEMENT_MCP_NAME]))
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.MCPSERVER_PATH",
+            str(tmp_path / "not-there"),
+        )
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.SETTINGS_PATH", str(settings)
+        )
+        assert mcp_server_present() is False
+
+    def test_false_when_mcpservers_not_dict(self, tmp_path, monkeypatch):
+        # mcpServers present but the wrong type (list) must stay fail-closed.
+        settings = tmp_path / "settings.json"
+        settings.write_text(json.dumps({"mcpServers": [MANAGEMENT_MCP_NAME]}))
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.MCPSERVER_PATH",
+            str(tmp_path / "not-there"),
+        )
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.SETTINGS_PATH", str(settings)
         )
         assert mcp_server_present() is False
 
     def test_default_path_is_opt_molecule_mcp_server(self):
         assert MCPSERVER_PATH == "/opt/molecule-mcp-server"
+
+    def test_management_mcp_name_matches_plugin(self):
+        # Must match the mcpServers entry the molecule-platform plugin writes
+        # into settings.json (and what the claude-code executor loads).
+        assert MANAGEMENT_MCP_NAME == "molecule-platform"
 
     def test_identity_gate_payload_shape(self, monkeypatch):
         monkeypatch.setattr(
