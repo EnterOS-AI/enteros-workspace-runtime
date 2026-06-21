@@ -60,6 +60,117 @@ MCPSERVERS_KEY = "mcpServers"
 # The ``mcpServers`` entry name the management plugin registers under.
 MANAGEMENT_MCP_NAME = "molecule-platform"
 
+# Env marker baked into the platform-agent image (Dockerfile.platform-agent
+# ``ENV MOLECULE_PLATFORM_AGENT_IMAGE_BAKED=1``). When set, this container IS
+# the org-management concierge image: it bakes the ``@molecule-ai/mcp-server``
+# management binary at the ``molecule-platform-mcp`` symlink, and the
+# management MCP entry MUST be present in settings.json for the RCA #2970 gate
+# to mark the concierge online. Used by ensure_management_mcp_in_settings to
+# decide whether to self-heal the protected entry (a no-op on ordinary
+# workspace images, which carry no management MCP and must not declare one).
+PLATFORM_AGENT_IMAGE_ENV = "MOLECULE_PLATFORM_AGENT_IMAGE_BAKED"
+
+# The on-image command that launches the baked management MCP server. The
+# platform-agent image symlinks ``@molecule-ai/mcp-server``'s entry to
+# ``/usr/local/bin/molecule-platform-mcp`` (Dockerfile.platform-agent). This is
+# the SAME command + env the template's mcp_servers.yaml overlay declares
+# (``{name: molecule-platform, command: molecule-platform-mcp,
+# env: {MOLECULE_MCP_MODE: management}}``) — re-asserting it from the baked
+# binary makes the protected entry independent of the per-boot gitea fetch of
+# the molecule-platform-mcp plugin, which is the failure this self-heal closes.
+MANAGEMENT_MCP_COMMAND = "molecule-platform-mcp"
+
+# The protected ``mcpServers`` spec the runtime re-asserts at boot on the
+# platform-agent image. ``name -> {command, env}`` per the cross-repo delivery
+# contract entry_shape.
+MANAGEMENT_MCP_SPEC = {
+    "command": MANAGEMENT_MCP_COMMAND,
+    "env": {"MOLECULE_MCP_MODE": "management"},
+}
+
+
+def on_platform_agent_image() -> bool:
+    """True when this container is the baked platform-agent (concierge) image.
+
+    Reads the ``MOLECULE_PLATFORM_AGENT_IMAGE_BAKED`` env marker the
+    Dockerfile.platform-agent sets. Treated as set when the value is a
+    non-empty, non-"0"/"false" string so a stray ``=0`` doesn't flip it on.
+    """
+    val = os.environ.get(PLATFORM_AGENT_IMAGE_ENV, "").strip().lower()
+    return val not in ("", "0", "false", "no")
+
+
+def ensure_management_mcp_in_settings() -> bool:
+    """Re-assert the protected ``molecule-platform`` management MCP entry into
+    ``/configs/.claude/settings.json`` at boot — additively, never clobbering
+    user-plugin entries.
+
+    Root cause this closes (concierge fail-closed on user-plugin install):
+    a SaaS restart is a fresh ephemeral instance, so ``/configs`` is rebuilt
+    every boot. The entrypoint boot-install ``rm -rf /configs/plugins`` then
+    re-fetches the DB desired-set (declared ∪ installed) and the runtime's
+    per-plugin ``_merge_settings_fragment`` re-adds each plugin's mcpServers
+    block additively. That additive merge is correct — BUT the management MCP's
+    survival depended on its OWN plugin (``molecule-platform-mcp``, a PRIVATE
+    gitea repo) re-fetching + re-merging on the SAME boot. When that private
+    fetch fails (missing/over-scoped token, 404, gitea hang — recurring
+    core#3065/#3108) while a PUBLIC user plugin (e.g. image-gen) fetches fine,
+    settings.json ends up with only the user plugin's entry and the
+    ``molecule-platform`` entry is gone → ``_settings_has_management_mcp()``
+    is False → the RCA #2970 gate fail-closes the concierge to ``failed``.
+
+    The fix makes the desired set ``protected-platform-entries ∪ declared-user-
+    plugins``: the runtime ALWAYS re-asserts the protected entry from the
+    image-baked binary, so a user-plugin install/restart can never evict it and
+    a failed plugin re-fetch self-heals. Idempotent and additive — it only
+    writes when the protected entry is absent or not byte-identical, and it
+    preserves every other key + mcpServer already in settings.json.
+
+    No-op (returns False) on ordinary workspace images: only the baked
+    platform-agent image carries the management MCP, so only it may declare one
+    (security hygiene — the org-admin MCP stays out of tenant workspaces). The
+    server-side org-root entitlement + org-admin key injection remain the real
+    privilege boundary; this only wires the local liveness entry.
+
+    Returns True when settings.json was (re)written, False otherwise.
+    """
+    if not on_platform_agent_image():
+        return False
+
+    path = SETTINGS_PATH
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            data = {}
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError):
+        # Unreadable/malformed: rebuild a minimal settings.json carrying the
+        # protected entry rather than leave the concierge fail-closed. A
+        # corrupt file with no recoverable user content is the safe case to
+        # overwrite — losing a broken file beats a wedged concierge.
+        data = {}
+
+    servers = data.get(MCPSERVERS_KEY)
+    if not isinstance(servers, dict):
+        servers = {}
+
+    if servers.get(MANAGEMENT_MCP_NAME) == MANAGEMENT_MCP_SPEC:
+        return False  # already present + identical — nothing to do
+
+    # Additive: keep every other mcpServer (user plugins) intact; only set ours.
+    servers[MANAGEMENT_MCP_NAME] = dict(MANAGEMENT_MCP_SPEC)
+    data[MCPSERVERS_KEY] = servers
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+    return True
+
 
 def _settings_has_management_mcp() -> bool:
     """True when the plugin-delivered management MCP is wired into settings.json.

@@ -552,6 +552,27 @@ class BaseAdapter(ABC):
         if plugins.plugin_names:
             logger.info(f"Plugins: {', '.join(plugins.plugin_names)}")
 
+        # Protected platform-MCP self-heal (RCA #2970). On the baked
+        # platform-agent (concierge) image, ALWAYS re-assert the
+        # ``molecule-platform`` management MCP entry in settings.json AFTER the
+        # plugin merges above — additively, never evicting a user plugin. This
+        # makes the desired set "protected-platform-entries ∪ declared-user-
+        # plugins": a user-plugin install (which triggers a fresh-instance
+        # restart) can no longer drop the management MCP, and a failed per-boot
+        # fetch of the private molecule-platform-mcp plugin self-heals instead of
+        # fail-closing the concierge. No-op on ordinary workspace images.
+        try:
+            from molecule_runtime.platform_agent_identity import (
+                ensure_management_mcp_in_settings,
+            )
+            if ensure_management_mcp_in_settings():
+                logger.info(
+                    "platform-agent: re-asserted protected management MCP "
+                    "(molecule-platform) into settings.json"
+                )
+        except Exception:  # noqa: BLE001 — self-heal must never block boot
+            logger.exception("platform-agent: management MCP self-heal failed")
+
         # Load skills (workspace + plugin skills, deduped). Pass the runtime
         # name so SKILL.md frontmatter `runtime: [...]` can opt skills out
         # of incompatible adapters (hermes won't load claude-code-only

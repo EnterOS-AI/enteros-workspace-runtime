@@ -6,10 +6,14 @@ import pytest
 
 from molecule_runtime.platform_agent_identity import (
     MANAGEMENT_MCP_NAME,
+    MANAGEMENT_MCP_SPEC,
     MCPSERVER_PATH,
+    PLATFORM_AGENT_IMAGE_ENV,
+    ensure_management_mcp_in_settings,
     identity_gate_payload,
     loaded_mcp_tools,
     mcp_server_present,
+    on_platform_agent_image,
     set_loaded_mcp_tools,
 )
 
@@ -258,3 +262,157 @@ class TestLoadedMCPTools:
         assert recorded["json"]["loaded_mcp_tools"] == [
             "mcp__molecule-platform__create_workspace"
         ]
+
+
+class TestOnPlatformAgentImage:
+    def test_true_when_marker_set(self, monkeypatch):
+        monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
+        assert on_platform_agent_image() is True
+
+    def test_false_when_unset(self, monkeypatch):
+        monkeypatch.delenv(PLATFORM_AGENT_IMAGE_ENV, raising=False)
+        assert on_platform_agent_image() is False
+
+    @pytest.mark.parametrize("val", ["0", "false", "no", "", "  "])
+    def test_false_for_falsey_values(self, monkeypatch, val):
+        monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, val)
+        assert on_platform_agent_image() is False
+
+
+class TestEnsureManagementMCPInSettings:
+    """The protected-entry self-heal that keeps the management MCP from being
+    evicted by a user-plugin install/restart (RCA #2970, concierge fail-closed).
+    """
+
+    def _point_settings_at(self, monkeypatch, tmp_path):
+        settings = tmp_path / ".claude" / "settings.json"
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.SETTINGS_PATH", str(settings)
+        )
+        return settings
+
+    def test_noop_on_ordinary_workspace_image(self, tmp_path, monkeypatch):
+        # Ordinary workspaces must NEVER declare the org-admin MCP.
+        monkeypatch.delenv(PLATFORM_AGENT_IMAGE_ENV, raising=False)
+        settings = self._point_settings_at(monkeypatch, tmp_path)
+        assert ensure_management_mcp_in_settings() is False
+        assert not settings.exists()
+
+    def test_seeds_protected_entry_when_settings_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
+        settings = self._point_settings_at(monkeypatch, tmp_path)
+        assert ensure_management_mcp_in_settings() is True
+        data = json.loads(settings.read_text())
+        assert data["mcpServers"][MANAGEMENT_MCP_NAME] == MANAGEMENT_MCP_SPEC
+        # The gate now sees the management MCP.
+        with patch.object(
+            __import__("molecule_runtime.platform_agent_identity", fromlist=["x"]),
+            "MCPSERVER_PATH",
+            str(tmp_path / "no-binary"),
+        ):
+            with patch.object(
+                __import__("molecule_runtime.platform_agent_identity", fromlist=["x"]),
+                "SETTINGS_PATH",
+                str(settings),
+            ):
+                assert mcp_server_present() is True
+
+    def test_additive_preserves_user_plugin_entry(self, tmp_path, monkeypatch):
+        # The exact bug: a user plugin (image-gen) is in settings.json after a
+        # fresh-box rebuild; the self-heal must ADD molecule-platform WITHOUT
+        # evicting the user plugin.
+        monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
+        settings = self._point_settings_at(monkeypatch, tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(
+            json.dumps(
+                {
+                    "permissions": {"allow": ["Bash(*)"]},
+                    "mcpServers": {"image-gen": {"command": "npx", "args": ["x"]}},
+                }
+            )
+        )
+        assert ensure_management_mcp_in_settings() is True
+        data = json.loads(settings.read_text())
+        # BOTH present — additive, never evict.
+        assert MANAGEMENT_MCP_NAME in data["mcpServers"]
+        assert "image-gen" in data["mcpServers"]
+        assert data["mcpServers"]["image-gen"] == {"command": "npx", "args": ["x"]}
+        # Unrelated keys untouched.
+        assert data["permissions"] == {"allow": ["Bash(*)"]}
+
+    def test_idempotent_when_already_present(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
+        settings = self._point_settings_at(monkeypatch, tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({"mcpServers": {MANAGEMENT_MCP_NAME: MANAGEMENT_MCP_SPEC}}))
+        # Already identical → no rewrite.
+        assert ensure_management_mcp_in_settings() is False
+
+    def test_overwrites_drifted_management_entry(self, tmp_path, monkeypatch):
+        # A stale/wrong management entry (e.g. an old npx spec from a prior
+        # plugin merge) is re-asserted to the canonical baked-binary spec.
+        monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
+        settings = self._point_settings_at(monkeypatch, tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(
+            json.dumps({"mcpServers": {MANAGEMENT_MCP_NAME: {"command": "stale"}}})
+        )
+        assert ensure_management_mcp_in_settings() is True
+        data = json.loads(settings.read_text())
+        assert data["mcpServers"][MANAGEMENT_MCP_NAME] == MANAGEMENT_MCP_SPEC
+
+    def test_rebuilds_on_corrupt_settings(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
+        settings = self._point_settings_at(monkeypatch, tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text("{ this is not json")
+        assert ensure_management_mcp_in_settings() is True
+        data = json.loads(settings.read_text())
+        assert data["mcpServers"][MANAGEMENT_MCP_NAME] == MANAGEMENT_MCP_SPEC
+
+    def test_user_plugin_install_simulation_keeps_management_mcp(self, tmp_path, monkeypatch):
+        """End-to-end of the reported bug: simulate a fresh-box boot where only
+        the PUBLIC user plugin re-merged (the PRIVATE management-MCP plugin
+        fetch failed), then run the boot self-heal. The management MCP must be
+        present afterward AND the user plugin must persist.
+        """
+        from molecule_runtime.plugins_registry import builtins as b
+
+        monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
+        settings = self._point_settings_at(monkeypatch, tmp_path)
+
+        # Simulate the runtime's per-plugin additive merge for the user plugin
+        # only (the private molecule-platform-mcp plugin fetch failed at boot).
+        import logging
+
+        class _Ctx:
+            def __init__(self, plugin_root, configs_dir):
+                self.plugin_root = plugin_root
+                self.configs_dir = configs_dir
+                self.logger = logging.getLogger("t")
+
+        class _Res:
+            def __init__(self):
+                self.files_written = []
+                self.warnings = []
+
+        plugin_root = tmp_path / "image-gen-plugin"
+        plugin_root.mkdir()
+        (plugin_root / "settings-fragment.json").write_text(
+            json.dumps({"mcpServers": {"image-gen": {"command": "npx", "args": ["y"]}}})
+        )
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        b._merge_settings_fragment(_Ctx(plugin_root, tmp_path), claude_dir, _Res(), "image-gen")
+
+        # Pre-self-heal: only the user plugin is present (the bug state).
+        pre = json.loads(settings.read_text())
+        assert MANAGEMENT_MCP_NAME not in pre["mcpServers"]
+        assert "image-gen" in pre["mcpServers"]
+
+        # Boot self-heal runs → protected entry restored, user plugin kept.
+        assert ensure_management_mcp_in_settings() is True
+        post = json.loads(settings.read_text())
+        assert post["mcpServers"][MANAGEMENT_MCP_NAME] == MANAGEMENT_MCP_SPEC
+        assert post["mcpServers"]["image-gen"] == {"command": "npx", "args": ["y"]}
