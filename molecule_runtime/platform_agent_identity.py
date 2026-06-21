@@ -42,6 +42,7 @@ in this repo.
 
 import json
 import os
+import threading
 
 # Legacy in-container path to the platform MCP server binary baked into the
 # platform-agent image.
@@ -96,11 +97,52 @@ def mcp_server_present() -> bool:
     return os.path.exists(MCPSERVER_PATH) or _settings_has_management_mcp()
 
 
+# ── loaded_mcp_tools producer (core#3082) ──────────────────────────────────
+# mcp_server_present() proves the management MCP is DECLARED. The platform's
+# online/degraded gate also wants to know its tools were ACTUALLY LOADED into
+# the model's tool list — a declared-but-not-loaded server is the exact
+# false-green #3082 catches. The runtime can only know that from a live turn:
+# the claude CLI's `init` system-message carries the tool list the model sees.
+# The executor records it here (the mcp__* ids) and the heartbeat reports it as
+# `loaded_mcp_tools`. It stays None until the first turn runs, so the heartbeat
+# OMITS the field and the gate stays fail-closed (degraded) until the tools are
+# observed live — never reporting a guessed/static list.
+_loaded_mcp_tools_lock = threading.Lock()
+_loaded_mcp_tools = None  # type: list[str] | None
+
+
+def set_loaded_mcp_tools(tools) -> None:
+    """Record the MCP tool ids the running agent actually loaded.
+
+    Called by the claude-code executor when it observes the `init`
+    system-message tool list. Pass the mcp__* tool ids (or an empty list when a
+    turn ran but loaded no MCP tools — that is itself a meaningful, non-None
+    signal). Pass None to clear.
+    """
+    global _loaded_mcp_tools
+    with _loaded_mcp_tools_lock:
+        _loaded_mcp_tools = None if tools is None else [str(t) for t in tools]
+
+
+def loaded_mcp_tools():
+    """The last-observed loaded MCP tool ids, or None if no turn has run yet."""
+    with _loaded_mcp_tools_lock:
+        return None if _loaded_mcp_tools is None else list(_loaded_mcp_tools)
+
+
 def identity_gate_payload() -> dict:
     """Return the payload fragment the runtime sends on register/heartbeat.
 
-    Always present in the wire body so the controlplane can treat its absence
-    as fail-closed (an old/generic runtime that doesn't declare mcp-server
-    availability cannot be trusted as a platform agent).
+    `mcp_server_present` is always present so the controlplane can treat its
+    absence as fail-closed (an old/generic runtime that doesn't declare
+    mcp-server availability cannot be trusted as a platform agent).
+
+    `loaded_mcp_tools` is included ONLY once a live turn has reported a tool
+    list (core#3082). Omitting it pre-first-turn keeps the gate fail-closed
+    rather than asserting an empty/guessed list.
     """
-    return {"mcp_server_present": mcp_server_present()}
+    payload = {"mcp_server_present": mcp_server_present()}
+    tools = loaded_mcp_tools()
+    if tools is not None:
+        payload["loaded_mcp_tools"] = tools
+    return payload
