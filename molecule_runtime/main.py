@@ -47,7 +47,7 @@ from molecule_runtime.initial_prompt import (
     resolve_initial_prompt_marker,
 )
 from molecule_runtime.a2a_client import build_message_send_params
-from molecule_runtime.platform_agent_identity import mcp_server_present
+from molecule_runtime.platform_agent_identity import identity_gate_payload
 from molecule_runtime.platform_auth import auth_headers, self_source_headers
 from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
 
@@ -177,7 +177,7 @@ async def register_with_platform(
                     "id": workspace_id,
                     "url": workspace_url,
                     "agent_card": agent_card,
-                    "mcp_server_present": mcp_server_present(),
+                    **identity_gate_payload(),
                 },
                 headers=headers,
             )

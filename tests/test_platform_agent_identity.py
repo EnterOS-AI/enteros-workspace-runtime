@@ -8,7 +8,9 @@ from molecule_runtime.platform_agent_identity import (
     MANAGEMENT_MCP_NAME,
     MCPSERVER_PATH,
     identity_gate_payload,
+    loaded_mcp_tools,
     mcp_server_present,
+    set_loaded_mcp_tools,
 )
 
 
@@ -191,3 +193,73 @@ class TestHeartbeatPayloadIncludesMCP:
 
         hb._send_heartbeat(_FakeClient())
         assert recorded["json"]["mcp_server_present"] is True
+
+
+class TestLoadedMCPTools:
+    """core#3082: the loaded_mcp_tools producer the heartbeat reports so the
+    platform online/degraded gate can verify the management MCP's tools are
+    actually live, not just declared."""
+
+    def setup_method(self):
+        set_loaded_mcp_tools(None)  # reset module-level holder per test
+
+    def teardown_method(self):
+        set_loaded_mcp_tools(None)
+
+    def test_none_until_a_turn_runs(self):
+        assert loaded_mcp_tools() is None
+        p = identity_gate_payload()
+        assert "mcp_server_present" in p  # always present
+        assert "loaded_mcp_tools" not in p  # omitted pre-first-turn (fail-closed)
+
+    def test_set_then_reported_and_in_payload(self):
+        set_loaded_mcp_tools(
+            ["mcp__molecule-platform__create_workspace", "Read"]
+        )
+        assert loaded_mcp_tools() == [
+            "mcp__molecule-platform__create_workspace",
+            "Read",
+        ]
+        assert identity_gate_payload()["loaded_mcp_tools"] == [
+            "mcp__molecule-platform__create_workspace",
+            "Read",
+        ]
+
+    def test_empty_list_is_a_meaningful_non_none_signal(self):
+        # A turn ran but loaded no MCP tools — distinct from "no turn yet".
+        set_loaded_mcp_tools([])
+        assert loaded_mcp_tools() == []
+        assert identity_gate_payload()["loaded_mcp_tools"] == []
+
+    def test_none_clears(self):
+        set_loaded_mcp_tools(["mcp__molecule-platform__create_workspace"])
+        set_loaded_mcp_tools(None)
+        assert loaded_mcp_tools() is None
+        assert "loaded_mcp_tools" not in identity_gate_payload()
+
+    def test_returns_a_copy(self):
+        set_loaded_mcp_tools(["a"])
+        got = loaded_mcp_tools()
+        got.append("b")
+        assert loaded_mcp_tools() == ["a"]  # internal state not mutable by caller
+
+    def test_heartbeat_includes_loaded_tools_when_set(self):
+        from molecule_runtime.heartbeat import HeartbeatLoop
+
+        set_loaded_mcp_tools(["mcp__molecule-platform__create_workspace"])
+        hb = HeartbeatLoop("http://platform", "ws-1")
+        recorded = {}
+
+        class _FakeResp:
+            def json(self):
+                return {}
+
+        class _FakeClient:
+            def post(self, url, *, json, headers):
+                recorded["json"] = json
+                return _FakeResp()
+
+        hb._send_heartbeat(_FakeClient())
+        assert recorded["json"]["loaded_mcp_tools"] == [
+            "mcp__molecule-platform__create_workspace"
+        ]
