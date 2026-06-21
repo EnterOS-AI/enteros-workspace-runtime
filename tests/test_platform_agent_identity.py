@@ -123,18 +123,13 @@ class TestMCPServerPresent:
 
 @pytest.fixture
 def patch_mcp_present(monkeypatch):
-    # The runtime modules import the helper by name, so we must patch the
-    # module-local binding used at call sites, not just the source function.
+    # main + heartbeat now build the wire payload via identity_gate_payload(),
+    # which calls mcp_server_present() from platform_agent_identity. Patching the
+    # SOURCE function flows through both call sites — the per-module
+    # `mcp_server_present` bindings were removed when main/heartbeat switched to
+    # importing identity_gate_payload (RC 12977).
     monkeypatch.setattr(
         "molecule_runtime.platform_agent_identity.mcp_server_present",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "molecule_runtime.main.mcp_server_present",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "molecule_runtime.heartbeat.mcp_server_present",
         lambda: True,
     )
 
