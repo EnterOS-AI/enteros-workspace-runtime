@@ -259,3 +259,74 @@ def test_provider_openai_drops_oauth():
     r = normalise_llm_env(env, provider="openai")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
     assert r.detected_kind == "none"
+
+
+# --- CP-proxy foreign-OAuth drop (platform-agent concierge 401 fix) -----------
+
+_CP_PROXY_BASE = "https://controlplane.example.com/api/v1/internal/llm/anthropic"
+_ADMIN_TOKEN = "abc123def456ghi789jkl012"  # 24-hex per-workspace admin token
+
+
+def test_cp_proxy_base_url_drops_inherited_oauth_even_with_empty_provider():
+    # The platform-agent concierge bug: an inherited tenant OAuth token co-exists
+    # with the CP proxy base URL + the per-workspace admin token. With an empty
+    # provider (the rebuilt-from-DB payload), the old provider-only guard skipped
+    # and the OAuth short-circuit hijacked the request → the OAuth bearer hit the
+    # CP proxy → 401. The OAuth token MUST be dropped here, UN-GATED on provider.
+    env = {
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-inherited-tenant",
+        "ANTHROPIC_AUTH_TOKEN": _ADMIN_TOKEN,
+        "ANTHROPIC_BASE_URL": _CP_PROXY_BASE,
+    }
+    r = normalise_llm_env(env, provider="")  # empty provider — the failing case
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in r.cleared_vars
+    # Proof the drop ran BEFORE the OAuth short-circuit: the admin token + proxy
+    # URL survive (the short-circuit would have cleared both and gone native).
+    assert env["ANTHROPIC_AUTH_TOKEN"] == _ADMIN_TOKEN
+    assert env["ANTHROPIC_BASE_URL"] == _CP_PROXY_BASE
+    assert r.detected_kind != "oauth"
+
+
+def test_cp_proxy_base_url_drops_oauth_even_for_anthropic_provider():
+    # Un-gated on provider too: even provider='anthropic' cannot keep an OAuth
+    # token when the base URL is the CP proxy — OAuth can't authenticate there.
+    env = {
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-inherited",
+        "ANTHROPIC_AUTH_TOKEN": _ADMIN_TOKEN,
+        "ANTHROPIC_BASE_URL": _CP_PROXY_BASE,
+    }
+    normalise_llm_env(env, provider="anthropic")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert env["ANTHROPIC_AUTH_TOKEN"] == _ADMIN_TOKEN
+    assert env["ANTHROPIC_BASE_URL"] == _CP_PROXY_BASE
+
+
+def test_byok_oauth_direct_native_url_untouched():
+    # BYOK-via-OAuth-direct: a workspace legitimately pointing at native Anthropic
+    # with its own OAuth token is NOT the proxy case → OAuth kept, base preserved.
+    env = {
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-byok-legit",
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+    }
+    r = normalise_llm_env(env, provider="")
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-byok-legit"
+    assert r.detected_kind == "oauth"
+    assert env.get("ANTHROPIC_BASE_URL") == "https://api.anthropic.com"
+
+
+def test_is_molecule_cp_proxy_base_url_matching():
+    from molecule_runtime.llm_auth import _is_molecule_cp_proxy_base_url as m
+
+    # Matches the CP proxy path prefix, host-agnostic (prod/staging/local).
+    assert m("https://controlplane.example.com/api/v1/internal/llm/anthropic")
+    assert m("https://cp.staging.moleculesai.app/api/v1/internal/llm/openai/v1")
+    assert m("http://localhost:8080/api/v1/internal/llm/anthropic")
+    # Prefix-anchored: a direct-provider proxy, native Anthropic, a deeper path,
+    # a query-string match, a bare path (no host), and empty all fail.
+    assert not m("https://api.minimax.io/anthropic")
+    assert not m("https://api.anthropic.com")
+    assert not m("https://evil.example/redirect/api/v1/internal/llm/x")
+    assert not m("https://evil.example/?x=/api/v1/internal/llm/anthropic")
+    assert not m("/api/v1/internal/llm/anthropic")
+    assert not m("")

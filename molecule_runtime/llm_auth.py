@@ -112,6 +112,41 @@ def _is_native_anthropic_base_url(base_url: str) -> bool:
     return host in _ANTHROPIC_NATIVE_HOSTS
 
 
+def _is_molecule_cp_proxy_base_url(base_url: str) -> bool:
+    """True if the base URL points at the Molecule platform LLM proxy.
+
+    The platform routes managed-LLM traffic through
+    ``<cp-host>/api/v1/internal/llm/<protocol>`` and authenticates the caller
+    with the workspace's own admin token (carried in ``ANTHROPIC_AUTH_TOKEN``).
+    A Claude-subscription OAuth token (``sk-ant-oat01-*``) can NEVER authenticate
+    against that proxy — it 401s — so an inherited one must be dropped before the
+    OAuth short-circuit can hijack the request, regardless of the resolved
+    provider or model (the gating that previously failed on an empty
+    rebuilt-from-DB payload and 401'd platform-agent concierges).
+
+    Anchored on the proxy's stable, slash-bounded path segment so it is
+    host-agnostic (prod/staging/local CP hosts differ) and a BYOK base URL
+    cannot match it as a loose substring. Requires a real scheme+host so a bare
+    path string can't trip it.
+    """
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(base_url)
+    except Exception:
+        return False
+    if not parsed.scheme or not parsed.hostname:
+        return False
+    # Prefix-anchored (NOT a loose substring): the proxy is always mounted at
+    # this exact path prefix (<cp>/api/v1/internal/llm/<protocol>), so a BYOK URL
+    # that merely contains the segment deeper in its path — or in a query string
+    # — never matches.
+    path = (parsed.path or "").lower()
+    return path.startswith("/api/v1/internal/llm/")
+
+
 def _prefix_of(token: str) -> str:
     """Classify a token string by its well-known prefix."""
     if token.startswith("sk-ant-oat01-"):
@@ -152,22 +187,39 @@ def normalise_llm_env(
 
     result = NormalisationResult()
 
-    # Provider-honoring guard (drain fix, 2026-05-29). Provider is SSOT: a
-    # non-Anthropic workspace must never authenticate via an inherited
-    # CLAUDE_CODE_OAUTH_TOKEN from shared tenant globals. Drop it BEFORE any
-    # detection so the OAuth short-circuit below can't hijack a minimax /
-    # openai / moonshot workspace into billing Anthropic. If the configured
-    # provider's own key is missing, preflight fails loudly — no silent
-    # fallback, no drain.
+    # Foreign-OAuth drop guard. An inherited CLAUDE_CODE_OAUTH_TOKEN (injected
+    # into every workspace from shared tenant globals) must be dropped BEFORE the
+    # OAuth short-circuit below can let it win. Two INDEPENDENT, UN-GATED signals
+    # say the token is foreign — kept independent so neither a missing provider
+    # slug nor a missing/empty model can leave it in place (that gating is exactly
+    # what 401'd platform-agent concierges on a rebuilt-from-DB payload):
+    #
+    #   (1) ANTHROPIC_BASE_URL is the Molecule platform LLM proxy. That proxy
+    #       authenticates the caller against the workspace's own admin token
+    #       (carried in ANTHROPIC_AUTH_TOKEN); an OAuth bearer can NEVER match it
+    #       and 401s. Independent of provider/model.
+    #   (2) Provider is SSOT and non-Anthropic (minimax/openai/moonshot…):
+    #       keeping the OAuth token would silently bill Anthropic (the 2026-05-28
+    #       drain). If the configured provider's own key is missing, preflight
+    #       fails loudly — no silent fallback.
     prov = (provider or "").strip().lower()
-    if prov and prov not in _ANTHROPIC_OAUTH_PROVIDERS:
-        if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
-            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-            result.cleared_vars.append("CLAUDE_CODE_OAUTH_TOKEN")
+    cp_proxy_routed = _is_molecule_cp_proxy_base_url(env.get("ANTHROPIC_BASE_URL", ""))
+    provider_forbids_oauth = bool(prov) and prov not in _ANTHROPIC_OAUTH_PROVIDERS
+    if (cp_proxy_routed or provider_forbids_oauth) and env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        result.cleared_vars.append("CLAUDE_CODE_OAUTH_TOKEN")
+        if cp_proxy_routed:
             result.warning = (
-                f"dropped inherited CLAUDE_CODE_OAUTH_TOKEN for "
-                f"provider='{prov}' (provider is SSOT; Anthropic OAuth is "
-                f"not used by this provider — prevents silent Anthropic drain)"
+                "dropped inherited CLAUDE_CODE_OAUTH_TOKEN: ANTHROPIC_BASE_URL is "
+                "the Molecule platform LLM proxy, which authenticates via the "
+                "per-workspace admin token — an OAuth bearer cannot authenticate "
+                "there and would 401"
+            )
+        else:
+            result.warning = (
+                f"dropped inherited CLAUDE_CODE_OAUTH_TOKEN for provider='{prov}' "
+                f"(provider is SSOT; Anthropic OAuth is not used by this provider "
+                f"— prevents silent Anthropic drain)"
             )
 
     # Priority: explicit CLAUDE_CODE_OAUTH_TOKEN wins if already present
