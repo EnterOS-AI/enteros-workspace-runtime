@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 from pathlib import Path
 
@@ -184,3 +185,61 @@ def test_reconcile_clean_when_all_accounted(monkeypatch: pytest.MonkeyPatch) -> 
         )
         == []
     )
+
+
+
+def test_org_listing_403_raises_reconcile_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token-scope 403 on /orgs/{org}/repos is a CONFIG gap (needs
+    read:organization), surfaced as ReconcileUnavailable, not a generic
+    RuntimeError — so main() can warn+skip instead of painting main red."""
+    import urllib.error
+    import urllib.request
+
+    import check_consumer_runtime_drift as guard
+
+    def fake_urlopen(req, timeout=15):  # noqa: ANN001
+        raise urllib.error.HTTPError(
+            req.full_url, 403, "Forbidden", {},
+            io.BytesIO(b'{"message":"token does not have at least one of required '
+                       b'scope(s), required=[read:organization]"}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(guard.ReconcileUnavailable):
+        guard._org_template_repos("https://git.moleculesai.app", "scopeless-token")
+
+
+def test_main_warns_and_skips_reconcile_on_scope_gap(monkeypatch: pytest.MonkeyPatch, capsys, tmp_path) -> None:
+    """When the org-scan reconcile is unavailable (token scope), main() must NOT
+    fail: it warns and falls through to the pin-drift check, which passes here."""
+    import check_consumer_runtime_drift as guard
+
+    # reconcile blows up with the config-gap signal
+    def boom(*a, **k):  # noqa: ANN002, ANN003
+        raise guard.ReconcileUnavailable("org repo listing requires read:organization (HTTP 403)")
+
+    monkeypatch.setattr(guard, "reconcile_org_consumers", boom)
+    # Build a clean --root so the clone path is skipped and no findings arise.
+    root = tmp_path / "consumers"
+    for repo in guard.DEFAULT_CONSUMERS:
+        (root / repo).mkdir(parents=True)
+    # current_runtime_version would hit the network; force a known SSOT and make
+    # every consumer carry a matching pin so there is zero drift.
+    monkeypatch.setattr(guard, "current_runtime_version", lambda *a, **k: "9.9.9")
+    for repo in guard.DEFAULT_CONSUMERS:
+        (root / repo / ".runtime-version").write_text("9.9.9\n")
+
+    monkeypatch.setenv("GITEA_TOKEN", "scopeless-token")
+    # --root path skips reconcile by design; to exercise the scope-gap branch we
+    # must run the live (no --root) reconcile gate. Patch clone to use our root.
+    monkeypatch.setattr(
+        guard, "clone_consumers",
+        lambda workdir, repos, *, gitea_url, token: {r: root / r for r in repos},
+    )
+    # NB: pass a non-empty argv; main() does `parse_args(argv or sys.argv[1:])`,
+    # so [] would fall through to pytest's own argv. An explicit --gitea-url keeps
+    # the reconcile gate active (no --root / no --repo) while being a real argv.
+    rc = guard.main(["--gitea-url", "https://git.moleculesai.app"])
+    err = capsys.readouterr().err
+    assert rc == 0, "scope-gap reconcile must not fail the guard"
+    assert "skipping org-scan reconcile" in err

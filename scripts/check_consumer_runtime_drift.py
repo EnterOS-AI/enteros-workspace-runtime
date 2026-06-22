@@ -81,6 +81,20 @@ SKIP_DIRS = {
 }
 
 
+class ReconcileUnavailable(RuntimeError):
+    """The org-scan reconciliation could not run for a CONFIG/PERMISSION reason
+    (e.g. the CI token lacks ``read:organization`` so ``/orgs/{org}/repos`` 403s),
+    as opposed to discovering a real blind spot.
+
+    runtime#83: a token-scope gap is a config gap, not a runtime regression. The
+    primary pin-drift check still runs against the explicit ``DEFAULT_CONSUMERS``
+    set (which is read per-repo, not via the org listing), so the guard must NOT
+    paint runtime ``main`` red just because the *advisory* blind-spot reconcile
+    can't enumerate the org. ``main`` degrades to a loud warning + skip in this
+    case, exactly like the absent-token path in consumer-drift.yml.
+    """
+
+
 @dataclass(frozen=True)
 class DriftFinding:
     repo: str
@@ -208,7 +222,16 @@ def _org_template_repos(gitea_url: str, token: str, *, org: str = "molecule-ai")
             with urllib.request.urlopen(req, timeout=15) as resp:
                 batch = json.load(resp)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"org repo listing failed (HTTP {exc.code}): {exc.read().decode()[:200]}")
+            detail = exc.read().decode()[:200]
+            # 401/403 here is a token-SCOPE gap (org listing needs
+            # read:organization), not a real blind spot — surface it as a
+            # reconcile-unavailable so main() can warn+skip instead of failing.
+            if exc.code in (401, 403):
+                raise ReconcileUnavailable(
+                    f"org repo listing requires a token with read:organization "
+                    f"(HTTP {exc.code}): {detail}"
+                )
+            raise RuntimeError(f"org repo listing failed (HTTP {exc.code}): {detail}")
         except Exception as exc:  # pragma: no cover - network errors
             raise RuntimeError(f"org repo listing failed: {exc}")
         if not isinstance(batch, list) or not batch:
@@ -382,9 +405,24 @@ def main(argv: list[str] | None = None) -> int:
     tempdir: Path | None = None
     try:
         if do_reconcile:
-            unaccounted = reconcile_org_consumers(
-                DEFAULT_CONSUMERS, gitea_url=args.gitea_url, token=token
-            )
+            try:
+                unaccounted = reconcile_org_consumers(
+                    DEFAULT_CONSUMERS, gitea_url=args.gitea_url, token=token
+                )
+            except ReconcileUnavailable as exc:
+                # Config/permission gap, not a runtime regression: warn loudly and
+                # skip the blind-spot reconcile. The pin-drift check below still
+                # runs against the explicit DEFAULT_CONSUMERS, so SSOT enforcement
+                # is unaffected. Provision read:organization on the token to
+                # re-enable the org-scan (runtime#83).
+                print(
+                    f"::warning::skipping org-scan reconcile: {exc}. The pin-drift "
+                    f"check still runs against the enumerated DEFAULT_CONSUMERS; "
+                    f"grant the CI token read:organization to re-enable the "
+                    f"blind-spot reconcile.",
+                    file=sys.stderr,
+                )
+                unaccounted = []
             if unaccounted:
                 print(
                     "Runtime SSOT drift guard blind spot: these "
@@ -430,3 +468,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -36,19 +36,54 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-# SSOT for the set of template repos that pin .runtime-version. This is the
-# template subset of check_consumer_runtime_drift.DEFAULT_CONSUMERS (which also
-# lists molecule-core — core installs the wheel but does not pin .runtime-version,
-# so it is not a propagation target). langgraph/autogen templates also exist but
-# are out of the runtime#91 scope; add them here when they adopt .runtime-version.
-TEMPLATE_CONSUMERS = (
-    "molecule-ai-workspace-template-claude-code",
-    "molecule-ai-workspace-template-hermes",
-    "molecule-ai-workspace-template-openclaw",
-    "molecule-ai-workspace-template-codex",
-)
-
 ORG = "molecule-ai"
+
+# SSOT for the set of template repos that pin .runtime-version and therefore get
+# an auto-bump PR on every release.
+#
+# runtime#83/#91 BUG: this list used to be a HAND-MAINTAINED 4-template subset
+# (claude-code, hermes, openclaw, codex) while the consumer-drift GUARD enforces
+# the full ``check_consumer_runtime_drift.DEFAULT_CONSUMERS`` set (10 templates +
+# molecule-core). The two lists silently diverged: langgraph/autogen/google-adk/
+# crewai/deepagents/gemini-cli all pin .runtime-version and are FAILED by the
+# guard when they drift, but the propagation bot never opened a bump PR for them —
+# so runtime ``main`` went (and stayed) RED on every release that out-paced those
+# pins, with no automation to converge them. A human had to hand-author each bump.
+#
+# FIX: derive TEMPLATE_CONSUMERS from the guard's DEFAULT_CONSUMERS so the
+# propagate set can never again be narrower than the set the guard enforces.
+# We take every DEFAULT_CONSUMERS entry that is a ``*-workspace-template-*`` repo
+# (i.e. carries a .runtime-version pin) and is not EXEMPT. molecule-core is
+# excluded by construction: it installs the wheel but carries no .runtime-version
+# pin (not a ``-template-`` repo), so there is nothing to bump. A consumer that is
+# behind but has no .runtime-version file is handled at runtime by plan_consumer
+# ("no-pin" → skipped), so over-inclusion is safe.
+try:  # normal import when run from the repo (scripts/ on sys.path)
+    from check_consumer_runtime_drift import (
+        DEFAULT_CONSUMERS as _GUARD_CONSUMERS,
+        EXEMPT_CONSUMERS as _GUARD_EXEMPT,
+    )
+except ImportError:  # pragma: no cover - allow running this file by absolute path
+    import importlib.util as _ilu
+    import pathlib as _pl
+
+    _spec = _ilu.spec_from_file_location(
+        "check_consumer_runtime_drift",
+        _pl.Path(__file__).resolve().parent / "check_consumer_runtime_drift.py",
+    )
+    _mod = _ilu.module_from_spec(_spec)
+    # Register before exec so @dataclass(frozen=True) inside the module can
+    # resolve cls.__module__ in sys.modules (else AttributeError on exec).
+    sys.modules[_spec.name] = _mod
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    _GUARD_CONSUMERS = _mod.DEFAULT_CONSUMERS
+    _GUARD_EXEMPT = _mod.EXEMPT_CONSUMERS
+
+TEMPLATE_CONSUMERS = tuple(
+    repo
+    for repo in _GUARD_CONSUMERS
+    if "-workspace-template-" in repo and repo not in _GUARD_EXEMPT
+)
 
 # Regex for the runtime pin line in requirements.txt. Matches lines like:
 #   molecule-ai-workspace-runtime==0.3.26
@@ -404,3 +439,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
