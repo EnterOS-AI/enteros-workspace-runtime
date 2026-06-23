@@ -122,7 +122,17 @@ class TestMCPServerPresent:
             "molecule_runtime.platform_agent_identity.mcp_server_present",
             lambda: True,
         )
-        assert identity_gate_payload() == {"mcp_server_present": True}
+        payload = identity_gate_payload()
+        assert payload["mcp_server_present"] is True
+        # loaded_mcp_tools omitted until a live turn reports a tool list.
+        assert "loaded_mcp_tools" not in payload
+        # cp#3164: the box-level diagnostic ships in the payload.
+        assert set(payload["platform_mcp_diag"]) == {
+            "on_platform_agent_image",
+            "mcp_binary_present",
+            "mcp_settings_entry",
+            "mcp_command_resolved",
+        }
 
 
 @pytest.fixture

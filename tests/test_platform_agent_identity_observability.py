@@ -177,3 +177,59 @@ def test_ensure_management_mcp_in_settings_logs_skip_on_ordinary_image(
     assert "ensure_management_mcp_in_settings" in msg
     assert "skipped" in msg
     assert "not on platform-agent image" in msg
+
+
+def test_management_mcp_diagnostic_reports_box_state(tmp_path, monkeypatch):
+    """cp#3164: the box-level diagnostic must report the four signals that
+    pinpoint WHY the management MCP is unavailable — so the controlplane can
+    record the cause from the heartbeat payload, with no box SSH (the blind
+    spot that kept #3164 un-fixable). Plain-image case: on_platform_agent_image
+    False, binary absent, no settings entry, command unresolved."""
+    monkeypatch.delenv("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", raising=False)
+    monkeypatch.setattr(
+        "molecule_runtime.platform_agent_identity.MCPSERVER_PATH",
+        str(tmp_path / "no-binary"),
+    )
+    settings = tmp_path / "settings.json"
+    settings.write_text('{"mcpServers": {}}')
+    monkeypatch.setattr(
+        "molecule_runtime.platform_agent_identity.SETTINGS_PATH", str(settings)
+    )
+
+    from molecule_runtime.platform_agent_identity import management_mcp_diagnostic
+
+    diag = management_mcp_diagnostic()
+    assert diag["on_platform_agent_image"] is False
+    assert diag["mcp_binary_present"] is False
+    assert diag["mcp_settings_entry"] is False
+    # molecule-platform-mcp is not installed in the test env → unresolved.
+    assert diag["mcp_command_resolved"] is None
+
+
+def test_identity_gate_payload_includes_platform_mcp_diag(tmp_path, monkeypatch):
+    """The register/heartbeat payload MUST carry platform_mcp_diag so the
+    controlplane (which knows kind=platform) can surface a missing/failed
+    management MCP without box access."""
+    monkeypatch.delenv("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", raising=False)
+    monkeypatch.setattr(
+        "molecule_runtime.platform_agent_identity.MCPSERVER_PATH",
+        str(tmp_path / "no-binary"),
+    )
+    settings = tmp_path / "settings.json"
+    settings.write_text('{"mcpServers": {}}')
+    monkeypatch.setattr(
+        "molecule_runtime.platform_agent_identity.SETTINGS_PATH", str(settings)
+    )
+
+    from molecule_runtime.platform_agent_identity import identity_gate_payload
+
+    payload = identity_gate_payload()
+    assert "mcp_server_present" in payload  # existing contract preserved
+    assert "platform_mcp_diag" in payload
+    diag = payload["platform_mcp_diag"]
+    assert set(diag) == {
+        "on_platform_agent_image",
+        "mcp_binary_present",
+        "mcp_settings_entry",
+        "mcp_command_resolved",
+    }
