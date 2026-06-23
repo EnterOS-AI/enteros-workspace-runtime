@@ -427,6 +427,68 @@ class BaseAdapter(ABC):
         """Default no-op. Sub-agent-capable runtimes override to register a sub-agent."""
         return None
 
+    # MCP-server config path where THIS runtime reads its mcpServers from.
+    # The default DISPATCHES on self.name() through molecule_runtime.mcp_render,
+    # so a codex run resolves ~/.codex/config.toml and a claude run resolves
+    # .claude/settings.json — no per-template override needed. An adapter MAY
+    # still override mcp_settings_path()/register_mcp_server_hook() for a runtime
+    # mcp_render doesn't map.
+    def mcp_settings_path(self, config: "AdapterConfig") -> str:
+        """Native MCP-config file for THIS runtime (``self.name()``), absolute.
+
+        Dispatches on the active runtime via
+        :func:`molecule_runtime.mcp_render.mcp_settings_path_for` —
+        ``.claude/settings.json`` for Claude Code, ``~/.codex/config.toml`` for
+        codex, ``~/.gemini/settings.json`` for gemini-cli, etc. An unmapped
+        runtime falls back to the Claude path (the base runtime). Tied to the
+        cross-repo delivery contract's per-runtime ``settings_path`` map."""
+        from molecule_runtime.mcp_render import mcp_settings_path_for
+        return str(mcp_settings_path_for(self.name(), config.config_path))
+
+    def register_mcp_server_hook(self, config: "AdapterConfig", name: str, spec: dict) -> None:
+        """Wire an MCP server into THIS runtime's native config (the MCP-wiring PORT).
+
+        DISPATCHES on the active runtime (``self.name()``) through
+        :func:`molecule_runtime.mcp_render.render_for_runtime`, so the SAME
+        production path (``install_plugins_via_registry`` → this hook) renders
+        the descriptor into the file the running runtime actually reads — codex →
+        ``~/.codex/config.toml``, claude → ``.claude/settings.json`` — WITHOUT a
+        per-template adapter override. This is the fix for the #3159 flaw where a
+        codex concierge got the management MCP written to ``.claude/settings.json``
+        (a file its runtime never reads) and so booted without ``create_workspace``.
+
+        An unverified runtime (gemini/hermes) renders via a deliberate
+        NotImplementedError stub — caught by ``MCPServerAdaptor.install``, which
+        fails the privileged management-MCP install LOUDLY rather than booting a
+        silently capability-less concierge. An adapter for such a runtime may
+        override this method once its native format is verified.
+        """
+        from molecule_runtime.mcp_render import render_for_runtime
+
+        target = render_for_runtime(self.name(), config.config_path, name, spec)
+        logger.info("register_mcp_server_hook: wired MCP %r into %s (runtime=%s)",
+                    name, target, self.name())
+
+    def management_mcp_present(self, config: "AdapterConfig") -> bool:
+        """True when the privileged management MCP (``molecule-platform``) is
+        wired into THIS runtime's native MCP config.
+
+        Runtime-agnostic answer to the RCA#2970 online gate's "is the management
+        MCP wired?" question — DISPATCHES on ``self.name()`` via
+        :func:`molecule_runtime.mcp_render.management_mcp_present_for`, so a codex
+        concierge is judged against ``~/.codex/config.toml`` (parsed as TOML) and
+        a claude concierge against ``.claude/settings.json``, rather than every
+        runtime being judged against a Claude file it may never read (#3159).
+
+        main.py registers this as the gate probe via
+        ``platform_agent_identity.register_mcp_present_probe`` once the adapter
+        is resolved.
+        """
+        from molecule_runtime.mcp_render import management_mcp_present_for
+        from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
+
+        return management_mcp_present_for(self.name(), config.config_path, MANAGEMENT_MCP_NAME)
+
     def append_to_memory_hook(self, config: AdapterConfig, filename: str, content: str) -> None:
         """Append text to /configs/<filename> if the marker isn't already present.
 
@@ -483,6 +545,7 @@ class BaseAdapter(ABC):
                 memory_filename=self.memory_filename(),
                 register_tool=self.register_tool_hook,
                 register_subagent=self.register_subagent_hook,
+                register_mcp_server=lambda n, s, _cfg=config: self.register_mcp_server_hook(_cfg, n, s),
                 append_to_memory=lambda fn, c, _cfg=config: self.append_to_memory_hook(_cfg, fn, c),
             )
             try:

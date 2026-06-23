@@ -46,6 +46,7 @@ __all__ = [
 class AdaptorSource:
     REGISTRY = "registry"
     PLUGIN = "plugin"
+    MCP_SERVER = "mcp_server_default"
     AGENTSKILLS = "agentskills_default"
     RAW_DROP = "raw_drop"
 
@@ -149,11 +150,58 @@ def resolve(
     if adaptor is not None:
         return adaptor, AdaptorSource.PLUGIN
 
+    adaptor = _resolve_mcp_default(plugin_root, plugin_name, runtime)
+    if adaptor is not None:
+        return adaptor, AdaptorSource.MCP_SERVER
+
     adaptor = _resolve_agentskills_default(plugin_root, plugin_name, runtime)
     if adaptor is not None:
         return adaptor, AdaptorSource.AGENTSKILLS
 
     return RawDropAdaptor(plugin_name, runtime), AdaptorSource.RAW_DROP
+
+
+def _resolve_mcp_default(
+    plugin_root: Path, plugin_name: str, runtime: str
+) -> Optional[PluginAdaptor]:
+    """Default MCP-shaped plugins to :class:`MCPServerAdaptor` (#3159).
+
+    Because the MCP-wiring PORT made ``MCPServerAdaptor`` runtime-AGNOSTIC (it
+    calls ``ctx.register_mcp_server`` and the active adapter renders the native
+    config), an MCP plugin no longer needs a hand-written ``adapters/<runtime>.py``
+    per runtime. A plugin is MCP-shaped when it ships an ``mcpServers`` descriptor
+    (``mcp-servers.json`` or a ``settings-fragment.json`` carrying ``mcpServers``).
+
+    This is what lets a CODEX concierge resolve ``MCPServerAdaptor`` for the
+    ``molecule-platform-mcp`` plugin without that plugin shipping a ``codex.py``
+    — and then the PORT renders ``~/.codex/config.toml`` instead of
+    ``.claude/settings.json`` (the #3159 fix, end-to-end). Checked BEFORE the
+    agentskills default so an MCP plugin that also ships skills/rules still gets
+    the MCP wired (``MCPServerAdaptor`` delegates skills/rules to
+    ``AgentskillsAdaptor`` internally).
+    """
+    try:
+        if (plugin_root / "mcp-servers.json").is_file():
+            shaped = True
+        else:
+            frag = plugin_root / "settings-fragment.json"
+            shaped = False
+            if frag.is_file():
+                import json as _json
+                try:
+                    data = _json.loads(frag.read_text())
+                except (OSError, ValueError):
+                    data = None
+                shaped = isinstance(data, dict) and isinstance(
+                    data.get("mcpServers"), dict
+                ) and bool(data["mcpServers"])
+    except OSError:
+        return None
+    if not shaped:
+        return None
+    from .builtins import MCPServerAdaptor
+
+    return MCPServerAdaptor(plugin_name, runtime)
 
 
 def _resolve_agentskills_default(
