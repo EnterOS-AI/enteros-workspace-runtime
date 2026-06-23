@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -123,6 +124,65 @@ def _http(
             return resp.status, resp.read().decode()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode()
+
+
+# Transient HTTP failures worth retrying. 5xx are server-side and may recover;
+# connection errors / timeouts are network blips the next attempt often clears.
+# 4xx are client errors and are NOT retried — a 401/403/404/422 won't fix itself.
+_RETRIABLE_5XX = frozenset({500, 502, 503, 504})
+
+
+def _http_with_retry(
+    url: str,
+    *,
+    token: str | None = None,
+    method: str = "GET",
+    payload: dict | None = None,
+    timeout: int = 30,
+    max_retries: int = 3,
+    sleep: "callable | None" = None,
+) -> tuple[int, str]:
+    """Same contract as ``_http`` plus bounded retry/backoff for transient failures.
+
+    runtime#52 (audit 2026-05-24, medium-severity finding): a single transient
+    Gitea/network blip on the PR POST marks a template failed even though the
+    branch + file writes already succeeded upstream. This helper retries
+    5xx + connection errors / timeouts with exponential backoff (1s, 2s, 4s by
+    default — caller passes a custom ``sleep`` in tests for instant replay).
+
+    4xx responses are returned on the first attempt (no retry) because they
+    indicate a client-side problem (auth, schema, not-found) that retrying
+    cannot fix.
+
+    ``max_retries`` is the ADDITIONAL attempts after the first call. ``max_retries=3``
+    means up to 4 total HTTP calls before raising the final error.
+
+    The ``sleep`` parameter resolves to ``time.sleep`` at call time (not at
+    function-definition time) so tests can patch ``time.sleep`` and have
+    ``_http_with_retry`` pick the patch up. Production callers leave it as
+    ``None`` and get the real ``time.sleep``.
+    """
+    if sleep is None:
+        sleep = time.sleep
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            status, body = _http(
+                url, token=token, method=method, payload=payload, timeout=timeout
+            )
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                raise
+            sleep(2 ** attempt)
+            continue
+        if status in _RETRIABLE_5XX and attempt < max_retries:
+            sleep(2 ** attempt)
+            continue
+        return status, body
+    # Unreachable: the loop above either returns or raises on the last attempt.
+    assert last_exc is not None  # pragma: no cover
+    raise last_exc
 
 
 def read_pinned_version(repo: str, *, gitea_url: str, token: str | None = None) -> str | None:
@@ -350,7 +410,13 @@ def open_bump_pr(plan: ConsumerPlan, target: str, *, gitea_url: str, token: str)
     )
     pr_url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/pulls"
     pr_payload = {"base": base, "head": plan.branch, "title": title, "body": body_md}
-    status, body = _http(pr_url, token=token, method="POST", payload=pr_payload)
+    # runtime#52: PR POST is the most transient-prone step — a 503/504/network
+    # blip after the branch + file writes have already succeeded would orphan
+    # the bump branch with no PR. Wrap with bounded retry/backoff so a single
+    # blip does not cascade into a manual open.
+    status, body = _http_with_retry(
+        pr_url, token=token, method="POST", payload=pr_payload
+    )
     if status == 201:
         try:
             return json.loads(body).get("html_url", "(created)")
