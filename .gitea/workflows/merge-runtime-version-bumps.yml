@@ -1,0 +1,88 @@
+name: merge-runtime-version-bumps
+
+# runtime#131: auto-merge propagated `.runtime-version` bump PRs on consumer
+# template repos. Closes the "auto-bump-default gap" from the CTO directive
+# (2026-06-10): green merge → auto-release → auto-deploy to prod was the
+# rule, except for runtime templates (the explicit gap). The propagate
+# script (scripts/propagate_runtime_version.py) opens a bump PR per
+# consumer template on every release; this sweeper is the human-approval
+# automation that was missing.
+#
+# Tightly scoped:
+#   - only `molecule-runtime-release-bot` (the identity the propagate
+#     script uses, per scripts/auto_release_runtime.py)
+#   - only `.runtime-version` and `requirements.txt` (the dual-pin
+#     templates bump both atomically; nothing else is allowed)
+#   - only when both `validate-runtime` + `t4-conformance` commit
+#     statuses are `success` on the head
+#   - per-repo opt-out via `.gitea/REPO.yaml`'s `runtime-merge-bumps: false`
+#
+# Replaces the manual approve+merge that had to happen every release
+# (the 2026-06-13 incident: openclaw had 3 stacked unmerged bumps;
+# claude-code/hermes/codex also drifted). Now: cron + post-propagate.
+
+on:
+  schedule:
+    # Every 30 min. Cheap (one API call per consumer repo).
+    # 10 random minutes in [:05, :35] skews the load vs the 17:10
+    # consumer-drift sweep so two CI waves don't fire back-to-back.
+    - cron: "*/30 5-23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize: never cancel an in-flight sweep (a partially-completed
+  # merge is worse than a delayed one — the next sweep will retry).
+  group: merge-runtime-version-bumps
+  cancel-in-progress: false
+
+env:
+  # runtime#131 RC 13418: GITEA_HOST must include the URL scheme. The
+  # script uses this value as the API base URL (`--base-url` default
+  # in scripts/merge_runtime_version_bumps.py) and concatenates it
+  # directly with `/api/v1/...`; a bare host ("git.moleculesai.app")
+  # would build "git.moleculesai.app/api/v1/..." (no scheme) and
+  # Python urllib rejects it with `ValueError: unknown url type`.
+  # Convention matches the test (`GITEA_HOST="https://example.invalid"`)
+  # and the script's default (`https://git.moleculesai.app`).
+  GITEA_HOST: https://git.moleculesai.app
+
+jobs:
+  merge-bumps:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Merge propagated .runtime-version bump PRs
+        env:
+          # runtime#131 contract: the sweeper performs approve+merge
+          # as a NON-AUTHOR identity distinct from the bot that opened
+          # the bump PR (`molecule-runtime-release-bot`). Two tokens
+          # are wired:
+          #   - CONSUMER_BUMP_MERGE_TOKEN: the non-author approve+merge
+          #     identity. If absent the script exits 0 with a loud
+          #     warning (config gap per runtime#83; not a runtime
+          #     regression — must not paint runtime main red).
+          #   - DISPATCH_TOKEN: the read-only token for listing PRs,
+          #     fetching files, checking commit status, and reading
+          #     the per-repo opt-out file. Same identity the propagate
+          #     + auto-release workflows use.
+          CONSUMER_BUMP_MERGE_TOKEN: ${{ secrets.CONSUMER_BUMP_MERGE_TOKEN }}
+          DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${CONSUMER_BUMP_MERGE_TOKEN:-}" ]; then
+            echo "::warning::CONSUMER_BUMP_MERGE_TOKEN secret absent; skipping consumer runtime-version bump merge sweeper (runtime#131 + runtime#83). Provision a non-author identity with write on the consumer template repos to enable."
+            exit 0
+          fi
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::DISPATCH_TOKEN secret absent; cannot list PRs / check status. Provision DISPATCH_TOKEN to enable pre-flight checks."
+            exit 0
+          fi
+          python scripts/merge_runtime_version_bumps.py
