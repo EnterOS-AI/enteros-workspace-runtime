@@ -84,6 +84,15 @@ from molecule_runtime.builtin_tools.telemetry import (
     get_tracer,
     record_llm_token_usage,
 )
+from molecule_runtime.context_budget import (
+    get_model_context_window,
+    should_compact_context,
+    should_emit_budget_warning,
+)
+from molecule_runtime.compact import (
+    DEFAULT_KEEP_RECENT_N,
+    compact_messages,
+)
 from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 
 logger = logging.getLogger(__name__)
@@ -268,6 +277,13 @@ class RuntimeA2AExecutor(AgentExecutor):
         self.agent = agent  # Compiled runtime graph (create_react_agent output)
         self._heartbeat = heartbeat
         self._model = model  # e.g. "anthropic:claude-sonnet-4-6"
+        # runtime#133: per-context_id LRU of the last turn's
+        # input_tokens. Used by the compact-and-continue hook to
+        # act on the previous turn's usage BEFORE the next turn's
+        # LLM call. Bounded (256 entries, see the post-LLM-call
+        # block) so a long-running executor doesn't grow this
+        # unboundedly.
+        self._last_input_tokens: dict[str, int] = {}
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Execute a task from an A2A request with SSE streaming.
@@ -468,6 +484,47 @@ class RuntimeA2AExecutor(AgentExecutor):
                 messages = _extract_history(context)
                 if messages:
                     logger.info("A2A execute: injecting %d history messages", len(messages))
+                # runtime#133 compact-and-continue (step 2 + step 4):
+                # if the PREVIOUS turn's input_tokens for this
+                # context was at the watermark, compact the
+                # history before adding the new user message. The
+                # next LLM call (now on the compacted history) is
+                # the one that would have overflowed, so this
+                # shortcut prevents the 400 entirely on the
+                # common path. The detection layer (step 1,
+                # context_budget.should_compact_context) decided
+                # the watermark cross; this is the deterministic
+                # act-on-it step. Step 4's brief notice is the
+                # logger.info immediately below — observable, not
+                # silent. _last_input_tokens is updated in the
+                # post-LLM-call block further down (so this
+                # turn's compaction decision is based on the
+                # PREVIOUS turn's usage). If _last_input_tokens
+                # for this context is missing (first turn,
+                # process restart, or context-id rotation), we
+                # fall through without compacting — the LLM call
+                # itself will return 400 if we're already over,
+                # and the existing error path takes over.
+                _last_inp = getattr(self, "_last_input_tokens", {}).get(context_id)
+                if _last_inp is not None and _last_inp > 0:
+                    _ctx_win = get_model_context_window(self._model)
+                    if should_compact_context(int(_last_inp), _ctx_win):
+                        compacted, _stats = compact_messages(
+                            messages,
+                            keep_recent_n=DEFAULT_KEEP_RECENT_N,
+                        )
+                        if _stats.dropped_count > 0:
+                            logger.info(
+                                "context_compacted: context_id=%s model=%s "
+                                "before=%d after=%d dropped=%d system_preserved=%s "
+                                "trigger=last_turn_input_tokens=%d threshold_pct=85 "
+                                "— runtime#133 compact-and-continue",
+                                context_id[:8], self._model,
+                                _stats.original_count, _stats.compacted_count,
+                                _stats.dropped_count, _stats.system_preserved,
+                                int(_last_inp),
+                            )
+                            messages = compacted
                 messages.append(("human", user_content))
 
                 # Recursion limit: see DEFAULT_RECURSION_LIMIT and
@@ -675,6 +732,76 @@ class RuntimeA2AExecutor(AgentExecutor):
                     # Record token usage from the last completed LLM call
                     if last_ai_message is not None:
                         record_llm_token_usage(llm_span, {"messages": [last_ai_message]})
+                        # runtime#133 (smallest-scope-first): emit a
+                        # structured `context budget warning` log when
+                        # the input token count crosses the
+                        # compact-context watermark (default 85% of
+                        # the model's context window). The actual
+                        # compaction algorithm lives in the workspace
+                        # agent (core); this hook surfaces the
+                        # budget-pressure signal in the runtime's log
+                        # so the future workspace-agent step has a
+                        # deterministic event to filter on. The
+                        # log fields (model, input_tokens,
+                        # context_window, threshold_pct) are the
+                        # minimum a downstream consumer needs to
+                        # decide whether/how to compact. A2A-status
+                        # event emission is intentionally NOT wired
+                        # here — that's a follow-up ticket.
+                        try:
+                            usage = (
+                                getattr(last_ai_message, "response_metadata", None) or {}
+                            ).get("usage") or {}
+                            inp = usage.get("input_tokens") or usage.get("prompt_tokens")
+                            if inp is not None and int(inp) > 0:
+                                # runtime#133 (smallest-scope-first):
+                                # track this turn's input_tokens per
+                                # context_id so the NEXT turn's
+                                # compact-and-continue decision (the
+                                # hook above, before
+                                # ``messages.append``) can act on
+                                # the previous turn's usage. LRU-
+                                # bounded by hand to keep memory
+                                # bounded across long-running
+                                # executors that see many
+                                # context_ids (each A2A session
+                                # is one context_id; old ones are
+                                # safe to forget because the
+                                # turn-by-turn tracking only
+                                # matters for the NEXT turn of an
+                                # active session).
+                                _lit = getattr(self, "_last_input_tokens", None)
+                                if _lit is None:
+                                    _lit = {}
+                                    self._last_input_tokens = _lit
+                                if len(_lit) > 256:
+                                    # Drop the oldest half to
+                                    # bound memory; LRU semantics
+                                    # are approximate (dict
+                                    # insertion order is FIFO
+                                    # in CPython 3.7+).
+                                    for _old in list(_lit.keys())[:128]:
+                                        _lit.pop(_old, None)
+                                _lit[context_id] = int(inp)
+                                ctx_win = get_model_context_window(self._model)
+                                # CR2 RC 13423: split the COMPACTION
+                                # decision (urgent: yes whenever the
+                                # previous turn crossed the watermark,
+                                # including the at-the-wall case) from
+                                # the WARNING emission (suppress at the
+                                # wall — that would just be noise since
+                                # the COMPACTION hook already fired). The
+                                # prior single function conflated them
+                                # and skipped compaction at the wall,
+                                # which is exactly when it's needed most.
+                                if should_emit_budget_warning(int(inp), ctx_win):
+                                    pct = round(100.0 * int(inp) / ctx_win, 1) if ctx_win > 0 else 0.0
+                                    logger.warning(
+                                        "context_budget_warning: context_id=%s model=%s input_tokens=%d context_window=%d threshold_pct=%.0f used_pct=%.1f — runtime#133 detection layer (compaction step is the workspace agent's job)",
+                                        context_id[:8], self._model, int(inp), ctx_win, 85.0, pct,
+                                    )
+                        except Exception as _cb_exc:  # never let telemetry break the executor
+                            logger.debug("context_budget detection skipped: %s", _cb_exc)
 
                 # Build final text from all accumulated streaming tokens
                 final_text = "".join(accumulated).strip() or "(no response generated)"
