@@ -258,6 +258,37 @@ def normalise_llm_env(
     result.detected_kind = kind
 
     if kind == "oauth":
+        # runtime#162 (OAuth-leak via ANTHROPIC_AUTH_TOKEN under CP-proxy
+        # routing): when an inherited Anthropic OAuth token arrives via
+        # ANTHROPIC_AUTH_TOKEN while the base URL is the Molecule CP proxy,
+        # the prior code renamed it to CLAUDE_CODE_OAUTH_TOKEN AND stripped
+        # the proxy base URL — making the agent talk directly to
+        # api.anthropic.com (silent billing leak, the 2026-05-28 drain
+        # shape). Fix: drop the token entirely when the proxy would have
+        # authenticated it differently anyway. An OAuth bearer can NEVER
+        # match the CP proxy's per-workspace admin-token auth, so keeping
+        # it serves no purpose — every boot would 401 instead of running
+        # the proxy path. cp_proxy_routed is already computed above
+        # (line 206) for the CLAUDE_CODE_OAUTH_TOKEN guard; reuse it.
+        if cp_proxy_routed:
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            result.cleared_vars.append("ANTHROPIC_AUTH_TOKEN")
+            # Keep the proxy base URL — the SDK still needs it to reach the
+            # proxy via the workspace's own admin token (NOT the OAuth
+            # bearer we just dropped). Removing the URL would force the SDK
+            # back to api.anthropic.com, which is exactly the leak this
+            # branch is closing.
+            result.detected_kind = "oauth_dropped_cp_proxy"
+            result.warning = (
+                "dropped inherited ANTHROPIC_AUTH_TOKEN (OAuth token under "
+                "CP-proxy routing): the Molecule platform LLM proxy "
+                "authenticates via the per-workspace admin token, NOT an "
+                "OAuth bearer — keeping it would 401 the proxy. Renaming "
+                "it to CLAUDE_CODE_OAUTH_TOKEN (the prior behaviour) also "
+                "stripped the proxy URL and silently fell back to native "
+                "Anthropic, which is the runtime#162 billing-leak shape."
+            )
+            return result
         env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
         result.cleared_vars.append("ANTHROPIC_AUTH_TOKEN")

@@ -330,3 +330,135 @@ def test_is_molecule_cp_proxy_base_url_matching():
     assert not m("https://evil.example/?x=/api/v1/internal/llm/anthropic")
     assert not m("/api/v1/internal/llm/anthropic")
     assert not m("")
+
+
+# --- runtime#162: OAuth-leak via ANTHROPIC_AUTH_TOKEN under CP-proxy routing --
+#
+# When an inherited OAuth token arrives via ANTHROPIC_AUTH_TOKEN (not
+# CLAUDE_CODE_OAUTH_TOKEN — that's the #161 case) AND the base URL points at
+# the Molecule CP proxy, the prior code RENAMED the token to CLAUDE_CODE_OAUTH_TOKEN
+# AND STRIPPED the proxy URL. Result: the agent talked directly to api.anthropic.com
+# using the inherited OAuth token (silent billing leak / 2026-05-28 drain shape).
+#
+# Fix: drop the OAuth token entirely when the proxy would have authenticated
+# differently anyway. The CP proxy uses a per-workspace admin token, never an
+# OAuth bearer. Preserve the proxy URL so the SDK still reaches the proxy
+# (using the workspace admin token, not the dropped OAuth bearer).
+
+
+def test_oauth_via_anthropic_auth_token_under_cp_proxy_is_dropped():
+    # The runtime#162 failure case: OAuth token in ANTHROPIC_AUTH_TOKEN, CP
+    # proxy base URL. The token must NOT be renamed to CLAUDE_CODE_OAUTH_TOKEN
+    # (that was the leak) — it must be DROPPED, and the proxy URL must survive.
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-inherited-tenant-leak",
+        "ANTHROPIC_BASE_URL": _CP_PROXY_BASE,
+    }
+    r = normalise_llm_env(env)
+    assert "ANTHROPIC_AUTH_TOKEN" not in env, (
+        "OAuth token under CP-proxy routing must be dropped, not preserved"
+    )
+    assert "ANTHROPIC_AUTH_TOKEN" in r.cleared_vars
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env, (
+        "renaming to CLAUDE_CODE_OAUTH_TOKEN is the leak shape — must not happen"
+    )
+    # Proxy URL MUST survive so the SDK can still reach the proxy with the
+    # workspace's per-workspace admin token.
+    assert env["ANTHROPIC_BASE_URL"] == _CP_PROXY_BASE
+    assert "ANTHROPIC_BASE_URL" not in r.cleared_vars
+    assert r.detected_kind == "oauth_dropped_cp_proxy"
+    assert r.renamed_to is None
+    assert r.warning is not None
+    assert "ANTHROPIC_AUTH_TOKEN" in r.warning
+    assert "Molecule" in r.warning or "CP-proxy" in r.warning or "proxy" in r.warning
+
+
+def test_oauth_via_anthropic_auth_token_to_native_anthropic_still_renamed():
+    # Control: OAuth token + native Anthropic URL → STILL renamed to
+    # CLAUDE_CODE_OAUTH_TOKEN (BYOK-via-OAuth-direct path). The #162 fix must
+    # only kick in for CP-proxy routing.
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-byok-legit",
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+    }
+    r = normalise_llm_env(env)
+    assert r.detected_kind == "oauth"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-byok-legit"
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert env.get("ANTHROPIC_BASE_URL") == "https://api.anthropic.com"
+
+
+def test_oauth_via_anthropic_auth_token_to_byok_proxy_still_renamed():
+    # Control: OAuth token + a non-CP proxy URL → STILL renamed. The proxy
+    # detection is host-agnostic but path-prefix-anchored, so a BYOK proxy
+    # (e.g. a tenant's own internal Anthropic proxy that IS NOT the Molecule
+    # CP) does not match. OAuth rename + base-URL strip happens normally.
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-byok-proxy",
+        "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+    }
+    r = normalise_llm_env(env)
+    assert r.detected_kind == "oauth"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-byok-proxy"
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_oauth_via_anthropic_auth_token_under_cp_proxy_does_not_leak_token():
+    # Security: the warning must NOT contain any bytes of the secret token,
+    # even a prefix — operators paste these warnings into tickets.
+    sensitive = "sk-ant-oat01-verysecret-1234567890abcdef"
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": sensitive,
+        "ANTHROPIC_BASE_URL": _CP_PROXY_BASE,
+    }
+    r = normalise_llm_env(env)
+    assert r.warning is not None
+    for i in range(4, len(sensitive)):
+        assert sensitive[:i] not in r.warning, (
+            f"token prefix leaked to warning: {sensitive[:i]!r} found in "
+            f"{r.warning!r}"
+        )
+
+
+def test_oauth_via_anthropic_auth_token_under_cp_proxy_works_with_provider_arg():
+    # The #162 drop must be UN-GATED on provider (same as #161's CLAUDE_CODE
+    # OAuth path). Provider='anthropic' cannot keep an OAuth token when the
+    # base URL is the CP proxy — OAuth can't authenticate there.
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-inherited",
+        "ANTHROPIC_BASE_URL": _CP_PROXY_BASE,
+    }
+    r = normalise_llm_env(env, provider="anthropic")
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert env["ANTHROPIC_BASE_URL"] == _CP_PROXY_BASE
+    assert r.detected_kind == "oauth_dropped_cp_proxy"
+
+
+def test_oauth_via_anthropic_auth_token_under_cp_proxy_is_idempotent():
+    # Calling normalise_llm_env twice must produce the same result: the second
+    # call sees no ANTHROPIC_AUTH_TOKEN (it was dropped on the first call) and
+    # is a no-op. Prevents the boot loop from re-introducing the leak on retry.
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-idempotent",
+        "ANTHROPIC_BASE_URL": _CP_PROXY_BASE,
+    }
+    r1 = normalise_llm_env(env)
+    assert r1.detected_kind == "oauth_dropped_cp_proxy"
+    r2 = normalise_llm_env(env)
+    assert r2.detected_kind == "none"
+    assert r2.warning is None
+    assert env["ANTHROPIC_BASE_URL"] == _CP_PROXY_BASE
+
+
+def test_summary_renders_oauth_dropped_cp_proxy_without_error():
+    # Boot logs must not crash on the new detected_kind.
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-x",
+        "ANTHROPIC_BASE_URL": _CP_PROXY_BASE,
+    }
+    r = normalise_llm_env(env)
+    line = r.summary()
+    assert "oauth_dropped_cp_proxy" in line
+    assert "ANTHROPIC_AUTH_TOKEN" in line  # in the cleared list
