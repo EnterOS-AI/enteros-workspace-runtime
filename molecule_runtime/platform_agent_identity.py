@@ -283,6 +283,40 @@ def loaded_mcp_tools():
         return None if _loaded_mcp_tools is None else list(_loaded_mcp_tools)
 
 
+def management_mcp_diagnostic() -> dict:
+    """Box-level diagnostic of WHY the management MCP is (or isn't) available.
+
+    cp#3164 root-cause visibility: the existing Layer-2 logs
+    (``on_platform_agent_image``, ``mcp_server_present``) only reach the
+    container's stdout, which is INVISIBLE on a locked-down prod box (no inbound
+    SSH; not shipped to any log store). That blind spot is precisely why the
+    #3164 staging-E2E ("concierge can't create_workspace") stayed red and
+    un-fixable: nobody could see why the ``molecule-platform`` MCP server fails
+    to start. Shipping these four signals in the register/heartbeat payload lets
+    the controlplane — which knows the workspace is ``kind=platform`` — record
+    the cause WITHOUT box access:
+
+      - ``on_platform_agent_image``: False ⇒ the box fell back to the plain
+        runtime image, so the baked ``molecule-platform-mcp`` is absent.
+      - ``mcp_command_resolved``: null ⇒ the ``molecule-platform-mcp`` command
+        is not on PATH ⇒ the MCP server cannot start ⇒ ``status='failed'``.
+      - ``mcp_binary_present`` / ``mcp_settings_entry``: which delivery path (if
+        any) wired the MCP in.
+
+    Computed WITHOUT re-calling the logging helpers so heartbeat cadence does
+    not double the stdout log volume.
+    """
+    import shutil
+
+    val = os.environ.get(PLATFORM_AGENT_IMAGE_ENV, "").strip().lower()
+    return {
+        "on_platform_agent_image": val not in ("", "0", "false", "no"),
+        "mcp_binary_present": os.path.exists(MCPSERVER_PATH),
+        "mcp_settings_entry": _settings_has_management_mcp(),
+        "mcp_command_resolved": shutil.which(MANAGEMENT_MCP_COMMAND),
+    }
+
+
 def identity_gate_payload() -> dict:
     """Return the payload fragment the runtime sends on register/heartbeat.
 
@@ -293,9 +327,13 @@ def identity_gate_payload() -> dict:
     `loaded_mcp_tools` is included ONLY once a live turn has reported a tool
     list (core#3082). Omitting it pre-first-turn keeps the gate fail-closed
     rather than asserting an empty/guessed list.
+
+    `platform_mcp_diag` (cp#3164) ships the box-level diagnostic so a missing /
+    failed management MCP is diagnosable from the controlplane without box SSH.
     """
     payload = {"mcp_server_present": mcp_server_present()}
     tools = loaded_mcp_tools()
     if tools is not None:
         payload["loaded_mcp_tools"] = tools
+    payload["platform_mcp_diag"] = management_mcp_diagnostic()
     return payload
