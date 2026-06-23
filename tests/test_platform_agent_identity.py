@@ -387,34 +387,19 @@ class TestEnsureManagementMCPInSettings:
         fetch failed), then run the boot self-heal. The management MCP must be
         present afterward AND the user plugin must persist.
         """
-        from molecule_runtime.plugins_registry import builtins as b
+        from molecule_runtime.mcp_render import render_claude_settings
+        from pathlib import Path
 
         monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
         settings = self._point_settings_at(monkeypatch, tmp_path)
 
-        # Simulate the runtime's per-plugin additive merge for the user plugin
-        # only (the private molecule-platform-mcp plugin fetch failed at boot).
-        import logging
-
-        class _Ctx:
-            def __init__(self, plugin_root, configs_dir):
-                self.plugin_root = plugin_root
-                self.configs_dir = configs_dir
-                self.logger = logging.getLogger("t")
-
-        class _Res:
-            def __init__(self):
-                self.files_written = []
-                self.warnings = []
-
-        plugin_root = tmp_path / "image-gen-plugin"
-        plugin_root.mkdir()
-        (plugin_root / "settings-fragment.json").write_text(
-            json.dumps({"mcpServers": {"image-gen": {"command": "npx", "args": ["y"]}}})
-        )
-        claude_dir = tmp_path / ".claude"
-        claude_dir.mkdir(parents=True, exist_ok=True)
-        b._merge_settings_fragment(_Ctx(plugin_root, tmp_path), claude_dir, _Res(), "image-gen")
+        # Simulate the runtime's per-plugin MCP wiring for the user plugin only
+        # (the private molecule-platform-mcp plugin fetch failed at boot). The
+        # user plugin's mcpServers now lands in settings.json via the MCP-wiring
+        # PORT's claude renderer (render_claude_settings) — the same path the
+        # default BaseAdapter.register_mcp_server_hook uses — rather than the old
+        # _merge_settings_fragment mcpServers branch (which now skips mcpServers).
+        render_claude_settings(Path(settings), "image-gen", {"command": "npx", "args": ["y"]})
 
         # Pre-self-heal: only the user plugin is present (the bug state).
         pre = json.loads(settings.read_text())

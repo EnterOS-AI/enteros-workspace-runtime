@@ -427,6 +427,73 @@ class BaseAdapter(ABC):
         """Default no-op. Sub-agent-capable runtimes override to register a sub-agent."""
         return None
 
+    # MCP-server config path where THIS runtime reads its mcpServers from.
+    # The default is Claude Code's settings.json (this base class IS the Claude
+    # default — see register_mcp_server_hook). Per-runtime adapters override
+    # mcp_settings_path() so register_mcp_server_hook lands the MCP in the file
+    # their runtime actually reads.
+    def mcp_settings_path(self, config: "AdapterConfig") -> str:
+        """Native MCP-config file for this runtime, absolute.
+
+        Default = ``<config_path>/.claude/settings.json`` (Claude Code). Codex
+        overrides to ``~/.codex/config.toml``, gemini-cli to
+        ``~/.gemini/settings.json``, etc. Tied to the cross-repo delivery
+        contract's per-runtime ``settings_path`` map."""
+        return os.path.join(config.config_path, ".claude", "settings.json")
+
+    def register_mcp_server_hook(self, config: "AdapterConfig", name: str, spec: dict) -> None:
+        """Wire an MCP server into THIS runtime's native config (the MCP-wiring PORT).
+
+        Default implementation = Claude Code behavior: additively deep-merge
+        ``name -> spec`` into ``<config_path>/.claude/settings.json`` under
+        ``mcpServers`` (idempotent, never evicting other servers). This is the
+        SAME behavior the old MCPServerAdaptor hard-coded — promoted to an
+        overridable hook so non-Claude runtimes render the descriptor into the
+        file THEY read (codex → ``~/.codex/config.toml``, …) instead of getting
+        the MCP silently written to ``.claude/settings.json``, which their
+        runtime never reads (the #3159 bug).
+
+        Per-runtime adapters override either:
+          * just :meth:`mcp_settings_path` + this method's renderer choice, or
+          * this whole method, dispatching to the right
+            ``molecule_runtime.mcp_render`` renderer for their format.
+        """
+        from molecule_runtime.mcp_render import render_claude_settings
+        from pathlib import Path
+
+        render_claude_settings(Path(self.mcp_settings_path(config)), name, spec)
+        logger.info("register_mcp_server_hook: wired MCP %r into %s",
+                    name, self.mcp_settings_path(config))
+
+    def management_mcp_present(self, config: "AdapterConfig") -> bool:
+        """True when the privileged management MCP (``molecule-platform``) is
+        wired into THIS runtime's native MCP config.
+
+        This is the runtime-agnostic answer to the RCA#2970 online gate's "is
+        the management MCP wired?" question. The default reads the Claude
+        ``settings.json`` ``mcpServers`` map at :meth:`mcp_settings_path`. A
+        codex/gemini/hermes adapter overrides to parse its own native config
+        (config.toml table, …) so a non-Claude concierge isn't judged against a
+        file its runtime never reads (#3159).
+
+        main.py registers this as the gate probe via
+        ``platform_agent_identity.register_mcp_present_probe`` once the adapter
+        is resolved.
+        """
+        import json as _json
+        from molecule_runtime.platform_agent_identity import (
+            MANAGEMENT_MCP_NAME, MCPSERVERS_KEY,
+        )
+
+        path = self.mcp_settings_path(config)
+        try:
+            with open(path) as fh:
+                data = _json.load(fh)
+        except (OSError, ValueError):
+            return False
+        servers = data.get(MCPSERVERS_KEY) if isinstance(data, dict) else None
+        return isinstance(servers, dict) and MANAGEMENT_MCP_NAME in servers
+
     def append_to_memory_hook(self, config: AdapterConfig, filename: str, content: str) -> None:
         """Append text to /configs/<filename> if the marker isn't already present.
 
@@ -483,6 +550,7 @@ class BaseAdapter(ABC):
                 memory_filename=self.memory_filename(),
                 register_tool=self.register_tool_hook,
                 register_subagent=self.register_subagent_hook,
+                register_mcp_server=lambda n, s, _cfg=config: self.register_mcp_server_hook(_cfg, n, s),
                 append_to_memory=lambda fn, c, _cfg=config: self.append_to_memory_hook(_cfg, fn, c),
             )
             try:

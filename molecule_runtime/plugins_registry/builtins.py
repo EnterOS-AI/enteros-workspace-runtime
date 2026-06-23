@@ -388,7 +388,21 @@ def _merge_settings_fragment(
     else:
         existing = {}
 
-    rewritten = _rewrite_hook_paths(fragment, claude_dir)
+    # mcpServers are NOT merged here. They are wired through the MCP-wiring PORT
+    # (ctx.register_mcp_server → BaseAdapter.register_mcp_server_hook) so that a
+    # non-Claude runtime gets the MCP rendered into the file IT reads (codex
+    # config.toml, …) instead of being silently written to .claude/settings.json
+    # that its runtime never loads (#3159). MCPServerAdaptor parses the
+    # mcpServers block and calls the port; this claude-layer path only handles
+    # hooks (and any other non-mcpServers settings keys). Dropping mcpServers
+    # here also avoids double-writing the same entry on Claude.
+    fragment_no_mcp = {k: v for k, v in fragment.items() if k != "mcpServers"}
+    if not fragment_no_mcp:
+        # The fragment only declared mcpServers — nothing for the claude hook
+        # layer to merge. The port owns it; leave settings.json untouched here.
+        return
+
+    rewritten = _rewrite_hook_paths(fragment_no_mcp, claude_dir)
     merged = _deep_merge_hooks(existing, rewritten)
     settings_path.write_text(json.dumps(merged, indent=2) + "\n")
     result.files_written.append(str(settings_path.relative_to(ctx.configs_dir)))
@@ -449,6 +463,36 @@ def _deep_merge_hooks(existing: dict, fragment: dict) -> dict:
 # ----------------------------------------------------------------------
 
 
+def _read_mcp_descriptor(plugin_root: Path) -> dict[str, dict]:
+    """Parse the runtime-agnostic ``mcpServers`` descriptor a plugin ships.
+
+    The plugin is the SSOT for the descriptor (RFC §2b). Today it is carried in
+    ``settings-fragment.json``'s ``mcpServers`` block — historically the Claude
+    adapter's *rendering*, now read as the canonical descriptor and re-rendered
+    per runtime via the MCP-wiring PORT. A dedicated ``mcp-servers.json`` (a
+    pure descriptor, no Claude framing) takes precedence if present, so a plugin
+    can drop the Claude-specific filename entirely once consumers migrate.
+
+    Returns ``{name: spec}`` (possibly empty). Malformed JSON yields ``{}``.
+    """
+    for candidate in ("mcp-servers.json", "settings-fragment.json"):
+        path = plugin_root / candidate
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        # mcp-servers.json may be either {name: spec} directly or wrapped in an
+        # mcpServers key; settings-fragment.json always nests under mcpServers.
+        servers = data.get("mcpServers", data if candidate == "mcp-servers.json" else {})
+        if isinstance(servers, dict) and servers:
+            return {n: s for n, s in servers.items() if isinstance(s, dict)}
+    return {}
+
+
 class MCPServerAdaptor:
     """Sub-type adaptor for plugins that wrap an MCP server.
 
@@ -477,11 +521,17 @@ class MCPServerAdaptor:
 
     On ``install()``:
 
-      1. ``settings-fragment.json`` → ``_install_claude_layer()`` merges the
-         ``mcpServers`` block into ``<configs>/.claude/settings.json``.
-         Hooks are also merged via the same path (so MCP-server plugins
-         can also ship hooks if they need them).
-      2. Skills + rules + setup.sh → delegated to ``AgentskillsAdaptor``.
+      1. The ``mcpServers`` descriptor (from ``mcp-servers.json`` or
+         ``settings-fragment.json``) is parsed and each entry is wired via the
+         MCP-wiring PORT: ``ctx.register_mcp_server(name, spec)``. The active
+         runtime's adapter renders the descriptor into the file IT reads —
+         ``.claude/settings.json`` for Claude Code (the default hook),
+         ``~/.codex/config.toml`` for codex, etc. This replaces the old path
+         that always wrote ``.claude/settings.json`` regardless of runtime,
+         which silently mis-wired non-Claude concierges (#3159).
+      2. Hooks/commands + skills + rules + setup.sh → delegated to
+         ``AgentskillsAdaptor`` (which still merges any NON-mcpServers
+         settings-fragment keys, e.g. hooks, via the claude layer).
 
     On ``uninstall()``:
 
@@ -510,12 +560,36 @@ class MCPServerAdaptor:
             runtime=self.runtime,
             source="plugin",
         )
-        # 1. Merge mcpServers (and any hooks) from settings-fragment.json.
-        _install_claude_layer(ctx, result, self.plugin_name)
-        # 2. Skills + rules + setup.sh — reuse AgentskillsAdaptor logic.
+        # 1. Wire each MCP server through the runtime-agnostic PORT. The active
+        #    adapter (resolved at install time) renders the descriptor into the
+        #    native config its runtime reads — Claude settings.json, codex
+        #    config.toml, etc. — instead of this adaptor hard-coding the Claude
+        #    path (the #3159 bug: a codex concierge got the MCP written to a file
+        #    its runtime never reads).
+        descriptor = _read_mcp_descriptor(ctx.plugin_root)
+        for name, spec in descriptor.items():
+            try:
+                ctx.register_mcp_server(name, spec)
+                ctx.logger.info("%s: wired MCP server %r via register_mcp_server (runtime=%s)",
+                                self.plugin_name, name, self.runtime)
+            except NotImplementedError as exc:
+                # A runtime whose native MCP-config renderer is not yet
+                # implemented (gemini/hermes stubs). For the privileged
+                # management MCP this is a loud failure — a concierge on that
+                # runtime would boot WITHOUT create_workspace, the exact #3159
+                # class of bug — so surface it like a privileged-install failure.
+                err = f"register_mcp_server({name!r}) unsupported on runtime {self.runtime!r}: {exc}"
+                result.warnings.append(err)
+                result.errors.append(err)
+                ctx.logger.error("%s: %s", self.plugin_name, err)
+                if self.plugin_name == _PRIVILEGED_MCP_PLUGIN:
+                    raise PrivilegedPluginInstallError(err) from exc
+        # 2. Hooks/commands + skills + rules + setup.sh — reuse AgentskillsAdaptor
+        #    logic (its claude layer now skips mcpServers; the PORT owns those).
         sub = await AgentskillsAdaptor(self.plugin_name, self.runtime).install(ctx)
         result.files_written.extend(sub.files_written)
         result.warnings.extend(sub.warnings)
+        result.errors.extend(sub.errors)
         return result
 
     async def uninstall(self, ctx: InstallContext) -> None:

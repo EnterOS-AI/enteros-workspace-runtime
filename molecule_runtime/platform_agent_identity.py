@@ -99,6 +99,32 @@ MANAGEMENT_MCP_SPEC = {
 PLATFORM_AGENT_IDENTITY_LOGGER = "platform-agent.identity"
 logger = logging.getLogger(PLATFORM_AGENT_IDENTITY_LOGGER)
 
+
+# ── Active-adapter MCP-config probe (runtime-agnostic gate) ─────────────────
+# The "is the management MCP wired?" signal must ask the ACTIVE runtime where
+# IT reads MCP servers from — not unconditionally read .claude/settings.json,
+# which is meaningless on a codex/gemini/hermes concierge (the #3159 bug). The
+# claude path stays the DEFAULT when no adapter probe is registered (so the
+# baked-image self-heal, the legacy binary path, and every existing test keep
+# working unchanged).
+#
+# main.py registers a probe right after it creates the adapter:
+#   register_mcp_present_probe(lambda: adapter.management_mcp_present(cfg))
+# A probe returns True/False ("is the management MCP wired into MY native
+# config?"). When unset, the gate falls back to the claude settings.json check.
+_mcp_present_probe = None  # type: callable | None
+
+
+def register_mcp_present_probe(probe) -> None:
+    """Register the active adapter's "is the management MCP wired?" probe.
+
+    ``probe`` is a zero-arg callable returning bool. Pass None to clear (tests).
+    main.py wires this from the resolved adapter so the gate asks the runtime
+    that's actually running rather than assuming Claude's settings.json.
+    """
+    global _mcp_present_probe
+    _mcp_present_probe = probe
+
 def on_platform_agent_image() -> bool:
     """True when this container is the baked platform-agent (concierge) image.
 
@@ -220,10 +246,13 @@ def _settings_has_management_mcp() -> bool:
 def mcp_server_present() -> bool:
     """Return True when the management MCP is available to this runtime.
 
-    Delivery-agnostic: a baked ``/opt/molecule-mcp-server`` binary OR a
-    plugin-wired ``molecule-platform`` entry in the Claude ``settings.json``
-    both prove the org-admin MCP tooling is wired in. Absence of both is
-    fail-closed.
+    Delivery- AND runtime-agnostic: a baked ``/opt/molecule-mcp-server`` binary
+    OR a plugin-wired ``molecule-platform`` entry in the ACTIVE runtime's native
+    MCP config both prove the org-admin MCP tooling is wired in. The active
+    runtime is consulted via the registered probe (``register_mcp_present_probe``
+    — main.py wires it from the resolved adapter); when no probe is registered
+    the check falls back to the Claude ``settings.json`` (the default, since
+    Claude Code is the base runtime). Absence of both is fail-closed.
 
     NECESSARY-BUT-NOT-SUFFICIENT. This is the runtime-side *liveness* signal that
     the management MCP is wired in; it is NOT an authorization check. The actual
@@ -236,16 +265,37 @@ def mcp_server_present() -> bool:
     aligned with the cross-repo contract (see module docstring).
     """
     binary_exists = os.path.exists(MCPSERVER_PATH)
-    settings_has = _settings_has_management_mcp()
+    # Ask the ACTIVE runtime where IT reads MCP servers from. When a probe is
+    # registered (main.py wires it from the resolved adapter), it answers "is
+    # the management MCP wired into MY native config?" — codex reads
+    # config.toml, gemini reads its own settings.json, etc. When no probe is
+    # registered, fall back to the claude settings.json check (the default and
+    # the historical behavior). A probe error is swallowed and treated as the
+    # claude fallback so a buggy probe can never crash the register/heartbeat.
+    settings_has = False
+    probe_used = False
+    probe = _mcp_present_probe
+    if probe is not None:
+        try:
+            settings_has = bool(probe())
+            probe_used = True
+        except Exception:  # noqa: BLE001 — never let a probe crash the gate
+            logger.exception(
+                "platform-agent.identity: mcp_present probe raised; "
+                "falling back to claude settings.json check"
+            )
+    if not probe_used:
+        settings_has = _settings_has_management_mcp()
     present = binary_exists or settings_has
     # cp#3164 Layer-2 observability: log which delivery path satisfied
     # the gate (or neither). The two booleans map 1:1 to the two
-    # delivery mechanisms (baked binary vs plugin-wired settings.json),
+    # delivery mechanisms (baked binary vs adapter-wired native config),
     # so a stuck-False case is immediately diagnosable.
     logger.info(
         "platform-agent.identity: mcp_server_present=%s "
-        "(binary=%s at %s, settings_has_entry=%s)",
+        "(binary=%s at %s, settings_has_entry=%s via %s)",
         present, binary_exists, MCPSERVER_PATH, settings_has,
+        "adapter-probe" if probe_used else "claude-settings-fallback",
     )
     return present
 

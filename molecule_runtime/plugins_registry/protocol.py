@@ -6,9 +6,17 @@ via :func:`plugins_registry.resolve` and calls ``install(ctx)`` to wire the
 plugin into a workspace.
 
 The :class:`InstallContext` deliberately gives adaptors ONLY the hooks they
-need (``register_tool``, ``register_subagent``, ``append_to_memory``) — it
-does not leak runtime internals. This keeps adaptors thin and lets the
-workspace runtime adapter own its own state.
+need (``register_tool``, ``register_subagent``, ``register_mcp_server``,
+``append_to_memory``) — it does not leak runtime internals. This keeps adaptors
+thin and lets the workspace runtime adapter own its own state.
+
+The ``register_mcp_server`` hook is the MCP-wiring PORT: an adaptor that wraps
+an MCP server calls ``ctx.register_mcp_server(name, spec)`` with a
+runtime-AGNOSTIC descriptor (``{command, args?, env?}``), and the active
+runtime's adapter renders it into the native config that runtime actually reads
+(Claude → ``.claude/settings.json``; codex → ``~/.codex/config.toml``; …). This
+replaces the old hard-coded "always merge into Claude settings.json" path that
+silently mis-wired non-Claude concierges (#3159).
 """
 
 from __future__ import annotations
@@ -66,6 +74,24 @@ class InstallContext:
         default=lambda name, spec: None
     )
     """Register a sub-agent specification. No-op on runtimes without sub-agents."""
+
+    register_mcp_server: Callable[[str, dict[str, Any]], None] = field(
+        default=lambda name, spec: None
+    )
+    """Wire an MCP server into the active runtime's native config.
+
+    ``name`` is the server's ``mcpServers`` key (e.g. ``molecule-platform``);
+    ``spec`` is the runtime-agnostic descriptor ``{command, args?, env?}``. The
+    adapter behind this hook renders ``spec`` into whatever file its runtime
+    reads MCP servers from — ``.claude/settings.json`` for Claude Code,
+    ``~/.codex/config.toml`` for codex, etc.
+
+    The default no-op lets adaptors run in test harnesses without a real
+    workspace filesystem. The real implementation is
+    :meth:`BaseAdapter.register_mcp_server_hook`, bound in
+    ``install_plugins_via_registry``. Adaptors MUST call this hook rather than
+    writing ``.claude/settings.json`` directly so non-Claude runtimes get the
+    MCP wired into the file they actually read (#3159)."""
 
     append_to_memory: Callable[[str, str], None] = field(
         default=lambda filename, content: None

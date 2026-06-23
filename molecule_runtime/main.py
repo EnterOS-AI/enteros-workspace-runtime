@@ -393,6 +393,23 @@ async def main():  # pragma: no cover
         heartbeat=heartbeat,
     )
 
+    # 4a. Wire the runtime-agnostic management-MCP gate probe (#3159). The
+    # RCA#2970 online gate must ask the ACTIVE adapter whether the management
+    # MCP is wired into the file IT reads (codex config.toml, gemini
+    # settings.json, …) rather than unconditionally checking
+    # .claude/settings.json. main.py is the one place that holds both the
+    # adapter and its config, so it registers the probe here. The baked-binary
+    # path and the claude-settings fallback both still apply inside
+    # mcp_server_present().
+    try:
+        from molecule_runtime.platform_agent_identity import register_mcp_present_probe
+        register_mcp_present_probe(
+            lambda _a=adapter, _c=adapter_config: _a.management_mcp_present(_c)
+        )
+    except Exception:  # noqa: BLE001 — probe wiring must never block boot
+        print("WARNING: failed to register management-MCP gate probe; "
+              "falling back to claude settings.json check")
+
     # 5. Build the AgentCard *before* adapter.setup() so /.well-known/agent-card.json
     # is reachable as soon as uvicorn binds, regardless of whether the adapter
     # has working LLM credentials. Decoupling readiness ("is the workspace up?")
