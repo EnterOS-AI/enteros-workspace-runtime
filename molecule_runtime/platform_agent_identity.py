@@ -41,6 +41,7 @@ in this repo.
 """
 
 import json
+import logging
 import os
 import threading
 
@@ -88,6 +89,15 @@ MANAGEMENT_MCP_SPEC = {
     "env": {"MOLECULE_MCP_MODE": "management"},
 }
 
+# Explicit logger name (not `__name__`) so the gate-decision log lines
+# surface under a stable, grep-friendly namespace regardless of how Python's
+# import system happens to spell the module path. CR2 RC 13372: the
+# previous `__name__`-derived logger would surface as
+# `molecule_runtime.platform_agent_identity` (varies with sys.path / package
+# layout), breaking the documented "grep platform-agent.identity"
+# operator contract. Pin the name explicitly.
+PLATFORM_AGENT_IDENTITY_LOGGER = "platform-agent.identity"
+logger = logging.getLogger(PLATFORM_AGENT_IDENTITY_LOGGER)
 
 def on_platform_agent_image() -> bool:
     """True when this container is the baked platform-agent (concierge) image.
@@ -97,7 +107,17 @@ def on_platform_agent_image() -> bool:
     non-empty, non-"0"/"false" string so a stray ``=0`` doesn't flip it on.
     """
     val = os.environ.get(PLATFORM_AGENT_IMAGE_ENV, "").strip().lower()
-    return val not in ("", "0", "false", "no")
+    on_image = val not in ("", "0", "false", "no")
+    # cp#3164 Layer-2 observability: log the env var state at boot so a
+    # future #3164-style incident ("concierge LLM doesn't see the
+    # management MCP") can be diagnosed from the boot logs alone. The
+    # value is included so operators can spot a stale/missing
+    # MOLECULE_PLATFORM_AGENT_IMAGE_BAKED without ssh-ing in.
+    logger.info(
+        "platform-agent.identity: env=%s=%r -> on_platform_agent_image=%s",
+        PLATFORM_AGENT_IMAGE_ENV, os.environ.get(PLATFORM_AGENT_IMAGE_ENV), on_image,
+    )
+    return on_image
 
 
 def ensure_management_mcp_in_settings() -> bool:
@@ -135,6 +155,16 @@ def ensure_management_mcp_in_settings() -> bool:
     Returns True when settings.json was (re)written, False otherwise.
     """
     if not on_platform_agent_image():
+        # cp#3164 Layer-2 observability: log the no-op so a future
+        # #3164-style incident ("concierge on an ordinary workspace image
+        # OR a stale image that doesn't set the marker") is
+        # diagnosable from the boot logs alone. The decision is made
+        # by on_platform_agent_image() which already logs the env var.
+        logger.info(
+            "platform-agent.identity: ensure_management_mcp_in_settings "
+            "skipped (not on platform-agent image) — relying on plugin "
+            "install pipeline for any management MCP wiring"
+        )
         return False
 
     path = SETTINGS_PATH
@@ -205,7 +235,19 @@ def mcp_server_present() -> bool:
     boolean grants nothing without the server-side grant. Keep the literals here
     aligned with the cross-repo contract (see module docstring).
     """
-    return os.path.exists(MCPSERVER_PATH) or _settings_has_management_mcp()
+    binary_exists = os.path.exists(MCPSERVER_PATH)
+    settings_has = _settings_has_management_mcp()
+    present = binary_exists or settings_has
+    # cp#3164 Layer-2 observability: log which delivery path satisfied
+    # the gate (or neither). The two booleans map 1:1 to the two
+    # delivery mechanisms (baked binary vs plugin-wired settings.json),
+    # so a stuck-False case is immediately diagnosable.
+    logger.info(
+        "platform-agent.identity: mcp_server_present=%s "
+        "(binary=%s at %s, settings_has_entry=%s)",
+        present, binary_exists, MCPSERVER_PATH, settings_has,
+    )
+    return present
 
 
 # ── loaded_mcp_tools producer (core#3082) ──────────────────────────────────
