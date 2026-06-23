@@ -243,3 +243,34 @@ def test_main_warns_and_skips_reconcile_on_scope_gap(monkeypatch: pytest.MonkeyP
     err = capsys.readouterr().err
     assert rc == 0, "scope-gap reconcile must not fail the guard"
     assert "skipping org-scan reconcile" in err
+
+
+def test_clone_consumers_never_puts_token_in_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """GIT_ASKPASS path: token must not appear in git clone argv or remote URL (runtime#86).
+
+    Re-introduced on the runtime#86 branch after Kimi's prior commit
+    (061716f) was reverted twice on main; the gate test (see
+    tests/test_workflow_no_token_in_url.py) makes a future reversion
+    red-by-default in CI.
+    """
+    import subprocess
+
+    captured: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def capture_run(*args: object, **kwargs: object) -> object:
+        captured.append((args, kwargs))
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", capture_run)
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    import check_consumer_runtime_drift as guard
+    guard.clone_consumers(workdir, ("molecule-core",), gitea_url="https://git.moleculesai.app", token="s3cr3t-t0k3n")
+
+    assert len(captured) == 1
+    cmd = captured[0][0][0]
+    env = captured[0][1].get("env") or {}
+    cmd_str = " ".join(str(c) for c in cmd)
+    assert "s3cr3t-t0k3n" not in cmd_str, "token leaked into subprocess argv"
+    assert "x-access-token" not in cmd_str, "username leaked into subprocess argv"
+    assert env.get("GIT_ASKPASS") is not None, "GIT_ASKPASS not set in clone env"

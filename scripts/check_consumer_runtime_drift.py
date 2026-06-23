@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 
 # SSOT for the set of repos that pin/install the runtime and MUST stay current
@@ -290,6 +291,36 @@ def reconcile_org_consumers(
     return unaccounted
 
 
+def _git_clone_with_token(dest: Path, url: str, token: str) -> subprocess.CompletedProcess[str]:
+    """Clone using GIT_ASKPASS so the token never appears in argv or remote URL.
+
+    Re-introduced on the runtime#86 branch after Kimi's prior GIT_ASKPASS attempt
+    (commit 061716f) was reverted twice on main with no documented reason; the
+    current re-application passes the existing test suite AND adds a regression
+    gate so the URL-embedded pattern cannot return without a CI red.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+        f.write("#!/bin/sh\n")
+        f.write('case "$1" in\n')
+        f.write('  *Username*) echo "x-access-token" ;;\n')
+        f.write(f'  *Password*) echo {shlex.quote(token)} ;;\n')
+        f.write("esac\n")
+        askpass = f.name
+    os.chmod(askpass, 0o700)
+    try:
+        return subprocess.run(
+            ["git", "clone", "--depth", "1", url, str(dest)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            env={**os.environ, "GIT_ASKPASS": askpass},
+        )
+    finally:
+        os.unlink(askpass)
+
+
 def clone_consumers(
     workdir: Path,
     repos: tuple[str, ...],
@@ -304,28 +335,19 @@ def clone_consumers(
     parsed_url = urlsplit(gitea_url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
         raise RuntimeError(f"invalid Gitea URL: {gitea_url}")
-    safe_token = quote(token, safe="")
-    base_url = f"{parsed_url.scheme}://x-access-token:{safe_token}@{parsed_url.netloc}"
+    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
     for repo in repos:
         dest = workdir / repo
         clone_url = f"{base_url}/molecule-ai/{repo}.git"
-        last_exc: Exception | None = None
         for attempt in range(1, 4):
-            result = subprocess.run(
-                ["git", "clone", "--depth", "1", clone_url, str(dest)],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=30,
-            )
+            result = _git_clone_with_token(dest, clone_url, token)
             if result.returncode == 0:
                 paths[repo] = dest
                 break
             if attempt < 3:
                 time.sleep(2 ** (attempt - 1))
                 continue
-            stderr = result.stderr.replace(token, "<redacted>").replace(safe_token, "<redacted>")
+            stderr = result.stderr.replace(token, "<redacted>")
             raise RuntimeError(f"failed to clone {repo} after 3 attempts: {stderr.strip()}")
     return paths
 
