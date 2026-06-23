@@ -24,6 +24,7 @@ from molecule_runtime.context_budget import (
     MODEL_CONTEXT_WINDOWS,
     get_model_context_window,
     should_compact_context,
+    should_emit_budget_warning,
 )
 
 
@@ -82,7 +83,21 @@ class TestGetModelContextWindow:
 
 
 class TestShouldCompactContext:
-    """Pin the threshold + headroom semantics of the runtime#133 detection."""
+    """Pin the COMPACTION decision semantics (CR2 RC 13423 fix).
+
+    Post-fix semantics: ``should_compact_context`` is the URGENT
+    COMPACTION check. When the previous turn crossed the watermark
+    (input_tokens >= context_window * threshold_pct), the NEXT turn
+    is at imminent overflow risk and must be compacted — regardless
+    of how close to the wall we already are. The previous version
+    had a ``headroom_tokens`` floor (default 256) that suppressed
+    this case, which was the CR2 RC 13423 correctness bug: a
+    near-wall previous turn returned False (no compaction) when
+    compaction is most needed. The headroom floor moved to the
+    WARNING-emission helper
+    (:func:`should_emit_budget_warning`) — the warning is
+    suppressable at the wall (it's noise), but compaction is not.
+    """
 
     def test_default_watermark_is_85pct_per_spec(self) -> None:
         # The runtime#133 spec fixes the watermark at 85% of the
@@ -111,35 +126,25 @@ class TestShouldCompactContext:
             input_tokens=180_000, context_window=200_000
         ) is True
 
-    def test_at_wall_does_not_trigger(self) -> None:
-        # When the agent is AT the model wall (input_tokens ==
-        # context_window), the headroom rule suppresses the
-        # "approaching the limit" notice. Emitting it at 0 tokens
-        # of headroom is noise — the agent is already there, and
-        # the next LLM call will return a 400, which the existing
-        # error path (auto-heal/reset) already handles.
+    def test_at_wall_triggers(self) -> None:
+        # CR2 RC 13423 regression guard: at the model wall
+        # (input_tokens == context_window, 0 headroom), the
+        # COMPACTION decision MUST be True. The previous version
+        # suppressed this case via the headroom_tokens floor and
+        # returned False here — exactly when the next turn WILL
+        # overflow and compaction is most needed. The headroom
+        # floor was moved to should_emit_budget_warning (the
+        # warning is suppressable at the wall; compaction is not).
         assert should_compact_context(
             input_tokens=200_000, context_window=200_000
-        ) is False
+        ) is True
 
-    def test_within_min_headroom_does_not_trigger(self) -> None:
-        # 1 token of headroom is below MIN_HEADROOM_TOKENS (256) —
-        # must NOT trigger, even if we've crossed the watermark.
-        # (Edge case: 85% of 200K = 170_000, so 170_001 is past the
-        # watermark but only 29_999 tokens of headroom remain.
-        # That's well above 256, so this would normally trigger.
-        # We need a tighter edge: a window so small that 256 tokens
-        # of headroom == below watermark. Use 200K window, input
-        # 199_999 -> 1 token of headroom.)
+    def test_just_below_wall_triggers(self) -> None:
+        # Same regression guard as test_at_wall_triggers, with
+        # 1 token of headroom. Pre-fix: returned False. Post-fix:
+        # True (compaction is urgent).
         assert should_compact_context(
             input_tokens=199_999, context_window=200_000
-        ) is False
-
-    def test_just_above_min_headroom_triggers(self) -> None:
-        # 200K - 257 = 199_743 input tokens, 257 headroom — just
-        # above the 256-token min headroom floor. Must trigger.
-        assert should_compact_context(
-            input_tokens=199_743, context_window=200_000
         ) is True
 
     def test_invalid_threshold_is_fail_closed(self) -> None:
@@ -183,11 +188,57 @@ class TestShouldCompactContext:
             input_tokens=140_000, context_window=200_000, threshold_pct=0.70
         ) is True
 
+
+class TestShouldEmitBudgetWarning:
+    """Pin the WARNING-emission semantics (CR2 RC 13423 fix).
+
+    The warning IS suppressable at the wall: when the agent is
+    already at the model wall, emitting "you're approaching the
+    limit" is noise (the next call WILL overflow regardless, and
+    compaction has already fired from should_compact_context). This
+    helper keeps the headroom_tokens floor that the prior combined
+    function had, so the warning contract stays: "you have room to
+    compact, do it now" — never "you have zero room, sorry."
+    """
+
+    def test_below_watermark_does_not_warn(self) -> None:
+        assert should_emit_budget_warning(
+            input_tokens=167_999, context_window=200_000
+        ) is False
+
+    def test_above_watermark_with_headroom_warns(self) -> None:
+        # 90% of 200K = 180_000, 20K headroom — well above the 256
+        # floor. Must warn.
+        assert should_emit_budget_warning(
+            input_tokens=180_000, context_window=200_000
+        ) is True
+
+    def test_at_wall_does_not_warn(self) -> None:
+        # At the wall (0 headroom), the warning is suppressed —
+        # compaction has already fired, and "you're approaching the
+        # limit" is just noise.
+        assert should_emit_budget_warning(
+            input_tokens=200_000, context_window=200_000
+        ) is False
+
+    def test_just_below_wall_does_not_warn(self) -> None:
+        # 1 token of headroom is below the 256-token floor — must
+        # NOT warn.
+        assert should_emit_budget_warning(
+            input_tokens=199_999, context_window=200_000
+        ) is False
+
+    def test_just_above_min_headroom_warns(self) -> None:
+        # 257 tokens of headroom — just above the 256 floor. Must
+        # warn.
+        assert should_emit_budget_warning(
+            input_tokens=199_743, context_window=200_000
+        ) is True
+
     def test_min_headroom_constant_pinned(self) -> None:
-        # Sanity: the spec says "85% of the model's context" and
-        # doesn't specify headroom. 256 is a deliberate choice
+        # The 256-token headroom floor is a deliberate choice
         # (small enough to be a real budget pressure, large enough
-        # to be a meaningful "you have room to compact" notice). If
-        # you change this, also update the test in
-        # test_within_min_headroom_does_not_trigger.
+        # to be a meaningful "you have room to compact" notice).
+        # If you change this, update TestShouldCompactContext
+        # fixtures that depend on the threshold-vs-headroom gap.
         assert MIN_HEADROOM_TOKENS == 256

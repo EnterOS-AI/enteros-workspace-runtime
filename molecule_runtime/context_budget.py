@@ -136,15 +136,17 @@ def should_compact_context(
     input_tokens: int,
     context_window: int,
     threshold_pct: float = DEFAULT_COMPACT_THRESHOLD_PCT,
-    headroom_tokens: int = MIN_HEADROOM_TOKENS,
 ) -> bool:
     """Return True if the current input-token count has crossed the
     compact-context watermark for the given model.
 
     The threshold is "X% of the context window" (per the runtime#133
-    spec). Returns False in degenerate cases (non-positive window,
-    threshold outside (0, 1]) so the runtime never emits a spurious
-    warning off a misconfigured model.
+    spec). This is the COMPACTION decision — when the previous turn
+    crossed the watermark, the NEXT turn is at imminent overflow
+    risk and must be compacted, regardless of how close to the
+    wall we already are. Returns False in degenerate cases
+    (non-positive window, threshold outside (0, 1], negative input)
+    so the runtime never compacts on a misconfigured model.
 
     Args:
         input_tokens: the current conversation's input-token count
@@ -154,19 +156,60 @@ def should_compact_context(
             (use :func:`get_model_context_window`).
         threshold_pct: watermark as a fraction in (0, 1). Default
             0.85 per the spec.
-        headroom_tokens: minimum headroom (in tokens) below the
-            watermark before emitting the warning. Prevents the
-            "approaching the limit" notice when the agent is already
-            at the wall. Default 256.
 
     Returns:
-        True iff the input has crossed the watermark AND there is
-        at least ``headroom_tokens`` of headroom below the watermark
-        for the future compaction to act on.
+        True iff the input has crossed the watermark.
+
+    Note (CR2 RC 13423): the previous version of this function ALSO
+    applied a ``headroom_tokens`` floor (default 256), which
+    conflated two concerns — the COMPACTION decision (urgent: yes
+    whenever we're at or above the watermark) and the WARNING
+    emission (don't spam at the wall). The headroom floor made the
+    COMPACTION decision return False when previous_turn_input was
+    nearly at the wall — exactly the case where compaction is most
+    urgent and the next turn WILL overflow. This split separates the
+    two: ``should_compact_context`` is the urgent COMPACTION check
+    (no headroom floor), and :func:`should_emit_budget_warning` is
+    the optional, suppressable WARNING check (with the headroom
+    floor preserved for the no-spam-at-the-wall semantics).
     """
     if context_window <= 0 or not (0.0 < threshold_pct < 1.0):
         return False
     if input_tokens < 0:
         return False
     watermark = int(context_window * threshold_pct)
-    return input_tokens >= watermark and (context_window - input_tokens) >= headroom_tokens
+    return input_tokens >= watermark
+
+
+def should_emit_budget_warning(
+    input_tokens: int,
+    context_window: int,
+    threshold_pct: float = DEFAULT_COMPACT_THRESHOLD_PCT,
+    headroom_tokens: int = MIN_HEADROOM_TOKENS,
+) -> bool:
+    """Return True if the runtime should emit a context_budget_warning
+    log for the current turn.
+
+    Same watermark check as :func:`should_compact_context`, plus a
+    headroom floor so we don't spam the "approaching the limit"
+    notice when the agent is already at the wall (the next call
+    WILL overflow regardless, so a warning is just noise — the
+    COMPACTION hook in :func:`should_compact_context` is what
+    actually fires).
+
+    Args:
+        input_tokens: the current conversation's input-token count.
+        context_window: the model's context-window size in tokens.
+        threshold_pct: watermark as a fraction in (0, 1). Default 0.85.
+        headroom_tokens: minimum headroom (in tokens) below the
+            watermark before emitting the warning. Default 256.
+
+    Returns:
+        True iff the input has crossed the watermark AND there is
+        at least ``headroom_tokens`` of headroom below the watermark
+        for the warning to be a meaningful "you still have room to
+        compact" notice (not "you're already at the wall").
+    """
+    if not should_compact_context(input_tokens, context_window, threshold_pct):
+        return False
+    return (context_window - input_tokens) >= headroom_tokens

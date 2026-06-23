@@ -87,6 +87,7 @@ from molecule_runtime.builtin_tools.telemetry import (
 from molecule_runtime.context_budget import (
     get_model_context_window,
     should_compact_context,
+    should_emit_budget_warning,
 )
 from molecule_runtime.compact import (
     DEFAULT_KEEP_RECENT_N,
@@ -783,7 +784,17 @@ class RuntimeA2AExecutor(AgentExecutor):
                                         _lit.pop(_old, None)
                                 _lit[context_id] = int(inp)
                                 ctx_win = get_model_context_window(self._model)
-                                if should_compact_context(int(inp), ctx_win):
+                                # CR2 RC 13423: split the COMPACTION
+                                # decision (urgent: yes whenever the
+                                # previous turn crossed the watermark,
+                                # including the at-the-wall case) from
+                                # the WARNING emission (suppress at the
+                                # wall — that would just be noise since
+                                # the COMPACTION hook already fired). The
+                                # prior single function conflated them
+                                # and skipped compaction at the wall,
+                                # which is exactly when it's needed most.
+                                if should_emit_budget_warning(int(inp), ctx_win):
                                     pct = round(100.0 * int(inp) / ctx_win, 1) if ctx_win > 0 else 0.0
                                     logger.warning(
                                         "context_budget_warning: context_id=%s model=%s input_tokens=%d context_window=%d threshold_pct=%.0f used_pct=%.1f — runtime#133 detection layer (compaction step is the workspace agent's job)",
