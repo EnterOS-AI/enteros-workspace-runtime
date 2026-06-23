@@ -33,6 +33,7 @@ reads).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 # The settings.json map key under which MCP servers live for the JSON runtimes
@@ -41,6 +42,12 @@ MCPSERVERS_KEY = "mcpServers"
 
 # Codex reads MCP servers from this TOML table.
 CODEX_MCP_TABLE = "mcp_servers"
+
+
+def normalize_runtime(runtime: str) -> str:
+    """Canonicalize a runtime identifier to the underscore dispatch key
+    (``claude-code`` -> ``claude_code``)."""
+    return (runtime or "").strip().lower().replace("-", "_")
 
 
 # ---------------------------------------------------------------------------
@@ -202,3 +209,120 @@ def render_hermes_config(config_path: Path, name: str, spec: dict) -> None:
     raise NotImplementedError(
         "hermes MCP render not implemented — format unverified (#3159 follow-up)"
     )
+
+
+# ===========================================================================
+# Per-runtime dispatch — the production wiring.
+# ===========================================================================
+# The default BaseAdapter hook dispatches HERE on the active runtime name
+# (self.name()), so a REAL codex concierge gets codex rendering through the
+# normal install_plugins_via_registry path WITHOUT needing a per-template
+# adapter override. Without this dispatch the default hook would render Claude
+# settings.json for every runtime — which is the exact #3159 flaw (a codex run
+# writing the management MCP to a file its runtime never reads).
+#
+# Each runtime entry declares:
+#   path:    config_path -> absolute native MCP-config file for this runtime
+#   render:  (Path, name, spec) -> None   native renderer
+#   present: (Path) -> bool               does this native file declare `name`?
+# The renderer for an unverified runtime raises NotImplementedError (fail-loud),
+# which the privileged-plugin install path turns into a loud boot failure rather
+# than a silently capability-less concierge.
+
+
+def _claude_path(config_path: str | os.PathLike) -> Path:
+    return Path(config_path) / ".claude" / "settings.json"
+
+
+def _codex_path(config_path: str | os.PathLike) -> Path:
+    # Codex reads ~/.codex/config.toml. config_path is unused (the codex CLI
+    # resolves $HOME), but the signature is uniform across runtimes.
+    return Path(os.path.expanduser("~")) / ".codex" / "config.toml"
+
+
+def _gemini_path(config_path: str | os.PathLike) -> Path:
+    return Path(os.path.expanduser("~")) / ".gemini" / "settings.json"
+
+
+def _json_settings_has(settings_path: Path, name: str) -> bool:
+    try:
+        data = json.loads(Path(settings_path).read_text())
+    except (OSError, ValueError):
+        return False
+    servers = data.get(MCPSERVERS_KEY) if isinstance(data, dict) else None
+    return isinstance(servers, dict) and name in servers
+
+
+def _codex_config_has(config_path: Path, name: str) -> bool:
+    """True when the codex config.toml declares ``[mcp_servers.<name>]``.
+
+    Uses stdlib ``tomllib`` (read-only; available 3.11+, our floor) so the
+    present-check parses the real TOML rather than string-matching markers.
+    """
+    import tomllib
+
+    try:
+        data = tomllib.loads(Path(config_path).read_text())
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return False
+    table = data.get(CODEX_MCP_TABLE)
+    return isinstance(table, dict) and name in table
+
+
+# runtime -> (path_resolver, renderer, present_reader). Unverified runtimes get
+# the fail-loud renderer; their present_reader returns False (never silently
+# "present"). claude_code is also the default for any unknown runtime so the
+# base behavior is unchanged when a new runtime hasn't been mapped yet.
+_RUNTIME_SPECS: dict[str, tuple] = {
+    "claude_code": (_claude_path, render_claude_settings, _json_settings_has),
+    "codex": (_codex_path, render_codex_config, _codex_config_has),
+    "gemini_cli": (_gemini_path, render_gemini_settings, _json_settings_has),
+    # hermes: native path unverified; fail-loud render, never falsely present.
+    "hermes": (_claude_path, render_hermes_config, lambda p, n: False),
+}
+
+# The runtime used when the active runtime isn't mapped above. Claude Code is
+# the base runtime, so an unmapped runtime keeps today's behavior rather than
+# crashing — EXCEPT the privileged management MCP, whose install path fails loud
+# on a runtime it can't prove it rendered for.
+_DEFAULT_RUNTIME = "claude_code"
+
+
+# Runtimes whose renderer is a deliberate fail-loud stub (format unverified).
+_UNVERIFIED_RUNTIMES = frozenset({"gemini_cli", "hermes"})
+
+
+def _spec_for(runtime: str) -> tuple:
+    return _RUNTIME_SPECS.get(normalize_runtime(runtime), _RUNTIME_SPECS[_DEFAULT_RUNTIME])
+
+
+def is_runtime_supported(runtime: str) -> bool:
+    """True when this runtime has a CONCRETE (non-stub) renderer mapped.
+
+    Unmapped runtimes fall back to the claude renderer (supported); the
+    gemini/hermes stubs are mapped but their renderer raises, so they are
+    reported unsupported."""
+    return normalize_runtime(runtime) not in _UNVERIFIED_RUNTIMES
+
+
+def mcp_settings_path_for(runtime: str, config_path: str | os.PathLike) -> Path:
+    """Absolute native MCP-config file the given runtime reads from."""
+    return _spec_for(runtime)[0](config_path)
+
+
+def render_for_runtime(runtime: str, config_path: str | os.PathLike, name: str, spec: dict) -> Path:
+    """Render ``name -> spec`` into the given runtime's native MCP config.
+
+    Returns the path written. Raises NotImplementedError for an unverified
+    runtime (gemini/hermes) — the caller decides whether that's fatal (it is for
+    the privileged management MCP)."""
+    path_fn, render_fn, _ = _spec_for(runtime)
+    target = path_fn(config_path)
+    render_fn(target, name, spec)
+    return target
+
+
+def management_mcp_present_for(runtime: str, config_path: str | os.PathLike, name: str) -> bool:
+    """True when ``name`` is declared in the given runtime's native MCP config."""
+    path_fn, _, present_fn = _spec_for(runtime)
+    return present_fn(path_fn(config_path), name)
