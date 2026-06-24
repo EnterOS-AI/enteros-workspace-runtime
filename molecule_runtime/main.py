@@ -42,6 +42,32 @@ def _is_privileged_setup_failure(setup_err: BaseException) -> bool:
     return isinstance(setup_err, PrivilegedPluginInstallError)
 
 
+def _probe_wiring_failure_is_fatal() -> bool:
+    """Return True when failing to wire the management-MCP gate probe must ABORT
+    the boot (fail-closed) rather than degrade to the claude settings.json
+    fallback (fail-open).
+
+    The probe is the ONLY runtime-agnostic way the RCA#2970 online gate can tell
+    whether the management MCP is wired into the file THIS runtime actually
+    reads. If wiring it fails on a PLATFORM agent (concierge) and we silently
+    fall back to the claude settings.json check, a non-claude concierge
+    (codex/openclaw/…) is judged against a file it never reads — the #3159
+    cross-runtime mis-attribution (a healthy concierge false-negatived, or a
+    wrong "present" asserted). That is a fail-OPEN of the platform gate, so on a
+    platform agent it is FATAL. An ordinary (non-platform) workspace does not
+    gate on the management MCP, so the fallback is harmless there and a probe
+    hiccup must not block its boot.
+
+    Extracted as a pure function so ``tests/test_main_privileged_plugin_failure.py``
+    (and friends) can exercise the exact rule ``main.py`` uses without
+    duplicating it. The runtime-side kind=platform signal is
+    ``on_platform_agent_image()`` (the MOLECULE_PLATFORM_AGENT_IMAGE_BAKED env
+    marker core sets for concierge workspaces)."""
+    from molecule_runtime.platform_agent_identity import on_platform_agent_image
+
+    return on_platform_agent_image()
+
+
 from molecule_runtime.initial_prompt import (
     mark_initial_prompt_attempted,
     resolve_initial_prompt_marker,
@@ -409,7 +435,18 @@ async def main():  # pragma: no cover
         register_mcp_present_probe(
             lambda _a=adapter, _c=adapter_config: _a.management_mcp_present(_c)
         )
-    except Exception:  # noqa: BLE001 — probe wiring must never block boot
+    except Exception as probe_err:  # noqa: BLE001
+        # On a PLATFORM agent (concierge), silently falling back to the claude
+        # settings.json check would fail-OPEN the RCA#2970 gate for a non-claude
+        # concierge (the #3159 cross-runtime mis-attribution). Fail CLOSED +
+        # LOUD: abort the boot. An ordinary workspace doesn't gate on the
+        # management MCP, so its boot proceeds with the harmless fallback.
+        if _probe_wiring_failure_is_fatal():
+            raise RuntimeError(
+                "FATAL: failed to register management-MCP gate probe on a "
+                "platform agent — refusing to boot fail-open against the claude "
+                "settings.json fallback (the #3159 cross-runtime mis-attribution)"
+            ) from probe_err
         print("WARNING: failed to register management-MCP gate probe; "
               "falling back to claude settings.json check")
 
