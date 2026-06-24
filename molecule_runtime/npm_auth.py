@@ -16,12 +16,13 @@ started → ``create_workspace`` never loaded → every concierge sat ``degraded
 read:package token and the same ``npx`` starts ("Molecule AI MCP server running
 on stdio (96 tools available)").
 
-This module writes ``~/.npmrc`` with the gitea ``@molecule-ai`` registry and an
-``_authToken`` taken from the **same** gitea read token the git auth already
-uses (SSOT — no new credential). It mirrors :func:`install_credential_helper`:
-called once early in startup, fail-soft, idempotent, additive (it preserves any
-unrelated ``.npmrc`` lines). Generic by construction — any ``npm``/``npx`` in
-the container that fetches a private ``@molecule-ai`` package now authenticates,
+This module writes ``~/.npmrc`` with the gitea ``@molecule-ai`` registry and
+basic-auth credentials (username ``x-access-token``, base64-encoded password)
+taken from the **same** gitea read token the git auth already uses (SSOT — no
+new credential). It mirrors :func:`install_credential_helper`: called once early
+in startup, fail-soft, idempotent, additive (it preserves any unrelated
+``.npmrc`` lines). Generic by construction — any ``npm``/``npx`` in the
+container that fetches a private ``@molecule-ai`` package now authenticates,
 not just the concierge MCP.
 
 NOTE (credential prerequisite): the gitea token MUST carry ``read:package``
@@ -31,6 +32,7 @@ scope. The token used for git fetches (``MOLECULE_TEMPLATE_REPO_TOKEN``) is
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from pathlib import Path
@@ -44,23 +46,24 @@ log = logging.getLogger(__name__)
 _DEFAULT_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
 _SCOPE = "@molecule-ai"
 
-# Token env precedence — the UNAMBIGUOUS canonical gitea token vars only.
-# MOLECULE_TEMPLATE_REPO_TOKEN is the read token the box holds for fetching
-# template/plugin repos (and, once widened with read:package, packages too);
-# GITEA_TOKEN is its alias.
-#
-# We deliberately do NOT fall back to the gitea HTTPS-auth pair. It is an
-# ambiguous token source: core's concierge env uses the PAT-as-username pattern
-# (GIT_HTTP_USERNAME=<PAT>, GIT_HTTP_PASSWORD="x-oauth-basic" — verified live in
-# the running container), whereas credential_helper's name+password model puts
-# the secret in GIT_HTTP_PASSWORD. So NEITHER GIT_HTTP_USERNAME nor
-# GIT_HTTP_PASSWORD reliably holds the token, and reading either risks writing a
-# WRONG _authToken (the literal "x-oauth-basic", or an account name). It also
-# serves no real consumer: the concierge — the only box that runs the private
-# @molecule-ai MCP — always carries MOLECULE_TEMPLATE_REPO_TOKEN, and self-host
-# uses the plain claude-code image that doesn't run the private MCP at all. So
-# this no-ops only where npm auth isn't needed. Fail-loud (RCA gates), never wrong.
-_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN")
+# Token env precedence. MOLECULE_TEMPLATE_REPO_TOKEN is the canonical gitea read
+# token the box holds for fetching template/plugin repos (and, once widened with
+# read:package, packages too); GITEA_TOKEN is its alias. GIT_HTTP_PASSWORD is the
+# credential-helper "password-token" case: when it holds a real secret it can
+# serve the same gitea read token. We deliberately do NOT read GIT_HTTP_USERNAME
+# as a token source. The x-oauth-basic sentinel is handled safely: if
+# GIT_HTTP_PASSWORD is exactly "x-oauth-basic" it signals the PAT-as-username
+# pattern, so that source is skipped rather than writing a literal placeholder.
+_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_PASSWORD")
+
+# Username npm uses for the basic-auth PAT shape. It is a public placeholder;
+# the actual secret goes in the _password field.
+_AUTH_USERNAME = "x-access-token"
+
+# Sentinel value core's concierge uses in GIT_HTTP_PASSWORD when the real PAT is
+# stored in GIT_HTTP_USERNAME. We never read GIT_HTTP_USERNAME as a token, so
+# encountering this sentinel means the GIT_HTTP_PASSWORD source is unusable.
+_OAUTH_BASIC_SENTINEL = "x-oauth-basic"
 
 
 def _gitea_read_token() -> str:
@@ -68,20 +71,28 @@ def _gitea_read_token() -> str:
 
     SSOT: the SAME token the box uses for git fetches. Must carry read:package
     scope for npm fetches to succeed (see module docstring).
+
+    GIT_HTTP_PASSWORD is considered only when it actually holds a secret; the
+    x-oauth-basic sentinel is skipped because it means the PAT lives in
+    GIT_HTTP_USERNAME, which this module never reads as a token source.
     """
     for var in _TOKEN_ENV_PRECEDENCE:
         v = (os.environ.get(var) or "").strip()
-        if v:
-            return v
+        if not v:
+            continue
+        if var == "GIT_HTTP_PASSWORD" and v.lower() == _OAUTH_BASIC_SENTINEL:
+            continue
+        return v
     return ""
 
 
 def _auth_key(registry: str) -> str | None:
-    """Derive npm's per-registry auth config key from a registry URL.
+    """Derive npm's per-registry auth config key prefix from a registry URL.
 
-    npm keys per-registry auth as ``//<host>/<path>/:_authToken`` — i.e. the
-    registry URL with the scheme stripped, a leading ``//``, and a trailing
-    slash. Returns None if the registry has no scheme (caller skips).
+    npm keys per-registry auth as ``//<host>/<path>/:username`` and
+    ``//<host>/<path>/:_password`` (basic-auth shape). This returns the prefix
+    ``//<host>/<path>/`` so callers can build those keys. Returns None if the
+    registry has no scheme (caller skips).
     """
     if "://" not in registry:
         return None
@@ -115,7 +126,12 @@ def install_npm_gitea_auth() -> None:
     if not registry.endswith("/"):
         registry += "/"
     registry_line = f"{_SCOPE}:registry={registry}"
-    auth_line = f"{key}:_authToken={token}"
+    # npm basic-auth shape: public placeholder username + base64-encoded token
+    # as the password. This matches the credential-helper "password-token" case
+    # and keeps the secret out of the username field.
+    encoded_token = base64.b64encode(token.encode()).decode()
+    username_line = f"{key}:username={_AUTH_USERNAME}"
+    password_line = f"{key}:_password={encoded_token}"
 
     npmrc = Path(os.environ.get("HOME", "/home/agent")) / ".npmrc"
     try:
@@ -126,8 +142,10 @@ def install_npm_gitea_auth() -> None:
             ln for ln in existing
             if not ln.startswith(f"{_SCOPE}:registry=")
             and not ln.startswith(f"{key}:_authToken=")
+            and not ln.startswith(f"{key}:username=")
+            and not ln.startswith(f"{key}:_password=")
         ]
-        content = "\n".join(keep + [registry_line, auth_line]) + "\n"
+        content = "\n".join(keep + [registry_line, username_line, password_line]) + "\n"
         # Create 0600 from the start so the token never sits at a world-readable
         # default mode (no write-then-chmod TOCTOU window); O_TRUNC rewrites an
         # existing file. Then chmod to ALSO tighten a pre-existing file, whose
@@ -142,7 +160,7 @@ def install_npm_gitea_auth() -> None:
             log.warning("npm_auth: could not chmod %s to 0600 (%s) — token left at default perms", npmrc, exc)
         # SECURITY: never log the token value — only its length.
         log.info(
-            "npm_auth: wrote %s with gitea %s registry + _authToken (token len=%d)",
+            "npm_auth: wrote %s with gitea %s registry + username/_password (token len=%d)",
             npmrc, _SCOPE, len(token),
         )
     except OSError as exc:
