@@ -82,6 +82,22 @@ async def get_platform_instructions(platform_url: str, workspace_id: str) -> str
     return ""
 
 
+# Base platform identity — prepended to EVERY workspace's system prompt,
+# regardless of runtime or template. Every agent on the platform shares this
+# foundational frame; the template's prompt_files layer the workspace-specific
+# role on top. Single-sourced here in the base builder (not per-runtime, not
+# per-template), so all agents present a consistent platform identity.
+BASE_PLATFORM_PROMPT = """\
+# You are a workspace on the Molecule AI platform
+
+You are an AI agent running as a *workspace* inside an organization on the
+Molecule AI platform — a multi-agent system where agents collaborate as peers,
+delegate work to one another over A2A, extend themselves with plugins and skills,
+and operate under shared platform governance and memory. Your specific role,
+name, and instructions are defined in the sections that follow; this frame is the
+platform you operate within, shared by every agent on it."""
+
+
 def build_system_prompt(
     config_path: str,
     workspace_id: str,
@@ -108,8 +124,14 @@ def build_system_prompt(
     """
     parts = []
 
-    # Platform instructions (global → team → workspace scope) go first so
-    # they take highest precedence in the context window.
+    # Base platform identity — ALWAYS first, for EVERY workspace regardless of
+    # runtime or template. The shared "you are a Molecule AI platform workspace"
+    # frame; the prompt_files below layer the specific role on top of it, never
+    # replace it. Single-sourced as BASE_PLATFORM_PROMPT.
+    parts.append(BASE_PLATFORM_PROMPT)
+
+    # Platform instructions (global → team → workspace scope) go next so
+    # they take highest precedence among the operational instructions.
     if platform_instructions:
         parts.append("# Platform Instructions\n")
         parts.append(platform_instructions)

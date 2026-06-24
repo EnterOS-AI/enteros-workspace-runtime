@@ -383,7 +383,10 @@ async def main():  # pragma: no cover
     # 4. Build adapter config
     adapter_config = AdapterConfig(
         model=config.model,
-        system_prompt=None,  # Adapter builds its own prompt
+        # system_prompt is intentionally NOT set here — it is BASE-OWNED. The
+        # base fills config.system_prompt during setup() (_common_setup ->
+        # build_system_prompt, honoring config.yaml prompt_files) on this same
+        # instance, before any executor reads it. (Field defaults to None.)
         tools=config.skills,  # Skill names from config.yaml
         runtime_config=vars(config.runtime_config) if config.runtime_config else {},
         config_path=config_path,

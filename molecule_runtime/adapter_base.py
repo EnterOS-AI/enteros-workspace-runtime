@@ -101,7 +101,12 @@ class SetupResult:
 class AdapterConfig:
     """Standardized config passed to every adapter."""
     model: str                              # e.g. "anthropic:claude-sonnet-4-6" or "openrouter:google/gemini-2.5-flash"
-    system_prompt: str | None = None        # Assembled system prompt text
+    # The assembled system prompt — BASE-OWNED (an OUTPUT, not an input).
+    # None at construction; the base fills it during setup()
+    # (_common_setup -> build_system_prompt, which honors config.yaml
+    # prompt_files) on THIS instance, before any executor reads it. Executors
+    # consume config.system_prompt; none builds or re-reads its own prompt.
+    system_prompt: str | None = None
     tools: list[str] = field(default_factory=list)  # Tool names from config.yaml
     runtime_config: dict[str, Any] = field(default_factory=dict)  # Raw runtime_config block
     config_path: str = "/configs"           # Path to configs directory
@@ -694,6 +699,15 @@ class BaseAdapter(ABC):
             plugin_prompts=extra_prompts,
             platform_instructions=platform_instructions,
         )
+
+        # SSOT: publish the single base-built system prompt (which honors
+        # config.yaml `prompt_files`, with the `system-prompt.md` fallback baked
+        # into build_system_prompt) back onto the shared AdapterConfig instance.
+        # main.py passes this SAME AdapterConfig to create_executor, so every
+        # runtime executor can consume ONE source via config.system_prompt
+        # instead of each re-reading /configs/system-prompt.md itself (the
+        # per-runtime drift that left the concierge identity-less). Idempotent.
+        config.system_prompt = system_prompt
 
         return SetupResult(
             system_prompt=system_prompt,
