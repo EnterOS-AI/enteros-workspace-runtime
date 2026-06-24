@@ -34,7 +34,9 @@ CONTRACT = json.loads(
 
 
 def test_settings_path_matches_contract():
-    assert pai.SETTINGS_PATH == CONTRACT["settings_path"]
+    # The claude_code runtime is the canonical delivery surface for the
+    # platform-agent-identity settings.json gate.
+    assert pai.SETTINGS_PATH == CONTRACT["runtimes"]["claude_code"]["settings_path"]
 
 
 def test_mcp_server_name_matches_contract():
@@ -49,7 +51,7 @@ def test_settings_key_matches_contract():
     # Tie the SOURCE constant (used by _settings_has_management_mcp) to the
     # contract — not a bare literal — so a source-side rename of the settings
     # map key is caught here too.
-    assert pai.MCPSERVERS_KEY == CONTRACT["key"]
+    assert pai.MCPSERVERS_KEY == CONTRACT["runtimes"]["claude_code"]["key"]
 
 
 def test_present_field_name_matches_contract():
@@ -105,7 +107,7 @@ def test_delivered_settings_makes_management_mcp_present(
     settings = _write_settings(
         tmp_path,
         {
-            CONTRACT["key"]: {
+            CONTRACT["runtimes"]["claude_code"]["key"]: {
                 CONTRACT["mcp_server_name"]: {
                     "command": "npx",
                     "args": ["-y", "@molecule/mcp-server"],
@@ -148,7 +150,7 @@ def test_wrong_settings_key_stays_fail_closed(tmp_path, monkeypatch):
 def test_wrong_mcp_name_stays_fail_closed(tmp_path, monkeypatch):
     settings = _write_settings(
         tmp_path,
-        {CONTRACT["key"]: {"other-platform": {"command": "npx"}}},
+        {CONTRACT["runtimes"]["claude_code"]["key"]: {"other-platform": {"command": "npx"}}},
     )
     _patch_paths(tmp_path, monkeypatch, settings)
     assert pai._settings_has_management_mcp() is False
@@ -173,7 +175,7 @@ def test_top_level_not_dict_stays_fail_closed(tmp_path, monkeypatch):
 def test_mcpservers_not_dict_stays_fail_closed(tmp_path, monkeypatch):
     settings = _write_settings(
         tmp_path,
-        {CONTRACT["key"]: [CONTRACT["mcp_server_name"]]},
+        {CONTRACT["runtimes"]["claude_code"]["key"]: [CONTRACT["mcp_server_name"]]},
     )
     _patch_paths(tmp_path, monkeypatch, settings)
     assert pai._settings_has_management_mcp() is False

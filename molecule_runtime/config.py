@@ -392,6 +392,36 @@ def _derive_provider_from_model(model: str) -> str:
     return ""
 
 
+def _resolve_provider_from_models(model: str, models: list[dict]) -> str:
+    """Look up the intended provider for ``model`` from ``runtime_config.models``.
+
+    The template's ``models`` list is the SSOT for which provider a given
+    model id should route through (e.g. ``moonshot/kimi-k2.6`` → ``platform``).
+    When the operator did not explicitly pin a provider, using this value
+    keeps the runtime's idea of the provider consistent with the adapter's
+    registry and with core's prefix-aware ``DeriveProvider`` — preventing
+    raw namespace prefixes like ``moonshot`` from being emitted as a
+    provider slug and failing the adapter's registry lookup.
+
+    Model ids may use ``:`` (LangChain style) or ``/`` (template style) as
+    the namespace separator, so both are normalized for lookup. Returns
+    ``""`` when the model is not listed or the listed entry has no provider,
+    signalling the caller to fall back to prefix derivation / adapter default.
+    """
+    if not model or not models:
+        return ""
+    normalized = model.replace(":", "/").lower()
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id", "")).replace(":", "/").lower()
+        if entry_id and entry_id == normalized:
+            provider = str(entry.get("provider", "")).strip()
+            if provider:
+                return provider
+    return ""
+
+
 _legacy_model_provider_warned = False
 
 
@@ -564,26 +594,35 @@ def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
     # the precedence (MOLECULE_MODEL > MODEL > legacy MODEL_PROVIDER).
     model = _picked_model_from_env(raw.get("model", "anthropic:claude-opus-4-7"))
 
+    runtime = raw.get("runtime", "claude-code")
+    runtime_raw = raw.get("runtime_config", {})
+
+    # ``runtime_config.models`` is the SSOT for model→provider routing in the
+    # template. Resolve it early so an un-pinned provider can be inferred from
+    # the picked model's listed provider (e.g. ``moonshot/kimi-k2.6`` →
+    # ``platform``) rather than from the raw namespace prefix, which may be a
+    # model prefix rather than a registry provider name (template-143).
+    models = [m for m in (runtime_raw.get("models") or []) if isinstance(m, dict)]
+
     # Resolve top-level provider with this priority chain:
     #   1. ``LLM_PROVIDER`` env var (canvas Save+Restart sets this so the
     #      operator's choice survives a CP-driven restart even though the
     #      regenerated /configs/config.yaml drops most user fields).
     #   2. Explicit YAML ``provider:`` (an operator pinned it in the file).
-    #   3. Derive from the model slug prefix for backward compat:
+    #   3. Provider listed for the picked model in ``runtime_config.models``.
+    #   4. Derive from the model slug prefix for backward compat:
     #        ``anthropic:claude-opus-4-7`` → ``anthropic``
     #        ``minimax/abab7-chat-preview`` → ``minimax``
     #        bare model names → ``""``  (signals "use adapter default")
-    # Empty after all three is fine — adapters that don't need an explicit
+    # Empty after all four is fine — adapters that don't need an explicit
     # provider keep their existing routing; adapters that do (hermes via
     # derive-provider.sh) prefer this over slug-parsing the model name.
     provider = (
         os.environ.get("LLM_PROVIDER")
         or raw.get("provider")
+        or _resolve_provider_from_models(model, models)
         or _derive_provider_from_model(model)
     )
-
-    runtime = raw.get("runtime", "claude-code")
-    runtime_raw = raw.get("runtime_config", {})
 
     a2a_raw = raw.get("a2a", {})
     delegation_raw = raw.get("delegation", {})
@@ -696,7 +735,7 @@ def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
             # entries that are dicts are kept — a malformed YAML element
             # (string, list, None) is silently dropped rather than raising,
             # matching the rest of this parser's lenient defaults.
-            models=[m for m in (runtime_raw.get("models") or []) if isinstance(m, dict)],
+            models=models,
             # Deprecated fields — kept for backward compat
             auth_token_env=runtime_raw.get("auth_token_env", ""),
             auth_token_file=runtime_raw.get("auth_token_file", ""),
