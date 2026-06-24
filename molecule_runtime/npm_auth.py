@@ -44,12 +44,23 @@ log = logging.getLogger(__name__)
 _DEFAULT_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
 _SCOPE = "@molecule-ai"
 
-# Token env precedence. MOLECULE_TEMPLATE_REPO_TOKEN is the canonical gitea read
-# token the box holds for fetching template/plugin repos (and, once widened with
-# read:package, packages too). GITEA_TOKEN / GIT_HTTP_PASSWORD are the aliases
-# credential_helper recognises for the Gitea flow. GIT_HTTP_USERNAME is only a
-# username placeholder; the actual secret lives in GIT_HTTP_PASSWORD.
-_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_PASSWORD")
+# Token env precedence — the UNAMBIGUOUS canonical gitea token vars only.
+# MOLECULE_TEMPLATE_REPO_TOKEN is the read token the box holds for fetching
+# template/plugin repos (and, once widened with read:package, packages too);
+# GITEA_TOKEN is its alias.
+#
+# We deliberately do NOT fall back to the gitea HTTPS-auth pair. It is an
+# ambiguous token source: core's concierge env uses the PAT-as-username pattern
+# (GIT_HTTP_USERNAME=<PAT>, GIT_HTTP_PASSWORD="x-oauth-basic" — verified live in
+# the running container), whereas credential_helper's name+password model puts
+# the secret in GIT_HTTP_PASSWORD. So NEITHER GIT_HTTP_USERNAME nor
+# GIT_HTTP_PASSWORD reliably holds the token, and reading either risks writing a
+# WRONG _authToken (the literal "x-oauth-basic", or an account name). It also
+# serves no real consumer: the concierge — the only box that runs the private
+# @molecule-ai MCP — always carries MOLECULE_TEMPLATE_REPO_TOKEN, and self-host
+# uses the plain claude-code image that doesn't run the private MCP at all. So
+# this no-ops only where npm auth isn't needed. Fail-loud (RCA gates), never wrong.
+_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN")
 
 
 def _gitea_read_token() -> str:
@@ -116,11 +127,19 @@ def install_npm_gitea_auth() -> None:
             if not ln.startswith(f"{_SCOPE}:registry=")
             and not ln.startswith(f"{key}:_authToken=")
         ]
-        npmrc.write_text("\n".join(keep + [registry_line, auth_line]) + "\n")
+        content = "\n".join(keep + [registry_line, auth_line]) + "\n"
+        # Create 0600 from the start so the token never sits at a world-readable
+        # default mode (no write-then-chmod TOCTOU window); O_TRUNC rewrites an
+        # existing file. Then chmod to ALSO tighten a pre-existing file, whose
+        # mode O_CREAT would not change.
+        fd = os.open(npmrc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(content)
         try:
-            npmrc.chmod(0o600)  # token at rest — restrict like .netrc
-        except OSError:
-            pass
+            os.chmod(npmrc, 0o600)  # token at rest — restrict like .netrc
+        except OSError as exc:
+            # A failed hardening of a secret file should be observable, not silent.
+            log.warning("npm_auth: could not chmod %s to 0600 (%s) — token left at default perms", npmrc, exc)
         # SECURITY: never log the token value — only its length.
         log.info(
             "npm_auth: wrote %s with gitea %s registry + _authToken (token len=%d)",

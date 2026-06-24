@@ -14,8 +14,8 @@ import pytest
 
 from molecule_runtime.npm_auth import _auth_key, install_npm_gitea_auth
 
-_ALL_TOKEN_VARS = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_PASSWORD",
-                   "GIT_HTTP_USERNAME", "MOLECULE_GITEA_NPM_REGISTRY")
+_ALL_TOKEN_VARS = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_USERNAME",
+                   "GIT_HTTP_PASSWORD", "MOLECULE_GITEA_NPM_REGISTRY")
 
 
 @pytest.fixture(autouse=True)
@@ -44,22 +44,38 @@ def test_no_token_is_noop(tmp_path):
     assert not _npmrc(tmp_path).exists()
 
 
+def test_npmrc_is_chmod_0600(monkeypatch, tmp_path):
+    # The token is at rest in ~/.npmrc — it must be 0600 (created restricted,
+    # no world-readable window). Guards the chmod/hardening regression.
+    import stat
+    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-AAA")
+    install_npm_gitea_auth()
+    mode = stat.S_IMODE(_npmrc(tmp_path).stat().st_mode)
+    assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+
+
 def test_token_precedence_prefers_canonical(monkeypatch, tmp_path):
-    # MOLECULE_TEMPLATE_REPO_TOKEN wins over GITEA_TOKEN/GIT_HTTP_PASSWORD.
-    monkeypatch.setenv("GIT_HTTP_PASSWORD", "tok-GHP")
+    # MOLECULE_TEMPLATE_REPO_TOKEN wins over GITEA_TOKEN; the ambiguous gitea
+    # HTTPS-auth vars are NOT a token source and are ignored entirely.
+    monkeypatch.setenv("GIT_HTTP_USERNAME", "tok-GHU")
+    monkeypatch.setenv("GIT_HTTP_PASSWORD", "x-oauth-basic")
     monkeypatch.setenv("GITEA_TOKEN", "tok-GITEA")
     monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-CANON")
     install_npm_gitea_auth()
     assert "_authToken=tok-CANON" in _npmrc(tmp_path).read_text()
 
 
-def test_falls_back_to_git_http_password(monkeypatch, tmp_path):
-    # The actual secret is in GIT_HTTP_PASSWORD, not GIT_HTTP_USERNAME.
-    monkeypatch.setenv("GIT_HTTP_USERNAME", "x-access-token")
-    monkeypatch.setenv("GIT_HTTP_PASSWORD", "tok-GHP")
+def test_git_http_vars_are_not_a_token_source(monkeypatch, tmp_path):
+    # The gitea HTTPS-auth pair is ambiguous: core's concierge uses
+    # GIT_HTTP_USERNAME=<PAT> + GIT_HTTP_PASSWORD="x-oauth-basic", while
+    # credential_helper uses USERNAME=<name> + PASSWORD=<secret>. Neither var
+    # reliably holds the token, so with only GIT_HTTP_* set (no canonical token
+    # var) we no-op rather than write a wrong _authToken — e.g. the literal
+    # "x-oauth-basic" or an account name.
+    monkeypatch.setenv("GIT_HTTP_USERNAME", "9f90deadbeef")  # PAT-as-username pattern
+    monkeypatch.setenv("GIT_HTTP_PASSWORD", "x-oauth-basic")
     install_npm_gitea_auth()
-    assert "_authToken=tok-GHP" in _npmrc(tmp_path).read_text()
-    assert "x-access-token" not in _npmrc(tmp_path).read_text()
+    assert not _npmrc(tmp_path).exists()
 
 
 def test_idempotent_and_additive(monkeypatch, tmp_path):
