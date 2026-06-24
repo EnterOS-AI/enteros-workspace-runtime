@@ -14,8 +14,8 @@ import pytest
 
 from molecule_runtime.npm_auth import _auth_key, install_npm_gitea_auth
 
-_ALL_TOKEN_VARS = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_USERNAME",
-                   "MOLECULE_GITEA_NPM_REGISTRY")
+_ALL_TOKEN_VARS = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_PASSWORD",
+                   "GIT_HTTP_USERNAME", "MOLECULE_GITEA_NPM_REGISTRY")
 
 
 @pytest.fixture(autouse=True)
@@ -45,18 +45,21 @@ def test_no_token_is_noop(tmp_path):
 
 
 def test_token_precedence_prefers_canonical(monkeypatch, tmp_path):
-    # MOLECULE_TEMPLATE_REPO_TOKEN wins over GITEA_TOKEN/GIT_HTTP_USERNAME.
-    monkeypatch.setenv("GIT_HTTP_USERNAME", "tok-GHU")
+    # MOLECULE_TEMPLATE_REPO_TOKEN wins over GITEA_TOKEN/GIT_HTTP_PASSWORD.
+    monkeypatch.setenv("GIT_HTTP_PASSWORD", "tok-GHP")
     monkeypatch.setenv("GITEA_TOKEN", "tok-GITEA")
     monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-CANON")
     install_npm_gitea_auth()
     assert "_authToken=tok-CANON" in _npmrc(tmp_path).read_text()
 
 
-def test_falls_back_to_git_http_username(monkeypatch, tmp_path):
-    monkeypatch.setenv("GIT_HTTP_USERNAME", "tok-GHU")
+def test_falls_back_to_git_http_password(monkeypatch, tmp_path):
+    # The actual secret is in GIT_HTTP_PASSWORD, not GIT_HTTP_USERNAME.
+    monkeypatch.setenv("GIT_HTTP_USERNAME", "x-access-token")
+    monkeypatch.setenv("GIT_HTTP_PASSWORD", "tok-GHP")
     install_npm_gitea_auth()
-    assert "_authToken=tok-GHU" in _npmrc(tmp_path).read_text()
+    assert "_authToken=tok-GHP" in _npmrc(tmp_path).read_text()
+    assert "x-access-token" not in _npmrc(tmp_path).read_text()
 
 
 def test_idempotent_and_additive(monkeypatch, tmp_path):

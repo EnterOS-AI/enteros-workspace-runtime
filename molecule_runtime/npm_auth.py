@@ -46,9 +46,10 @@ _SCOPE = "@molecule-ai"
 
 # Token env precedence. MOLECULE_TEMPLATE_REPO_TOKEN is the canonical gitea read
 # token the box holds for fetching template/plugin repos (and, once widened with
-# read:package, packages too). GITEA_TOKEN / GIT_HTTP_USERNAME are the aliases
-# credential_helper recognises for the Gitea flow.
-_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_USERNAME")
+# read:package, packages too). GITEA_TOKEN / GIT_HTTP_PASSWORD are the aliases
+# credential_helper recognises for the Gitea flow. GIT_HTTP_USERNAME is only a
+# username placeholder; the actual secret lives in GIT_HTTP_PASSWORD.
+_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_PASSWORD")
 
 
 def _gitea_read_token() -> str:
