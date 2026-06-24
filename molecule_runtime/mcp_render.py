@@ -211,6 +211,34 @@ def render_hermes_config(config_path: Path, name: str, spec: dict) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# OpenClaw — native MCP-config shape unverified (TODO: phase P4)
+# ---------------------------------------------------------------------------
+
+def render_openclaw_config(config_path: Path, name: str, spec: dict) -> None:
+    """TODO(P4): OpenClaw's native MCP-config shape is unverified.
+
+    Until this entry existed, an ``openclaw`` concierge fell through
+    ``_spec_for`` to the ``claude_code`` default — so its management MCP was
+    rendered into (and the RCA#2970 gate judged it against)
+    ``.claude/settings.json``, a file the openclaw runtime never reads. That is
+    the exact #3159 mis-attribution: it both false-NEGATIVES a healthy openclaw
+    concierge (its real native config is never checked) AND silently mis-renders
+    the privileged MCP to the wrong file.
+
+    This INTERIM stub makes that failure EXPLICIT and DIAGNOSABLE instead of
+    silent: the renderer raises a clear ``NotImplementedError`` (so the
+    privileged-management-MCP install path fails CLOSED and loudly — see
+    ``MCPServerAdaptor.install`` / ``install_plugins_via_registry``), and the
+    paired present-reader returns False (never falsely "present"). The real
+    openclaw renderer + native-config path is a later phase (P4); build it there
+    once the format is pinned against a live openclaw runtime.
+    """
+    raise NotImplementedError(
+        "openclaw MCP render not implemented — format unverified (phase P4)"
+    )
+
+
 # ===========================================================================
 # Per-runtime dispatch — the production wiring.
 # ===========================================================================
@@ -279,6 +307,12 @@ _RUNTIME_SPECS: dict[str, tuple] = {
     "gemini_cli": (_gemini_path, render_gemini_settings, _json_settings_has),
     # hermes: native path unverified; fail-loud render, never falsely present.
     "hermes": (_claude_path, render_hermes_config, lambda p, n: False),
+    # openclaw: native path unverified; fail-loud render, never falsely present.
+    # INTERIM stub (phase P1) so an openclaw concierge fails CLOSED and
+    # DIAGNOSABLY rather than silently falling back to the claude_code default
+    # and being judged against a .claude/settings.json it never reads (#3159
+    # mis-attribution). The concrete openclaw renderer is phase P4.
+    "openclaw": (_claude_path, render_openclaw_config, lambda p, n: False),
 }
 
 # The runtime used when the active runtime isn't mapped above. Claude Code is
@@ -289,7 +323,7 @@ _DEFAULT_RUNTIME = "claude_code"
 
 
 # Runtimes whose renderer is a deliberate fail-loud stub (format unverified).
-_UNVERIFIED_RUNTIMES = frozenset({"gemini_cli", "hermes"})
+_UNVERIFIED_RUNTIMES = frozenset({"gemini_cli", "hermes", "openclaw"})
 
 
 def _spec_for(runtime: str) -> tuple:
