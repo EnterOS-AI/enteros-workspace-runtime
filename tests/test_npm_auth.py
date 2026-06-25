@@ -2,8 +2,12 @@
 
 The concierge MCP (`npx @molecule-ai/mcp-server`) needs the gitea registry +
 _authToken in ~/.npmrc or it ETARGETs the private package and never starts.
-These lock in: writes the right lines, SSOT token precedence, no-op without a
-token, idempotent/additive, correct key derivation, and no token in logs.
+These lock in: writes the right lines, SSOT token precedence (canonical vars
+beat the gitea HTTPS-auth pair), the verified live concierge shape (PAT in
+GIT_HTTP_USERNAME when GIT_HTTP_PASSWORD is the x-oauth-basic sentinel), the
+normal basic-auth shape (token in GIT_HTTP_PASSWORD), never writing the literal
+x-oauth-basic as the secret, no-op without a token, idempotent/additive, correct
+key derivation, and no token in logs.
 """
 from __future__ import annotations
 
@@ -55,24 +59,51 @@ def test_npmrc_is_chmod_0600(monkeypatch, tmp_path):
 
 
 def test_token_precedence_prefers_canonical(monkeypatch, tmp_path):
-    # MOLECULE_TEMPLATE_REPO_TOKEN wins over GITEA_TOKEN; the ambiguous gitea
-    # HTTPS-auth vars are NOT a token source and are ignored entirely.
+    # MOLECULE_TEMPLATE_REPO_TOKEN wins over GITEA_TOKEN, and both canonical vars
+    # take precedence over the gitea HTTPS-auth pair (GIT_HTTP_USERNAME/PASSWORD).
     monkeypatch.setenv("GIT_HTTP_USERNAME", "tok-GHU")
-    monkeypatch.setenv("GIT_HTTP_PASSWORD", "x-oauth-basic")
+    monkeypatch.setenv("GIT_HTTP_PASSWORD", "tok-GHP")
     monkeypatch.setenv("GITEA_TOKEN", "tok-GITEA")
     monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-CANON")
     install_npm_gitea_auth()
     assert "_authToken=tok-CANON" in _npmrc(tmp_path).read_text()
 
 
-def test_git_http_vars_are_not_a_token_source(monkeypatch, tmp_path):
-    # The gitea HTTPS-auth pair is ambiguous: core's concierge uses
-    # GIT_HTTP_USERNAME=<PAT> + GIT_HTTP_PASSWORD="x-oauth-basic", while
-    # credential_helper uses USERNAME=<name> + PASSWORD=<secret>. Neither var
-    # reliably holds the token, so with only GIT_HTTP_* set (no canonical token
-    # var) we no-op rather than write a wrong _authToken — e.g. the literal
-    # "x-oauth-basic" or an account name.
-    monkeypatch.setenv("GIT_HTTP_USERNAME", "9f90deadbeef")  # PAT-as-username pattern
+def test_gitea_token_precedence_over_git_http(monkeypatch, tmp_path):
+    # GITEA_TOKEN (canonical alias) still beats the gitea HTTPS-auth pair.
+    monkeypatch.setenv("GIT_HTTP_USERNAME", "tok-GHU")
+    monkeypatch.setenv("GIT_HTTP_PASSWORD", "x-oauth-basic")
+    monkeypatch.setenv("GITEA_TOKEN", "tok-GITEA")
+    install_npm_gitea_auth()
+    assert "_authToken=tok-GITEA" in _npmrc(tmp_path).read_text()
+
+
+def test_git_http_x_oauth_basic_uses_username_pat(monkeypatch, tmp_path):
+    # VERIFIED live concierge shape (workspace-server conciergePlatformMCPEnv):
+    # GIT_HTTP_USERNAME=<PAT>, GIT_HTTP_PASSWORD="x-oauth-basic" (the sentinel).
+    # With no canonical token var, the PAT must be resolved from the USERNAME and
+    # written as the _authToken — and the literal sentinel must NEVER be written.
+    monkeypatch.setenv("GIT_HTTP_USERNAME", "tok-PAT")
+    monkeypatch.setenv("GIT_HTTP_PASSWORD", "x-oauth-basic")
+    install_npm_gitea_auth()
+    content = _npmrc(tmp_path).read_text()
+    assert "//git.moleculesai.app/api/packages/molecule-ai/npm/:_authToken=tok-PAT" in content
+    assert "x-oauth-basic" not in content
+
+
+def test_git_http_password_as_token(monkeypatch, tmp_path):
+    # Normal basic-auth shape: the secret/token lives in GIT_HTTP_PASSWORD (when
+    # it is not the x-oauth-basic sentinel). It is used as the _authToken.
+    monkeypatch.setenv("GIT_HTTP_USERNAME", "user")
+    monkeypatch.setenv("GIT_HTTP_PASSWORD", "tok-PASS")
+    install_npm_gitea_auth()
+    content = _npmrc(tmp_path).read_text()
+    assert "//git.moleculesai.app/api/packages/molecule-ai/npm/:_authToken=tok-PASS" in content
+
+
+def test_x_oauth_basic_never_written_as_secret(monkeypatch, tmp_path):
+    # If the only signal is the x-oauth-basic sentinel with NO username PAT to
+    # fall back to, we no-op rather than write the literal sentinel as a token.
     monkeypatch.setenv("GIT_HTTP_PASSWORD", "x-oauth-basic")
     install_npm_gitea_auth()
     assert not _npmrc(tmp_path).exists()
