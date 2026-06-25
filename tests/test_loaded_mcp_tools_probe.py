@@ -421,18 +421,24 @@ class TestBootSafetyStall:
 class TestKindPlatformGate:
     @pytest.mark.asyncio
     async def test_non_platform_workspace_skips_enumeration(self, tmp_path, monkeypatch):
-        # kind!=platform: the env marker is absent/off.
+        # Ordinary tenant: NOT the baked image AND no management molecule-platform
+        # MCP wired in (the plugin is org-root entitlement-gated, #50). Both gate
+        # signals are False -> enumeration must be skipped entirely, even though
+        # the tenant may declare OTHER (non-management) MCP servers.
         monkeypatch.delenv("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", raising=False)
-
-        # A perfectly good server is declared — but the gate must skip it entirely.
-        server = _write_fake_server(tmp_path, tools=["create_workspace"])
-        config_root = _claude_settings_with(
-            tmp_path,
-            {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.mcp_server_present",
+            lambda: False,
         )
 
-        # If the gate failed and enumeration ran, this would be a non-None list and
-        # the call below would spawn a subprocess; assert it is a pure no-op.
+        # A non-management MCP (image-gen) is declared — the gate must STILL skip:
+        # only the concierge (management MCP present) enumerates.
+        server = _write_fake_server(tmp_path, tools=["generate_image"])
+        config_root = _claude_settings_with(
+            tmp_path,
+            {"image-gen": {"command": sys.executable, "args": [str(server)]}},
+        )
+
         called = {"enum": False}
         real_enum = probe.enumerate_loaded_mcp_tools_async
 
@@ -450,9 +456,17 @@ class TestKindPlatformGate:
         assert "loaded_mcp_tools" not in identity_gate_payload()
 
     @pytest.mark.asyncio
-    async def test_platform_workspace_runs_enumeration(self, tmp_path, monkeypatch):
-        # kind=platform: the baked-image env marker is set -> enumeration runs.
-        monkeypatch.setenv("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", "1")
+    async def test_debaked_concierge_runs_via_mcp_server_present(self, tmp_path, monkeypatch):
+        # THE de-bake regression test. The de-baked concierge runs the STANDARD
+        # runtime image -> MOLECULE_PLATFORM_AGENT_IMAGE_BAKED is ABSENT
+        # (on_platform_agent_image() == False). The gate must STILL run because
+        # the management MCP is present (mcp_server_present() == True). Before the
+        # fix this skipped -> producer None -> concierge stuck degraded forever.
+        monkeypatch.delenv("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", raising=False)
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.mcp_server_present",
+            lambda: True,
+        )
 
         server = _write_fake_server(tmp_path, tools=["create_workspace"])
         config_root = _claude_settings_with(
@@ -469,9 +483,37 @@ class TestKindPlatformGate:
         ]
 
     @pytest.mark.asyncio
+    async def test_baked_concierge_runs_via_legacy_marker(self, tmp_path, monkeypatch):
+        # Legacy baked concierge: the marker is set even though mcp_server_present
+        # is forced False here -> the OR'd legacy fallback must still run it.
+        monkeypatch.setenv("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", "1")
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.mcp_server_present",
+            lambda: False,
+        )
+
+        server = _write_fake_server(tmp_path, tools=["create_workspace"])
+        config_root = _claude_settings_with(
+            tmp_path,
+            {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
+        )
+
+        observed = await probe.capture_loaded_mcp_tools_at_init("claude-code", config_root)
+
+        assert observed == ["mcp__molecule-platform__create_workspace"]
+        assert identity_gate_payload()["loaded_mcp_tools"] == [
+            "mcp__molecule-platform__create_workspace"
+        ]
+
+    @pytest.mark.asyncio
     async def test_force_bypasses_the_gate(self, tmp_path, monkeypatch):
-        # force=True (used by the happy-path tests) runs enumeration regardless.
+        # force=True (used by the happy-path tests) runs enumeration regardless of
+        # BOTH gate signals being off.
         monkeypatch.delenv("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", raising=False)
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.mcp_server_present",
+            lambda: False,
+        )
         server = _write_fake_server(tmp_path, tools=["create_workspace"])
         config_root = _claude_settings_with(
             tmp_path,

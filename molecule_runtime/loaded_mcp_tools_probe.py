@@ -463,21 +463,37 @@ def read_mcp_servers(runtime: str, config_path: str | os.PathLike) -> dict:
 
 
 def _is_platform_agent() -> bool:
-    """True when this container is the concierge (kind=platform).
+    """True when this container should enumerate the management MCP's loaded tools.
 
-    The runtime-side kind=platform signal is ``on_platform_agent_image()`` (the
-    ``MOLECULE_PLATFORM_AGENT_IMAGE_BAKED`` env marker core sets for concierge
-    workspaces) — the SAME source ``main.py``'s ``_probe_wiring_failure_is_fatal``
-    uses for the management-MCP gate probe. Only the concierge gates on the
-    management MCP, so only it needs the init enumeration; every other workspace
-    skips it (no extra cost, no extra hang blast-radius).
+    POST-DE-BAKE SIGNAL (the load-bearing fix). "Platform-ness" is a COMPOSITION
+    — an ORDINARY runtime image plus the management ``molecule-platform`` MCP
+    wired in — NOT a special baked image (rfc-platform-mcp-as-plugin §3.4;
+    platform_agent_identity module docstring). The legacy
+    ``on_platform_agent_image()`` marker (``MOLECULE_PLATFORM_AGENT_IMAGE_BAKED``)
+    is set ONLY by Dockerfile.platform-agent, so it is **FALSE on a de-baked
+    concierge** running the standard runtime image. Gating on it ALONE would skip
+    enumeration on exactly the concierge this producer exists to fix — the fix
+    would ship and silently leave every concierge ``degraded``.
 
-    Defaults to False (skip enumeration) if the signal can't be read.
+    The de-bake-correct signal is ``mcp_server_present()``: the management
+    ``molecule-platform`` MCP is wired into the ACTIVE runtime's native config
+    (consulted via the registered probe — same source the online/degraded gate
+    uses). It is TRUE for both baked (``/opt`` binary) and de-baked (plugin-wired)
+    concierges, and FALSE for ordinary tenants (the plugin is org-root
+    entitlement-gated, #50). We OR the legacy marker as belt-and-suspenders for
+    the baked->de-baked transition window.
+
+    Defaults to False (skip enumeration) if neither signal can be read.
     """
     try:
-        from molecule_runtime.platform_agent_identity import on_platform_agent_image
+        from molecule_runtime.platform_agent_identity import (
+            mcp_server_present,
+            on_platform_agent_image,
+        )
 
-        return on_platform_agent_image()
+        # Primary: composition signal (management MCP present). Fallback: the
+        # legacy baked-image marker. Either is sufficient.
+        return on_platform_agent_image() or mcp_server_present()
     except Exception:  # noqa: BLE001
         return False
 
