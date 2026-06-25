@@ -527,6 +527,61 @@ async def main():  # pragma: no cover
         await adapter.setup(adapter_config)
         executor = await adapter.create_executor(adapter_config)
 
+        # 6.0 loaded_mcp_tools producer (core#3082) — INIT-TIME enumeration.
+        # Right after the executor is built (MCP servers are wired into the
+        # runtime's native config by setup()), enumerate the connected MCP
+        # servers' tool inventory and publish it via set_loaded_mcp_tools, so
+        # the FIRST heartbeat carries `loaded_mcp_tools` and the platform gate
+        # can flip a de-baked concierge degraded->online WITHOUT waiting for a
+        # user turn (task #85). Runtime-agnostic: reads the declared servers
+        # from the active runtime's native config and talks the MCP wire
+        # protocol directly (mirrors the adk#34 / codex#142 prior art).
+        #
+        # GATED to kind=platform (the concierge): capture_loaded_mcp_tools_at_init
+        # itself no-ops unless _is_platform_agent() (the same
+        # MOLECULE_PLATFORM_AGENT_IMAGE_BAKED signal main.py uses for the
+        # management-MCP gate probe), so tenants that declare MCP servers (e.g.
+        # image-gen) don't spawn+enumerate them at every boot.
+        #
+        # BOOT-SAFE: the probe is fully async (asyncio.create_subprocess_exec +
+        # asyncio.wait_for on every read AND a hard overall-enumeration deadline),
+        # so a management MCP that answers `initialize` then stalls on
+        # `tools/list` (e.g. CP slow/unreachable during an incident) CANNOT hang
+        # boot. Doubly defended here with an outer asyncio.wait_for and a
+        # blanket except so this hook can NEVER raise or hang into the register/
+        # heartbeat path below. On any timeout/stall/failure the producer is left
+        # None — the heartbeat omits the field and core's grace window applies
+        # (degraded-until-first-turn, the accepted fallback). The claude-code
+        # executor's per-turn `init`-message capture (separate template repo)
+        # still runs as a complementary refresh.
+        try:
+            from molecule_runtime.loaded_mcp_tools_probe import (
+                _MCP_ENUMERATION_TIMEOUT_SECONDS,
+                capture_loaded_mcp_tools_at_init,
+            )
+            observed = await asyncio.wait_for(
+                capture_loaded_mcp_tools_at_init(runtime, config_path),
+                timeout=_MCP_ENUMERATION_TIMEOUT_SECONDS + 5.0,
+            )
+            if observed is None:
+                print(
+                    "loaded_mcp_tools: init enumeration observed no connected MCP "
+                    "server tools — producer left unset (grace window applies)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"loaded_mcp_tools: init enumeration published "
+                    f"{len(observed)} tool id(s) to the gate producer",
+                    flush=True,
+                )
+        except Exception as mcp_probe_err:  # noqa: BLE001 — never block boot
+            print(
+                f"loaded_mcp_tools: init enumeration failed (non-fatal): "
+                f"{type(mcp_probe_err).__name__}: {mcp_probe_err}",
+                flush=True,
+            )
+
         # 6a. Boot-smoke short-circuit (issue #2275): if MOLECULE_SMOKE_MODE
         # is set, exercise the executor's full import tree by calling
         # execute() once with stub deps + a short timeout. Skips platform

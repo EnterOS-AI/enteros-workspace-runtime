@@ -416,3 +416,82 @@ def management_mcp_present_for(runtime: str, config_path: str | os.PathLike, nam
     """True when ``name`` is declared in the given runtime's native MCP config."""
     path_fn, _, present_fn = _spec_for(runtime)
     return present_fn(path_fn(config_path), name)
+
+
+# ===========================================================================
+# Native MCP-server READERS — return the full {name: spec} server map from the
+# active runtime's native config (the inverse of the renderers above).
+# ===========================================================================
+# The loaded_mcp_tools producer (core#3082) enumerates the connected MCP
+# servers' tools AT INIT. To do that it first needs the list of declared servers
+# (and their launch command/args/env) from the file THIS runtime actually reads
+# — codex's config.toml, claude's settings.json, openclaw's openclaw.json. These
+# readers are the exact inverse of the renderers and reuse the same path
+# resolution + native parser as the present-checks, so a server the producer
+# enumerates is byte-for-byte the one the runtime will launch. Every reader is
+# fail-closed: a missing/unreadable/malformed/structurally-unexpected config
+# yields ``{}`` so the producer degrades safely (never crashes boot).
+
+
+def _read_json_mcp_servers(settings_path: Path) -> dict:
+    """Read the ``mcpServers`` map from a JSON settings file (claude, gemini)."""
+    try:
+        data = json.loads(Path(settings_path).read_text())
+    except (OSError, ValueError):
+        return {}
+    servers = data.get(MCPSERVERS_KEY) if isinstance(data, dict) else None
+    return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
+
+
+def _read_codex_mcp_servers(config_path: Path) -> dict:
+    """Read the ``[mcp_servers.<name>]`` tables from codex's config.toml."""
+    import tomllib
+
+    try:
+        data = tomllib.loads(Path(config_path).read_text())
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return {}
+    table = data.get(CODEX_MCP_TABLE)
+    return {k: v for k, v in table.items() if isinstance(v, dict)} if isinstance(table, dict) else {}
+
+
+def _read_openclaw_mcp_servers(config_path: Path) -> dict:
+    """Read the ``mcp.servers`` map from ``~/.openclaw/openclaw.json``."""
+    try:
+        data = json.loads(Path(config_path).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    mcp = data.get(OPENCLAW_MCP_PARENT)
+    if not isinstance(mcp, dict):
+        return {}
+    servers = mcp.get(OPENCLAW_MCP_SERVERS)
+    return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
+
+
+# runtime -> native-config reader. Mirrors _RUNTIME_SPECS (same path resolver +
+# native format), but returns the FULL {name: spec} map rather than a single
+# present-bool. Unverified runtimes (gemini/hermes) get a reader that returns {}
+# — their format is not pinned, so the producer reports nothing for them rather
+# than guessing (the same fail-loud-vs-fail-silent stance as their renderers).
+_RUNTIME_READERS: dict[str, callable] = {
+    "claude_code": _read_json_mcp_servers,
+    "codex": _read_codex_mcp_servers,
+    "gemini_cli": lambda _p: {},
+    "hermes": lambda _p: {},
+    "openclaw": _read_openclaw_mcp_servers,
+}
+
+
+def read_mcp_servers_for(runtime: str, config_path: str | os.PathLike) -> dict:
+    """Return ``{server_name: spec}`` declared in the runtime's native MCP config.
+
+    Reuses the SAME per-runtime path resolver as the renderers/present-checks, so
+    the producer enumerates exactly the servers this runtime will launch. Fail-
+    closed: returns ``{}`` for an unmapped/unverified runtime or any unreadable /
+    malformed config.
+    """
+    path_fn = _spec_for(runtime)[0]
+    reader = _RUNTIME_READERS.get(normalize_runtime(runtime), lambda _p: {})
+    return reader(path_fn(config_path))
