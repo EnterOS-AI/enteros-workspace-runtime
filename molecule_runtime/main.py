@@ -25,6 +25,10 @@ import uuid as _uuid
 from molecule_runtime.builtin_tools.telemetry import setup_telemetry, make_trace_middleware
 from molecule_runtime.policies.namespaces import resolve_awareness_namespace
 
+# Holds the background loaded_mcp_tools init-enumeration task so it is not
+# garbage-collected before it completes (asyncio only keeps weak refs to tasks).
+_LOADED_MCP_TOOLS_BG_TASK = None  # type: "asyncio.Task | None"
+
 
 def _is_privileged_setup_failure(setup_err: BaseException) -> bool:
     """Return True when *setup_err* is a privileged-plugin install failure.
@@ -554,30 +558,33 @@ async def main():  # pragma: no cover
         # (degraded-until-first-turn, the accepted fallback). The claude-code
         # executor's per-turn `init`-message capture (separate template repo)
         # still runs as a complementary refresh.
+        # Spawn as a NON-BLOCKING BACKGROUND task with retry. The management MCP
+        # is frequently NOT connectable at this early-boot moment
+        # (mcp_server_present hasn't flipped true yet, and/or
+        # `npx @molecule-ai/mcp-server` is still cold-starting), so a one-shot
+        # enumeration here misses and the concierge sits degraded until a user
+        # turn (validated 2026-06-25: provisioning->online->degraded, then a turn
+        # flips it online). Running with retry in the BACKGROUND lets it succeed
+        # once the MCP becomes ready, so a fresh concierge reaches online WITHOUT
+        # a turn — while NEVER delaying register/heartbeat below (fire-and-forget;
+        # the coroutine is boot-safe + never raises). Keep a reference so the task
+        # is not GC'd. The per-turn capture (template executor) remains a fallback.
         try:
             from molecule_runtime.loaded_mcp_tools_probe import (
-                _MCP_ENUMERATION_TIMEOUT_SECONDS,
-                capture_loaded_mcp_tools_at_init,
+                capture_loaded_mcp_tools_with_retry,
             )
-            observed = await asyncio.wait_for(
-                capture_loaded_mcp_tools_at_init(runtime, config_path),
-                timeout=_MCP_ENUMERATION_TIMEOUT_SECONDS + 5.0,
+            global _LOADED_MCP_TOOLS_BG_TASK
+            _LOADED_MCP_TOOLS_BG_TASK = asyncio.create_task(
+                capture_loaded_mcp_tools_with_retry(runtime, config_path)
             )
-            if observed is None:
-                print(
-                    "loaded_mcp_tools: init enumeration observed no connected MCP "
-                    "server tools — producer left unset (grace window applies)",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"loaded_mcp_tools: init enumeration published "
-                    f"{len(observed)} tool id(s) to the gate producer",
-                    flush=True,
-                )
+            print(
+                "loaded_mcp_tools: spawned background init-enumeration (retry until "
+                "the management MCP is connectable; non-blocking)",
+                flush=True,
+            )
         except Exception as mcp_probe_err:  # noqa: BLE001 — never block boot
             print(
-                f"loaded_mcp_tools: init enumeration failed (non-fatal): "
+                f"loaded_mcp_tools: failed to spawn init enumeration (non-fatal): "
                 f"{type(mcp_probe_err).__name__}: {mcp_probe_err}",
                 flush=True,
             )

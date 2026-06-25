@@ -541,3 +541,60 @@ async def capture_loaded_mcp_tools_at_init(
     if observed is not None:
         set_loaded_mcp_tools(observed)
     return observed
+
+
+async def capture_loaded_mcp_tools_with_retry(
+    runtime: str,
+    config_path: str | os.PathLike,
+    *,
+    max_attempts: int = 20,
+    interval_seconds: float = 15.0,
+    force: bool = False,
+) -> list[str] | None:
+    """Retry :func:`capture_loaded_mcp_tools_at_init` until it observes tools.
+
+    WHY (the timing fix). The one-shot init enumeration runs at early boot, but
+    the management ``molecule-platform`` MCP isn't necessarily *connectable* yet
+    at that moment — the gate signal ``mcp_server_present()`` may not have flipped
+    true, and/or ``npx @molecule-ai/mcp-server`` is still cold-starting. A single
+    attempt therefore often finds nothing and the concierge sits ``degraded``
+    until a user turn triggers the per-turn capture (validated 2026-06-25:
+    provisioning→online→degraded, then a turn flips it online). This retry waits
+    for the MCP to become ready so a fresh concierge reaches ``online`` **without
+    any turn** — the "heartbeat verifies it, not a user" behaviour.
+
+    Each attempt re-evaluates the ``_is_platform_agent()`` gate (so a concierge
+    whose MCP is declared a bit late is still picked up) and re-runs the bounded,
+    boot-safe enumeration. Returns the observed ids on the first success (the
+    producer is set as a side effect), or ``None`` when the window elapses — in
+    which case the per-turn capture remains the fallback (degraded-until-turn).
+    This coroutine is meant to run as a BACKGROUND task (it must NOT block boot);
+    it never raises (a failed attempt is swallowed and retried).
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            observed = await capture_loaded_mcp_tools_at_init(
+                runtime, config_path, force=force
+            )
+        except Exception:  # noqa: BLE001 — a background task must never crash the loop
+            logger.warning(
+                "loaded_mcp_tools: retry attempt %d errored — will retry", attempt,
+                exc_info=True,
+            )
+            observed = None
+        if observed is not None:
+            logger.info(
+                "loaded_mcp_tools: init enumeration succeeded on attempt %d/%d "
+                "(%d tool id(s)) — concierge can reach online without a turn",
+                attempt, max_attempts, len(observed),
+            )
+            return observed
+        if attempt < max_attempts:
+            await asyncio.sleep(interval_seconds)
+    logger.info(
+        "loaded_mcp_tools: init enumeration window elapsed (%d attempts x %.0fs) "
+        "without connectable management MCP — producer left unset; the per-turn "
+        "capture will publish on the first turn (degraded-until-turn fallback)",
+        max_attempts, interval_seconds,
+    )
+    return None
