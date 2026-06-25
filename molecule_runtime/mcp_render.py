@@ -212,31 +212,60 @@ def render_hermes_config(config_path: Path, name: str, spec: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OpenClaw — native MCP-config shape unverified (TODO: phase P4)
+# OpenClaw — ~/.openclaw/openclaw.json  mcp.servers.<name>  (phase P4)
 # ---------------------------------------------------------------------------
+# Native format PINNED against a live ``openclaw@2026.5.7`` CLI (phase P4).
+# ``openclaw mcp set <name> '<json>'`` persists the server under
+# ``mcp.servers.<name>`` in ``~/.openclaw/openclaw.json``. A STDIO server is the
+# bare ``{command, args?, env?}`` form — the SAME descriptor shape the plugin
+# ships and the codex/claude renderers consume — so ``@molecule-ai/mcp-server``
+# registers DIRECTLY as a stdio child, no HTTP shim (unlike the a2a sidecar in
+# adapter.py, which needs HTTP only because a2a_mcp_server's stdio main blocks).
+# Verified round-trip: ``openclaw mcp set`` / ``mcp show`` echo back exactly
+# this ``{command, args, env}`` block under ``mcp.servers``.
+
+# The openclaw.json key path under which MCP servers live (mcp -> servers map).
+OPENCLAW_MCP_PARENT = "mcp"
+OPENCLAW_MCP_SERVERS = "servers"
+
 
 def render_openclaw_config(config_path: Path, name: str, spec: dict) -> None:
-    """TODO(P4): OpenClaw's native MCP-config shape is unverified.
+    """Additively merge ``name -> spec`` into ``~/.openclaw/openclaw.json``'s
+    ``mcp.servers`` map. Idempotent; preserves every other key + server.
 
-    Until this entry existed, an ``openclaw`` concierge fell through
-    ``_spec_for`` to the ``claude_code`` default — so its management MCP was
-    rendered into (and the RCA#2970 gate judged it against)
-    ``.claude/settings.json``, a file the openclaw runtime never reads. That is
-    the exact #3159 mis-attribution: it both false-NEGATIVES a healthy openclaw
-    concierge (its real native config is never checked) AND silently mis-renders
-    the privileged MCP to the wrong file.
-
-    This INTERIM stub makes that failure EXPLICIT and DIAGNOSABLE instead of
-    silent: the renderer raises a clear ``NotImplementedError`` (so the
-    privileged-management-MCP install path fails CLOSED and loudly — see
-    ``MCPServerAdaptor.install`` / ``install_plugins_via_registry``), and the
-    paired present-reader returns False (never falsely "present"). The real
-    openclaw renderer + native-config path is a later phase (P4); build it there
-    once the format is pinned against a live openclaw runtime.
+    This produces the exact on-disk shape ``openclaw mcp set <name> '<json>'``
+    writes (verified against openclaw@2026.5.7): the stdio descriptor
+    (``{command, args?, env?}``) nested under ``mcp.servers.<name>``. We write
+    the JSON directly rather than shelling out so the renderer stays a PURE,
+    side-effect-scoped filesystem renderer (testable without the CLI, matching
+    the claude/codex renderers) and works even when the openclaw binary isn't on
+    PATH at install time. The openclaw gateway re-reads this file on start, so a
+    direct write is equivalent to the CLI mutation.
     """
-    raise NotImplementedError(
-        "openclaw MCP render not implemented — format unverified (phase P4)"
-    )
+    settings_path = Path(config_path)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if settings_path.is_file():
+        try:
+            data = json.loads(settings_path.read_text())
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+    else:
+        data = {}
+
+    mcp = data.get(OPENCLAW_MCP_PARENT)
+    if not isinstance(mcp, dict):
+        mcp = {}
+    servers = mcp.get(OPENCLAW_MCP_SERVERS)
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[name] = dict(spec)
+    mcp[OPENCLAW_MCP_SERVERS] = servers
+    data[OPENCLAW_MCP_PARENT] = mcp
+
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 # ===========================================================================
@@ -272,6 +301,13 @@ def _gemini_path(config_path: str | os.PathLike) -> Path:
     return Path(os.path.expanduser("~")) / ".gemini" / "settings.json"
 
 
+def _openclaw_path(config_path: str | os.PathLike) -> Path:
+    # OpenClaw reads ~/.openclaw/openclaw.json (the file `openclaw mcp set`
+    # mutates). config_path is unused (openclaw resolves $HOME), but the
+    # signature is uniform across runtimes — mirrors _codex_path.
+    return Path(os.path.expanduser("~")) / ".openclaw" / "openclaw.json"
+
+
 def _json_settings_has(settings_path: Path, name: str) -> bool:
     try:
         data = json.loads(Path(settings_path).read_text())
@@ -297,6 +333,25 @@ def _codex_config_has(config_path: Path, name: str) -> bool:
     return isinstance(table, dict) and name in table
 
 
+def _openclaw_config_has(config_path: Path, name: str) -> bool:
+    """True when ``~/.openclaw/openclaw.json`` declares ``mcp.servers.<name>``.
+
+    Fail-closed by construction: a missing, unreadable, malformed, or
+    structurally-unexpected config yields False, so a genuinely MCP-less
+    openclaw concierge stays fail-closed (degraded) at the RCA#2970 gate."""
+    try:
+        data = json.loads(Path(config_path).read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    mcp = data.get(OPENCLAW_MCP_PARENT)
+    if not isinstance(mcp, dict):
+        return False
+    servers = mcp.get(OPENCLAW_MCP_SERVERS)
+    return isinstance(servers, dict) and name in servers
+
+
 # runtime -> (path_resolver, renderer, present_reader). Unverified runtimes get
 # the fail-loud renderer; their present_reader returns False (never silently
 # "present"). claude_code is also the default for any unknown runtime so the
@@ -307,12 +362,11 @@ _RUNTIME_SPECS: dict[str, tuple] = {
     "gemini_cli": (_gemini_path, render_gemini_settings, _json_settings_has),
     # hermes: native path unverified; fail-loud render, never falsely present.
     "hermes": (_claude_path, render_hermes_config, lambda p, n: False),
-    # openclaw: native path unverified; fail-loud render, never falsely present.
-    # INTERIM stub (phase P1) so an openclaw concierge fails CLOSED and
-    # DIAGNOSABLY rather than silently falling back to the claude_code default
-    # and being judged against a .claude/settings.json it never reads (#3159
-    # mis-attribution). The concrete openclaw renderer is phase P4.
-    "openclaw": (_claude_path, render_openclaw_config, lambda p, n: False),
+    # openclaw (phase P4): CONCRETE renderer + present-reader pinned against a
+    # live openclaw@2026.5.7. Renders the stdio descriptor into
+    # ~/.openclaw/openclaw.json mcp.servers.<name> (the file `openclaw mcp set`
+    # mutates); present-reader parses the same file, fail-closed on absence.
+    "openclaw": (_openclaw_path, render_openclaw_config, _openclaw_config_has),
 }
 
 # The runtime used when the active runtime isn't mapped above. Claude Code is
@@ -323,7 +377,9 @@ _DEFAULT_RUNTIME = "claude_code"
 
 
 # Runtimes whose renderer is a deliberate fail-loud stub (format unverified).
-_UNVERIFIED_RUNTIMES = frozenset({"gemini_cli", "hermes", "openclaw"})
+# openclaw graduated out (phase P4): it now has a concrete renderer +
+# present-reader verified against a live openclaw runtime.
+_UNVERIFIED_RUNTIMES = frozenset({"gemini_cli", "hermes"})
 
 
 def _spec_for(runtime: str) -> tuple:

@@ -1,17 +1,21 @@
-"""Phase P1 — cross-runtime fail-closed online gate for the concierge.
+"""Phase P4 — openclaw concierge management-MCP render + present-reader.
 
-Before this change ``mcp_render._RUNTIME_SPECS`` had no ``openclaw`` entry, so an
-openclaw concierge fell through ``_spec_for`` to the ``claude_code`` DEFAULT and
-was judged against ``.claude/settings.json`` — a file the openclaw runtime never
-reads. That is the #3159 cross-runtime mis-attribution: it both false-NEGATIVES a
-healthy openclaw concierge (its real native config is never consulted) and
-silently mis-renders the privileged MCP to the wrong file.
+Phase P1 (#178) mapped openclaw as an INTERIM fail-loud stub (renderer raised
+NotImplementedError; present-reader returned False) so an openclaw concierge
+failed CLOSED + diagnosably instead of silently falling through ``_spec_for`` to
+the ``claude_code`` default and being judged against ``.claude/settings.json`` —
+a file the openclaw runtime never reads (the #3159 cross-runtime mis-attribution).
 
-These tests prove the INTERIM fix: openclaw is mapped as an explicit fail-loud
-stub — present-reader returns False (and does NOT probe claude settings.json),
-renderer raises NotImplementedError — so an openclaw concierge fails CLOSED and
-DIAGNOSABLY. They FAIL against the pre-change source (where openclaw silently
-maps to claude_code) and pass after.
+Phase P4 (this change) replaces that stub with the CONCRETE implementation,
+pinned against a live ``openclaw@2026.5.7`` CLI: ``openclaw mcp set <name>
+'<json>'`` persists the stdio descriptor (``{command, args?, env?}``) under
+``mcp.servers.<name>`` in ``~/.openclaw/openclaw.json``. The renderer writes that
+exact shape and the present-reader parses it — both fail-CLOSED on a missing /
+malformed config, so a genuinely MCP-less openclaw concierge still degrades.
+
+These tests prove: the present-reader reads the openclaw-NATIVE config (never
+``.claude/settings.json``), the renderer writes ``~/.openclaw/openclaw.json``
+(NOT ``.claude/settings.json``), and openclaw is no longer ``_UNVERIFIED``.
 """
 
 from __future__ import annotations
@@ -25,93 +29,158 @@ from molecule_runtime import mcp_render
 MANAGEMENT_MCP_NAME = "molecule-platform"
 
 
-# ── openclaw present-reader: False AND does not probe claude settings.json ──
+def _seed_openclaw_config(home, servers: dict) -> None:
+    """Write an ~/.openclaw/openclaw.json carrying ``mcp.servers = servers``."""
+    cfg = home / ".openclaw" / "openclaw.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"mcp": {"servers": servers}}))
 
-def test_openclaw_present_false_and_does_not_probe_claude_settings(tmp_path):
-    """An openclaw concierge whose MCP is NOT wired must report present=False —
-    AND must NOT be judged against ``.claude/settings.json``.
 
-    PROVE-FAIL: pre-change, openclaw fell back to claude_code, whose
-    present-reader (_json_settings_has) reads ``<config>/.claude/settings.json``.
-    If that file happens to declare molecule-platform, the pre-change code
-    returns True (the false-positive mis-attribution). We seed exactly that file
-    and assert the openclaw reader still returns False — which can only hold once
-    openclaw has its own (False-returning) present-reader.
+# ── openclaw present-reader: reads the openclaw-native config, fail-closed ──
+
+def test_openclaw_present_does_not_probe_claude_settings(tmp_path, monkeypatch):
+    """An openclaw concierge must NOT be judged against ``.claude/settings.json``.
+
+    PROVE-FAIL: pre-P4-stub openclaw fell back to claude_code, whose
+    present-reader reads ``<config>/.claude/settings.json``. We seed exactly that
+    file declaring the MCP but leave the openclaw-native config empty, and assert
+    present is still False — only an openclaw-native present-reader can hold this.
     """
-    # Seed a claude settings.json under the config dir that DOES declare the MCP.
+    monkeypatch.setenv("HOME", str(tmp_path))
     claude_settings = tmp_path / ".claude" / "settings.json"
     claude_settings.parent.mkdir(parents=True, exist_ok=True)
     claude_settings.write_text(
         json.dumps({"mcpServers": {MANAGEMENT_MCP_NAME: {"command": "npx"}}})
     )
-
-    # openclaw must NOT consult that claude file → present is False.
+    # No ~/.openclaw/openclaw.json → present is False despite the claude file.
     assert (
         mcp_render.management_mcp_present_for("openclaw", tmp_path, MANAGEMENT_MCP_NAME)
         is False
     )
 
 
-def test_openclaw_present_false_on_malformed_config(tmp_path):
-    """Stays fail-closed (False) even with a malformed/garbage config in play."""
-    claude_settings = tmp_path / ".claude" / "settings.json"
-    claude_settings.parent.mkdir(parents=True, exist_ok=True)
-    claude_settings.write_text("{ not json at all")
+def test_openclaw_present_true_when_registered(tmp_path, monkeypatch):
+    """present=True when ``~/.openclaw/openclaw.json`` declares
+    ``mcp.servers.molecule-platform`` (the shape ``openclaw mcp set`` writes)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _seed_openclaw_config(
+        tmp_path,
+        {MANAGEMENT_MCP_NAME: {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"]}},
+    )
+    assert (
+        mcp_render.management_mcp_present_for("openclaw", tmp_path, MANAGEMENT_MCP_NAME)
+        is True
+    )
+
+
+def test_openclaw_present_false_when_only_other_server(tmp_path, monkeypatch):
+    """An UNRELATED server registered (but not molecule-platform) → False."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _seed_openclaw_config(tmp_path, {"some-other": {"command": "uvx"}})
     assert (
         mcp_render.management_mcp_present_for("openclaw", tmp_path, MANAGEMENT_MCP_NAME)
         is False
     )
 
 
-def test_openclaw_present_false_when_nothing_wired(tmp_path):
+def test_openclaw_present_false_on_malformed_config(tmp_path, monkeypatch):
+    """Stays fail-closed (False) on a malformed/garbage native config."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".openclaw" / "openclaw.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("{ not json at all")
     assert (
         mcp_render.management_mcp_present_for("openclaw", tmp_path, MANAGEMENT_MCP_NAME)
         is False
     )
 
 
-# ── openclaw renderer: explicit fail-loud stub (not a silent claude write) ──
+def test_openclaw_present_false_when_nothing_wired(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.openclaw/openclaw.json
+    assert (
+        mcp_render.management_mcp_present_for("openclaw", tmp_path, MANAGEMENT_MCP_NAME)
+        is False
+    )
 
-def test_openclaw_render_raises_not_implemented(tmp_path):
-    """The renderer must raise NotImplementedError (fail-loud) rather than
-    silently writing claude's settings.json.
 
-    PROVE-FAIL: pre-change, render_for_runtime('openclaw', …) dispatched to the
-    claude renderer and WROTE ``.claude/settings.json`` (returning a path, no
-    raise). After: it raises, and no claude file is written.
+# ── openclaw renderer: writes openclaw-native config, NOT claude settings.json ──
+
+def test_openclaw_render_writes_native_config_not_claude(tmp_path, monkeypatch):
+    """The renderer writes ``~/.openclaw/openclaw.json`` ``mcp.servers.<name>`` —
+    NOT ``.claude/settings.json``.
+
+    PROVE-FAIL: the P1 stub raised NotImplementedError (no file). The pre-stub
+    code wrote ``.claude/settings.json``. After P4 it writes the openclaw-native
+    file with the stdio descriptor and the claude file is never touched.
     """
+    monkeypatch.setenv("HOME", str(tmp_path))
     claude_settings = tmp_path / ".claude" / "settings.json"
-    with pytest.raises(NotImplementedError):
-        mcp_render.render_for_runtime(
-            "openclaw", tmp_path, MANAGEMENT_MCP_NAME, {"command": "npx"}
-        )
+
+    target = mcp_render.render_for_runtime(
+        "openclaw", tmp_path, MANAGEMENT_MCP_NAME,
+        {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"],
+         "env": {"MOLECULE_MCP_MODE": "management"}},
+    )
+
     assert not claude_settings.exists(), (
         "openclaw render must NOT write .claude/settings.json (the #3159 bug)"
     )
+    expected = tmp_path / ".openclaw" / "openclaw.json"
+    assert target == expected
+    data = json.loads(expected.read_text())
+    server = data["mcp"]["servers"][MANAGEMENT_MCP_NAME]
+    assert server["command"] == "npx"
+    assert server["args"] == ["-y", "@molecule-ai/mcp-server"]
+    assert server["env"] == {"MOLECULE_MCP_MODE": "management"}
+    # And the present-reader agrees with what the renderer just wrote.
+    assert (
+        mcp_render.management_mcp_present_for("openclaw", tmp_path, MANAGEMENT_MCP_NAME)
+        is True
+    )
 
 
-def test_openclaw_render_fn_directly_raises(tmp_path):
-    with pytest.raises(NotImplementedError):
-        mcp_render.render_openclaw_config(
-            tmp_path / "out", MANAGEMENT_MCP_NAME, {"command": "npx"}
-        )
+def test_openclaw_render_is_additive_and_idempotent(tmp_path, monkeypatch):
+    """Re-rendering preserves other servers + other top-level keys (idempotent)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".openclaw" / "openclaw.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({
+        "commands": {"native": "auto"},
+        "mcp": {"servers": {"keep-me": {"command": "uvx"}}},
+    }))
+
+    mcp_render.render_for_runtime(
+        "openclaw", tmp_path, MANAGEMENT_MCP_NAME, {"command": "npx"}
+    )
+    data = json.loads(cfg.read_text())
+    # Other top-level key + the pre-existing server both survive.
+    assert data["commands"] == {"native": "auto"}
+    assert data["mcp"]["servers"]["keep-me"] == {"command": "uvx"}
+    assert data["mcp"]["servers"][MANAGEMENT_MCP_NAME] == {"command": "npx"}
 
 
-# ── openclaw is classified as an unverified (fail-loud) runtime ──
+def test_openclaw_render_fn_directly_writes(tmp_path):
+    """The renderer fn writes the descriptor under mcp.servers at the given path."""
+    out = tmp_path / "openclaw.json"
+    mcp_render.render_openclaw_config(out, MANAGEMENT_MCP_NAME, {"command": "npx"})
+    data = json.loads(out.read_text())
+    assert data["mcp"]["servers"][MANAGEMENT_MCP_NAME] == {"command": "npx"}
 
-def test_openclaw_is_unverified_runtime():
-    """PROVE-FAIL: pre-change ``is_runtime_supported('openclaw')`` is True
-    (openclaw not in _UNVERIFIED_RUNTIMES → reported supported), which is exactly
-    the silent claude fall-back. After: openclaw is unsupported (fail-loud)."""
-    assert mcp_render.is_runtime_supported("openclaw") is False
-    assert "openclaw" in mcp_render._UNVERIFIED_RUNTIMES
+
+# ── openclaw is now a VERIFIED (concrete) runtime ──
+
+def test_openclaw_is_supported_runtime():
+    """PROVE-FAIL: the P1 stub kept openclaw in _UNVERIFIED_RUNTIMES (unsupported).
+    After P4 it has a concrete renderer → supported, and is OUT of the stub set."""
+    assert mcp_render.is_runtime_supported("openclaw") is True
+    assert "openclaw" not in mcp_render._UNVERIFIED_RUNTIMES
 
 
 @pytest.mark.parametrize("runtime", ["openclaw", "OpenClaw", "  OPENCLAW "])
-def test_openclaw_normalization_variants_are_unverified(runtime):
-    """Case/whitespace variants normalize to the same fail-loud entry
+def test_openclaw_normalization_variants_are_supported(runtime):
+    """Case/whitespace variants normalize to the same concrete entry
     (``normalize_runtime`` lowercases + strips)."""
-    assert mcp_render.is_runtime_supported(runtime) is False
+    assert mcp_render.is_runtime_supported(runtime) is True
 
 
 # ── codex present-reader: True iff config.toml declares the MCP table ──
