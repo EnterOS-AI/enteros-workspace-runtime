@@ -597,3 +597,65 @@ class TestReadMcpServersFor:
         from molecule_runtime.mcp_render import read_mcp_servers_for
 
         assert read_mcp_servers_for("claude-code", str(tmp_path)) == {}
+
+
+class TestRetryUntilReady:
+    """capture_loaded_mcp_tools_with_retry: no-turn fix — keep enumerating in the
+    background until the management MCP becomes connectable, then publish."""
+
+    @pytest.mark.asyncio
+    async def test_succeeds_when_mcp_becomes_ready_late(self, monkeypatch):
+        # Simulate the real timing: the MCP isn't connectable for the first 2
+        # attempts (init enumeration finds nothing -> None), then becomes ready.
+        calls = {"n": 0}
+        result = ["mcp__molecule-platform__create_workspace"]
+
+        async def _fake_capture(runtime, config_path, *, force=False):
+            calls["n"] += 1
+            return None if calls["n"] < 3 else result
+
+        monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _fake_capture)
+        out = await probe.capture_loaded_mcp_tools_with_retry(
+            "claude-code", "/cfg", max_attempts=5, interval_seconds=0.01
+        )
+        assert out == result
+        assert calls["n"] == 3, "should stop on first success, not keep retrying"
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_window_without_hanging(self, monkeypatch):
+        # MCP never becomes ready -> always None -> give up after max_attempts,
+        # returning None (the per-turn capture is then the fallback). Must not hang.
+        calls = {"n": 0}
+
+        async def _never(runtime, config_path, *, force=False):
+            calls["n"] += 1
+            return None
+
+        monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _never)
+        out = await probe.capture_loaded_mcp_tools_with_retry(
+            "claude-code", "/cfg", max_attempts=4, interval_seconds=0.01
+        )
+        assert out is None
+        assert calls["n"] == 4, "should attempt exactly max_attempts times"
+
+    @pytest.mark.asyncio
+    async def test_swallows_per_attempt_errors_and_keeps_retrying(self, monkeypatch):
+        # A transient error on an attempt (e.g. config not written yet) must be
+        # swallowed and retried, never crash the background task.
+        calls = {"n": 0}
+        result = ["mcp__molecule-platform__create_workspace"]
+
+        async def _flaky(runtime, config_path, *, force=False):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("config not ready")
+            if calls["n"] == 2:
+                return None
+            return result
+
+        monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _flaky)
+        out = await probe.capture_loaded_mcp_tools_with_retry(
+            "claude-code", "/cfg", max_attempts=5, interval_seconds=0.01
+        )
+        assert out == result
+        assert calls["n"] == 3
