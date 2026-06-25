@@ -311,6 +311,16 @@ async def main():  # pragma: no cover
     from molecule_runtime.credential_helper import install_credential_helper
     install_credential_helper()
 
+    # 0.2b Gitea npm-registry auth — the npm companion to the git credential
+    # helper above. The concierge's management MCP is `npx @molecule-ai/mcp-server`,
+    # an npm fetch from the PRIVATE gitea registry; without registry auth npx only
+    # saw the unauth view and ETARGET'd the current version → MCP never started →
+    # fleet-wide concierge `degraded` (RCA 2026-06-24). Writes ~/.npmrc with the
+    # gitea registry + _authToken from the SAME gitea read token (SSOT). No-op
+    # when no gitea token is present; fail-soft. See npm_auth.py.
+    from molecule_runtime.npm_auth import install_npm_gitea_auth
+    install_npm_gitea_auth()
+
     # 0.3 Pre-commit hook installer — refuses commits that add internal-flavored
     # paths or known secret shapes to any git repo the workspace touches. Lifted
     # into runtime so all templates get the gate without per-Dockerfile wiring.
