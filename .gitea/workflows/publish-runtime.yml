@@ -146,7 +146,7 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("accessToken") or "")')
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); print(v if isinstance(v,str) and v else "")')
           if [ -z "${TOK}" ]; then
             echo "::error::Infisical universal-auth login returned no accessToken -- authoritative fetch cannot proceed"
             exit 1
@@ -157,7 +157,7 @@ jobs:
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("secret") or {}).get("secretValue") or "")'
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); print(v if isinstance(v,str) and v else "")'
           }
           MOLECULE_PYPI_GITEA_PUBLISHER_USER=$(read_secret MOLECULE_PYPI_GITEA_PUBLISHER_USER %2Fci%2Fgitea-pypi-publisher)
           MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN=$(read_secret MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN %2Fci%2Fgitea-pypi-publisher)
