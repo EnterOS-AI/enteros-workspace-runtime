@@ -7,8 +7,10 @@ name: lint-infisical-extractor
 # missing, null, or a non-string):
 #   - raw key access:    print(json.load(sys.stdin)["accessToken"])
 #   - fail-open .get:    print(json.load(sys.stdin).get("accessToken",""))
+#   - fail-open or "":   print(d.get("accessToken") or "")
 #   - raw secretValue:   print(json.load(sys.stdin)["secret"]["secretValue"])
 #   - fail-open secret:  print((d.get("secret") or {}).get("secretValue",""))
+#   - fail-open or "":   print((d.get("secret") or {}).get("secretValue") or "")
 #   - bare print(secretValue)
 #
 # Canonical shape (required):
@@ -54,6 +56,83 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Self-test lint patterns against known-good and known-bad samples
+        run: |
+          set -euo pipefail
+          TMPDIR="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR"' EXIT
+
+          # Known-bad samples: each forbidden shape should be caught by at
+          # least one pattern. Split across files so a single pattern that
+          # matches everything cannot hide a regression in another pattern.
+          cat > "$TMPDIR/raw-key.yml" <<'BAD'
+          run: print(json.load(sys.stdin)["accessToken"])
+          BAD
+          cat > "$TMPDIR/get-default-empty.yml" <<'BAD'
+          run: print(json.load(sys.stdin).get("accessToken",""))
+          BAD
+          cat > "$TMPDIR/get-or-empty.yml" <<'BAD'
+          run: print(d.get("accessToken") or "")
+          BAD
+          cat > "$TMPDIR/secret-get-default-empty.yml" <<'BAD'
+          run: print((d.get("secret") or {}).get("secretValue",""))
+          BAD
+          cat > "$TMPDIR/secret-get-or-empty.yml" <<'BAD'
+          run: print((d.get("secret") or {}).get("secretValue") or "")
+          BAD
+          cat > "$TMPDIR/bare-secretvalue.yml" <<'BAD'
+          run: print(secretValue)
+          BAD
+
+          # Known-good sample: canonical string-only isinstance idiom.
+          cat > "$TMPDIR/canonical.yml" <<'GOOD'
+          run: |
+            import json,sys
+            d=json.load(sys.stdin)
+            v=d.get("accessToken")
+            print(v if isinstance(v,str) and v else "")
+            sv=(d.get("secret") or {}).get("secretValue")
+            print(sv if isinstance(sv,str) and sv else "")
+          GOOD
+
+          PATTERNS=(
+            'print\(json\.load\([^)]*\)\[[^]]+\]\)'
+            '\.get\("(accessToken|secretValue)", *""\)'
+            '\.get\("(accessToken|secretValue)"\)[^)]* or ""'
+            'print\([^)]*secretValue[^)]*\)'
+          )
+
+          # Every known-bad file must be flagged.
+          for f in "$TMPDIR"/*.yml; do
+            [ "$(basename "$f")" != "canonical.yml" ] || continue
+            flagged=0
+            for pat in "${PATTERNS[@]}"; do
+              if grep -qE "$pat" "$f"; then
+                flagged=1
+                break
+              fi
+            done
+            if [ "$flagged" -ne 1 ]; then
+              echo "::error::self-test failed: known-bad sample was not flagged: $f"
+              exit 1
+            fi
+          done
+
+          # The known-good file must NOT be flagged.
+          good_flagged=0
+          for pat in "${PATTERNS[@]}"; do
+            if grep -qE "$pat" "$TMPDIR/canonical.yml"; then
+              good_flagged=1
+              break
+            fi
+          done
+          if [ "$good_flagged" -ne 0 ]; then
+            echo "::error::self-test failed: canonical isinstance idiom was incorrectly flagged"
+            exit 1
+          fi
+
+          echo "OK lint patterns correctly flag known-bad samples and ignore the canonical idiom."
+
       - name: Forbid unsafe Infisical accessToken / secretValue extractors
         run: |
           set -euo pipefail
@@ -64,8 +143,10 @@ jobs:
           PATTERNS=(
             # raw key access to accessToken or secretValue
             'print\(json\.load\([^)]*\)\[[^]]+\]\)'
-            # fail-open .get(... ,"") for accessToken/secretValue anywhere in the line
+            # fail-open .get(...,"") for accessToken/secretValue anywhere in the line
             '\.get\("(accessToken|secretValue)", *""\)'
+            # fail-open `or ""` fallback after .get(...) for accessToken/secretValue
+            '\.get\("(accessToken|secretValue)"\)[^)]* or ""'
             # bare print(secretValue) without isinstance guard
             'print\([^)]*secretValue[^)]*\)'
           )
