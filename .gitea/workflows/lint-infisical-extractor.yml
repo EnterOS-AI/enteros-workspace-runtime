@@ -1,0 +1,179 @@
+name: lint-infisical-extractor
+
+# Static workflow-shape lint: forbid fail-open / non-type-checked Infisical
+# JSON extractors for accessToken and secretValue.
+#
+# Forbidden shapes (all crash or emit a non-string when the JSON field is
+# missing, null, or a non-string):
+#   - raw key access:    print(json.load(sys.stdin)["accessToken"])
+#   - fail-open .get:    print(json.load(sys.stdin).get("accessToken",""))
+#   - fail-open or "":   print(d.get("accessToken") or "")
+#   - raw secretValue:   print(json.load(sys.stdin)["secret"]["secretValue"])
+#   - fail-open secret:  print((d.get("secret") or {}).get("secretValue",""))
+#   - fail-open or "":   print((d.get("secret") or {}).get("secretValue") or "")
+#   - bare print(secretValue)
+#
+# Canonical shape (required):
+#   import json,sys
+#   d=json.load(sys.stdin)
+#   v=d.get("accessToken")            # or (d.get("secret") or {}).get("secretValue")
+#   print(v if isinstance(v,str) and v else "")
+#
+# Why: the unsafe shapes have recurred ~5× across controlplane CI workflows.
+# A missing/null/non-string token value must produce an empty string so the
+# downstream [ -z "$VAR" ] guard fails closed instead of crashing or passing
+# garbage into Authorization / $GITHUB_ENV.
+#
+# Scope discipline:
+#   No paths: filter — required-status workflows must run on every PR per
+#   feedback_path_filtered_workflow_cant_be_required.
+#
+# Branch-protection note:
+#   Making this check a required BP status is a CTO action; landing it as a
+#   non-blocking job first lets the org verify stability before flipping the
+#   BP bit.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, staging]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-infisical-extractor-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint-infisical-extractor
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Self-test lint patterns against known-good and known-bad samples
+        run: |
+          set -euo pipefail
+          TMPDIR="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR"' EXIT
+
+          # Known-bad samples: each forbidden shape should be caught by at
+          # least one pattern. Split across files so a single pattern that
+          # matches everything cannot hide a regression in another pattern.
+          cat > "$TMPDIR/raw-key.yml" <<'BAD'
+          run: print(json.load(sys.stdin)["accessToken"])
+          BAD
+          cat > "$TMPDIR/get-default-empty.yml" <<'BAD'
+          run: print(json.load(sys.stdin).get("accessToken",""))
+          BAD
+          cat > "$TMPDIR/get-or-empty.yml" <<'BAD'
+          run: print(d.get("accessToken") or "")
+          BAD
+          cat > "$TMPDIR/secret-get-default-empty.yml" <<'BAD'
+          run: print((d.get("secret") or {}).get("secretValue",""))
+          BAD
+          cat > "$TMPDIR/secret-get-or-empty.yml" <<'BAD'
+          run: print((d.get("secret") or {}).get("secretValue") or "")
+          BAD
+          cat > "$TMPDIR/bare-secretvalue.yml" <<'BAD'
+          run: print(secretValue)
+          BAD
+
+          # Known-good sample: canonical string-only isinstance idiom.
+          cat > "$TMPDIR/canonical.yml" <<'GOOD'
+          run: |
+            import json,sys
+            d=json.load(sys.stdin)
+            v=d.get("accessToken")
+            print(v if isinstance(v,str) and v else "")
+            sv=(d.get("secret") or {}).get("secretValue")
+            print(sv if isinstance(sv,str) and sv else "")
+          GOOD
+
+          PATTERNS=(
+            'print\(json\.load\([^)]*\)\[[^]]+\]\)'
+            '\.get\("(accessToken|secretValue)", *""\)'
+            '\.get\("(accessToken|secretValue)"\)[^)]* or ""'
+            'print\([^)]*secretValue[^)]*\)'
+          )
+
+          # Every known-bad file must be flagged.
+          for f in "$TMPDIR"/*.yml; do
+            [ "$(basename "$f")" != "canonical.yml" ] || continue
+            flagged=0
+            for pat in "${PATTERNS[@]}"; do
+              if grep -qE "$pat" "$f"; then
+                flagged=1
+                break
+              fi
+            done
+            if [ "$flagged" -ne 1 ]; then
+              echo "::error::self-test failed: known-bad sample was not flagged: $f"
+              exit 1
+            fi
+          done
+
+          # The known-good file must NOT be flagged.
+          good_flagged=0
+          for pat in "${PATTERNS[@]}"; do
+            if grep -qE "$pat" "$TMPDIR/canonical.yml"; then
+              good_flagged=1
+              break
+            fi
+          done
+          if [ "$good_flagged" -ne 0 ]; then
+            echo "::error::self-test failed: canonical isinstance idiom was incorrectly flagged"
+            exit 1
+          fi
+
+          echo "OK lint patterns correctly flag known-bad samples and ignore the canonical idiom."
+
+      - name: Forbid unsafe Infisical accessToken / secretValue extractors
+        run: |
+          set -euo pipefail
+
+          # Forbidden regexes. Each is intentionally narrow and only flags
+          # the unsafe idioms described above; canonical isinstance lines
+          # do not match.
+          PATTERNS=(
+            # raw key access to accessToken or secretValue
+            'print\(json\.load\([^)]*\)\[[^]]+\]\)'
+            # fail-open .get(...,"") for accessToken/secretValue anywhere in the line
+            '\.get\("(accessToken|secretValue)", *""\)'
+            # fail-open `or ""` fallback after .get(...) for accessToken/secretValue
+            '\.get\("(accessToken|secretValue)"\)[^)]* or ""'
+            # bare print(secretValue) without isinstance guard
+            'print\([^)]*secretValue[^)]*\)'
+          )
+
+          HITS=""
+          for pat in "${PATTERNS[@]}"; do
+            # grep -E on .gitea/workflows/*.yml
+            found=$(grep -R -nE --include='*.yml' --exclude='lint-infisical-extractor.yml' "$pat" .gitea/workflows 2>/dev/null || true)
+            if [ -n "$found" ]; then
+              HITS="${HITS}--- pattern: ${pat} ---\n${found}\n"
+            fi
+          done
+
+          if [ -n "$HITS" ]; then
+            echo "::error::lint-infisical-extractor: unsafe JSON extractor(s) found in .gitea/workflows/*.yml"
+            printf "$HITS"
+            echo ""
+            echo "Unsafe extractors can crash or emit non-string values when the"
+            echo "Infisical response is missing, null, or malformed. Use the canonical"
+            echo "string-only isinstance idiom:"
+            echo '  import json,sys'
+            echo '  d=json.load(sys.stdin)'
+            echo '  v=d.get("accessToken")'
+            echo '  print(v if isinstance(v,str) and v else "")'
+            echo ""
+            echo "Making this check branch-protection required is a CTO action."
+            exit 1
+          fi
+
+          echo "OK No unsafe Infisical extractors found in .gitea/workflows/*.yml."
