@@ -209,13 +209,71 @@ jobs:
         with:
           python-version: "3.11"
 
+      # CI bot-token consolidation (RFC: Gitea-Actions-secrets -> Infisical/KMS,
+      # mirrors #971 / #3274): source the molecule-runtime-release-bot token from
+      # the Infisical SSOT (/shared/runtime-bot, key RUNTIME_BOT_TOKEN) via the CI
+      # machine identity, instead of the per-repo Gitea Actions secret
+      # DISPATCH_TOKEN. The fetched value is exported to $GITHUB_ENV under
+      # DISPATCH_TOKEN — the exact env var name the consumer step + the
+      # propagate script (--token-env DISPATCH_TOKEN) already read — so nothing
+      # downstream changes.
+      #
+      # ABSENT -> REPORT-ONLY DEGRADE PRESERVED (runtime#83): if the bootstrap
+      # INFISICAL_CI_* creds are absent (a config gap), this step warns and exports
+      # nothing, so the propagate script degrades to report-only (exits 0) rather
+      # than painting runtime main red. When the creds ARE present, Infisical is
+      # AUTHORITATIVE: a broken/empty/404 fetch hard-fails here so a broken
+      # migration cannot masquerade as a green report-only no-op.
+      - name: Fetch RUNTIME_BOT_TOKEN from Infisical SSOT
+        id: runtime_bot_token
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -z "${INFISICAL_CI_CLIENT_ID:-}" ] || [ -z "${INFISICAL_CI_CLIENT_SECRET:-}" ] || [ -z "${INFISICAL_PROJECT_ID:-}" ]; then
+            echo "::warning::INFISICAL_CI_* bootstrap creds absent; cannot fetch RUNTIME_BOT_TOKEN. propagate will degrade to report-only (config gap, runtime#83). Provision INFISICAL_CI_CLIENT_ID/_CLIENT_SECRET/_PROJECT_ID to enable real bump PRs."
+            exit 0
+          fi
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("accessToken") or "")')
+          if [ -z "${TOK}" ]; then
+            echo "::error::Infisical universal-auth login returned no accessToken -- creds present but auth failed; this is a real infra fault, failing loudly instead of degrading." >&2
+            exit 1
+          fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("secret") or {}).get("secretValue") or "")'
+          }
+          RUNTIME_BOT_TOKEN=$(read_secret RUNTIME_BOT_TOKEN %2Fshared%2Fruntime-bot)
+          if [ -z "${RUNTIME_BOT_TOKEN}" ]; then
+            echo "::error::Infisical returned empty for RUNTIME_BOT_TOKEN at /shared/runtime-bot (prod) -- creds present but authoritative fetch failed; failing loudly so a broken migration cannot masquerade as a green report-only no-op." >&2
+            exit 1
+          fi
+          echo "::add-mask::$RUNTIME_BOT_TOKEN"
+          # Export under DISPATCH_TOKEN — the name the consumer step + script expect.
+          echo "DISPATCH_TOKEN=$RUNTIME_BOT_TOKEN" >> "$GITHUB_ENV"
+          echo "RUNTIME_BOT_TOKEN loaded from Infisical /shared/runtime-bot (non-empty, len=${#RUNTIME_BOT_TOKEN})"
+
       - name: Open .runtime-version bump PRs on consumer templates
         env:
-          DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          # Now sourced from the Infisical SSOT (/shared/runtime-bot,
+          # RUNTIME_BOT_TOKEN) by the fetch step above and exported to $GITHUB_ENV
+          # under DISPATCH_TOKEN — the name scripts/propagate_runtime_version.py
+          # (--token-env DISPATCH_TOKEN) already reads. The old per-repo Gitea
+          # secret DISPATCH_TOKEN is kept in place until a green run validates this
+          # path (validate-before-delete).
+          DISPATCH_TOKEN: ${{ env.DISPATCH_TOKEN }}
           RUNTIME_VERSION: ${{ needs.publish.outputs.version }}
         run: |
-          # runtime#83: when DISPATCH_TOKEN is absent the script degrades to
-          # report-only (warns, lists the consumers that would be bumped, exits 0)
-          # instead of hard-failing — a missing-secret config gap must not paint
-          # runtime main red. When present, it opens the bump PRs for real.
+          # runtime#83: when DISPATCH_TOKEN is absent (Infisical fetch skipped on
+          # absent bootstrap creds) the script degrades to report-only (warns,
+          # lists the consumers that would be bumped, exits 0) instead of
+          # hard-failing — a missing-secret config gap must not paint runtime main
+          # red. When present, it opens the bump PRs for real.
           python scripts/propagate_runtime_version.py --version "$RUNTIME_VERSION"

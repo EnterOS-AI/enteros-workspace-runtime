@@ -109,25 +109,72 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read   # the only write is the TAG, via the API + RELEASE_BOT_TOKEN
+      contents: read   # the only write is the TAG, via the API + RUNTIME_BOT_TOKEN
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
+
+      # CI bot-token consolidation (RFC: Gitea-Actions-secrets -> Infisical/KMS,
+      # mirrors #971 / #3274): source the molecule-runtime-release-bot token from
+      # the Infisical SSOT (/shared/runtime-bot, key RUNTIME_BOT_TOKEN) via the CI
+      # machine identity, instead of the per-repo Gitea Actions secret
+      # RELEASE_BOT_TOKEN. RELEASE_BOT_TOKEN and DISPATCH_TOKEN across this repo
+      # were the SAME bot identity, so they collapse to one consolidated cred
+      # (RUNTIME_BOT). The fetched value is exported to $GITHUB_ENV under the env
+      # var name the consumer step already expects (RELEASE_BOT_TOKEN) so
+      # scripts/auto_release_runtime.py --token-env RELEASE_BOT_TOKEN is unchanged.
+      #
+      # FAIL-CLOSED (release/tag job): Infisical is now the AUTHORITATIVE source
+      # for this token. A broken/empty/404 fetch hard-fails here — a release must
+      # never proceed (or silently no-op) on a broken authoritative fetch.
+      - name: Fetch RUNTIME_BOT_TOKEN from Infisical SSOT
+        id: runtime_bot_token
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("accessToken") or "")')
+          if [ -z "${TOK}" ]; then
+            echo "::error::Infisical universal-auth login returned no accessToken -- cannot fetch RUNTIME_BOT_TOKEN; failing the release fail-closed." >&2
+            exit 1
+          fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("secret") or {}).get("secretValue") or "")'
+          }
+          RUNTIME_BOT_TOKEN=$(read_secret RUNTIME_BOT_TOKEN %2Fshared%2Fruntime-bot)
+          if [ -z "${RUNTIME_BOT_TOKEN}" ]; then
+            echo "::error::Infisical returned empty for RUNTIME_BOT_TOKEN at /shared/runtime-bot (prod) -- authoritative fetch failed; failing the release loudly (fail-closed)." >&2
+            exit 1
+          fi
+          echo "::add-mask::$RUNTIME_BOT_TOKEN"
+          # Export under the name the consumer/script already expects so nothing breaks.
+          echo "RELEASE_BOT_TOKEN=$RUNTIME_BOT_TOKEN" >> "$GITHUB_ENV"
+          echo "RUNTIME_BOT_TOKEN loaded from Infisical /shared/runtime-bot (non-empty, len=${#RUNTIME_BOT_TOKEN})"
+
       - name: Compute next version + cut tag at main HEAD
         env:
-          # molecule-runtime-release-bot identity with write on this repo.
-          # The SAME bot used by publish-runtime.yml's propagate job
-          # (DISPATCH_TOKEN). Provision RELEASE_BOT_TOKEN as a repo/org secret
-          # holding that bot's token (NOT a founder PAT —
-          # feedback_per_agent_gitea_identity_default). The token only needs
-          # repository Read+Write to create a tag; it never pushes to main.
-          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          # molecule-runtime-release-bot identity with write on this repo, now
+          # sourced from the Infisical SSOT (/shared/runtime-bot, RUNTIME_BOT_TOKEN)
+          # by the fetch step above and exported to $GITHUB_ENV under the name
+          # RELEASE_BOT_TOKEN that scripts/auto_release_runtime.py expects. The
+          # token only needs repository Read+Write to create a tag; it never
+          # pushes to main. The old per-repo Gitea secret RELEASE_BOT_TOKEN is
+          # kept in place until a green run validates this path (validate-before-delete).
+          RELEASE_BOT_TOKEN: ${{ env.RELEASE_BOT_TOKEN }}
         run: |
           set -eu
           if [ -z "${RELEASE_BOT_TOKEN:-}" ]; then
-            echo "::error::RELEASE_BOT_TOKEN secret not configured — cannot auto-release. Provision the molecule-runtime-release-bot token (write on this repo)."
+            echo "::error::RELEASE_BOT_TOKEN empty after Infisical fetch — cannot auto-release. Check the 'Fetch RUNTIME_BOT_TOKEN from Infisical SSOT' step and /shared/runtime-bot."
             exit 1
           fi
           python scripts/auto_release_runtime.py --token-env RELEASE_BOT_TOKEN
