@@ -60,6 +60,59 @@ jobs:
         with:
           python-version: "3.11"
 
+      # CI bot-token consolidation (RFC: Gitea-Actions-secrets -> Infisical/KMS,
+      # mirrors #971 / #3274): source the molecule-runtime-release-bot READ token
+      # from the Infisical SSOT (/shared/runtime-bot, key RUNTIME_BOT_TOKEN) via
+      # the CI machine identity, instead of the per-repo Gitea Actions secret
+      # DISPATCH_TOKEN. The fetched value is exported to $GITHUB_ENV under
+      # DISPATCH_TOKEN — the exact env var name the consumer step + the merge
+      # script (--read-token-env DISPATCH_TOKEN) already read. Only DISPATCH_TOKEN
+      # is consolidated here; CONSUMER_BUMP_MERGE_TOKEN is a DISTINCT non-author
+      # approve+merge identity (runtime#131) and is intentionally left on
+      # secrets.* — out of scope for this bot-token consolidation.
+      #
+      # ABSENT -> SKIP DEGRADE PRESERVED (runtime#83 + runtime#131): if the
+      # bootstrap INFISICAL_CI_* creds are absent (a config gap), this step warns
+      # and exports nothing, so the downstream `[ -z "${DISPATCH_TOKEN:-}" ]` check
+      # skips the sweeper (exit 0) rather than painting runtime main red. When the
+      # creds ARE present, Infisical is AUTHORITATIVE: a broken/empty/404 fetch
+      # hard-fails here so a broken migration cannot masquerade as a green skip.
+      - name: Fetch RUNTIME_BOT_TOKEN from Infisical SSOT
+        id: runtime_bot_token
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -z "${INFISICAL_CI_CLIENT_ID:-}" ] || [ -z "${INFISICAL_CI_CLIENT_SECRET:-}" ] || [ -z "${INFISICAL_PROJECT_ID:-}" ]; then
+            echo "::warning::INFISICAL_CI_* bootstrap creds absent; cannot fetch RUNTIME_BOT_TOKEN. The sweeper will skip pre-flight (config gap, runtime#83). Provision INFISICAL_CI_CLIENT_ID/_CLIENT_SECRET/_PROJECT_ID to enable."
+            exit 0
+          fi
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);v=d.get("accessToken");print(v if isinstance(v,str) and v else "")')
+          if [ -z "${TOK}" ]; then
+            echo "::error::Infisical universal-auth login returned no accessToken -- creds present but auth failed; this is a real infra fault, failing loudly instead of skipping." >&2
+            exit 1
+          fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json;d=json.load(sys.stdin);v=(d.get("secret") or {}).get("secretValue");print(v if isinstance(v,str) and v else "")'
+          }
+          RUNTIME_BOT_TOKEN=$(read_secret RUNTIME_BOT_TOKEN %2Fshared%2Fruntime-bot)
+          if [ -z "${RUNTIME_BOT_TOKEN}" ]; then
+            echo "::error::Infisical returned empty for RUNTIME_BOT_TOKEN at /shared/runtime-bot (prod) -- creds present but authoritative fetch failed; failing loudly so a broken migration cannot masquerade as a green skip." >&2
+            exit 1
+          fi
+          echo "::add-mask::$RUNTIME_BOT_TOKEN"
+          # Export under DISPATCH_TOKEN — the read-token name the consumer + script expect.
+          echo "DISPATCH_TOKEN=$RUNTIME_BOT_TOKEN" >> "$GITHUB_ENV"
+          echo "RUNTIME_BOT_TOKEN loaded from Infisical /shared/runtime-bot (non-empty, len=${#RUNTIME_BOT_TOKEN})"
+
       - name: Merge propagated .runtime-version bump PRs
         env:
           # runtime#131 contract: the sweeper performs approve+merge
@@ -67,22 +120,28 @@ jobs:
           # the bump PR (`molecule-runtime-release-bot`). Two tokens
           # are wired:
           #   - CONSUMER_BUMP_MERGE_TOKEN: the non-author approve+merge
-          #     identity. If absent the script exits 0 with a loud
-          #     warning (config gap per runtime#83; not a runtime
-          #     regression — must not paint runtime main red).
+          #     identity. DISTINCT identity — intentionally NOT consolidated
+          #     into RUNTIME_BOT; stays on secrets.*. If absent the script
+          #     exits 0 with a loud warning (config gap per runtime#83; not a
+          #     runtime regression — must not paint runtime main red).
           #   - DISPATCH_TOKEN: the read-only token for listing PRs,
           #     fetching files, checking commit status, and reading
-          #     the per-repo opt-out file. Same identity the propagate
-          #     + auto-release workflows use.
+          #     the per-repo opt-out file. Same molecule-runtime-release-bot
+          #     identity the propagate + auto-release workflows use — now
+          #     sourced from the Infisical SSOT (/shared/runtime-bot,
+          #     RUNTIME_BOT_TOKEN) by the fetch step above and exported to
+          #     $GITHUB_ENV under DISPATCH_TOKEN. The old per-repo Gitea secret
+          #     DISPATCH_TOKEN is kept in place until a green run validates this
+          #     path (validate-before-delete).
           CONSUMER_BUMP_MERGE_TOKEN: ${{ secrets.CONSUMER_BUMP_MERGE_TOKEN }}
-          DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          DISPATCH_TOKEN: ${{ env.DISPATCH_TOKEN }}
         run: |
           if [ -z "${CONSUMER_BUMP_MERGE_TOKEN:-}" ]; then
             echo "::warning::CONSUMER_BUMP_MERGE_TOKEN secret absent; skipping consumer runtime-version bump merge sweeper (runtime#131 + runtime#83). Provision a non-author identity with write on the consumer template repos to enable."
             exit 0
           fi
           if [ -z "${DISPATCH_TOKEN:-}" ]; then
-            echo "::warning::DISPATCH_TOKEN secret absent; cannot list PRs / check status. Provision DISPATCH_TOKEN to enable pre-flight checks."
+            echo "::warning::DISPATCH_TOKEN unavailable (Infisical fetch skipped on absent bootstrap creds); cannot list PRs / check status. Provision INFISICAL_CI_* to enable pre-flight checks."
             exit 0
           fi
           python scripts/merge_runtime_version_bumps.py
