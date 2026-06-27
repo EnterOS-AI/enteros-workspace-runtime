@@ -19,11 +19,12 @@ runtime-side signal therefore proves the MCP is *wired in* by whatever delivery
 mechanism. Absence of BOTH stays fail-closed: a generic runtime that declares
 neither cannot be trusted as a platform agent.
 
-SSOT — the literals below (``SETTINGS_PATH``, ``MCPSERVERS_KEY``, and
-``MANAGEMENT_MCP_NAME``) are NOT free to drift. They are declared in the
-cross-repo contract ``contracts/mcp-plugin-delivery.contract.json``. The same
-path/key/name are produced by the MCPServerAdaptor plugin and consumed by
-``claude_sdk_executor._load_settings_mcp`` — this module is a THIRD consumer.
+SSOT — the literals below (``SETTINGS_PATH``, ``MCPSERVERS_KEY``,
+``MANAGEMENT_MCP_NAME``, and ``REQUIRED_TOOL``) are NOT free to drift. They are
+declared in the cross-repo contract ``contracts/mcp-plugin-delivery.contract.json``.
+The same path/key/name are produced by the MCPServerAdaptor plugin and consumed
+by ``claude_sdk_executor._load_settings_mcp`` — this module is a THIRD consumer,
+and ``mcp_readiness_probe`` (the active tools/list readiness probe) is a FOURTH.
 
 Enforcement is layered, and honestly scoped:
   * RUNTIME-LOCAL (this repo, active): ``tests/test_mcp_plugin_delivery_contract.py``
@@ -60,6 +61,24 @@ MCPSERVERS_KEY = "mcpServers"
 
 # The ``mcpServers`` entry name the management plugin registers under.
 MANAGEMENT_MCP_NAME = "molecule-platform"
+
+# The management lifecycle verb the controlplane online/degraded gate requires
+# to consider the management MCP actually LOADED (contract ``required_tool``).
+# In MOLECULE_MCP_MODE=management the @molecule-ai/mcp-server registers ONLY the
+# management surface — provision_workspace is the lifecycle verb on ALL
+# published versions (create_workspace is a workspace-mode tool that never ships
+# on the concierge's management surface). Pinned to the contract by
+# tests/test_mcp_plugin_delivery_contract.py so it can't silently drift from the
+# core gate's conciergePlatformMCPRequiredTool.
+REQUIRED_TOOL = "provision_workspace"
+
+# The fully-qualified tool id the Claude dispatcher exposes for the management
+# MCP's required verb (``mcp__<server>__<tool>``), composed from the two
+# contract-pinned literals above. This is byte-identical to the core gate's
+# conciergePlatformMCPProvisionWorkspaceTool == mcp__molecule-platform__provision_workspace
+# — the exact value the heartbeat's loaded_mcp_tools must carry for the concierge
+# to be marked online (core#3082 / runtime#181).
+MANAGEMENT_PROVISION_TOOL_ID = f"mcp__{MANAGEMENT_MCP_NAME}__{REQUIRED_TOOL}"
 
 # Env marker baked into the platform-agent image (Dockerfile.platform-agent
 # ``ENV MOLECULE_PLATFORM_AGENT_IMAGE_BAKED=1``). When set, this container IS

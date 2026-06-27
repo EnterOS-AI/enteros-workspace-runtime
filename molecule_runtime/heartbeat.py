@@ -212,6 +212,14 @@ class HeartbeatLoop:
         # of the httpx.AsyncClient / asyncio primitives those POSTs use.
         self._hb_thread: threading.Thread | None = None
         self._hb_stop = threading.Event()
+        # core#3082 / runtime#181: a dedicated daemon thread that actively probes
+        # the management MCP (side-effect-free tools/list) and publishes
+        # loaded_mcp_tools, so the readiness signal the CP online/degraded gate
+        # reads is reliable and turn-INDEPENDENT — it no longer depends on the
+        # per-turn init capture ever firing. Created in start(), stopped in
+        # stop(). None until started; self-gates to a no-op (no subprocess) on a
+        # runtime that doesn't declare the management MCP.
+        self._mcp_prober = None
         self._seen_delegation_ids: set[str] = set()
         self._last_self_message_time = 0.0
         self._parent_name: str | None = None  # Cached after first lookup
@@ -245,6 +253,17 @@ class HeartbeatLoop:
             daemon=True,
         )
         self._hb_thread.start()
+        # core#3082 / runtime#181: start the management-MCP readiness prober on
+        # its OWN daemon thread (never the heartbeat POST thread — a cold MCP
+        # spawn must not delay the alive signal). Defensive: a prober failure can
+        # never break heartbeat startup.
+        try:
+            from molecule_runtime.mcp_readiness_probe import MCPReadinessProber
+
+            self._mcp_prober = MCPReadinessProber()
+            self._mcp_prober.start()
+        except Exception:  # noqa: BLE001 — readiness probing is best-effort
+            logger.exception("heartbeat: failed to start MCP readiness prober")
         self._task = asyncio.create_task(self._loop())
         self._task.add_done_callback(self._on_done)
 
@@ -375,6 +394,14 @@ class HeartbeatLoop:
         # Stop the dedicated heartbeat thread first (signal + join), then
         # cancel the async delegation loop.
         self._hb_stop.set()
+        # Stop the MCP readiness prober off the event loop (it may be mid-probe
+        # in a subprocess wait). Best-effort — never let teardown raise.
+        if self._mcp_prober is not None:
+            try:
+                await asyncio.to_thread(self._mcp_prober.stop)
+            except Exception:  # noqa: BLE001
+                logger.debug("heartbeat: MCP readiness prober stop raised", exc_info=True)
+            self._mcp_prober = None
         if self._hb_thread is not None:
             # Join off the event loop so a blocked/slow thread shutdown does
             # not stall the async caller. Interval is small (<=300s) and the

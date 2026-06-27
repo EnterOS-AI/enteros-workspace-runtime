@@ -47,6 +47,39 @@ def test_legacy_binary_path_matches_contract():
     assert pai.MCPSERVER_PATH == CONTRACT["legacy_binary_path"]
 
 
+def test_required_tool_matches_contract():
+    # The management lifecycle verb the readiness probe enumerates and the core
+    # gate (conciergePlatformMCPRequiredTool) matches MUST be the same literal.
+    assert pai.REQUIRED_TOOL == CONTRACT["required_tool"]
+
+
+def test_provision_tool_id_derives_from_contract_literals():
+    # The fully-qualified id the heartbeat's loaded_mcp_tools must carry is
+    # composed from the two contract-pinned building blocks via the canonical
+    # mcp__<server>__<tool> formula — byte-identical to the core gate's
+    # conciergePlatformMCPProvisionWorkspaceTool.
+    expected = "mcp__{}__{}".format(CONTRACT["mcp_server_name"], CONTRACT["required_tool"])
+    assert pai.MANAGEMENT_PROVISION_TOOL_ID == expected
+    assert pai.MANAGEMENT_PROVISION_TOOL_ID == "mcp__molecule-platform__provision_workspace"
+
+
+def test_loaded_mcp_tools_field_name_matches_contract():
+    # The readiness signal is published under exactly the wire field the
+    # server-side gate reads (payload.loaded_mcp_tools).
+    pai.set_loaded_mcp_tools(["x"])
+    try:
+        payload = pai.identity_gate_payload()
+    finally:
+        pai.set_loaded_mcp_tools(None)
+    assert CONTRACT["loaded_mcp_tools_field"] in payload
+
+
+def test_readiness_probe_listed_as_consumer():
+    # The active tools/list probe is the fourth party bound by the contract;
+    # make that explicit so a future reader sees it.
+    assert any("mcp_readiness_probe" in c for c in CONTRACT.get("consumers", []))
+
+
 def test_settings_key_matches_contract():
     # Tie the SOURCE constant (used by _settings_has_management_mcp) to the
     # contract — not a bare literal — so a source-side rename of the settings
