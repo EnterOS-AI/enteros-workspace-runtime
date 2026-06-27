@@ -44,6 +44,12 @@ jobs:
         # the fast unit lane.
         run: pytest -q --ignore=tests/integration
 
+      - name: Run build_routes real-subprocess regression gate
+        # Explicit, loud step for issue #88: the 4-branch build_routes contract
+        # must be exercised against the REAL a2a-sdk in child processes. A skip
+        # here means the real SDK is missing and the gate is inert.
+        run: pytest -v -rs tests/test_boot_routes_subprocess.py
+
   responsiveness-e2e:
     # Deterministic, merge-BLOCKING integration gate for the "busy agent
     # becomes unreachable / blocks ~300s" regression class (2026-06-10).
