@@ -115,9 +115,24 @@ def _calls_self_auth_headers(node: ast.AST) -> bool:
 
 
 def check_sdk_client(repo_path: Path) -> list[ContractFinding]:
-    rel_path = Path("molecule_agent/client.py")
-    path = repo_path / rel_path
-    if not path.exists():
+    # The SDK subpackage is being renamed in place from `molecule_agent` to
+    # `molecule_external_workspace` (dist + classes unchanged). Stay tolerant of
+    # both layouts so this gate is green before AND after the rename lands:
+    # prefer the new path, fall back to the legacy one.
+    candidate_rel_paths = [
+        Path("molecule_external_workspace/client.py"),
+        Path("molecule_agent/client.py"),
+    ]
+    rel_path = candidate_rel_paths[-1]
+    path = None
+    for candidate in candidate_rel_paths:
+        candidate_path = repo_path / candidate
+        if candidate_path.exists():
+            rel_path = candidate
+            path = candidate_path
+            break
+
+    if path is None:
         return [
             ContractFinding(
                 repo="molecule-sdk-python",

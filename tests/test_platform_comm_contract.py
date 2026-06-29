@@ -204,6 +204,87 @@ class RemoteAgentClient:
     assert findings == []
 
 
+def test_sdk_client_passes_with_renamed_package(sdk_repo: Path) -> None:
+    """No findings when the client lives under the renamed package.
+
+    The SDK subpackage is being renamed in place from `molecule_agent` to
+    `molecule_external_workspace`. The drift gate must stay green for the
+    post-rename layout (the new path is preferred over the legacy one).
+    """
+    src = sdk_repo / "molecule_external_workspace" / "client.py"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("""
+import httpx
+
+class RemoteAgentClient:
+    def __init__(self, workspace_id: str):
+        self.workspace_id = workspace_id
+
+    def _auth_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.workspace_id}"}
+
+    async def register(self, agent_id: str) -> dict:
+        resp = httpx.post(
+            "https://platform.moleculesai.app/registry/register",
+            headers=self._auth_headers(),
+            json={"agent_id": agent_id},
+        )
+        return resp.json()
+
+    async def delegate(self, target_id: str, task: str) -> dict:
+        resp = httpx.post(
+            f"https://platform.moleculesai.app/workspaces/{self.workspace_id}/delegate",
+            headers=self._auth_headers(),
+            json={"target_id": target_id, "task": task},
+        )
+        return resp.json()
+""")
+    findings = contract_mod.check_sdk_client(sdk_repo)
+    assert findings == []
+
+
+def test_sdk_client_prefers_renamed_package_over_legacy(sdk_repo: Path) -> None:
+    """When both layouts coexist mid-rename, the renamed package path wins.
+
+    The legacy module is intentionally non-compliant; a passing result proves
+    the renamed package is the one inspected.
+    """
+    legacy = sdk_repo / "molecule_agent" / "client.py"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("class OtherClient:\n    pass\n")  # would fail if inspected
+
+    renamed = sdk_repo / "molecule_external_workspace" / "client.py"
+    renamed.parent.mkdir(parents=True, exist_ok=True)
+    renamed.write_text("""
+import httpx
+
+class RemoteAgentClient:
+    def __init__(self, workspace_id: str):
+        self.workspace_id = workspace_id
+
+    def _auth_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.workspace_id}"}
+
+    async def register(self, agent_id: str) -> dict:
+        resp = httpx.post(
+            "https://platform.moleculesai.app/registry/register",
+            headers=self._auth_headers(),
+            json={"agent_id": agent_id},
+        )
+        return resp.json()
+
+    async def delegate(self, target_id: str, task: str) -> dict:
+        resp = httpx.post(
+            f"https://platform.moleculesai.app/workspaces/{self.workspace_id}/delegate",
+            headers=self._auth_headers(),
+            json={"target_id": target_id, "task": task},
+        )
+        return resp.json()
+""")
+    findings = contract_mod.check_sdk_client(sdk_repo)
+    assert findings == []
+
+
 def test_sdk_client_fails_when_remote_agent_client_missing(sdk_repo: Path) -> None:
     """Finding when molecule_agent/client.py exists but has no RemoteAgentClient."""
     src = sdk_repo / "molecule_agent" / "client.py"
