@@ -115,6 +115,9 @@ def _http(
     """Minimal HTTP helper. Returns (status, body). Never raises on HTTP error."""
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
+    # CF edge 403s the default urllib UA (error 1010); send a curl UA so
+    # /raw/ reads (requirements.txt, .runtime-version) succeed.
+    req.add_header("User-Agent", "curl/8.4.0")
     if token:
         req.add_header("Authorization", f"token {token}")
     if data is not None:
