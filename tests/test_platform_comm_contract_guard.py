@@ -70,17 +70,17 @@ async def tool_check_task_status(workspace_id, task_id, source_workspace_id=None
 
 
 def test_sdk_contract_allows_source_workspace_url_and_target_body(tmp_path: Path) -> None:
-    repo = tmp_path / "molecule-sdk-python"
+    repo = tmp_path / "molecule-ai-sdk"
     _write_sdk_client(repo)
 
-    assert guard.find_platform_comm_drift("molecule-sdk-python", repo) == []
+    assert guard.find_platform_comm_drift("molecule-ai-sdk", repo) == []
 
 
 def test_sdk_contract_rejects_delegate_target_url_drift(tmp_path: Path) -> None:
-    repo = tmp_path / "molecule-sdk-python"
+    repo = tmp_path / "molecule-ai-sdk"
     _write_sdk_client(repo, source_url=False)
 
-    findings = guard.find_platform_comm_drift("molecule-sdk-python", repo)
+    findings = guard.find_platform_comm_drift("molecule-ai-sdk", repo)
 
     assert [(f.path, f.reason) for f in findings] == [
         (
@@ -91,10 +91,10 @@ def test_sdk_contract_rejects_delegate_target_url_drift(tmp_path: Path) -> None:
 
 
 def test_sdk_contract_rejects_missing_register_routing_headers(tmp_path: Path) -> None:
-    repo = tmp_path / "molecule-sdk-python"
+    repo = tmp_path / "molecule-ai-sdk"
     _write_sdk_client(repo, register_headers=False)
 
-    findings = guard.find_platform_comm_drift("molecule-sdk-python", repo)
+    findings = guard.find_platform_comm_drift("molecule-ai-sdk", repo)
 
     assert [(f.path, f.reason) for f in findings] == [
         (
