@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_REPOS = (
     "molecule-ai-workspace-runtime",
-    "molecule-sdk-python",
+    "molecule-ai-sdk",
 )
 
 
@@ -135,7 +135,7 @@ def check_sdk_client(repo_path: Path) -> list[ContractFinding]:
     if path is None:
         return [
             ContractFinding(
-                repo="molecule-sdk-python",
+                repo="molecule-ai-sdk",
                 path=rel_path.as_posix(),
                 reason="missing SDK client module",
             )
@@ -146,7 +146,7 @@ def check_sdk_client(repo_path: Path) -> list[ContractFinding]:
     if cls is None:
         return [
             ContractFinding(
-                repo="molecule-sdk-python",
+                repo="molecule-ai-sdk",
                 path=rel_path.as_posix(),
                 reason="RemoteAgentClient class not found",
             )
@@ -156,12 +156,12 @@ def check_sdk_client(repo_path: Path) -> list[ContractFinding]:
     register = _find_method(cls, "register")
     if register is None:
         findings.append(
-            ContractFinding("molecule-sdk-python", rel_path.as_posix(), "register() not found")
+            ContractFinding("molecule-ai-sdk", rel_path.as_posix(), "register() not found")
         )
     elif not _register_sends_auth_headers(register):
         findings.append(
             ContractFinding(
-                "molecule-sdk-python",
+                "molecule-ai-sdk",
                 rel_path.as_posix(),
                 "register() must call /registry/register with self._auth_headers()",
             )
@@ -170,12 +170,12 @@ def check_sdk_client(repo_path: Path) -> list[ContractFinding]:
     delegate = _find_method(cls, "delegate")
     if delegate is None:
         findings.append(
-            ContractFinding("molecule-sdk-python", rel_path.as_posix(), "delegate() not found")
+            ContractFinding("molecule-ai-sdk", rel_path.as_posix(), "delegate() not found")
         )
     elif not _delegate_uses_source_url_and_target_body(delegate):
         findings.append(
             ContractFinding(
-                "molecule-sdk-python",
+                "molecule-ai-sdk",
                 rel_path.as_posix(),
                 "delegate() must POST to source workspace URL and send target_id in JSON body",
             )
@@ -289,7 +289,7 @@ def _function_calls_resolver_with_src(fn: ast.FunctionDef | ast.AsyncFunctionDef
 def find_platform_comm_drift(repo_name: str, repo_path: Path) -> list[ContractFinding]:
     if repo_name == "molecule-ai-workspace-runtime":
         return check_runtime_delegation(repo_path)
-    if repo_name == "molecule-sdk-python":
+    if repo_name == "molecule-ai-sdk":
         return check_sdk_client(repo_path)
     return []
 

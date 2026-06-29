@@ -37,7 +37,7 @@ def runtime_repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def sdk_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "molecule-sdk-python"
+    repo = tmp_path / "molecule-ai-sdk"
     repo.mkdir()
     return repo
 
@@ -451,8 +451,8 @@ def _delegate_sync_via_polling(src: str, target_id: str, task: str) -> dict:
 
 
 def test_find_platform_comm_drift_routes_to_sdk_checker(tmp_path: Path) -> None:
-    """Routing: molecule-sdk-python → check_sdk_client."""
-    repo = tmp_path / "molecule-sdk-python"
+    """Routing: molecule-ai-sdk → check_sdk_client."""
+    repo = tmp_path / "molecule-ai-sdk"
     src = repo / "molecule_agent" / "client.py"
     src.parent.mkdir(parents=True, exist_ok=True)
     src.write_text("""
@@ -481,7 +481,7 @@ class RemoteAgentClient:
         )
         return resp.json()
 """)
-    findings = contract_mod.find_platform_comm_drift("molecule-sdk-python", repo)
+    findings = contract_mod.find_platform_comm_drift("molecule-ai-sdk", repo)
     assert findings == []
 
 
