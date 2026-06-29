@@ -14,6 +14,10 @@ on:
   push:
     branches: [main, staging]
   pull_request:
+  # Dispatch lane for the LIVE Langfuse obs-smoke (needs the running local
+  # stack + Infisical creds, which only the on-box runner has). On a generic
+  # runner the smoke self-gates to SKIP, so it is also safe on push/PR.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -186,3 +190,27 @@ jobs:
           "
           # CLI entry-point — molecule-mcp must be installed + show help.
           /tmp/smoke-venv/bin/molecule-mcp --help | head -5
+
+  # LIVE Langfuse trace smoke — the runtime end of the obs verification. The
+  # per-PR hermetic emission test (tests/test_langfuse_emission.py, unit-tests
+  # job) proves the OTLP bridge POSTs to the right endpoint with the right auth
+  # WITHOUT a live Langfuse; this job proves a real emitted trace actually lands
+  # in a reachable Langfuse, keyed off a run-id. It is GATED: with no Langfuse /
+  # no Infisical keys (any generic runner, or a stack with Langfuse off) the
+  # script SKIPs (exit 0) and never reds the lane — it only fails when Langfuse
+  # IS up+configured but the trace never shows up. Runs for real only on the
+  # on-box runner that can reach the local stack.
+  obs-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Live Langfuse trace smoke (gated when Langfuse off)
+        env:
+          # SSOT: the smoke derives LANGFUSE_HOST/keys from Infisical when these
+          # are present; empty on a runner without the identity → script SKIPs.
+          INFISICAL_API: ${{ secrets.INFISICAL_API }}
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+          INFISICAL_WORKSPACE_ID: ${{ secrets.INFISICAL_WORKSPACE_ID }}
+          INFISICAL_OBS_ENV: prod
+        run: bash scripts/obs_smoke.sh
