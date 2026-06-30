@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-comms/a2a-envelope.schema.json",
+  "title": "Workspace-Comms A2A Envelope Contract (message/send)",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the A2A JSON-RPC 2.0 envelope proxied through POST /workspaces/:id/a2a. Promoted from workspace-comms/registry-contract.md, DERIVED FROM THE WIRE AUTHORITY: molecule-core workspace-server/internal/handlers/a2a_proxy.go (the message/send normalization + the synthetic `{status:\"queued\"}` ack) and registry.go buildConciergeWarmupBody (the canonical message/send body the platform itself constructs). The instance models BOTH directions: `request` = the A2A v0.3 `message/send` JSON-RPC request, `response` = the platform's queued ack. LOAD-BEARING INVARIANT (A2A v0.3): each `params.message.parts[]` item is discriminated by `kind` (NOT `type`) — a `type`-keyed Part is silently dropped by the receiver's v0.3 Pydantic validator (#2345); text parts carry `kind:\"text\"` + `text`. The producer wraps a bare body in the JSON-RPC envelope and injects messageId if missing, but the canonical/produced shape is the full envelope modeled here. The push-async ack is what THIS proxy returns for poll-mode / over-budget turns; a synchronous push turn instead streams back the upstream agent's own JSON-RPC result (passthrough, not owned by this contract — see response.note).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request", "response"],
+  "properties": {
+    "request": {
+      "type": "object",
+      "description": "A2A v0.3 JSON-RPC 2.0 message/send request body.",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "method", "params"],
+      "properties": {
+        "jsonrpc": {
+          "type": "string",
+          "const": "2.0",
+          "description": "JSON-RPC version. Always \"2.0\" (the producer injects it when a bare body omits it)."
+        },
+        "id": {
+          "type": "string",
+          "description": "JSON-RPC request id. A fresh UUID per turn (the producer injects one if absent) so the turn is idempotent at the runtime and never collides with a real message."
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1,
+          "description": "JSON-RPC method. The canonical workspace-comms verb is `message/send` (the only method the can_delegate gate and the queued-ack path special-case). Modeled as a non-empty string; the queued ack echoes this value back."
+        },
+        "params": {
+          "type": "object",
+          "description": "message/send params. Carries the single `message` object.",
+          "additionalProperties": true,
+          "required": ["message"],
+          "properties": {
+            "message": {
+              "type": "object",
+              "description": "The A2A message. role/messageId/parts are the load-bearing fields.",
+              "additionalProperties": true,
+              "required": ["role", "parts"],
+              "properties": {
+                "role": {
+                  "type": "string",
+                  "description": "Message role. The platform-constructed turns use \"user\"."
+                },
+                "messageId": {
+                  "type": "string",
+                  "description": "Stable per-turn message id (the producer ensures one exists — required by a2a-sdk). Distinct from the JSON-RPC `id`, though the platform sets them equal for its own warmup/delegate turns."
+                },
+                "parts": {
+                  "type": "array",
+                  "minItems": 1,
+                  "description": "Ordered message parts. Each part is discriminated by `kind` (A2A v0.3). A text part is `{\"kind\":\"text\",\"text\":\"...\"}`. NEVER `type` — a type-keyed part is dropped by the v0.3 validator (#2345).",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Part discriminator (A2A v0.3). \"text\" for a text part; other kinds (file/data) extend this. MUST be `kind`, not `type`."
+                      },
+                      "text": {
+                        "type": "string",
+                        "description": "Text payload, present when kind=\"text\"."
+                      }
+                    }
+                  }
+                },
+                "metadata": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "Optional per-message metadata bag (e.g. {\"concierge_warmup\": true})."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "description": "The platform's synthetic push-async / poll-mode ACK returned by the A2A proxy (HTTP 200). NOTE: a synchronous push turn instead returns the upstream agent's own JSON-RPC result envelope (passthrough), which is the remote agent's shape, not owned by this contract; only the queued ack is the platform's own product here.",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "queued",
+          "description": "The literal \"queued\" — delivery acknowledged but pending consumption (poll-mode logged to activity, or push over-budget acked async)."
+        },
+        "delivery_mode": {
+          "type": "string",
+          "enum": ["push-async", "poll"],
+          "description": "How the queued turn will be delivered: \"push-async\" (turn exceeded the sync budget, will finish out-of-band) or \"poll\" (recorded to activity_logs for the poll-mode agent to pull)."
+        },
+        "method": {
+          "type": "string",
+          "description": "Echo of the request `method` (e.g. \"message/send\") the ack corresponds to."
+        }
+      }
+    }
+  }
+}
