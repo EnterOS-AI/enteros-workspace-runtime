@@ -8,12 +8,16 @@ Every 30 seconds:
 Resilient: recreates HTTP client on failure, auto-restarts on crash.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import threading
 import time
+from typing import TYPE_CHECKING
+
 import httpx
 
 from molecule_runtime.a2a_client import build_message_send_params
@@ -23,6 +27,24 @@ from molecule_runtime.a2a_executor import (
     A2A_SOURCE_SELF_HARVESTER,
 )
 from molecule_runtime.platform_auth import auth_headers, refresh_cache, self_source_headers
+
+if TYPE_CHECKING:
+    # SSOT typed payloads (molecule-contracts / RFC molecule-core#3285),
+    # published as `molecule-ai-contracts` on the gitea PyPI registry and
+    # generated from molecule-contracts/workspace-comms. Imported under
+    # TYPE_CHECKING ONLY: these are TypedDicts (plain dicts at runtime),
+    # `from __future__ import annotations` keeps every annotation a string, and
+    # the runtime's `pip install` / wheel smoke-test resolves from plain PyPI
+    # (which does not carry this package). So there is NO hard runtime
+    # dependency — the wire payloads below stay byte-identical dicts, now
+    # checked against the SSOT contract shapes by a type checker for
+    # drift-prevention. Install the `contracts` extra (gitea index) to
+    # type-check against it locally. This is the SAME pattern molecule-ai-sdk
+    # adopted in #36; the runtime is the reference consumer of the contract.
+    from molecule_ai_contracts.workspace_comms_gen import (
+        HeartbeatRequest,
+        HeartbeatRuntimeMetadata,
+    )
 
 # Typed marker for activity-log rows that represent backpressure echoes rather
 # than genuine peer results. The platform sets this on "queued: target busy"
@@ -84,7 +106,9 @@ def _runtime_metadata_payload() -> dict:
         adapter_cls = get_adapter("")
         adapter = adapter_cls()
         caps = adapter.capabilities()
-        meta: dict = {"capabilities": caps.to_dict()}
+        # Typed against the SSOT contract sub-shape (molecule-contracts
+        # HeartbeatRuntimeMetadata) for drift-prevention; same plain dict on the wire.
+        meta: HeartbeatRuntimeMetadata = {"capabilities": caps.to_dict()}
         idle = adapter.idle_timeout_override()
         # Only include the override when it's a positive integer. None /
         # zero / negative falls through to the platform's global default
@@ -279,7 +303,16 @@ class HeartbeatLoop:
         URL, same payload, same 401-refresh-and-retry-once, same
         platform_inbound_secret persistence. Raises on transport/HTTP error
         so the caller can track consecutive failures."""
-        body: dict = {
+        # Typed against the SSOT contract (molecule-contracts HeartbeatRequest)
+        # for drift-prevention; the wire payload is unchanged. This is the
+        # reference HeartbeatPayload: identity_gate_payload() layers in the
+        # contract's mcp_server_present + loaded_mcp_tools tri-states, and the
+        # _runtime_state_payload / _runtime_metadata_payload merges below add
+        # runtime_state + runtime_metadata. (platform_mcp_diag is a runtime-only
+        # diagnostic not yet promoted into the schema — see the contracts repo's
+        # heartbeat divergence notes; a type checker surfacing it is correct drift
+        # signal, not a regression.)
+        body: HeartbeatRequest = {
             "workspace_id": self.workspace_id,
             "error_rate": self.error_rate,
             "sample_error": self.sample_error,

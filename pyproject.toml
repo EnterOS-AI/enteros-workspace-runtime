@@ -37,6 +37,20 @@ dependencies = [
     "temporalio>=1.7.0",
 ]
 
+[project.optional-dependencies]
+# SSOT contract bindings (molecule-contracts / RFC molecule-core#3285), published
+# as `molecule-ai-contracts` on the gitea PyPI registry and generated from
+# molecule-contracts/workspace-comms. Used ONLY for type-checking the
+# register/heartbeat/A2A payloads (the TYPE_CHECKING-guarded imports in
+# heartbeat.py, mcp_heartbeat.py, main.py, a2a_client.py) against the shared
+# schema — NOT a runtime requirement, so it is intentionally kept out of the base
+# `dependencies` to keep `pip install` / the wheel smoke-test green against plain
+# PyPI (which does not carry this package). Install with the gitea index to
+# type-check locally:
+#   pip install "molecule-ai-workspace-runtime[contracts]" \
+#     --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+contracts = ["molecule-ai-contracts>=0.1.0"]
+
 [project.scripts]
 molecule-runtime = "molecule_runtime.main:main_sync"
 # External-runtime MCP server — operators running an agent outside the

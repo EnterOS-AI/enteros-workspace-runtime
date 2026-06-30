@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -25,6 +25,17 @@ from molecule_runtime.platform_auth import (
     self_source_headers,
     validate_workspace_id as _validate_workspace_id,
 )
+
+if TYPE_CHECKING:
+    # SSOT typed payload (molecule-contracts / RFC molecule-core#3285), published
+    # as `molecule-ai-contracts` on the gitea PyPI registry. Imported under
+    # TYPE_CHECKING ONLY — no hard runtime dependency (see the `[contracts]` extra
+    # in pyproject.toml). Used to type the hand-built outbound A2A `message/send`
+    # `params` against the SSOT A2A-envelope shape (which pins the load-bearing
+    # v0.3 `kind` part discriminator). `raw` is a function-local annotation, which
+    # CPython never evaluates at runtime, so this stays type-checker-only even
+    # without `from __future__ import annotations`. Mirrors molecule-ai-sdk #36.
+    from molecule_ai_contracts.workspace_comms_gen import A2aEnvelopeRequestParams
 
 logger = logging.getLogger(__name__)
 
@@ -679,7 +690,10 @@ def build_message_send_params(
     for att in attachments or []:
         if isinstance(att, dict):
             parts.append({"kind": "file", "file": dict(att)})
-    raw: dict[str, Any] = {
+    # Typed against the SSOT contract (molecule-contracts A2aEnvelopeRequestParams)
+    # for drift-prevention; the wire shape is unchanged and still flows through
+    # normalize_a2a_message_send_params below.
+    raw: A2aEnvelopeRequestParams = {
         "message": {"role": role, "messageId": message_id, "parts": parts}
     }
     if metadata is not None:

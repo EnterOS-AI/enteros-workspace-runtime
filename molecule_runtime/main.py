@@ -25,6 +25,20 @@ import uuid as _uuid
 from molecule_runtime.builtin_tools.telemetry import setup_telemetry, make_trace_middleware
 from molecule_runtime.policies.namespaces import resolve_awareness_namespace
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # SSOT typed payload (molecule-contracts / RFC molecule-core#3285), published
+    # as `molecule-ai-contracts` on the gitea PyPI registry. Imported under
+    # TYPE_CHECKING ONLY — no hard runtime dependency (see the `[contracts]` extra
+    # in pyproject.toml). Only `RegisterRequest` is pulled in here to avoid a name
+    # clash with the unrelated `a2a.types.AgentCard` imported above. The boot
+    # register body below is type-checked against the SSOT contract; mirrors the
+    # molecule-ai-sdk #36 adoption. NOTE: `register_body` is a function-local
+    # annotation, which CPython never evaluates at runtime, so this stays a pure
+    # type-checker-only reference even without `from __future__ import annotations`.
+    from molecule_ai_contracts.workspace_comms_gen import RegisterRequest
+
 # Holds the background loaded_mcp_tools init-enumeration task so it is not
 # garbage-collected before it completes (asyncio only keeps weak refs to tasks).
 _LOADED_MCP_TOOLS_BG_TASK = None  # type: "asyncio.Task | None"
@@ -201,14 +215,17 @@ async def register_with_platform(
     last_detail = "no attempts made"
     for attempt in range(max_attempts):
         try:
+            # Typed against the SSOT contract (molecule-contracts RegisterRequest)
+            # for drift-prevention; the wire payload is unchanged.
+            register_body: RegisterRequest = {
+                "id": workspace_id,
+                "url": workspace_url,
+                "agent_card": agent_card,
+                **identity_gate_payload(),
+            }
             resp = await client.post(
                 f"{platform_url}/registry/register",
-                json={
-                    "id": workspace_id,
-                    "url": workspace_url,
-                    "agent_card": agent_card,
-                    **identity_gate_payload(),
-                },
+                json=register_body,
                 headers=headers,
             )
             status = resp.status_code
