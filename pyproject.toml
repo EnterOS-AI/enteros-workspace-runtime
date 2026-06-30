@@ -51,6 +51,15 @@ dependencies = [
 #     --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 contracts = ["molecule-ai-contracts>=0.1.0"]
 
+# Test-only deps. jsonschema (draft 2020-12 via Draft202012Validator +
+# `referencing`, installed transitively) backs the offline workspace-comms
+# schema-conformance gate (tests/test_workspace_comms_conformance.py), which
+# replaced the retired cross-repo AST drift-checker
+# (scripts/check_platform_comm_contract.py) with real-payload-vs-SSOT-schema
+# validation. Kept out of base `dependencies` so the wheel smoke-install stays
+# lean.
+test = ["pytest", "pytest-asyncio", "jsonschema>=4.18"]
+
 [project.scripts]
 molecule-runtime = "molecule_runtime.main:main_sync"
 # External-runtime MCP server — operators running an agent outside the

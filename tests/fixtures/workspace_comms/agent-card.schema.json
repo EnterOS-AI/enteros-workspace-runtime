@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-comms/agent-card.schema.json",
+  "title": "Workspace-Comms Agent Card (minimal shared sub-shape)",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the minimal, canonical agent-card sub-shape shared across the workspace<->platform comms protocol. Promoted from the descriptive workspace-comms/registry-contract.md (divergence #6: \"agent_card has no shared shape\") and derived from the WIRE AUTHORITY in molecule-core: the agent_card field is `json.RawMessage` on RegisterPayload / UpdateCardPayload / HeartbeatPayload (workspace-server/internal/models/workspace.go) and on the Workspace row — i.e. today it is UNTYPED everywhere (each of the three independent impls ships a different card). This schema pins ONLY the universally-present, load-bearing field — `name` — leaving the rest of the A2A agent-card surface open (additionalProperties:true) so a real card (skills, url, capabilities, provider, version, ...) still validates. The producer SSRF-rejects `agent_card.url` (registry.go UpdateCard / Register), but url is not required here because poll/no-inbound cards legitimately omit it; the canonical minimum is the human/agent name the canvas and discovery surfaces render. INVARIANT: `name` is REQUIRED and a non-empty string — a card without a name is rejected.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["name"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human/agent display name for the workspace. The single field every card carries and the only one the platform requires; rendered by the canvas Agent Card view and used by discovery. Must be a non-empty string."
+    },
+    "url": {
+      "type": "string",
+      "description": "Optional A2A endpoint URL advertised by the card. When present the producer SSRF-validates it (validateAgentURL) and rejects private/loopback/metadata ranges. Omitted for poll-mode / no-inbound agents. Not required by this minimal sub-shape."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional free-text description of the agent's purpose, as carried by the A2A agent card."
+    }
+  }
+}

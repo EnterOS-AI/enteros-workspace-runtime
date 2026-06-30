@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-comms/heartbeat.schema.json",
+  "title": "Workspace-Comms /registry/heartbeat Contract",
+  "description": "SSOT JSON-Schema (draft 2020-12) for POST /registry/heartbeat — the periodic workspace->platform liveness + telemetry beat. Promoted from workspace-comms/registry-contract.md, DERIVED FROM THE WIRE AUTHORITY: molecule-core workspace-server/internal/models/workspace.go (`HeartbeatPayload` + `RuntimeMetadata`) and internal/handlers/registry.go (the Heartbeat handler's gin.H response). The instance models BOTH directions: `request` = HeartbeatPayload, `response` = the heartbeat ack. Requiredness mirrors the Go binding tags (only `workspace_id` is `binding:\"required\"`; everything else is optional — value fields default to their Go zero value, pointer/`,omitempty` fields are genuinely absentable). Two nullable tri-states are load-bearing and intentionally modeled as boolean (absent != false): `mcp_server_present` (nil=allow / false=fail-closed / true=ok) and the OMITTED-vs-empty distinction on `loaded_mcp_tools` (registry-contract.md divergence #5). The agent_card sub-shape (backfill-only) is the minimal shared one (see agent-card.schema.json), inlined under $defs/agentCard for offline validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request", "response"],
+  "properties": {
+    "request": {
+      "type": "object",
+      "description": "HeartbeatPayload — the body the workspace runtime POSTs each beat. Mirrors models.HeartbeatPayload. Only workspace_id is required; all telemetry fields are optional.",
+      "additionalProperties": false,
+      "required": ["workspace_id"],
+      "properties": {
+        "workspace_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Workspace id (self). `binding:\"required\"`. The bearer is bound to this id."
+        },
+        "error_rate": {
+          "type": "number",
+          "description": "Self-reported recent error rate (float64; Go zero value 0 means \"no errors / no signal\")."
+        },
+        "sample_error": {
+          "type": "string",
+          "description": "Optional most-recent sample error string surfaced to the canvas (last_sample_error)."
+        },
+        "active_tasks": {
+          "type": "integer",
+          "description": "Number of tasks the runtime currently has in flight (drives the scheduler spare-capacity / queue-drain decision)."
+        },
+        "uptime_seconds": {
+          "type": "integer",
+          "description": "Runtime uptime in seconds."
+        },
+        "current_task": {
+          "type": "string",
+          "description": "Optional human-readable description of what the agent is doing right now."
+        },
+        "monthly_spend": {
+          "type": "integer",
+          "description": "Cumulative USD spend for the current calendar month, in CENTS (1500 = $15.00). Zero means \"no update\" — the handler never writes zero (avoids clearing a prior value); non-zero is clamped to [0, maxMonthlySpend]. (#615)"
+        },
+        "runtime_state": {
+          "type": "string",
+          "description": "Self-reported runtime health flag, separate from \"is the beat firing\". Empty string = healthy/no signal; the only currently-recognised non-empty value is \"wedged\" (alive but the agent runtime is broken -> flip to degraded). Future values extend without migration; modeled as an open string, not an enum."
+        },
+        "runtime_metadata": {
+          "$ref": "#/$defs/runtimeMetadata",
+          "description": "Optional (`,omitempty`; *RuntimeMetadata so absent=nil is distinguishable from an all-false declaration). Adapter-declared capability map + per-capability overrides."
+        },
+        "agent_card": {
+          "$ref": "#/$defs/agentCard",
+          "description": "Optional (`,omitempty`). Backfill-only: sent when the initial /registry/register failed and the row has a NULL agent_card, so the workspace can come online without a full re-register (#2421). Minimal shared sub-shape."
+        },
+        "mcp_server_present": {
+          "type": "boolean",
+          "description": "Optional (`,omitempty`; *bool — absent=nil distinct from false). Mirrors the register field on every beat so the fail-closed kind=platform gate can block recovery paths that would resurrect an mcp-less concierge (RCA #2970). TRI-STATE: nil=allow, false=fail-closed, true=ok."
+        },
+        "loaded_mcp_tools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional (`,omitempty`). Namespaced MCP tool ids the runtime reports as actually loaded, each of the form `mcp__<server>__<tool>`. For kind=platform, core cross-checks this against the required `mcp__molecule-platform__provision_workspace` (#3082). OMITTED is NOT the same as `[]`: on a beat with mcp_server_present=true and this field absent/nil the #3082 gate fails loud (degraded). Per registry-contract.md divergence #5."
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "description": "The heartbeat ack (gin.H) returned on HTTP 200. Heartbeat fails OPEN: on an auth-DB hiccup it does not return a secret but still acks liveness. platform_inbound_secret is delivered (lazy-healed) on most beats — the periodic re-delivery path for volume-less SaaS workspaces.",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "ok",
+          "description": "Always the literal \"ok\" on a successful 200 (gin.H{\"status\": \"ok\", ...})."
+        },
+        "platform_inbound_secret": {
+          "type": "string",
+          "description": "Optional. The shared inbound-signing secret, re-delivered (lazy-healed) on the beat so volume-less SaaS workspaces can re-populate /configs/.platform_inbound_secret mid-life. Omitted when the heal read is empty/errors (fail-open)."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "runtimeMetadata": {
+      "$comment": "Mirrors models.RuntimeMetadata. Both fields omitempty.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": { "type": "boolean" },
+          "description": "Map of capability name -> \"adapter owns it natively\". Keys (heartbeat, scheduler, session, status_mgmt, retry, activity_decoration, channel_dispatch) match RuntimeCapabilities.to_dict() in the Python adapter_base.py. Open map (additionalProperties:boolean) so new capabilities extend without a schema change."
+        },
+        "idle_timeout_seconds": {
+          "type": "integer",
+          "description": "Optional (*int; nil=no override). Overrides the per-dispatch A2A silence window for this workspace in a2a_proxy.go. Zero/negative is treated as nil by the consumer."
+        }
+      }
+    },
+    "agentCard": {
+      "$comment": "Minimal shared agent-card sub-shape, kept in lockstep with agent-card.schema.json. Inlined for offline validation.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "description": "Human/agent display name. The single required card field." },
+        "url": { "type": "string", "description": "Optional advertised A2A URL." },
+        "description": { "type": "string", "description": "Optional free-text agent description." }
+      }
+    }
+  }
+}

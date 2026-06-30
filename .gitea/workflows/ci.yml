@@ -40,7 +40,9 @@ jobs:
           # Install the editable package so CI exercises pyproject.toml's
           # runtime dependency contract. This intentionally catches SDK/API
           # drift in package-local adapter tests, not only tests under tests/.
-          pip install -e . pytest pytest-asyncio
+          # The `[test]` extra adds jsonschema for the workspace-comms
+          # schema-conformance gate (tests/test_workspace_comms_conformance.py).
+          pip install -e ".[test]" pytest pytest-asyncio
 
       - name: Run unit tests
         # Exclude the over-the-wire responsiveness e2e (its own job below) —

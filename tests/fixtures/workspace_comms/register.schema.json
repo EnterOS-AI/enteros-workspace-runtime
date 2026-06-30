@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-comms/register.schema.json",
+  "title": "Workspace-Comms /registry/register Contract",
+  "description": "SSOT JSON-Schema (draft 2020-12) for POST /registry/register — the workspace<->platform registration handshake. Promoted from the descriptive workspace-comms/registry-contract.md into machine-enforced schema, DERIVED FROM THE WIRE AUTHORITY: molecule-core workspace-server/internal/models/workspace.go (`RegisterPayload`) and internal/handlers/registry.go (the `gin.H` response built at the end of Register). The instance models BOTH directions: `request` = RegisterPayload, `response` = the registration result. Field requiredness mirrors the Go struct binding tags exactly (`binding:\"required\"` -> required; `,omitempty` -> optional). The agent_card shape is the minimal shared sub-shape (see agent-card.schema.json); it is inlined under $defs/agentCard so this schema validates offline with no external $ref resolution (the CI gate runs check-jsonschema per file). Notes: `url` is conditionally required for push delivery, but the producer enforces that conditionally against the resolved delivery mode (payload || row || default push), so it is NOT statically required here. `kind=platform` is accepted on the wire but the producer 403s it on the public path (install-path-only).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request", "response"],
+  "properties": {
+    "request": {
+      "type": "object",
+      "description": "RegisterPayload — the body the workspace runtime POSTs to /registry/register. Mirrors models.RegisterPayload.",
+      "additionalProperties": false,
+      "required": ["id", "agent_card"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Workspace id (self). `binding:\"required\"`. The bearer token (minted in the response on first register) is strictly bound to this id thereafter (C18 / #761)."
+        },
+        "url": {
+          "type": "string",
+          "description": "Inbound A2A endpoint URL. Required for push-mode workspaces (the handler enforces this conditionally against the resolved delivery_mode); optional/unused for poll-mode. SSRF-validated by the producer (validateAgentURL). NOT statically required — hence omitted from `required`."
+        },
+        "agent_card": {
+          "$ref": "#/$defs/agentCard",
+          "description": "The workspace's A2A agent card. `binding:\"required\"`. On the wire it is json.RawMessage (untyped); this contract pins only the minimal shared sub-shape (required `name`)."
+        },
+        "delivery_mode": {
+          "type": "string",
+          "enum": ["push", "poll"],
+          "description": "Optional (`,omitempty`). Empty/absent means \"keep the row's existing value, or default to push for new rows\". When set, must be push|poll (models.IsValidDeliveryMode; empty is not valid here — the handler resolves the default before validating)."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["workspace", "platform"],
+          "description": "Optional (`,omitempty`). Empty/absent means \"keep existing, or default to workspace\". `platform` marks the org concierge and is accepted on the wire but 403'd on the public register path (assignable only by the platform-agent install path); it additionally requires parent_id IS NULL and org-singleton."
+        },
+        "mcp_server_present": {
+          "type": "boolean",
+          "description": "Optional (`,omitempty`; *bool on the wire so absent=nil is distinguishable from false). Runtime's declaration that the baked /opt/molecule-mcp-server management MCP is present. For kind=platform the producer treats nil/false as fail-closed (RCA #2970). Non-platform workspaces may omit it."
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "description": "The registration result (gin.H) returned by the Register handler on HTTP 200. `auth_token` is minted ONCE (first register / token-less legacy bootstrap) and omitted on re-register; `platform_inbound_secret` is delivered on (almost) every call (lazy-healed) and re-populates /configs/.platform_inbound_secret for volume-less SaaS workspaces (RFC #2312).",
+      "additionalProperties": false,
+      "required": ["status", "delivery_mode"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "registered",
+          "description": "Always the literal \"registered\" on a successful 200 (gin.H{\"status\": \"registered\", ...})."
+        },
+        "delivery_mode": {
+          "type": "string",
+          "enum": ["push", "poll"],
+          "description": "The EFFECTIVE resolved delivery mode for the workspace after this register (effectiveMode)."
+        },
+        "auth_token": {
+          "type": "string",
+          "description": "Optional. The workspace bearer, minted ONCE on first registration (or token-less legacy bootstrap) and persisted client-side at <configs>/.auth_token (0600). Absent on re-registration. This is the ONLY mint path for the outbound token."
+        },
+        "platform_inbound_secret": {
+          "type": "string",
+          "description": "Optional (present whenever the lazy-heal read/mint succeeds). The shared secret the producer signs proxied inbound A2A with; the workspace writes it to /configs/.platform_inbound_secret. Delivered here and on every heartbeat (the only delivery path for volume-less SaaS)."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "agentCard": {
+      "$comment": "Minimal shared agent-card sub-shape, kept in lockstep with agent-card.schema.json (the canonical standalone declaration). Inlined here so this schema validates offline without external $ref resolution.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "description": "Human/agent display name. The single required card field." },
+        "url": { "type": "string", "description": "Optional advertised A2A URL; SSRF-validated by the producer when present." },
+        "description": { "type": "string", "description": "Optional free-text agent description." }
+      }
+    }
+  }
+}

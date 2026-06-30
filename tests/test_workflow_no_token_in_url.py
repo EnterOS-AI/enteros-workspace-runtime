@@ -197,10 +197,12 @@ def test_askpass_username_response_is_the_only_allowed_occurrence() -> None:
         "replaced, update this test to match the new shape — do not silently "
         "let the gate pass on no occurrences (vacuous protection)."
     )
-    # The expected set: both consumer-drift + platform-comm-contract scripts.
+    # The expected set: the consumer-drift script. (The platform-comm-contract
+    # AST guard that also used this helper was retired — replaced by the in-repo
+    # offline schema-conformance gate, tests/test_workspace_comms_conformance.py,
+    # which does no cross-repo clone and so needs no GIT_ASKPASS helper.)
     expected_paths = {
         REPO_ROOT / "scripts" / "check_consumer_runtime_drift.py",
-        REPO_ROOT / "scripts" / "check_platform_comm_contract.py",
     }
     assert set(matches) == expected_paths, (
         f"GIT_ASKPASS helper moved/added/removed: got {sorted(p.name for p in matches)}, "
