@@ -692,12 +692,32 @@ class BaseAdapter(ABC):
         if coordinator_prompt:
             extra_prompts.append(coordinator_prompt)
 
+        # Orchestrator-only guardrail gate (platform/concierge ONLY). A concierge
+        # (kind='platform') has the org-management MCP wired in; a normal worker
+        # does not. mcp_server_present() is the runtime-side platform-ness signal
+        # (baked binary OR the active adapter's management-MCP probe, registered
+        # in main.py BEFORE setup()). True → inject the never-self-do guardrail so
+        # the concierge orchestrates instead of self-executing, EVEN on a stale
+        # template. False (every worker) → no guardrail; workers must do real work.
+        # Defensive: a predicate error must never gag a worker nor crash boot, so
+        # default to False (worker) on any exception.
+        try:
+            from molecule_runtime.platform_agent_identity import mcp_server_present
+            is_platform_agent = mcp_server_present()
+        except Exception:  # noqa: BLE001 — never let the gate crash boot
+            logger.exception(
+                "orchestrator-guardrail: mcp_server_present() raised; "
+                "defaulting to worker (no guardrail injected)"
+            )
+            is_platform_agent = False
+
         system_prompt = build_system_prompt(
             config.config_path, config.workspace_id, loaded_skills, peers,
             prompt_files=config.prompt_files,
             plugin_rules=plugins.rules,
             plugin_prompts=extra_prompts,
             platform_instructions=platform_instructions,
+            platform_guardrail=is_platform_agent,
         )
 
         # SSOT: publish the single base-built system prompt (which honors

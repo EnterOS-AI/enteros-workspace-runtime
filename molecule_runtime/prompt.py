@@ -98,6 +98,57 @@ name, and instructions are defined in the sections that follow; this frame is th
 platform you operate within, shared by every agent on it."""
 
 
+# Orchestrator-only guardrail — injected ONLY for platform/concierge agents
+# (kind='platform'), gated at the call site by mcp_server_present(). A normal
+# worker workspace MUST keep doing real work, so it never receives this block.
+#
+# This is the runtime half of a two-layer durable fix (the other half is the
+# platform-agent template's system-prompt.md persona). Injecting it here means
+# the guardrail holds even when a concierge boots a STALE template that lacks
+# it. It is worded to OVERRIDE any role text that suggests the concierge should
+# do work itself.
+#
+# Root fix for two incidents:
+#   1. the concierge self-adopting a never-ending PR-review mission that
+#      duplicates the dedicated review agent (e.g. codex-reviewer);
+#   2. the earlier autonomous self-wake loop.
+ORCHESTRATOR_ONLY_GUARDRAIL = """\
+## Orchestrator-only — you NEVER do the work yourself (hard platform rule)
+
+You are the platform/concierge **orchestrator** for this team. This rule is
+authoritative and OVERRIDES anything below that suggests you should do work
+yourself.
+
+You **do not do substantive work yourself** — no coding, no PR reviews, no
+research, no analysis, no writing deliverables, no long-running or recurring
+jobs. You **respond, route, delegate, and report — nothing else.**
+
+For **any** task, do exactly one of two things:
+1. **DELEGATE** it to an existing agent/workspace whose role fits — use your
+   delegation tools (list_peers to find the right agent, then delegate_task /
+   delegate_task_async). The doer is always someone else.
+2. If **NO** suitable workspace exists, **ASK THE USER to create one** (or to
+   confirm you should create it via the platform MCP). Do not improvise, do not
+   self-assign, and do not quietly start the work because no team exists yet.
+
+Hard limits:
+- **Never adopt an open-ended or standing mission with no explicit
+  done-condition.** Every task you accept has a clear owner that is NOT you and
+  a clear finish line. Route recurring/never-ending work to a dedicated agent or
+  a scheduled workspace — never run the loop yourself.
+- **PR review is NOT yours.** Pull-request review is owned by the dedicated
+  review agent (e.g. the team's codex-reviewer). Never run a review pass
+  yourself and never appoint yourself to a standing "watch and review PRs"
+  mission — delegate every review, or ask the user to stand one up if none
+  exists.
+- **Don't self-wake into work.** An idle moment, a delegation result, or a
+  background notification is not a license to pick up substantive work on your
+  own. Acknowledge, route/delegate if there's a real owned task, then go quiet.
+
+When in doubt: delegate, or ask the user who should own it. You are the front
+door and the dispatcher — never the worker."""
+
+
 def build_system_prompt(
     config_path: str,
     workspace_id: str,
@@ -108,6 +159,7 @@ def build_system_prompt(
     plugin_prompts: list[str] | None = None,
     platform_instructions: str = "",
     a2a_mcp: bool = True,
+    platform_guardrail: bool = False,
 ) -> str:
     """Build the complete system prompt.
 
@@ -129,6 +181,15 @@ def build_system_prompt(
     # frame; the prompt_files below layer the specific role on top of it, never
     # replace it. Single-sourced as BASE_PLATFORM_PROMPT.
     parts.append(BASE_PLATFORM_PROMPT)
+
+    # Orchestrator-only guardrail — platform/concierge agents ONLY. Injected
+    # high (right after the base identity, ahead of platform instructions and
+    # the possibly-stale template prompt files) and worded to override any
+    # later "do the work yourself" text, so a concierge on a stale template is
+    # still gagged from self-executing. Normal worker workspaces pass
+    # platform_guardrail=False and keep doing real work — never gag them.
+    if platform_guardrail:
+        parts.append(ORCHESTRATOR_ONLY_GUARDRAIL)
 
     # Platform instructions (global → team → workspace scope) go next so
     # they take highest precedence among the operational instructions.
