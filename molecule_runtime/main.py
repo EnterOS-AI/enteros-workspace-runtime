@@ -91,6 +91,10 @@ from molecule_runtime.initial_prompt import (
     resolve_initial_prompt_marker,
 )
 from molecule_runtime.a2a_client import build_message_send_params
+from molecule_runtime.a2a_executor import (
+    A2A_MESSAGE_SOURCE_TYPE,
+    A2A_SOURCE_SELF_IDLE,
+)
 from molecule_runtime.platform_agent_identity import identity_gate_payload
 from molecule_runtime.platform_auth import auth_headers, self_source_headers
 from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
@@ -1035,6 +1039,26 @@ async def main():  # pragma: no cover
                 except asyncio.CancelledError:
                     return
 
+                # Autonomous-loop circuit breaker (runaway self-fire incident
+                # 2026-06-29). Once the replay guard has tripped — N consecutive
+                # identical / no-new-info self-fired outputs — STOP firing the
+                # idle prompt entirely. The workspace is already marked degraded
+                # via runtime_wedge; continuing to self-wake would just keep
+                # re-emitting the same stale replay and burning tokens. A
+                # workspace restart clears the wedge and resumes idle behavior.
+                try:
+                    from molecule_runtime.autonomous_loop_guard import should_halt as _loop_should_halt
+
+                    if _loop_should_halt():
+                        print(
+                            "Idle loop: circuit breaker OPEN — halting self-fire "
+                            "(runtime degraded by replay guard; restart to resume)",
+                            flush=True,
+                        )
+                        return
+                except Exception:
+                    pass  # guard import/lookup must never crash the idle loop
+
                 # Local idle check — no platform API call, no LLM call.
                 # heartbeat.active_tasks == 0 means no in-flight work.
                 if heartbeat.active_tasks > 0:
@@ -1071,6 +1095,12 @@ async def main():  # pragma: no cover
                     "params": build_message_send_params(
                         config.idle_prompt,
                         message_id=f"idle-{_uuid.uuid4().hex[:8]}",
+                        # Stamp the typed self-ping marker so the executor (a)
+                        # drops the idle fire instead of queuing it behind an
+                        # in-flight turn, and (b) subjects its output to the
+                        # autonomous-loop replay guard. Idle self-wake was the
+                        # driver of the runaway replay incident.
+                        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
                     ),
                 }).encode()
 
