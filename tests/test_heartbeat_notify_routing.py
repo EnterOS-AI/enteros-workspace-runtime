@@ -92,7 +92,13 @@ def _isolate(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(hb_mod, "auth_headers", lambda *a, **kw: {})
     monkeypatch.setattr(hb_mod, "self_source_headers", lambda *a, **kw: {})
+    # Loop fix: _check_delegations now only harvests rows the concierge has an
+    # OPEN in-flight await for. These #384/#138 tests assert the harvest
+    # routing for a delegation the concierge initiated, so register that await
+    # explicitly. Reset between cases for hermeticity (process-scoped registry).
+    hb_mod.reset_awaited_delegations_for_test()
     yield
+    hb_mod.reset_awaited_delegations_for_test()
 
 
 @pytest.mark.asyncio
@@ -101,6 +107,7 @@ async def test_heartbeat_drops_success_delegation_chat_push():
     heartbeat must wake the agent via the A2A self-message path but
     must NOT POST to /notify. (Task #384 regression.)"""
     hb = HeartbeatLoop("http://test-platform", _WS)
+    hb_mod.register_awaited_delegation("deleg-success-1")
     posts: list[tuple[str, dict]] = []
     client = _make_client(
         get_payloads=[
@@ -138,6 +145,7 @@ async def test_heartbeat_keeps_failure_delegation_chat_push():
     with the actionable reason so the user sees the failure on the
     canvas. (Per feedback_surface_actionable_failure_reason_to_user.)"""
     hb = HeartbeatLoop("http://test-platform", _WS)
+    hb_mod.register_awaited_delegation("deleg-fail-1")
     posts: list[tuple[str, dict]] = []
     client = _make_client(
         get_payloads=[
@@ -335,6 +343,7 @@ async def test_heartbeat_self_message_stamps_typed_marker():
     source_type=self-harvester so the executor's drop/queue decision keys off
     the typed marker rather than text wording."""
     hb = HeartbeatLoop("http://test-platform", _WS)
+    hb_mod.register_awaited_delegation("deleg-success-138")
     posts: list[tuple[str, dict]] = []
     client = _make_client(
         get_payloads=[

@@ -56,6 +56,16 @@ jobs:
         # here means the real SDK is missing and the gate is inert.
         run: pytest -v -rs tests/test_boot_routes_subprocess.py
 
+      - name: Run delegation-harvest active-await scoping regression gate
+        # Loud, merge-blocking gate for the concierge delegation-result
+        # RE-NARRATION loop (root fix, supersedes the watermark band-aid): the
+        # heartbeat harvester must surface a result ONLY for a delegation the
+        # concierge has an OPEN in-flight await for. Pins: a peer's autonomous/
+        # scheduled-sweep result is NOT harvested; a user-awaited result is
+        # delivered exactly once; a fresh boot re-narrates ZERO of a historical
+        # backlog; a restart does not re-deliver.
+        run: pytest -v -rs tests/test_heartbeat_harvest_active_await.py tests/test_heartbeat_notify_routing.py
+
   responsiveness-e2e:
     # Deterministic, merge-BLOCKING integration gate for the "busy agent
     # becomes unreachable / blocks ~300s" regression class (2026-06-10).
