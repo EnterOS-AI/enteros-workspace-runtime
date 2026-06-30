@@ -214,14 +214,26 @@ def _extract_chunk_text(content) -> list[str]:
 A2A_MESSAGE_SOURCE_TYPE = "source_type"
 A2A_SOURCE_SELF_CRON = "self-cron"
 A2A_SOURCE_SELF_HARVESTER = "self-harvester"
+# Idle self-wake (main.py _run_idle_loop): periodically re-pokes the agent
+# while the workspace is idle. Marked as a routine self-ping so (a) it drops
+# rather than queues behind an in-flight turn, and (b) its output is subject
+# to the autonomous-loop replay guard — the idle self-wake was the driver of
+# the 2026-06-29 runaway delegation-result replay incident.
+A2A_SOURCE_SELF_IDLE = "self-idle"
 
-# Routine self-pings the runtime sends to ITSELF: the platform cron tick and
-# the heartbeat delegation-results harvester. Under the non-blocking fast-path
-# these must NOT queue behind (or interrupt) a long in-flight turn — the cron
-# recurs every cycle and delegation results are injected from
-# DELEGATION_RESULTS_FILE at the next turn, so dropping a mid-turn routine ping
-# loses nothing while avoiding both task-interruption and ping pile-up.
-_ROUTINE_SELF_SOURCE_TYPES = (A2A_SOURCE_SELF_CRON, A2A_SOURCE_SELF_HARVESTER)
+# Routine self-pings the runtime sends to ITSELF: the platform cron tick, the
+# heartbeat delegation-results harvester, and the idle self-wake. Under the
+# non-blocking fast-path these must NOT queue behind (or interrupt) a long
+# in-flight turn — the cron/idle recur every cycle and delegation results are
+# injected from DELEGATION_RESULTS_FILE at the next turn, so dropping a
+# mid-turn routine ping loses nothing while avoiding both task-interruption
+# and ping pile-up. These are also the ONLY turns the autonomous-loop replay
+# guard governs — a user-directed turn is never suppressed.
+_ROUTINE_SELF_SOURCE_TYPES = (
+    A2A_SOURCE_SELF_CRON,
+    A2A_SOURCE_SELF_HARVESTER,
+    A2A_SOURCE_SELF_IDLE,
+)
 
 # Deprecated text-prefix fallback. Wording drift has already been observed
 # (cron ticks no longer start with the registered literal), so new senders
@@ -330,6 +342,14 @@ class RuntimeA2AExecutor(AgentExecutor):
           3. Message(final_text)                      — terminal event
         """
         user_input = _extract_plain_message_text(context)
+        # Classify ROUTINE SELF-PING (idle self-wake / cron tick / delegation
+        # harvester) up front, from the ORIGINAL message — before the
+        # delegation-result injection below rewrites user_input. Only these
+        # autonomous turns are governed by the replay guard at the end of the
+        # turn; a user-directed turn is never suppressed. (Detection prefers
+        # the typed source_type marker, so the later injection is irrelevant —
+        # capturing here keeps the text-prefix fallback honest too.)
+        _is_routine_turn = _is_routine_self_message(context, user_input)
         # Inject delegation results from prior turns. Heartbeat writes
         # completed delegation rows to DELEGATION_RESULTS_FILE and sends
         # a self-message to wake the agent; this consumes the file and
@@ -819,6 +839,44 @@ class RuntimeA2AExecutor(AgentExecutor):
                             outcome="redacted",
                             pii_types=_pii_types,
                             context_id=context_id,
+                        )
+
+                # ── Autonomous-loop replay guard ─────────────────────────────
+                # Incident 2026-06-29: a platform agent's idle/cron/harvester
+                # self-wake re-emitted the SAME delegation-result replay on
+                # ~every turn (counter-bumping "Idempotency now N records", a
+                # STALE "PR #195 not merged" verdict) until the session hit
+                # ~130 messages and the workspace flipped to DEGRADED. Govern
+                # ONLY routine self-pings (never a user turn): suppress an
+                # already-delivered / no-new-info replay instead of re-
+                # broadcasting it, and after N consecutive such no-ops trip a
+                # circuit breaker that halts the loop + marks the runtime
+                # degraded (the idle loop reads should_halt() and stops
+                # firing). This is the enforce — not merely observe — gate.
+                if _is_routine_turn:
+                    from molecule_runtime import autonomous_loop_guard as _loop_guard
+
+                    _decision = _loop_guard.evaluate_autonomous_output(final_text)
+                    if _decision == _loop_guard.HALT:
+                        logger.warning(
+                            "A2A execute: autonomous-loop circuit breaker OPEN for "
+                            "context_id=%s — halting self-fire (%s)",
+                            context_id, _loop_guard.halt_reason(),
+                        )
+                        final_text = (
+                            "[autonomous loop halted — "
+                            + _loop_guard.halt_reason()
+                            + "]"
+                        )
+                    elif _decision == _loop_guard.SUPPRESS:
+                        logger.info(
+                            "A2A execute: suppressing duplicate autonomous replay for "
+                            "context_id=%s (already delivered / no new info) — ending turn",
+                            context_id,
+                        )
+                        final_text = (
+                            "[autonomous replay suppressed — delegation result already "
+                            "delivered; no new info, ending turn]"
                         )
 
                 # ── OTEL: task_complete span ─────────────────────────────────
