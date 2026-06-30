@@ -83,6 +83,13 @@ class A2AConfig:
     port: int = 8000
     streaming: bool = True
     push_notifications: bool = True
+    # Inbound A2A delivery mode (E1). "push" (default) = the platform POSTs A2A
+    # to this workspace's advertised URL (uvicorn route). "poll" = no public URL;
+    # the platform stages inbound A2A in activity_logs and main() runs the inbox
+    # poller to pull + drive the local executor. An env override
+    # (MOLECULE_DELIVERY_MODE) wins over this at runtime. NEVER run both push and
+    # poll for one workspace (double delivery — see inbox.py module docstring).
+    delivery_mode: str = "push"
 
 
 @dataclass
@@ -748,6 +755,7 @@ def load_config(config_path: Optional[str] = None) -> WorkspaceConfig:
             port=a2a_raw.get("port", 8000),
             streaming=a2a_raw.get("streaming", True),
             push_notifications=a2a_raw.get("push_notifications", True),
+            delivery_mode=str(a2a_raw.get("delivery_mode", "push") or "push").lower(),
         ),
         delegation=DelegationConfig(
             retry_attempts=delegation_raw.get("retry_attempts", 3),

@@ -180,6 +180,7 @@ async def register_with_platform(
     agent_card: dict,
     headers: dict,
     max_attempts: int = 8,
+    delivery_mode: str = "push",
 ) -> bool:
     """POST the boot registration to ``/registry/register`` with bounded
     exponential backoff until it gets a 2xx.
@@ -227,6 +228,14 @@ async def register_with_platform(
                 "agent_card": agent_card,
                 **identity_gate_payload(),
             }
+            # E1: declare poll delivery so the platform stages inbound A2A in
+            # activity_logs (for main()'s poller to pull) instead of POSTing to
+            # our URL. RegisterRequest already permits the key (mcp_heartbeat.py
+            # sets exactly this for the standalone path) — no contract change.
+            # Only added in poll mode, so the default push registration is
+            # byte-for-byte unchanged.
+            if delivery_mode == "poll":
+                register_body["delivery_mode"] = "poll"
             resp = await client.post(
                 f"{platform_url}/registry/register",
                 json=register_body,
@@ -299,6 +308,113 @@ async def register_with_platform(
     return False
 
 
+# ---------------------------------------------------------------------------
+# E1 — poll-mode inbound delivery (opt-in; default is push).
+# ---------------------------------------------------------------------------
+# Host of the LOCAL executor the poll consumer posts to. MUST be loopback: a
+# post to the platform proxy (/workspaces/<id>/a2a) would write a NEW
+# a2a_receive activity row that the poller re-fetches => infinite loop. A direct
+# 127.0.0.1 post hits the boot_routes DefaultRequestHandler -> executor and
+# creates no activity row, so the cursor advances exactly once (no echo).
+LOCAL_EXECUTOR_HOST = "127.0.0.1"
+
+
+def resolve_delivery_mode(env: Mapping[str, str], config_delivery_mode: str | None) -> str:
+    """Resolve the effective inbound delivery mode.
+
+    Precedence (env override wins, mirroring the LOG_LEVEL pattern): the
+    ``MOLECULE_DELIVERY_MODE`` env var, then ``config.a2a.delivery_mode``, else
+    ``"push"``. Lower-cased so ``"Poll"`` / ``"PUSH"`` resolve consistently.
+    """
+    return (env.get("MOLECULE_DELIVERY_MODE") or config_delivery_mode or "push").strip().lower()
+
+
+async def _post_polled_message_to_local_executor(port: int, workspace_id: str, text: str):
+    """POST one polled inbox message to the LOCAL executor as a JSON-RPC
+    ``message/send`` — NEVER the platform proxy (see LOCAL_EXECUTOR_HOST).
+
+    Same envelope shape the direct-peer delegate path uses (a2a_client) so the
+    boot_routes DefaultRequestHandler accepts it. No self-source ``source_type``
+    marker is stamped: a polled peer/canvas message is a real inbound turn, not a
+    routine self-ping, so it must not be dropped by the non-blocking fast-path.
+    """
+    url = f"http://{LOCAL_EXECUTOR_HOST}:{port}/"
+    body = {
+        "jsonrpc": "2.0",
+        "id": str(_uuid.uuid4()),
+        "method": "message/send",
+        "params": build_message_send_params(text),
+    }
+    headers = {"Content-Type": "application/json", **self_source_headers(workspace_id)}
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        resp = await client.post(url, json=body, headers=headers)
+        return resp.status_code
+
+
+def make_poll_inbox_consumer(port: int, workspace_id: str, loop):
+    """Build the inbox notification callback for poll mode.
+
+    The callback runs on the poller DAEMON thread (``inbox.record`` fires it),
+    so it marshals the httpx post onto the main asyncio ``loop`` via
+    ``run_coroutine_threadsafe`` — the post then shares the event loop instead of
+    racing it (the same marshalling rationale as the idle/initial-prompt
+    self-sends). Best-effort: a scheduling failure logs and returns so the poller
+    thread never crashes.
+    """
+    def _consume(msg: dict) -> None:
+        text = (msg or {}).get("text") or ""
+        if not text:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _post_polled_message_to_local_executor(port, workspace_id, text),
+                loop,
+            )
+        except Exception as exc:  # noqa: BLE001 — callback must never crash the poller
+            print(f"poll-consumer: failed to schedule local executor post: {exc}", flush=True)
+
+    return _consume
+
+
+def maybe_start_poll_delivery(
+    delivery_mode: str,
+    platform_url: str,
+    workspace_id: str,
+    port: int,
+    loop,
+    *,
+    start_pollers=None,
+    set_callback=None,
+) -> bool:
+    """Start poll-mode inbound delivery when ``delivery_mode == "poll"``.
+
+    Registers the inbox consumer (drives the local executor) then starts the
+    pollers via the SAME SSOT helper the standalone path uses
+    (``mcp_inbox_pollers.start_inbox_pollers``) so cursor-file semantics,
+    activation idempotency and multi-workspace handling are identical. Returns
+    True when poll delivery was started, False for push (default) — in push mode
+    this whole branch is dead code, preserving the never-run-both invariant
+    (inbox.py module docstring). ``start_pollers`` / ``set_callback`` are
+    injectable for tests.
+    """
+    if delivery_mode != "poll":
+        return False
+    if start_pollers is None:
+        from molecule_runtime.mcp_inbox_pollers import start_inbox_pollers
+        start_pollers = start_inbox_pollers
+    if set_callback is None:
+        from molecule_runtime.inbox import set_notification_callback
+        set_callback = set_notification_callback
+    set_callback(make_poll_inbox_consumer(port, workspace_id, loop))
+    start_pollers(platform_url, [workspace_id])
+    print(
+        f"Delivery mode: poll — inbox poller started for {workspace_id} "
+        f"(consumer posts to {LOCAL_EXECUTOR_HOST}:{port})",
+        flush=True,
+    )
+    return True
+
+
 async def main():  # pragma: no cover
     workspace_id = os.environ.get("WORKSPACE_ID", "")
     if not workspace_id:
@@ -346,6 +462,23 @@ async def main():  # pragma: no cover
     from molecule_runtime.npm_auth import install_npm_gitea_auth
     install_npm_gitea_auth()
 
+    # 0.2c Declared-plugins boot-install (RFC#2843 #32 — base-runtime hoist).
+    # Port of the proven shell block (wt-claude-code/entrypoint.sh:214-284) into
+    # a Python source-provider module so EVERY runtime gets the boot-install
+    # uniformly — no per-template fork. Runs AFTER npm_auth (so a plugin setup.sh
+    # that does an npm fetch is already authed) and BEFORE load_config /
+    # adapter.setup, so the plugins land on disk before _common_setup's
+    # load_plugins reads <config_path>/plugins and install_plugins_via_registry
+    # wires their MCP/skills. No-op when MOLECULE_DECLARED_PLUGINS is empty;
+    # fail-soft (never raises into boot). During the template cutover BOTH this
+    # and the shell block run idempotently (shell first as root pre-gosu, this
+    # second as the agent uid here) — the second simply rebuilds the same tree.
+    from molecule_runtime.plugin_sources import install_declared_plugins
+    try:
+        print(install_declared_plugins().summary(), flush=True)
+    except Exception as e:  # noqa: BLE001 — boot-install must never block boot
+        print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
+
     # 0.3 Pre-commit hook installer — refuses commits that add internal-flavored
     # paths or known secret shapes to any git repo the workspace touches. Lifted
     # into runtime so all templates get the gate without per-Dockerfile wiring.
@@ -387,6 +520,12 @@ async def main():  # pragma: no cover
     # Runs before preflight so required-env checks see the normalised shape.
     print(normalise_llm_env(provider=getattr(config, "provider", "")).summary())
     port = config.a2a.port
+    # E1: resolve inbound delivery mode once (env override wins over config;
+    # default "push"). Push (default) keeps the existing uvicorn-route-only
+    # inbound; "poll" tells the platform to stage A2A in activity_logs and starts
+    # the inbox poller below. The proven push concierge never sets this, so the
+    # entire poll branch is dead code for it.
+    delivery_mode = resolve_delivery_mode(os.environ, config.a2a.delivery_mode)
     preflight = run_preflight(config, config_path)
     render_preflight_report(preflight)
 
@@ -741,12 +880,28 @@ async def main():  # pragma: no cover
             workspace_url=workspace_url,
             agent_card=agent_card_dict,
             headers=auth_headers(),
+            delivery_mode=delivery_mode,
         )
 
     heartbeat.agent_card = agent_card_dict
 
     # 9. Start heartbeat
     heartbeat.start()
+
+    # 9a. E1 — poll-mode inbound delivery. When delivery_mode == "poll" (no
+    # public URL; the platform stages inbound A2A in activity_logs rather than
+    # POSTing to us), start the inbox poller (SSOT helper) + register the
+    # consumer that drives the LOCAL executor from each staged message. No-op in
+    # push mode (default), so the uvicorn route stays the sole inbound and the
+    # never-run-both invariant (inbox.py) holds. Captures the running loop so the
+    # poller-thread callback can marshal its post onto this event loop.
+    maybe_start_poll_delivery(
+        delivery_mode,
+        platform_url,
+        workspace_id,
+        port,
+        asyncio.get_running_loop(),
+    )
 
     # 9b. Start skills hot-reload watcher (background task)
     # When a skill file changes the watcher reloads the skill module and calls

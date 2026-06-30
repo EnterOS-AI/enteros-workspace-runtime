@@ -469,7 +469,14 @@ class BaseAdapter(ABC):
         override this method once its native format is verified.
         """
         from molecule_runtime.mcp_render import render_for_runtime
+        from molecule_runtime.privileged_mcp_env import inject_privileged_env
 
+        # F2 belt-and-suspenders: enrich the privileged MCP spec for any caller
+        # that invokes this hook DIRECTLY (e.g. the ensure_management_mcp_in_settings
+        # self-heal), not only via install_plugins_via_registry's funnel. No-op for
+        # non-management names; idempotent + descriptor-wins, so re-running over an
+        # already-enriched spec changes nothing.
+        spec = inject_privileged_env(name, spec)
         target = render_for_runtime(self.name(), config.config_path, name, spec)
         logger.info("register_mcp_server_hook: wired MCP %r into %s (runtime=%s)",
                     name, target, self.name())
@@ -536,6 +543,7 @@ class BaseAdapter(ABC):
         from pathlib import Path
         from molecule_runtime.plugins_registry import InstallContext, resolve
         from molecule_runtime.plugins_registry.builtins import _PRIVILEGED_MCP_PLUGIN
+        from molecule_runtime.privileged_mcp_env import inject_privileged_env
 
         results = []
         runtime = self.name().replace("-", "_")  # e.g. "claude-code" -> "claude_code"
@@ -550,7 +558,14 @@ class BaseAdapter(ABC):
                 memory_filename=self.memory_filename(),
                 register_tool=self.register_tool_hook,
                 register_subagent=self.register_subagent_hook,
-                register_mcp_server=lambda n, s, _cfg=config: self.register_mcp_server_hook(_cfg, n, s),
+                # F2: enrich the privileged MCP spec at the ONE base funnel all
+                # adapters share, BEFORE dispatch — so even an overriding hook
+                # (openclaw) receives the pre-merged org-admin env. inject_privileged_env
+                # no-ops for any name != the management MCP and is descriptor-wins +
+                # idempotent, so ordinary MCP specs and the proven flow are unchanged.
+                register_mcp_server=lambda n, s, _cfg=config: self.register_mcp_server_hook(
+                    _cfg, n, inject_privileged_env(n, s)
+                ),
                 append_to_memory=lambda fn, c, _cfg=config: self.append_to_memory_hook(_cfg, fn, c),
             )
             try:
