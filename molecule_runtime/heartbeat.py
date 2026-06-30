@@ -191,6 +191,104 @@ _ACTIVITY_DELEGATION_CURSOR_FILE = os.environ.get(
     "/tmp/delegation_activity_cursor",
 )
 
+# ── Active-await scoping for the delegation-result harvester ─────────────────
+# Root fix for the recurring delegation-result RE-NARRATION loop (supersedes
+# the watermark band-aid). The harvester (_check_delegations) used to surface
+# EVERY completed/failed delegation row where source_id==self, deduped only by
+# the IN-MEMORY _seen_delegation_ids set. Because that set is process-scoped,
+# every restart re-read the tenant's full backlog of historical completed
+# PR-review delegation rows (178 on the agents-team concierge) and fired a
+# self-message that woke the concierge to NARRATE the whole backlog again —
+# an endless re-narration loop across restarts, and a path that also harvested
+# a peer's autonomous/scheduled sweep results (codex-reviewer's
+# org-pr-review-sweep) the concierge never asked to be woken for.
+#
+# The concierge must auto-harvest + self-wake-narrate a delegation result ONLY
+# when it has an OPEN IN-FLIGHT AWAIT for that delegation — a delegation IT
+# initiated this process and is still tracking (genuinely awaiting on behalf of
+# a live task). The "open await set" is the UNION of:
+#   (a) the in-container in-flight delegation registry the concierge maintains
+#       (builtin_tools.delegation._delegations), populated by delegate_task_async
+#       — read defensively, never mutated, so this scoping needs no change to
+#       the delegation tool; and
+#   (b) ids explicitly registered via register_awaited_delegation() — the public
+#       seam other delegation paths (or tests) use to opt a delegation into
+#       heartbeat auto-harvest.
+#
+# Both layers are PROCESS-SCOPED (empty on a fresh boot), which is exactly what
+# kills the loop at the SOURCE: a (re)booted concierge has ZERO open awaits, so
+# the historical backlog is never re-read/re-narrated, and a peer's autonomous
+# sweep — which the concierge holds no await for — is never harvested. A
+# genuinely user-awaited delegation the concierge initiated IS still delivered
+# exactly once (it is in the open-await set, and _seen_delegation_ids dedupes
+# the within-process re-poll). Mirrors the one-platform-agent-per-process
+# posture of runtime_wedge / autonomous_loop_guard.
+_REGISTERED_AWAIT_IDS: "dict[str, None]" = {}
+_REGISTERED_AWAIT_LOCK = threading.Lock()
+# Cap so a long-lived process can't grow the registry unbounded; evicts the
+# oldest-inserted half on overflow (dict preserves insertion order).
+_MAX_REGISTERED_AWAIT_IDS = 512
+
+
+def register_awaited_delegation(delegation_id: str) -> None:
+    """Record that the concierge is actively AWAITING this delegation's result,
+    so the heartbeat harvester is allowed to surface it (once) when it
+    completes. Idempotent; no-op on an empty id. Bounded.
+
+    The in-container builtin delegate path is covered automatically (the
+    harvester also reads builtin_tools.delegation._delegations), so this seam is
+    for delegation paths that do NOT register there — e.g. the MCP/platform
+    delegate path — plus tests."""
+    if not delegation_id:
+        return
+    with _REGISTERED_AWAIT_LOCK:
+        _REGISTERED_AWAIT_IDS[delegation_id] = None
+        if len(_REGISTERED_AWAIT_IDS) > _MAX_REGISTERED_AWAIT_IDS:
+            drop = len(_REGISTERED_AWAIT_IDS) - _MAX_REGISTERED_AWAIT_IDS // 2
+            for k in list(_REGISTERED_AWAIT_IDS)[:drop]:
+                _REGISTERED_AWAIT_IDS.pop(k, None)
+
+
+def discard_awaited_delegation(delegation_id: str) -> None:
+    """Drop an await id once its result has been delivered (await satisfied)."""
+    if not delegation_id:
+        return
+    with _REGISTERED_AWAIT_LOCK:
+        _REGISTERED_AWAIT_IDS.pop(delegation_id, None)
+
+
+def reset_awaited_delegations_for_test() -> None:
+    """Test-only: clear the registered-await set between cases."""
+    with _REGISTERED_AWAIT_LOCK:
+        _REGISTERED_AWAIT_IDS.clear()
+
+
+def _in_flight_delegation_ids() -> set[str]:
+    """Delegation ids the concierge initiated this process and is tracking,
+    read READ-ONLY from the in-container in-flight delegation registry
+    (builtin_tools.delegation._delegations, populated by delegate_task_async).
+
+    Defensive: returns an empty set if that module isn't importable (partial
+    install / mid-deploy) — i.e. a missing registry fails CLOSED (no harvest),
+    the safe direction for the loop fix (better to miss a rare async result the
+    agent can still poll for than to re-enter the re-narration loop)."""
+    try:
+        from molecule_runtime.builtin_tools.delegation import _delegations
+
+        return {tid for tid in _delegations if tid}
+    except Exception:
+        return set()
+
+
+def _active_await_delegation_ids() -> set[str]:
+    """The concierge's set of OPEN in-flight delegation awaits — the union of
+    explicitly-registered awaits and the in-container in-flight registry. The
+    harvester surfaces a delegation result ONLY when its delegation_id is in
+    this set."""
+    with _REGISTERED_AWAIT_LOCK:
+        registered = set(_REGISTERED_AWAIT_IDS)
+    return registered | _in_flight_delegation_ids()
+
 
 class HeartbeatLoop:
     def __init__(
@@ -504,12 +602,28 @@ class HeartbeatLoop:
             if not isinstance(delegations, list):
                 return
 
+            # Active-await scoping (root loop fix): only surface results the
+            # concierge has an OPEN in-flight await for. Computed once per poll.
+            # On a fresh boot this is EMPTY, so a backlog of historical
+            # completed rows is never re-read/re-narrated, and a peer's
+            # autonomous/scheduled sweep (which the concierge holds no await
+            # for) is never harvested. See the module-level rationale above
+            # register_awaited_delegation().
+            active_awaits = _active_await_delegation_ids()
+
             new_results = []
             for d in delegations:
                 did = d.get("delegation_id", "")
                 status = d.get("status", "")
 
                 if not did or did in self._seen_delegation_ids:
+                    continue
+
+                # Skip any row the concierge is NOT actively awaiting: no
+                # self-wake, no narration. Deliberately NOT marked seen, so a
+                # result that lands just before its await is registered can
+                # still be delivered on a later poll once the await exists.
+                if did not in active_awaits:
                     continue
 
                 if status in ("completed", "failed"):
@@ -528,6 +642,10 @@ class HeartbeatLoop:
                         continue
 
                     self._seen_delegation_ids.add(did)
+                    # Await satisfied — drop it from the registered-await set so
+                    # the registry stays bounded (within-process re-poll is
+                    # already deduped by _seen_delegation_ids).
+                    discard_awaited_delegation(did)
                     new_results.append({
                         "delegation_id": did,
                         "target_id": d.get("target_id", ""),
