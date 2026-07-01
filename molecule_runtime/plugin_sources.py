@@ -23,12 +23,22 @@ Faithful to the shell block (``entrypoint.sh`` lines 214-284):
     name = last path segment of subpath else repo);
   * fetch ``<base>/api/v1/repos/<owner>/<repo>/archive/<ref>.tar.gz`` with
     ``Authorization: token <MOLECULE_TEMPLATE_REPO_TOKEN>`` (unauth fallback);
-  * untar, copy ``<subpath|top>/.`` into ``<plugins_dir>/<name>/``;
-  * fail-soft per source — a fetch/extract failure logs and continues, never
-    blocks boot; an empty ``MOLECULE_DECLARED_PLUGINS`` is a no-op (existing
-    behaviour preserved).
+  * untar, copy ``<subpath|top>/.`` into a STAGING tree, then atomically swap
+    the staging tree into ``<plugins_dir>`` only on a fully-successful build;
+  * fail-soft — a fetch/extract failure logs and never blocks boot; an empty
+    ``MOLECULE_DECLARED_PLUGINS`` is a no-op (existing behaviour preserved).
 
-Hardening win over the shell: ``tarfile`` extraction is path-traversal-guarded
+Atomic build-then-swap (hardening win #2 over the shell)
+========================================================
+The shell — and the first Python port — ``rm -rf``'d ``<plugins_dir>`` BEFORE
+re-fetching, so a single transient fetch failure wiped skills a prior boot had
+already materialized. This module instead builds the WHOLE declared set into a
+sibling ``staging`` dir and only ``os.replace``-swaps it into place when every
+source succeeds; any failure leaves the existing live tree untouched (retried
+next boot). Full-replace semantics (a de-declared plugin doesn't linger) are
+preserved — the swap just never leaves the live dir half-built/empty.
+
+Hardening win #1 over the shell: ``tarfile`` extraction is path-traversal-guarded
 (the shell ``cp -a`` had no such guard), so a malicious archive member whose
 resolved path escapes the extraction dir is rejected.
 
@@ -40,9 +50,9 @@ automatically. An unknown scheme is skipped + logged (matches the shell).
 Idempotency / cutover: this rebuilds ``<plugins_dir>`` from the same source
 list the shell block uses, so during the template cutover BOTH run (shell first
 as root pre-gosu, this second as the agent uid in ``main``) and the second run
-simply rebuilds the identical tree — harmless. Templates drop their shell
-copies LATER, gated by a runtime-capability floor; this base change must never
-regress the proven flow.
+simply rebuilds the identical tree via staging+swap — harmless. Templates drop
+their shell copies LATER, gated by a runtime-capability floor; this base change
+must never regress the proven flow.
 """
 from __future__ import annotations
 
@@ -51,6 +61,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -107,6 +118,12 @@ class InstallReport:
     installed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    # True once the freshly-built staging tree was atomically swapped into the
+    # live ``plugins_dir``. False means the existing tree was left intact — either
+    # because a source failed (we never promote a partial build) or the swap
+    # rename itself failed. ``installed`` lists sources that materialized into
+    # staging; they only went LIVE when ``swapped`` is True.
+    swapped: bool = False
 
     def summary(self) -> str:
         if not self.declared:
@@ -114,7 +131,7 @@ class InstallReport:
         return (
             "[plugins] boot-install complete: "
             f"installed={len(self.installed)} skipped={len(self.skipped)} "
-            f"failed={len(self.failed)} -> {self.plugins_dir}"
+            f"failed={len(self.failed)} swapped={self.swapped} -> {self.plugins_dir}"
         )
 
 
@@ -235,6 +252,47 @@ def _find_archive_top(extract_dir: Path) -> Path | None:
     return None
 
 
+def _atomic_swap_dir(staging_dir: Path, target_dir: Path) -> None:
+    """Replace ``target_dir`` with ``staging_dir`` as atomically as the platform
+    permits.
+
+    ``staging_dir`` and ``target_dir`` MUST live on the same filesystem (the
+    caller stages a sibling of ``target_dir``) so the renames are atomic and
+    never fall back to a slow cross-device copy. Strategy:
+
+      1. move any existing live tree aside (``os.replace`` — atomic rename);
+      2. rename the freshly-built staging tree into place (atomic);
+      3. delete the moved-aside copy.
+
+    If step 2 fails, the moved-aside copy is restored so the live tree is never
+    left missing. Raises ``OSError`` on an unrecoverable rename failure so the
+    caller can record ``swapped=False`` and keep the staging cleanup in its
+    ``finally``.
+    """
+    staging_dir = Path(staging_dir)
+    target_dir = Path(target_dir)
+    backup: Path | None = None
+    if target_dir.exists():
+        backup = target_dir.with_name(
+            f".{target_dir.name}.old-{os.getpid()}-{time.time_ns()}"
+        )
+        os.replace(target_dir, backup)
+    try:
+        os.replace(staging_dir, target_dir)
+    except OSError:
+        # Putting staging in place failed — restore the previous tree so the
+        # live plugins dir is never left missing.
+        if backup is not None and not target_dir.exists():
+            try:
+                os.replace(backup, target_dir)
+                backup = None
+            except OSError:
+                pass
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Provider seam — scheme -> fetch handler. v1: gitea only.
 # ---------------------------------------------------------------------------
@@ -318,10 +376,21 @@ def install_declared_plugins(
 
     No-op (returns a ``declared=False`` report) when ``MOLECULE_DECLARED_PLUGINS``
     is unset/empty, so existing behaviour is byte-for-byte unchanged when the
-    signal is absent. Otherwise ``rm -rf`` + recreate ``plugins_dir`` and fetch
-    each source via the scheme's provider (gitea v1), copying ``<content>/.``
-    into ``<plugins_dir>/<name>/``. Fail-soft per source. Never raises into the
-    caller — the runtime starting matters more than any one plugin landing.
+    signal is absent.
+
+    Atomic build-then-swap (the fix for F1's wipe-on-transient-failure)
+    -----------------------------------------------------------------
+    The previous implementation ``rm -rf``'d the live ``plugins_dir`` UP FRONT
+    and then re-fetched — so a single transient fetch failure wiped skills a
+    prior boot had already materialized, leaving the workspace skill-less for
+    that boot. Instead we now fetch the WHOLE declared set into a sibling
+    ``staging`` directory first, and only ``os.replace``-swap it into place when
+    EVERY source materialized. On any fetch/copy failure (or a swap-rename
+    failure) the existing live tree is left untouched — the build is discarded
+    and retried next boot. The swap still drops plugins no longer in the declared
+    set (full-replace semantics preserved), it just never leaves the live dir in
+    a half-built/empty state. Fail-soft: never raises into the caller — the
+    runtime starting matters more than any one plugin landing.
     """
     if env is None:
         env = os.environ
@@ -330,8 +399,8 @@ def install_declared_plugins(
     raw = env.get("MOLECULE_DECLARED_PLUGINS") or ""
     sources = parse_declared_plugins(raw)
     # ``declared`` reflects the SIGNAL being present (mirrors the shell's
-    # ``if [ -n "${MOLECULE_DECLARED_PLUGINS:-}" ]`` gate), so an all-invalid
-    # list still wipes+rebuilds the dir exactly like the shell does.
+    # ``if [ -n "${MOLECULE_DECLARED_PLUGINS:-}" ]`` gate), so an all-valid
+    # build still fully replaces the dir exactly like the shell does.
     report.declared = bool(raw.strip())
     if not report.declared:
         return report
@@ -346,43 +415,85 @@ def install_declared_plugins(
     except (TypeError, ValueError):
         timeout = _DEFAULT_FETCH_TIMEOUT_SECONDS
 
-    # rm -rf + mkdir — rebuild the desired set fresh every boot (the shell does
-    # the same), so a plugin removed from the declared set doesn't linger.
+    # Stage the new tree as a SIBLING of target_dir so the swap rename stays on
+    # one filesystem (atomic, no EXDEV copy). The live tree is NOT touched until
+    # the staging build fully succeeds.
     try:
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        # Can't even prepare the dir (e.g. a future template that skipped the
+        # Can't even prepare the parent (e.g. a future template that skipped the
         # entrypoint chown -> EPERM). Fail-soft: log + return, never block boot.
-        log.warning("[plugins] cannot prepare %s (%s) — skipping boot-install", target_dir, exc)
+        log.warning(
+            "[plugins] cannot prepare parent of %s (%s) — skipping boot-install",
+            target_dir, exc,
+        )
         return report
 
-    for source in sources:
-        fetch = _PROVIDERS.get(source.scheme)
-        if fetch is None:  # defensive — parse already filtered unknown schemes
-            log.info("[plugins] skip unsupported source: %s", source.raw)
-            report.skipped.append(source.raw)
-            continue
-        with tempfile.TemporaryDirectory(prefix="molecule-plugin-") as td:
-            content_dir = fetch(
-                source,
-                base_url=base_url,
-                token=token,
-                workdir=Path(td),
-                timeout=timeout,
-            )
-            if content_dir is None:
-                report.failed.append(source.raw)
-                continue
-            dest = target_dir / source.name
-            try:
-                shutil.copytree(content_dir, dest, dirs_exist_ok=True)
-            except OSError as exc:
-                log.warning("[plugins] copy failed: %s (%s)", source.raw, exc)
-                report.failed.append(source.raw)
-                continue
-        log.info("[plugins] installed %s <- %s", source.name, source.raw)
-        report.installed.append(source.raw)
+    staging_dir = target_dir.with_name(
+        f".{target_dir.name}.staging-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning(
+            "[plugins] cannot create staging dir %s (%s) — skipping boot-install",
+            staging_dir, exc,
+        )
+        return report
 
-    return report
+    try:
+        for source in sources:
+            fetch = _PROVIDERS.get(source.scheme)
+            if fetch is None:  # defensive — parse already filtered unknown schemes
+                log.info("[plugins] skip unsupported source: %s", source.raw)
+                report.skipped.append(source.raw)
+                continue
+            with tempfile.TemporaryDirectory(prefix="molecule-plugin-") as td:
+                content_dir = fetch(
+                    source,
+                    base_url=base_url,
+                    token=token,
+                    workdir=Path(td),
+                    timeout=timeout,
+                )
+                if content_dir is None:
+                    report.failed.append(source.raw)
+                    continue
+                dest = staging_dir / source.name
+                try:
+                    shutil.copytree(content_dir, dest, dirs_exist_ok=True)
+                except OSError as exc:
+                    log.warning("[plugins] copy failed: %s (%s)", source.raw, exc)
+                    report.failed.append(source.raw)
+                    continue
+            log.info("[plugins] staged %s <- %s", source.name, source.raw)
+            report.installed.append(source.raw)
+
+        # Atomic swap — ONLY when every declared source materialized. On any
+        # failure keep the existing live tree (no swap), so a transient gitea
+        # blip never deletes already-installed skills for this boot.
+        if report.failed:
+            log.warning(
+                "[plugins] %d of %d source(s) failed — keeping existing plugins "
+                "tree intact (no swap); will retry next boot",
+                len(report.failed), len(sources),
+            )
+            report.swapped = False
+            return report
+
+        try:
+            _atomic_swap_dir(staging_dir, target_dir)
+            report.swapped = True
+        except OSError as exc:
+            log.warning(
+                "[plugins] atomic swap into %s failed (%s) — existing tree left intact",
+                target_dir, exc,
+            )
+            report.swapped = False
+        return report
+    finally:
+        # Remove the staging tree if it wasn't consumed by the swap (failure
+        # path, or any leftover after a partial rename). A successful swap
+        # renamed it away, so this is a harmless no-op there.
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)

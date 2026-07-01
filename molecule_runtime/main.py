@@ -318,6 +318,17 @@ async def register_with_platform(
 # creates no activity row, so the cursor advances exactly once (no echo).
 LOCAL_EXECUTOR_HOST = "127.0.0.1"
 
+# Pre-bind retry budget for the local self-POST. The inbox poller fires its
+# first poll the instant its daemon thread starts; if uvicorn hasn't finished
+# binding 127.0.0.1:{port} yet, the consumer's self-POST raises ConnectError
+# (connection refused). We retry with a bounded backoff so a message staged in
+# that pre-bind window is held in-flight until the local executor is listening
+# — never dropped while the inbox cursor advances past it (the E1 startup-race
+# fix). Bounded so a genuinely dead executor can't wedge the poller callback
+# forever: 40 * 0.25s ≈ 10s, comfortably longer than a normal uvicorn bind.
+_LOCAL_POST_CONNECT_RETRIES = 40
+_LOCAL_POST_CONNECT_BACKOFF_SECONDS = 0.25
+
 
 def resolve_delivery_mode(env: Mapping[str, str], config_delivery_mode: str | None) -> str:
     """Resolve the effective inbound delivery mode.
@@ -346,9 +357,28 @@ async def _post_polled_message_to_local_executor(port: int, workspace_id: str, t
         "params": build_message_send_params(text),
     }
     headers = {"Content-Type": "application/json", **self_source_headers(workspace_id)}
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        resp = await client.post(url, json=body, headers=headers)
-        return resp.status_code
+    # Retry on connection-refused (uvicorn not bound yet). A ConnectError here is
+    # the pre-bind window, not a real delivery failure — backing off and retrying
+    # keeps the staged message from being lost while the inbox cursor advances.
+    # Any non-connection error (e.g. a real 4xx/5xx from the executor) returns on
+    # the first attempt as before. See _LOCAL_POST_CONNECT_* for the bound.
+    last_exc: Exception | None = None
+    for _attempt in range(_LOCAL_POST_CONNECT_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                return resp.status_code
+        except httpx.ConnectError as exc:
+            last_exc = exc
+            await asyncio.sleep(_LOCAL_POST_CONNECT_BACKOFF_SECONDS)
+    # Budget exhausted — the executor never came up. Log + give up (best-effort;
+    # the caller's run_coroutine_threadsafe must never see this crash the poller).
+    print(
+        f"poll-consumer: local executor {LOCAL_EXECUTOR_HOST}:{port} unreachable "
+        f"after {_LOCAL_POST_CONNECT_RETRIES} attempts ({last_exc}); message dropped",
+        flush=True,
+    )
+    return None
 
 
 def make_poll_inbox_consumer(port: int, workspace_id: str, loop):
@@ -413,6 +443,60 @@ def maybe_start_poll_delivery(
         flush=True,
     )
     return True
+
+
+async def start_poll_delivery_when_bound(
+    server,
+    delivery_mode: str,
+    platform_url: str,
+    workspace_id: str,
+    port: int,
+    loop,
+    *,
+    poll_interval: float = 0.05,
+    max_wait_seconds: float = 60.0,
+    start_pollers=None,
+    set_callback=None,
+) -> bool:
+    """Start poll-mode inbound delivery, but ONLY after uvicorn has bound.
+
+    The E1 startup-race fix. The inbox poller fires its first poll the instant
+    its daemon thread starts; if that happens before uvicorn binds
+    ``127.0.0.1:{port}`` the consumer's local self-POST hits a closed socket and
+    the staged message is dropped while the inbox cursor advances past it.
+    ``uvicorn.Server`` flips ``started`` True once its socket is bound and
+    accepting, so gating the poller on it guarantees the consumer only ever posts
+    to a listening executor — no staged message is lost.
+
+    No-op (returns False) in push mode (default), preserving the never-run-both
+    invariant. ``max_wait_seconds`` is a defensive bound: if startup somehow
+    stalls we still start the poller (the consumer's bounded connection-refused
+    retry is the backstop) rather than never delivering. ``poll_interval`` /
+    ``start_pollers`` / ``set_callback`` are injectable for tests.
+    """
+    if delivery_mode != "poll":
+        return False
+    waited = 0.0
+    while not getattr(server, "started", False):
+        if waited >= max_wait_seconds:
+            print(
+                "Delivery mode: poll — uvicorn not reported bound after "
+                f"{max_wait_seconds:.0f}s; starting poller anyway "
+                "(consumer retries connection-refused as backstop)",
+                flush=True,
+            )
+            break
+        await asyncio.sleep(poll_interval)
+        waited += poll_interval
+    return maybe_start_poll_delivery(
+        delivery_mode,
+        platform_url,
+        workspace_id,
+        port,
+        loop,
+        start_pollers=start_pollers,
+        set_callback=set_callback,
+    )
 
 
 async def main():  # pragma: no cover
@@ -888,20 +972,12 @@ async def main():  # pragma: no cover
     # 9. Start heartbeat
     heartbeat.start()
 
-    # 9a. E1 — poll-mode inbound delivery. When delivery_mode == "poll" (no
-    # public URL; the platform stages inbound A2A in activity_logs rather than
-    # POSTing to us), start the inbox poller (SSOT helper) + register the
-    # consumer that drives the LOCAL executor from each staged message. No-op in
-    # push mode (default), so the uvicorn route stays the sole inbound and the
-    # never-run-both invariant (inbox.py) holds. Captures the running loop so the
-    # poller-thread callback can marshal its post onto this event loop.
-    maybe_start_poll_delivery(
-        delivery_mode,
-        platform_url,
-        workspace_id,
-        port,
-        asyncio.get_running_loop(),
-    )
+    # 9a. E1 — poll-mode inbound delivery is started LATER, gated on uvicorn
+    # having bound (see the start_poll_delivery_when_bound task created just
+    # before server.serve() below). Starting the poller here — before the server
+    # socket is listening — would race: the poller's first poll could pull a
+    # staged message and self-POST to 127.0.0.1:{port} before uvicorn binds,
+    # dropping it while the inbox cursor advances. No-op in push mode (default).
 
     # 9b. Start skills hot-reload watcher (background task)
     # When a skill file changes the watcher reloads the skill module and calls
@@ -1312,6 +1388,27 @@ async def main():  # pragma: no cover
 
         idle_loop_task = asyncio.create_task(_run_idle_loop())
 
+    # 9a (deferred). E1 — poll-mode inbound delivery, gated on uvicorn bind.
+    # Created as a task so it can wait for server.started (flipped True once the
+    # socket is bound) before starting the inbox poller; this closes the
+    # startup race where a message staged in the pre-bind window would be
+    # self-POSTed to a not-yet-listening 127.0.0.1:{port} and lost while the
+    # inbox cursor advanced. No-op in push mode (the proven default path is
+    # byte-for-byte unchanged). Captures the running loop so the poller-thread
+    # consumer can marshal its post onto this event loop.
+    poll_delivery_task = None
+    if delivery_mode == "poll":
+        poll_delivery_task = asyncio.create_task(
+            start_poll_delivery_when_bound(
+                server,
+                delivery_mode,
+                platform_url,
+                workspace_id,
+                port,
+                asyncio.get_running_loop(),
+            )
+        )
+
     try:
         await server.serve()
     finally:
@@ -1333,6 +1430,10 @@ async def main():  # pragma: no cover
         # Cancel idle loop if running
         if idle_loop_task and not idle_loop_task.done():
             idle_loop_task.cancel()
+        # Cancel the deferred poll-delivery starter if it never got past the
+        # bind-wait (e.g. shutdown during a stalled startup).
+        if poll_delivery_task and not poll_delivery_task.done():
+            poll_delivery_task.cancel()
         # Gracefully stop the Temporal worker background task on shutdown
         await temporal_wrapper.stop()
 

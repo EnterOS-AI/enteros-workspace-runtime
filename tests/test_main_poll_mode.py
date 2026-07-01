@@ -12,6 +12,9 @@ Locks in:
 from __future__ import annotations
 
 import asyncio
+import http.server
+import socket
+import threading
 from pathlib import Path
 
 import pytest
@@ -221,3 +224,133 @@ def test_consumer_skips_empty_text(monkeypatch):
     consume({"text": ""})
     consume({})
     assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# E1 startup-race fix — pre-bind window must not drop a staged message.
+# ---------------------------------------------------------------------------
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.mark.asyncio
+async def test_post_polled_message_retries_until_executor_binds(monkeypatch):
+    # THE E1 regression guard: a message staged + posted DURING the pre-bind
+    # window (uvicorn not yet listening) must be held and delivered once the
+    # local executor comes up — NOT dropped on the first connection-refused.
+    monkeypatch.setattr(m, "_LOCAL_POST_CONNECT_BACKOFF_SECONDS", 0.02)
+    monkeypatch.setattr(m, "self_source_headers", lambda wsid: {"X-Workspace-ID": wsid})
+
+    port = _free_port()
+    received: dict[str, bytes] = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 — stdlib signature
+            n = int(self.headers.get("Content-Length", "0"))
+            received["body"] = self.rfile.read(n)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):  # silence the test server
+            return
+
+    # Fire the self-POST while NOTHING is listening on `port`.
+    post_task = asyncio.create_task(
+        m._post_polled_message_to_local_executor(port, "ws-pre", "staged-prebind-msg")
+    )
+    # Simulate the pre-bind window. The post MUST still be retrying (not dropped,
+    # not yet resolved) — proving the staged message survives the window.
+    await asyncio.sleep(0.1)
+    assert not post_task.done()
+
+    # Now bring the local executor up (uvicorn-bind analogue).
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        status = await asyncio.wait_for(post_task, timeout=5.0)
+    finally:
+        server.shutdown()
+        t.join(timeout=2)
+
+    assert status == 200
+    # The staged text reached the now-listening executor — delivered, not lost.
+    assert b"staged-prebind-msg" in received["body"]
+
+
+# ---------------------------------------------------------------------------
+# start_poll_delivery_when_bound — gate the poller on uvicorn bind.
+# ---------------------------------------------------------------------------
+class _FakeServer:
+    def __init__(self, started: bool = False):
+        self.started = started
+
+
+@pytest.mark.asyncio
+async def test_poll_delivery_when_bound_push_is_noop():
+    started = await m.start_poll_delivery_when_bound(
+        _FakeServer(started=True), "push", "http://p", "ws", 8000, object(),
+    )
+    assert started is False
+
+
+@pytest.mark.asyncio
+async def test_poll_delivery_does_not_start_before_bind():
+    server = _FakeServer(started=False)
+    calls = {"pollers": 0}
+
+    task = asyncio.create_task(
+        m.start_poll_delivery_when_bound(
+            server, "poll", "http://p", "ws", 8000, object(),
+            poll_interval=0.01,
+            start_pollers=lambda *a, **k: calls.__setitem__("pollers", calls["pollers"] + 1),
+            set_callback=lambda cb: None,
+        )
+    )
+    # While the server reports unbound, the poller MUST NOT start.
+    await asyncio.sleep(0.05)
+    assert calls["pollers"] == 0
+    assert not task.done()
+
+    # Flip "bound" — the gate releases and the poller starts exactly once.
+    server.started = True
+    result = await asyncio.wait_for(task, timeout=2.0)
+    assert result is True
+    assert calls["pollers"] == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_delivery_starts_immediately_when_already_bound():
+    server = _FakeServer(started=True)
+    captured = {}
+    result = await m.start_poll_delivery_when_bound(
+        server, "poll", "http://plat", "ws-1", 9000, object(),
+        poll_interval=0.01,
+        start_pollers=lambda url, wsids: captured.__setitem__("args", (url, wsids)),
+        set_callback=lambda cb: captured.__setitem__("cb", cb),
+    )
+    assert result is True
+    assert captured["args"] == ("http://plat", ["ws-1"])
+    assert callable(captured["cb"])
+
+
+@pytest.mark.asyncio
+async def test_poll_delivery_max_wait_proceeds_as_backstop(monkeypatch):
+    # Defensive bound: if startup never reports bound, the poller still starts
+    # (the consumer's connection-refused retry is the delivery backstop) rather
+    # than the workspace never receiving inbound at all.
+    server = _FakeServer(started=False)
+    calls = {"pollers": 0}
+    started = await m.start_poll_delivery_when_bound(
+        server, "poll", "http://p", "ws", 8000, object(),
+        poll_interval=0.01,
+        max_wait_seconds=0.03,
+        start_pollers=lambda *a, **k: calls.__setitem__("pollers", calls["pollers"] + 1),
+        set_callback=lambda cb: None,
+    )
+    assert started is True
+    assert calls["pollers"] == 1

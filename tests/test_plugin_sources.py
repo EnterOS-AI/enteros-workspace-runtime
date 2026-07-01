@@ -166,7 +166,11 @@ def test_install_empty_signal_is_noop_and_preserves_existing(monkeypatch, tmp_pa
     assert called["stream"] is False  # never fetched
 
 
-def test_install_fail_soft_one_bad_source_does_not_abort_others(monkeypatch, tmp_path):
+def test_install_partial_failure_does_not_swap_and_keeps_existing(monkeypatch, tmp_path):
+    # Atomic-swap contract (F1 fix): if ANY declared source fails to fetch, the
+    # staging build is NOT promoted — the existing live tree is left intact. A
+    # transient blip on one source must never half-replace the plugins dir. The
+    # per-source outcomes are still reported so observability is unchanged.
     good = _make_targz({"SKILL.md": b"ok"})
 
     def router(url, kwargs):
@@ -176,13 +180,71 @@ def test_install_fail_soft_one_bad_source_does_not_abort_others(monkeypatch, tmp
 
     _patch_stream(monkeypatch, router)
     plugins_dir = tmp_path / "plugins"
+    # A prior boot's tree exists and must survive the partial failure.
+    (plugins_dir / "prior").mkdir(parents=True)
+    (plugins_dir / "prior" / "keep.txt").write_text("prior")
+
     report = ps.install_declared_plugins(
         plugins_dir=plugins_dir,
         env={"MOLECULE_DECLARED_PLUGINS": "gitea://bad/repo,gitea://good/repo"},
     )
     assert report.failed == ["gitea://bad/repo"]
-    assert report.installed == ["gitea://good/repo"]
-    assert (plugins_dir / "repo" / "SKILL.md").read_text() == "ok"
+    assert report.installed == ["gitea://good/repo"]  # staged OK...
+    assert report.swapped is False  # ...but the build was NOT promoted
+    # Existing tree intact; the good source was NOT half-installed into the live
+    # dir (it only ever landed in the discarded staging tree).
+    assert (plugins_dir / "prior" / "keep.txt").read_text() == "prior"
+    assert not (plugins_dir / "repo").exists()
+
+
+def test_install_fetch_failure_preserves_existing_tree(monkeypatch, tmp_path):
+    # THE F1 regression guard: a transient fetch failure must leave the prior
+    # plugins tree intact (the old code rm -rf'd up front and wiped it).
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / "old-skill").mkdir(parents=True)
+    (plugins_dir / "old-skill" / "SKILL.md").write_text("prior-good")
+    (plugins_dir / "old-skill" / "tool.py").write_text("print('keep me')")
+
+    # Every fetch 503s (gitea blip) for this boot.
+    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(None, status=503))
+
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo"},
+    )
+    assert report.declared is True
+    assert report.failed == ["gitea://owner/repo"]
+    assert report.installed == []
+    assert report.swapped is False
+    # The prior tree MUST be byte-for-byte intact — the transient failure did
+    # not wipe the already-materialized skill.
+    assert (plugins_dir / "old-skill" / "SKILL.md").read_text() == "prior-good"
+    assert (plugins_dir / "old-skill" / "tool.py").read_text() == "print('keep me')"
+    # No staging leftovers next to the live dir.
+    assert [p.name for p in tmp_path.iterdir()] == ["plugins"]
+
+
+def test_install_full_success_swaps_and_drops_removed(monkeypatch, tmp_path):
+    # On a fully-successful build the swap still fully replaces the live tree —
+    # a plugin no longer in the declared set must not linger after the swap.
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / "stale").mkdir(parents=True)
+    (plugins_dir / "stale" / "x.txt").write_text("old")
+
+    archive = _make_targz({"SKILL.md": b"new"})
+    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
+
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo"},
+    )
+    assert report.swapped is True
+    assert report.installed == ["gitea://owner/repo"]
+    assert (plugins_dir / "repo" / "SKILL.md").read_text() == "new"
+    # The de-declared plugin is gone after the atomic full-replace.
+    assert not (plugins_dir / "stale").exists()
+    # No staging/backup leftovers next to the live dir.
+    assert [p.name for p in tmp_path.iterdir()] == ["plugins"]
 
 
 def test_install_rejects_path_traversal_member(monkeypatch, tmp_path):
