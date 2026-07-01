@@ -62,6 +62,21 @@ CONFIG_MOUNT = "/configs"
 # disappear from the agent's toolset.
 DEFAULT_MCP_SERVER_PATH = str(Path(__file__).parent / "a2a_mcp_server.py")
 DEFAULT_DELEGATION_RESULTS_FILE = "/tmp/delegation_results.jsonl"
+# Tool-activity liveness file (MUST-FIX 1, source C). Subprocess runtimes
+# (codex / openclaw / hermes / gemini) that don't surface native on_tool_start
+# events bump this file on every tool call; the turn-lease liveness poller
+# touches the lease when its mtime advances. Same env-override pattern as
+# DELEGATION_RESULTS_FILE so the platform / adapter can point it at the durable
+# volume. Exported here so both the writer (subprocess adapter) and the reader
+# (turn_lease.feed_from_activity_file) resolve the SAME path.
+#
+# This LEGACY /tmp default is the KERNEL-OFF path only (byte-identical to the
+# pre-mailbox-kernel behavior). When the mailbox kernel is ON the default moves
+# to a PRIVATE per-turn path under the mailbox dir (parent 0700, file 0600) —
+# see tool_activity_file() / ensure_tool_activity_file() — because a
+# world-writable /tmp file can be touched by ANY process in the workspace to
+# forge liveness and (pre-fix) keep a turn alive indefinitely.
+DEFAULT_TOOL_ACTIVITY_FILE = "/tmp/molecule_tool_activity"
 PLATFORM_HTTP_TIMEOUT_S = 5.0
 MEMORY_RECALL_LIMIT = 10
 MEMORY_CONTENT_MAX_CHARS = 200
@@ -171,6 +186,108 @@ async def commit_memory(content: str) -> None:
 
 
 # ========================================================================
+# Tool-activity liveness file (turn-lease source C)
+# ========================================================================
+
+def tool_activity_file() -> str:
+    """Resolve the tool-activity liveness file path.
+
+    Resolution:
+      - Explicit ``MOLECULE_TOOL_ACTIVITY_FILE`` always wins (cross-repo
+        subprocess executors + tests).
+      - Kernel OFF: the LEGACY ``DEFAULT_TOOL_ACTIVITY_FILE`` (``/tmp/...``) —
+        byte-identical to the pre-mailbox-kernel behavior. The activity file is
+        only consumed by the turn-lease liveness machinery, itself a no-op when
+        the kernel is off, so nothing in the default flow reads this path.
+      - Kernel ON: a PRIVATE per-turn path under the durable mailbox dir
+        (``<mailbox>/turn/tool_activity``) rather than world-writable ``/tmp``,
+        so a foreign process can't forge liveness. The parent/file perms are
+        locked down (0700 / 0600) and the path exported by
+        :func:`ensure_tool_activity_file`.
+
+    Mirrors ``DELEGATION_RESULTS_FILE`` resolution so a subprocess adapter and
+    the turn-lease reader agree on the path without threading it through a
+    constructor.
+    """
+    from molecule_runtime import mailbox_dir
+
+    if not mailbox_dir.kernel_enabled():
+        # Byte-identical legacy behavior: env override or the /tmp default.
+        return os.environ.get("MOLECULE_TOOL_ACTIVITY_FILE", DEFAULT_TOOL_ACTIVITY_FILE)
+    # Kernel ON: explicit override still wins; else the private mailbox path.
+    override = os.environ.get("MOLECULE_TOOL_ACTIVITY_FILE", "").strip()
+    if override:
+        return override
+    return str(mailbox_dir.resolve() / "turn" / "tool_activity")
+
+
+def _restrict_perms(path: str, mode: int) -> None:
+    """Best-effort ``chmod`` — silently no-ops where the OS ignores it (Windows
+    has no POSIX mode bits), so a perms failure never breaks a turn."""
+    try:
+        os.chmod(path, mode)
+    except (OSError, NotImplementedError):
+        pass
+
+
+def ensure_tool_activity_file() -> str:
+    """Resolve, create-with-restrictive-perms, and EXPORT the tool-activity path.
+
+    Called by the executor at KERNEL-ON turn setup. Creates the parent ``0700``
+    and the file ``0600`` so the liveness file can't be forged by a foreign
+    process (unlike a shared ``/tmp`` file), then exports the path via
+    ``MOLECULE_TOOL_ACTIVITY_FILE`` so cross-repo subprocess executors
+    (codex / openclaw / hermes / gemini) inherit the SAME path in their
+    environment and write to it automatically — keeping the env override.
+
+    Best-effort: on Windows / a read-only parent the perms/creation are skipped
+    without raising. Returns the resolved path.
+    """
+    path = tool_activity_file()
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+            _restrict_perms(parent, 0o700)
+        # Create (if absent) with 0600 from the start — os.open honors the mode
+        # on creation; no O_TRUNC so an existing file's live mtime is preserved.
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+        _restrict_perms(path, 0o600)
+    except OSError:
+        # A read-only parent / race must not wedge the turn — the liveness feed
+        # falls back to whatever the writer manages to create.
+        pass
+    # Export so subprocess children inherit the same path via the env var.
+    os.environ["MOLECULE_TOOL_ACTIVITY_FILE"] = path
+    return path
+
+
+def record_tool_activity() -> None:
+    """Bump the tool-activity file's mtime — best-effort liveness ping.
+
+    Called by subprocess runtimes on every tool call so the turn lease
+    (``turn_lease.feed_from_activity_file``) sees the mtime advance and stays
+    fresh through a long tool-running turn. Never raises: a liveness ping must
+    not break a tool call.
+    """
+    path = tool_activity_file()
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # Truncate-write a single byte; the CONTENT is irrelevant — only the
+        # mtime matters. open('w') updates mtime even on an existing file.
+        with open(path, "w") as f:
+            f.write("1")
+        # Keep the liveness file private (0600) even if this writer created it
+        # before the executor's ensure_tool_activity_file() ran. Best-effort.
+        _restrict_perms(path, 0o600)
+    except OSError:
+        pass
+
+
+# ========================================================================
 # Delegation results — written by heartbeat loop, consumed atomically
 # ========================================================================
 
@@ -179,10 +296,15 @@ def read_delegation_results() -> str:
 
     Uses atomic rename to prevent races with the heartbeat writer.
     Returns formatted text suitable for prompt injection, or empty string.
+
+    RC #203: resolves the queue via ``mailbox_dir.delegation_results_file`` so the
+    reader agrees with the heartbeat writer — kernel-ON that is the DURABLE mailbox
+    queue (survives restart), kernel-OFF the legacy ``/tmp`` default. An explicit
+    ``DELEGATION_RESULTS_FILE`` env still wins in both modes.
     """
-    results_file = Path(
-        os.environ.get("DELEGATION_RESULTS_FILE", DEFAULT_DELEGATION_RESULTS_FILE)
-    )
+    from molecule_runtime import mailbox_dir
+
+    results_file = Path(mailbox_dir.delegation_results_file())
     if not results_file.exists():
         return ""
     consumed = results_file.with_suffix(".consumed")

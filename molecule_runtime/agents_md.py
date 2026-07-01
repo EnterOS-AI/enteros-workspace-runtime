@@ -72,3 +72,20 @@ def generate_agents_md(config_dir: str, output_path: str) -> None:
 
     Path(output_path).write_text(content, encoding="utf-8")
     logger.info("Generated AGENTS.md at %s for workspace %r", output_path, cfg.name)
+
+    # MUST-FIX (memory WRITE-path reconciliation): with the mailbox kernel ON,
+    # also write AGENTS.md into the durable mailbox memory dir
+    # (/workspace/.molecule/memory) — the directory prompt.py READS memory
+    # snapshots from. The AAIF copy at output_path (typically /workspace/AGENTS.md)
+    # stays for peer/tool discovery; this durable copy is what gets injected
+    # into the system prompt and survives a restart, so a stale /configs copy
+    # can never shadow it. Kernel OFF: unchanged (only output_path is written).
+    import molecule_runtime.mailbox_dir as mailbox_dir
+
+    if mailbox_dir.kernel_enabled():
+        try:
+            mem_target = mailbox_dir.memory_file("AGENTS.md")
+            mem_target.write_text(content, encoding="utf-8")
+            logger.info("Mirrored AGENTS.md to durable memory %s", mem_target)
+        except OSError as exc:
+            logger.warning("Could not mirror AGENTS.md to mailbox memory: %s", exc)

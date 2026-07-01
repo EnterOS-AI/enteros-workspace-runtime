@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import molecule_runtime.configs_dir as configs_dir
+import molecule_runtime.mailbox_dir as mailbox_dir
 
 logger = logging.getLogger(__name__)
 
@@ -750,13 +751,26 @@ def _poll_once(
         return 0
 
     if resp.status_code == 410:
-        # Cursor pruned — drop back to the backlog window. The next
-        # poll picks up wherever the activity API has rows now.
-        logger.info(
-            "inbox poller: cursor %s expired (410); resetting to since_secs=%d",
-            cursor,
-            INITIAL_BACKLOG_SECONDS,
-        )
+        # Cursor pruned — drop back to the backlog window so the poller
+        # recovers. Under the mailbox kernel (MUST-FIX 3, acked delivery) this
+        # is the LOUD last-resort: the platform keeps a row until the runtime
+        # POSTs /activity/ack past its seq (soft floor 7d, hard ceiling 30d),
+        # so a 410 now means the runtime fell >= hard-ceiling behind or never
+        # acked — a real data-loss risk, not a routine reset. Kernel OFF keeps
+        # the original info-level message (byte-identical).
+        if mailbox_dir.kernel_enabled():
+            logger.warning(
+                "inbox poller: cursor %s pruned (410) — acked-delivery floor "
+                "exceeded; falling back to since_secs=%d (possible missed rows)",
+                cursor,
+                INITIAL_BACKLOG_SECONDS,
+            )
+        else:
+            logger.info(
+                "inbox poller: cursor %s expired (410); resetting to since_secs=%d",
+                cursor,
+                INITIAL_BACKLOG_SECONDS,
+            )
         state.reset_cursor(cursor_key)
         return 0
 
@@ -892,7 +906,70 @@ def _poll_once(
 
     if last_id is not None:
         state.save_cursor(last_id, cursor_key)
+
+    # MUST-FIX 3 (acked delivery): after persisting the local cursor, tell the
+    # platform how far we've durably consumed so it can prune acked rows early.
+    # The inbox POLLER is the SOLE acker (single acking authority) — the
+    # harvester and other consumers rely on the platform's soft/hard time
+    # floors, not on this ack. Gated on the mailbox kernel: OFF => no ack POST,
+    # byte-identical to today. The activity feed returns a monotonic ``seq``
+    # per row (distinct from the ``id`` used as the since_id cursor); we ack the
+    # MAX seq seen this batch. A 404 (endpoint not deployed / platform-before-
+    # runtime ordering) is a SOFT failure — we degrade to today's behavior.
+    if mailbox_dir.kernel_enabled():
+        max_seq = 0
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                s = int(r.get("seq", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if s > max_seq:
+                max_seq = s
+        if max_seq > 0:
+            _post_activity_ack(platform_url, workspace_id, headers, max_seq, timeout_secs)
     return new_count
+
+
+def _post_activity_ack(
+    platform_url: str,
+    workspace_id: str,
+    headers: dict[str, str],
+    acked_seq: int,
+    timeout_secs: float = 10.0,
+) -> bool:
+    """POST the durable-consumed high-water seq to the platform ack endpoint.
+
+    Monotonic max-advance is enforced server-side (GREATEST), so a stale/late
+    ack is harmless. Returns True on 2xx. A 404 is treated as a SOFT failure
+    (endpoint not yet deployed on this platform) and logged at debug — the
+    runtime keeps working exactly as it did before acked delivery. Any other
+    error is logged at debug and swallowed: ack is best-effort, never fatal.
+    """
+    import httpx
+
+    url = f"{platform_url}/workspaces/{workspace_id}/activity/ack"
+    try:
+        with httpx.Client(timeout=timeout_secs) as client:
+            resp = client.post(url, json={"acked_seq": acked_seq}, headers=headers)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("inbox poller: activity/ack POST failed (soft): %s", exc)
+        return False
+    if resp.status_code == 404:
+        logger.debug(
+            "inbox poller: activity/ack 404 (endpoint absent) — soft-fail, "
+            "degrading to time-floor pruning"
+        )
+        return False
+    if resp.status_code >= 400:
+        logger.debug(
+            "inbox poller: activity/ack HTTP %d (soft): %s",
+            resp.status_code,
+            (resp.text or "")[:200],
+        )
+        return False
+    return True
 
 
 def _poll_loop(
@@ -964,11 +1041,14 @@ def start_poller_thread(
 
 
 def default_cursor_path(workspace_id: str = "") -> Path:
-    """Standard cursor location: ``<resolved configs dir>/.mcp_inbox_cursor``.
+    """Standard cursor location: ``<resolved durable dir>/.mcp_inbox_cursor``.
 
-    Resolved via configs_dir so the cursor lives next to .auth_token
-    + .platform_inbound_secret regardless of whether the runtime is
-    in-container (/configs) or external (~/.molecule-workspace).
+    Resolved via ``mailbox_dir`` (MUST-FIX 5): with the mailbox kernel ON the
+    cursor lives on the durable ``/workspace/.molecule`` volume so it survives a
+    container restart / auto-heal instead of resetting to the backlog window.
+    With the kernel OFF ``mailbox_dir.resolve()`` returns ``configs_dir.resolve()``
+    — the LEGACY location, next to .auth_token / .platform_inbound_secret —
+    so existing on-disk cursors and the proven flow are byte-identical.
 
     Multi-workspace operators pass ``workspace_id`` to get a unique
     cursor file per workspace (``.mcp_inbox_cursor_<wsid_short>``) so
@@ -976,7 +1056,7 @@ def default_cursor_path(workspace_id: str = "") -> Path:
     operators omit the arg and keep the legacy filename — back-compat
     with existing on-disk cursors.
     """
-    base = configs_dir.resolve() / ".mcp_inbox_cursor"
+    base = mailbox_dir.resolve() / ".mcp_inbox_cursor"
     if workspace_id:
         # 8-char prefix is enough to disambiguate two workspaces in the
         # same operator's setup (UUID v4 first 32 bits ≈ 4 billion of

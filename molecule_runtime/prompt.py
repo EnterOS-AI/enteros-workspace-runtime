@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 
+import molecule_runtime.mailbox_dir as mailbox_dir
 from molecule_runtime.executor_helpers import (
     get_a2a_instructions,
     get_capabilities_preamble,
@@ -216,8 +217,28 @@ def build_system_prompt(
 
     seen_files = set(files_to_load)
 
+    # Durable memory-snapshot READ source. Kernel ON -> the mailbox memory dir
+    # every writer (agents_md, append-to-memory hook, consolidation) now targets;
+    # kernel OFF -> config_path, byte-identical to the pre-migration behavior.
+    # Computed ONCE and reused for BOTH the prompt_files loop below and the
+    # auto-load loop, so the SSOT rule ("fresh mailbox memory wins over a stale
+    # /configs copy") holds no matter WHERE a memory-snapshot file is referenced.
+    memory_source = mailbox_dir.memory_dir() if mailbox_dir.kernel_enabled() else Path(config_path)
+
     for filename in files_to_load:
+        # MUST-FIX (RC #203, SSOT): a memory-snapshot file NAMED in prompt_files
+        # must resolve to its DURABLE mailbox copy when the kernel is on and that
+        # copy exists — otherwise the param-rendered /configs copy loaded here
+        # (and added to seen_files) SHADOWS fresh mailbox memory, contradicting
+        # the memory-write-path SSOT. Only memory-snapshot NAMES are redirected,
+        # and only when a mailbox copy is present; every other prompt file keeps
+        # its /configs source. Kernel OFF => memory_source IS config_path, so
+        # this is byte-identical.
         file_path = Path(config_path) / filename
+        if filename in DEFAULT_MEMORY_SNAPSHOT_FILES:
+            mailbox_copy = memory_source / filename
+            if mailbox_copy.exists():
+                file_path = mailbox_copy
         if file_path.exists():
             content = file_path.read_text().strip()
             if content:
@@ -226,11 +247,25 @@ def build_system_prompt(
             print(f"Warning: prompt file not found: {file_path}")
 
     # Hermes-style memory snapshot files: load automatically when present.
-    # These stay as thin markdown files so the runtime does not need a new storage layer.
+    # These stay as thin markdown files so the runtime does not need a new
+    # storage layer.
+    #
+    # MUST-FIX (memory WRITE-path reconciliation): with the mailbox kernel ON,
+    # memory snapshots are READ from the durable mailbox memory dir
+    # (/workspace/.molecule/memory) — the SAME directory every writer
+    # (agents_md, append-to-memory hook, consolidation) now writes to. Because
+    # a param-rendered /configs copy is NEVER read here in kernel mode, a STALE
+    # /configs/MEMORY.md can never SHADOW a fresh mailbox copy. The /configs
+    # dir stays authoritative only for the param-rendered NON-memory system-prompt
+    # files loaded above; a memory-snapshot filename listed in prompt_files is
+    # redirected to its fresh mailbox copy IN the loop above (RC #203), so the
+    # SSOT holds whether or not the file is named in prompt_files.
+    # Kernel OFF => read from config_path exactly as before (byte-identical).
+    # ``memory_source`` was resolved above (shared with the prompt_files loop).
     for filename in DEFAULT_MEMORY_SNAPSHOT_FILES:
         if filename in seen_files:
             continue
-        file_path = Path(config_path) / filename
+        file_path = memory_source / filename
         if file_path.exists():
             content = file_path.read_text().strip()
             if content:

@@ -25,9 +25,15 @@ dropped wholesale. Secrets matching the pattern library are replaced with
 
 Storage
 -------
-Snapshots are written to /configs/.agent_snapshot.json by default. The
-config volume survives container restarts so the file is durable. The path
-is also overridable via ``AGENT_SNAPSHOT_PATH`` for testing or custom layouts.
+With the mailbox kernel ON the snapshot is written to
+``/workspace/.molecule/.agent_snapshot.json`` — the DURABLE WORKSPACE VOLUME,
+which survives container restart AND auto-heal (a fresh container re-mounts
+the same ``/workspace``). MUST-FIX 5 corrects the earlier docstring here that
+claimed ``/configs`` was durable: ``/configs`` is the provisioner-owned config
+volume, rewritten on every provision, NOT a safe home for evolving agent
+state. With the kernel OFF the default stays ``/configs/.agent_snapshot.json``
+so the flow is byte-identical. The path is overridable via
+``AGENT_SNAPSHOT_PATH`` for testing or custom layouts (override wins over both).
 """
 
 from __future__ import annotations
@@ -38,16 +44,38 @@ import os
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import molecule_runtime.mailbox_dir as mailbox_dir
+
 if TYPE_CHECKING:
     from molecule_runtime.heartbeat import HeartbeatLoop
 
 logger = logging.getLogger(__name__)
 
-# Default snapshot path — on the config volume, survives container restarts.
+# Legacy default (kernel-off). Kept for back-compat imports; the live resolver
+# below (_resolve_snapshot_path) is what functions actually use so the durable
+# path is picked up when the mailbox kernel is on.
 DEFAULT_SNAPSHOT_PATH = os.environ.get(
     "AGENT_SNAPSHOT_PATH",
     "/configs/.agent_snapshot.json",
 )
+
+
+def _resolve_snapshot_path() -> str:
+    """Resolve the snapshot path, honoring override > kernel > legacy.
+
+    Precedence:
+      1. ``AGENT_SNAPSHOT_PATH`` env override (tests / custom layouts).
+      2. Mailbox kernel ON -> durable ``/workspace/.molecule/.agent_snapshot.json``.
+      3. Legacy ``/configs/.agent_snapshot.json`` (byte-identical default).
+    Read live so a test toggling the flag between cases sees the change.
+    """
+    explicit = os.environ.get("AGENT_SNAPSHOT_PATH", "").strip()
+    if explicit:
+        return explicit
+    if mailbox_dir.kernel_enabled():
+        return str(mailbox_dir.snapshot_path())
+    return "/configs/.agent_snapshot.json"
+
 
 # How many transcript lines to capture in the snapshot (recent window).
 MAX_TRANSCRIPT_LINES = 200
@@ -132,7 +160,7 @@ def write_snapshot(
         Errors are logged but never raise — pre-stop serialization must be
         best-effort to avoid blocking shutdown.
     """
-    target = path or DEFAULT_SNAPSHOT_PATH
+    target = path or _resolve_snapshot_path()
 
     try:
         # Deep-scrub every string value in the snapshot to remove API keys,
@@ -165,7 +193,7 @@ def read_snapshot(
     path: str | None = None,
 ) -> dict[str, Any] | None:
     """Read and return a previously-written snapshot, or None if absent/invalid."""
-    target = path or DEFAULT_SNAPSHOT_PATH
+    target = path or _resolve_snapshot_path()
 
     if not os.path.exists(target):
         return None
@@ -180,7 +208,7 @@ def read_snapshot(
 
 def delete_snapshot(path: str | None = None) -> None:
     """Remove a snapshot file. Idempotent — no error if absent."""
-    target = path or DEFAULT_SNAPSHOT_PATH
+    target = path or _resolve_snapshot_path()
     try:
         os.remove(target)
         logger.debug("Snapshot deleted: %s", target)

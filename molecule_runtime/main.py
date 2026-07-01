@@ -161,10 +161,12 @@ def _check_delegation_results_pending() -> bool:
     The extracted form lets unit tests call this directly rather than mirroring
     the logic (anti-pattern flagged as #401).
     """
-    from molecule_runtime.heartbeat import DELEGATION_RESULTS_FILE
+    # RC #203: resolve the SAME queue the heartbeat writer and the executor
+    # reader use — kernel-ON the durable mailbox queue, kernel-OFF legacy /tmp.
+    from molecule_runtime.heartbeat import _delegation_results_file
 
     try:
-        with open(DELEGATION_RESULTS_FILE) as rf:
+        with open(_delegation_results_file()) as rf:
             rf.seek(0)
             return bool(rf.read().strip())
     except FileNotFoundError:
@@ -579,6 +581,17 @@ async def main():  # pragma: no cover
     # isn't root (template's own start.sh should have handled it there).
     from molecule_runtime.executor_helpers import ensure_workspace_writable
     ensure_workspace_writable()
+
+    # 0b. Mailbox kernel wiring (MUST-FIX 1/2/5). Gated on MOLECULE_MAILBOX_KERNEL:
+    # when ON this arms the process-global turn lease (so the executor's
+    # tool-activity touches have somewhere to land) and logs the durable base
+    # dir; when OFF it installs nothing and every kernel helper stays a no-op,
+    # so the proven push / hard-gate flow is byte-identical. The runaway-guard
+    # should_halt() pre-check (MUST-FIX 2) is kept in the idle loop below AND is
+    # centralized in kernel.should_inject_autonomous_turn for any new autonomous
+    # injector; active_tasks increment/decrement is preserved throughout.
+    from molecule_runtime import kernel as _mailbox_kernel
+    _mailbox_kernel.install()
 
     # 1. Load config
     config = load_config(config_path)

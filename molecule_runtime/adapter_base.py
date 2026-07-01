@@ -502,14 +502,28 @@ class BaseAdapter(ABC):
         return management_mcp_present_for(self.name(), config.config_path, MANAGEMENT_MCP_NAME)
 
     def append_to_memory_hook(self, config: AdapterConfig, filename: str, content: str) -> None:
-        """Append text to /configs/<filename> if the marker isn't already present.
+        """Append text to the durable memory file if the marker isn't present.
+
+        MUST-FIX (memory WRITE-path reconciliation): with the mailbox kernel ON
+        this writes to the durable mailbox memory dir
+        (``/workspace/.molecule/memory/<filename>``) — the SAME directory
+        ``prompt.py`` READS memory snapshots from — so plugin-injected memory
+        survives a restart and is never shadowed by a stale ``/configs`` copy.
+        Kernel OFF keeps the legacy ``/configs/<filename>`` target so the flow
+        is byte-identical.
 
         Idempotent: looks for the first line of `content` as a marker so a
         re-install doesn't duplicate the block. Adaptors should pass content
         beginning with a unique header (e.g. ``# Plugin: molecule-dev-conventions``).
         """
         import os
-        target = os.path.join(config.config_path, filename)
+
+        import molecule_runtime.mailbox_dir as mailbox_dir
+
+        if mailbox_dir.kernel_enabled():
+            target = str(mailbox_dir.memory_file(filename))
+        else:
+            target = os.path.join(config.config_path, filename)
         marker = content.splitlines()[0].strip() if content else ""
         existing = ""
         if os.path.exists(target):
