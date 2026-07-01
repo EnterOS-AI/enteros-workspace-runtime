@@ -3,13 +3,22 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "molecule-ai-workspace-runtime"
+# DISTRIBUTION (pip) name. Renamed 2026-06-30 from the legacy
+# `molecule-ai-workspace-runtime` to close a dependency-confusion hole: the
+# legacy dist name is SQUATTED on public PyPI (136 releases incl version-bombs
+# like 0.1.999999), so any resolver that also sees public PyPI (the CLI
+# one-liner's `--extra-index-url`, and the google-adk/hermes/openclaw template
+# image builds) could be silently hijacked by a public publish of a higher
+# version. `molecules-workspace-runtime` is NOT on public PyPI and resolves ONLY
+# from our Gitea registry, so it is confusion-safe. The IMPORT package stays
+# `molecule_runtime` (unchanged) — only the pip/dist name changed.
+name = "molecules-workspace-runtime"
 
-# 0.2.0 signals the SSOT migration — this repo became the editable
-# source on 2026-05-20. Prior 0.1.x line was a monorepo-published
-# mirror; 0.1.81 remains valid on PyPI for any consumer still pinned
-# to it (additive release, not a yank).
-version = "0.3.15"
+# 0.3.70 continues the runtime version line under the new dist name (last
+# publish under the legacy name was 0.3.69). The publish workflow stamps the
+# tag version at build time, so main's pyproject value is only the manual/local
+# fallback.
+version = "0.3.70"
 
 description = "Molecule AI workspace runtime — shared infrastructure for all agent adapters"
 requires-python = ">=3.11"
@@ -47,7 +56,7 @@ dependencies = [
 # `dependencies` to keep `pip install` / the wheel smoke-test green against plain
 # PyPI (which does not carry this package). Install with the gitea index to
 # type-check locally:
-#   pip install "molecule-ai-workspace-runtime[contracts]" \
+#   pip install "molecules-workspace-runtime[contracts]" \
 #     --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 contracts = ["molecule-ai-contracts>=0.1.0"]
 

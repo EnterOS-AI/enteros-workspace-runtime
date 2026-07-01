@@ -96,7 +96,7 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Publishing molecule-ai-workspace-runtime $VERSION to Gitea package registry"
+          echo "Publishing molecules-workspace-runtime $VERSION to Gitea package registry"
 
       - name: Build wheel + sdist
         run: |
@@ -234,8 +234,8 @@ jobs:
           $PIP install \
             --index-url "$GITEA_PYPI_SIMPLE_URL" \
             --no-cache-dir \
-            "molecule-ai-workspace-runtime==$RUNTIME_VERSION"
-          INSTALLED=$($PIP show molecule-ai-workspace-runtime | awk -F': ' '/^Version:/{print $2}')
+            "molecules-workspace-runtime==$RUNTIME_VERSION"
+          INSTALLED=$($PIP show molecules-workspace-runtime | awk -F': ' '/^Version:/{print $2}')
           if [ "$INSTALLED" != "$RUNTIME_VERSION" ]; then
             echo "::error::installed $INSTALLED, want $RUNTIME_VERSION"
             exit 1
