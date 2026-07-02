@@ -69,6 +69,8 @@ from typing import Callable
 
 import httpx
 
+from molecule_runtime import manifest_ssot
+
 log = logging.getLogger(__name__)
 
 # Default gitea base — overridable via MOLECULE_GITEA_BASE_URL (mirrors the
@@ -466,6 +468,14 @@ def install_declared_plugins(
                     log.warning("[plugins] copy failed: %s (%s)", source.raw, exc)
                     report.failed.append(source.raw)
                     continue
+            # Advisory phase of molecule-core#3383 (plugin-manifest SSOT):
+            # validate the staged plugin's plugin.yaml against the vendored
+            # SSOT schema. LOG-only — advisory_check never raises and the
+            # result does NOT feed the swap decision below, so fetch/extract/
+            # swap behaviour is byte-for-byte unchanged.
+            manifest_ssot.advisory_check(
+                source.name, dest / "plugin.yaml", log=log, prefix="[plugins] ",
+            )
             log.info("[plugins] staged %s <- %s", source.name, source.raw)
             report.installed.append(source.raw)
 

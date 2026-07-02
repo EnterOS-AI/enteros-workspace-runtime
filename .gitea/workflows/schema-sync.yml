@@ -1,0 +1,50 @@
+# schema-sync — keep the vendored plugin-manifest JSON-Schema in
+# molecule_runtime/contracts/ byte-identical to its molecule-ai-sdk
+# (contracts/) SSOT original.
+#
+# manifest_ssot.py (the advisory plugin-manifest gate, molecule-core#3383)
+# validates plugin.yaml against molecule_runtime/contracts/
+# plugin-manifest.schema.json (vendored from molecule-ai-sdk contracts/). This
+# gate re-fetches the schema from molecule-ai-sdk (contracts/) main and diffs
+# it against the vendored copy, failing the build on drift. Mirrors
+# molecule-ci's schema-sync gate (itself modelled on this repo's #196
+# vendored workspace-comms schemas). See molecule_runtime/contracts/PROVENANCE.md.
+#
+# Soft-skips (exit 2) on a fetch failure so a transient git.* TLS stall does
+# not paint PRs red; a real byte difference (exit 1) always fails.
+
+name: Schema Sync
+
+on:
+  pull_request:
+    paths:
+      - "molecule_runtime/contracts/**"
+      - "scripts/check-schemas-in-sync.sh"
+      - ".gitea/workflows/schema-sync.yml"
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  schema-sync:
+    name: Vendored schemas in sync with molecule-ai-sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+      - name: Check vendored schemas against molecule-ai-sdk main
+        run: |
+          set +e
+          bash scripts/check-schemas-in-sync.sh
+          rc=$?
+          set -e
+          # rc 2 = fetch could not complete (network/infra). Soft-skip so a
+          # transient git.* stall isn't a false red; rc 1 (real drift) fails.
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::schema-sync soft-skipped (could not fetch molecule-ai-sdk contracts main)."
+            exit 0
+          fi
+          exit "$rc"

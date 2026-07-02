@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 
 import yaml
 
+from molecule_runtime import manifest_ssot
+
 logger = logging.getLogger(__name__)
 
 WORKSPACE_PLUGINS_DIR = "/configs/plugins"
@@ -67,6 +69,16 @@ def load_plugin_manifest(plugin_path: str) -> PluginManifest:
     try:
         with open(manifest_file) as f:
             raw = yaml.safe_load(f) or {}
+        # Advisory phase of molecule-core#3383 (plugin-manifest SSOT): validate
+        # the parsed manifest against the vendored SSOT schema. LOG-only —
+        # violations never affect the load, and validate_manifest_ssot returns
+        # a list (never raises), so the existing degrade path is unchanged.
+        violations = manifest_ssot.validate_manifest_ssot(raw)
+        if violations:
+            logger.warning(
+                "SSOT manifest validation (advisory): plugin manifest %s: %d violation(s): %s",
+                manifest_file, len(violations), "; ".join(violations),
+            )
         return PluginManifest(
             name=raw.get("name", os.path.basename(plugin_path)),
             version=raw.get("version", "0.0.0"),

@@ -39,6 +39,15 @@ dependencies = [
     # requirements; >=0.0.27 avoids CVE-2024-53981 (DoS via malformed boundary).
     "python-multipart>=0.0.27",
     "pyyaml>=6.0",
+    # Backs the ADVISORY plugin-manifest SSOT validation (molecule-core#3383,
+    # manifest_ssot.py): plugin.yaml is validated at load
+    # (plugins.load_plugin_manifest) and at boot-install
+    # (plugin_sources.install_declared_plugins) against the vendored
+    # molecule-ai-sdk schema (molecule_runtime/contracts/, draft 2020-12 via
+    # Draft202012Validator). Promoted from the test extra to base because the
+    # advisory gate runs in the RUNTIME, not just tests; manifest_ssot degrades
+    # loudly (one logger.error, gate OFF) if it is somehow missing.
+    "jsonschema>=4.18",
     "langchain-core>=0.3.0",
     "opentelemetry-api>=1.24.0",
     "opentelemetry-sdk>=1.24.0",
@@ -60,13 +69,15 @@ dependencies = [
 #     --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 contracts = ["molecule-ai-contracts>=0.1.0"]
 
-# Test-only deps. jsonschema (draft 2020-12 via Draft202012Validator +
+# Test deps. jsonschema (draft 2020-12 via Draft202012Validator +
 # `referencing`, installed transitively) backs the offline workspace-comms
 # schema-conformance gate (tests/test_workspace_comms_conformance.py), which
 # replaced the retired cross-repo AST drift-checker
 # (scripts/check_platform_comm_contract.py) with real-payload-vs-SSOT-schema
-# validation. Kept out of base `dependencies` so the wheel smoke-install stays
-# lean.
+# validation. jsonschema is ALSO a base dependency now (promoted by the
+# advisory plugin-manifest SSOT gate, molecule-core#3383) — kept listed here
+# so the test extra stays self-describing about what the conformance gate
+# needs even if the base pin ever moves.
 test = ["pytest", "pytest-asyncio", "jsonschema>=4.18"]
 
 [project.scripts]
@@ -85,7 +96,10 @@ where = ["."]
 include = ["molecule_runtime*", "plugins_registry*"]
 
 [tool.setuptools.package-data]
-"molecule_runtime" = ["py.typed", "scripts/*.sh"]
+# contracts/* ships the vendored plugin-manifest SSOT schema (+ PROVENANCE.md)
+# that manifest_ssot.py loads via importlib.resources — it must be IN the wheel
+# for the advisory gate (molecule-core#3383) to run offline in workspaces.
+"molecule_runtime" = ["py.typed", "scripts/*.sh", "contracts/*.json", "contracts/*.md"]
 "plugins_registry" = ["py.typed"]
 
 [tool.ruff.lint.per-file-ignores]

@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/plugin-manifest/plugin-manifest.schema.json",
+  "title": "Marketplace Plugin Manifest Contract",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace plugin manifest — the publishable shape of a `plugin.yaml` artifact (molecule-ai-plugin-* repos), authored marketplace-side per RFC molecule-core#3285 (Tool-Contract SSOT & Codegen). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-plugin-molecule-careful-bash/plugin.yaml, image-gen/plugin.yaml, gh-identity/plugin.yaml, molecule-hitl/plugin.yaml, validated by each plugin repo's `.molecule-ci/scripts/validate-plugin.py` (required: name/version/description; runtimes must be a list; content is one of SKILL.md/hooks/skills/rules). The design is VS-Code-shaped: `engines` pins the minimum host version (like engines.vscode), and `contributes` is the OPEN, forward-compatible contribution surface — its KNOWN keys (skills/hooks/rules/mcpServers/commands, v1) are validated by shape while UNKNOWN contribution points (e.g. future themes/tabs/canvasElements) are tolerated (additionalProperties:true at the contributes level), so a newer plugin never fails this schema on an additive contribution point. The top-level `skills`/`hooks`/`rules` string lists mirror the real plugin.yaml v0 shorthand and remain accepted alongside the richer `contributes`. CANONICAL RUNTIMES: the `runtimes` enum is the SSOT reconciliation of the cross-artifact drift — the canonical form is the HYPHEN spelling (`claude-code`, matching the workspace/org templates and validate-workspace-template.py's known set); the legacy plugin UNDERSCORE spellings (`claude_code`, `gemini_cli`) used by today's plugin.yaml files are accepted as aliases (normalize to the hyphen form). The enum INCLUDES every runtime in use — claude-code, codex, hermes, openclaw, langgraph, autogen, crewai, deepagents, gemini-cli, google-adk, external — including deepagents/langgraph/autogen, which today's validate-plugin.py does not (it does not check the runtime enum) but real plugins already declare (gh-identity, molecule-hitl).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["name", "version", "description"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Plugin name (required by validate-plugin.py). The marketplace slug is derived from this. E.g. `molecule-careful-bash`, `image-gen`, `molecule-gh-identity`."
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[0-9]+(\\.[0-9]+)*$",
+      "description": "Plugin version (required). validate-plugin.py rejects any character outside `0-9.` — i.e. a dotted numeric version like `1.0.1` (no pre-release/build suffix). Modelled here with a numeric-dotted pattern mirroring that check."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable description (required)."
+    },
+    "publisher": {
+      "type": "string",
+      "description": "Optional marketplace publisher/namespace (VS-Code `publisher`). Distinct from `author` (free-text attribution). Falls back to the org when absent."
+    },
+    "author": {
+      "type": "string",
+      "description": "Optional free-text author attribution as it appears in plugin.yaml (e.g. `Molecule AI`)."
+    },
+    "tags": {
+      "type": "array",
+      "description": "Optional marketplace tags/keywords (plugin.yaml `tags`).",
+      "items": { "type": "string", "description": "A single tag." }
+    },
+    "kind": {
+      "type": "string",
+      "description": "Optional v1 plugin kind discriminator from plugin.yaml (e.g. `env-mutator` for the Go env-mutator class — gh-identity). Absent for skill/hook-class plugins. Open string (not enum) so new kinds are additive."
+    },
+    "entrypoint": {
+      "type": "string",
+      "description": "Optional Go entrypoint for code-class plugins (e.g. `pluginloader.BuildRegistry` — gh-identity). Absent for content-only plugins."
+    },
+    "engines": {
+      "$ref": "#/$defs/engines",
+      "description": "Host-version constraints (VS-Code `engines`). Pins the minimum Molecule host the plugin requires."
+    },
+    "runtimes": {
+      "type": "array",
+      "description": "Runtimes this plugin supports (plugin.yaml `runtimes`; validate-plugin.py requires a list). Items use the CANONICAL runtime enum (see schema description): hyphen form canonical, underscore form accepted as alias.",
+      "items": { "$ref": "#/$defs/runtimeId" }
+    },
+    "skills": {
+      "type": "array",
+      "description": "v0 shorthand: bare skill names contributed by the plugin (plugin.yaml `skills: [careful-mode]`). The richer structured form is `contributes.skills`.",
+      "items": { "type": "string", "description": "A contributed skill name." }
+    },
+    "hooks": {
+      "type": "array",
+      "description": "v0 shorthand: bare hook names contributed by the plugin (plugin.yaml `hooks: [pre-bash-careful]`). The richer structured form is `contributes.hooks`.",
+      "items": { "type": "string", "description": "A contributed hook name." }
+    },
+    "rules": {
+      "type": "array",
+      "description": "v0 shorthand: bare rule names contributed by the plugin. The richer structured form is `contributes.rules`.",
+      "items": { "type": "string", "description": "A contributed rule name." }
+    },
+    "contributes": {
+      "$ref": "#/$defs/contributes",
+      "description": "VS-Code-shaped contribution surface. OPEN object: known contribution points are validated by shape; unknown ones are tolerated (forward-compat)."
+    },
+    "privileged": {
+      "type": "boolean",
+      "description": "Whether the plugin requires org-admin / management privilege (e.g. the `molecule-platform` management MCP). image-gen explicitly documents `NOT privileged`. Absent/false = normal user capability."
+    },
+    "sha256": {
+      "type": "string",
+      "description": "Optional content digest of the published plugin artifact, for the marketplace integrity/attestation layer (Phase 3). Hex sha256."
+    }
+  },
+  "$defs": {
+    "runtimeId": {
+      "type": "string",
+      "description": "CANONICAL runtime identifier. Hyphen form is canonical (`claude-code`); underscore forms (`claude_code`, `gemini_cli`) are accepted legacy aliases that normalize to the hyphen form. The enum is the union of the canonical set and those two aliases, and INCLUDES deepagents/langgraph/autogen (which real plugins declare).",
+      "enum": [
+        "claude-code",
+        "codex",
+        "hermes",
+        "openclaw",
+        "langgraph",
+        "autogen",
+        "crewai",
+        "deepagents",
+        "gemini-cli",
+        "google-adk",
+        "external",
+        "claude_code",
+        "gemini_cli"
+      ]
+    },
+    "engines": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Host engine constraints, like VS-Code `engines`. `molecule` pins the minimum host version as a semver range. Open object so future host engines (e.g. a runtime-specific engine) are additive.",
+      "properties": {
+        "molecule": {
+          "type": "string",
+          "description": "Minimum Molecule host version as a semver range, e.g. `^1.0`."
+        }
+      }
+    },
+    "contributes": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "The contribution surface. KNOWN keys (v1) below are validated by shape. UNKNOWN keys (future contribution points such as `themes`, `tabs`, `canvasElements`) are explicitly TOLERATED via additionalProperties:true — adding a new contribution point MUST NOT fail validation against this schema (forward-compat).",
+      "properties": {
+        "skills": {
+          "type": "array",
+          "description": "Structured skill contributions.",
+          "items": { "$ref": "#/$defs/skillContribution" }
+        },
+        "hooks": {
+          "type": "array",
+          "description": "Structured hook contributions (e.g. a PreToolUse:Bash hook).",
+          "items": { "$ref": "#/$defs/hookContribution" }
+        },
+        "rules": {
+          "type": "array",
+          "description": "Structured rule contributions.",
+          "items": { "$ref": "#/$defs/ruleContribution" }
+        },
+        "mcpServers": {
+          "type": "array",
+          "description": "MCP server contributions. An mcpServers-shaped plugin is resolved to the MCP server adaptor for any runtime (see mcp/mcp-plugin-delivery.contract.json). The entry shape mirrors the runtime-agnostic descriptor name->{command,args?,env?}.",
+          "items": { "$ref": "#/$defs/mcpServerContribution" }
+        },
+        "commands": {
+          "type": "array",
+          "description": "Slash-command contributions.",
+          "items": { "$ref": "#/$defs/commandContribution" }
+        }
+      }
+    },
+    "skillContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id"],
+      "description": "A single contributed skill.",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "description": "Skill identifier (e.g. `careful-mode`)." },
+        "description": { "type": "string", "description": "Optional human-readable description." },
+        "path": { "type": "string", "description": "Optional path to the skill content within the plugin." }
+      }
+    },
+    "hookContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id"],
+      "description": "A single contributed hook.",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "description": "Hook identifier (e.g. `pre-bash-careful`)." },
+        "event": { "type": "string", "description": "Optional host event the hook binds to (e.g. `PreToolUse:Bash`)." },
+        "description": { "type": "string", "description": "Optional human-readable description." }
+      }
+    },
+    "ruleContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id"],
+      "description": "A single contributed rule.",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "description": "Rule identifier." },
+        "description": { "type": "string", "description": "Optional human-readable description." }
+      }
+    },
+    "mcpServerContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name"],
+      "description": "A single contributed MCP server descriptor (runtime-agnostic name->{command,args?,env?}).",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "description": "Logical MCP server name (e.g. `molecule-platform`)." },
+        "command": { "type": "string", "description": "Launch command (e.g. `npx`)." },
+        "args": {
+          "type": "array",
+          "description": "Optional command arguments.",
+          "items": { "type": "string", "description": "A single argument." }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "description": "An environment variable value." },
+          "description": "Optional environment map (var->value) for the MCP server process."
+        },
+        "privileged": { "type": "boolean", "description": "Whether this MCP server is the privileged management surface." }
+      }
+    },
+    "commandContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name"],
+      "description": "A single contributed slash-command.",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "description": "Command name (e.g. `/seo-audit`)." },
+        "description": { "type": "string", "description": "Optional human-readable description." }
+      }
+    }
+  }
+}
