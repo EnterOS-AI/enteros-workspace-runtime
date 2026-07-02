@@ -56,6 +56,9 @@ TAG_PREFIX = "runtime-v"
 def _http(url, *, token, method="GET", payload=None, timeout=30):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
+    # CF edge 403s (error 1010) the default python-urllib UA — send a curl UA,
+    # same fix propagate_runtime_version.py carries.
+    req.add_header("User-Agent", "curl/8.4.0")
     req.add_header("Authorization", f"token {token}")
     if data is not None:
         req.add_header("Content-Type", "application/json")

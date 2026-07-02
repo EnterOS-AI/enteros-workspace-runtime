@@ -138,6 +138,7 @@ def _latest_release_version() -> str:
     token = os.environ.get("GITEA_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
     url = "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-workspace-runtime/tags?limit=50"
     headers = {"Authorization": f"token {token}"} if token else {}
+    headers.setdefault("User-Agent", "curl/8.4.0")  # CF edge 403s python-urllib UA (error 1010)
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -218,7 +219,7 @@ def _org_template_repos(gitea_url: str, token: str, *, org: str = "molecule-ai")
     page = 1
     while True:
         url = f"{gitea_url}/api/v1/orgs/{org}/repos?limit=50&page={page}"
-        req = urllib.request.Request(url, headers={"Authorization": f"token {token}"} if token else {})
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0", **({"Authorization": f"token {token}"} if token else {})})
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 batch = json.load(resp)
@@ -253,7 +254,7 @@ def _repo_has_runtime_version(repo: str, gitea_url: str, token: str, *, org: str
     import urllib.error
 
     url = f"{gitea_url}/api/v1/repos/{org}/{repo}/raw/.runtime-version"
-    req = urllib.request.Request(url, headers={"Authorization": f"token {token}"} if token else {})
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0", **({"Authorization": f"token {token}"} if token else {})})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
