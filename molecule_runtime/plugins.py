@@ -61,24 +61,40 @@ class LoadedPlugins:
     plugins: list[Plugin] = field(default_factory=list)
 
 
-def load_plugin_manifest(plugin_path: str) -> PluginManifest:
-    """Parse plugin.yaml from a plugin directory. Returns empty manifest if not found."""
+def load_plugin_manifest(plugin_path: str) -> PluginManifest | None:
+    """Parse plugin.yaml from a plugin directory.
+
+    Returns an empty (name-only) manifest when plugin.yaml is MISSING —
+    manifest-less plugins (bare-SKILL.md dirs) are common and legal, so that
+    stays advisory-only. Returns ``None`` when an EXISTING plugin.yaml
+    violates the SSOT schema (or is unparseable) AND enforcement is on
+    (molecule-core#3383 PR-4, default ON, kill-switch
+    ``MOLECULE_MANIFEST_SSOT_ENFORCE=off``) — the caller must skip the plugin.
+    With enforcement off, the pre-existing advisory/degrade behaviour is
+    unchanged.
+    """
     manifest_file = os.path.join(plugin_path, "plugin.yaml")
     if not os.path.isfile(manifest_file):
         return PluginManifest(name=os.path.basename(plugin_path))
     try:
         with open(manifest_file) as f:
             raw = yaml.safe_load(f) or {}
-        # Advisory phase of molecule-core#3383 (plugin-manifest SSOT): validate
-        # the parsed manifest against the vendored SSOT schema. LOG-only —
-        # violations never affect the load, and validate_manifest_ssot returns
-        # a list (never raises), so the existing degrade path is unchanged.
+        # molecule-core#3383 plugin-manifest SSOT gate: validate the parsed
+        # manifest against the vendored SSOT schema. validate_manifest_ssot
+        # returns a list (never raises); the advisory warning always fires,
+        # and under enforcement a violating EXISTING manifest refuses to load.
         violations = manifest_ssot.validate_manifest_ssot(raw)
         if violations:
             logger.warning(
                 "SSOT manifest validation (advisory): plugin manifest %s: %d violation(s): %s",
                 manifest_file, len(violations), "; ".join(violations),
             )
+            if manifest_ssot.enforcement_enabled():
+                logger.error(
+                    "SSOT manifest ENFORCEMENT: refusing to load plugin %s: %d violation(s): %s",
+                    os.path.basename(plugin_path), len(violations), "; ".join(violations),
+                )
+                return None
         return PluginManifest(
             name=raw.get("name", os.path.basename(plugin_path)),
             version=raw.get("version", "0.0.0"),
@@ -92,14 +108,30 @@ def load_plugin_manifest(plugin_path: str) -> PluginManifest:
             runtimes=raw.get("runtimes", []),
         )
     except Exception as e:
+        # An EXISTING but unreadable/unparseable plugin.yaml IS an invalid
+        # manifest document: fail-closed under enforcement. With enforcement
+        # off, the pre-existing degrade path (warn + name-only manifest) is
+        # byte-identical.
+        if manifest_ssot.enforcement_enabled():
+            logger.error(
+                "SSOT manifest ENFORCEMENT: refusing to load plugin %s: invalid manifest %s: %s",
+                os.path.basename(plugin_path), manifest_file, e,
+            )
+            return None
         logger.warning("Failed to parse plugin manifest %s: %s", manifest_file, e)
         return PluginManifest(name=os.path.basename(plugin_path))
 
 
-def _load_single_plugin(plugin_path: str) -> Plugin:
-    """Load a single plugin from a directory."""
+def _load_single_plugin(plugin_path: str) -> Plugin | None:
+    """Load a single plugin from a directory.
+
+    Returns ``None`` (plugin skipped) when SSOT manifest enforcement refused
+    the manifest — see ``load_plugin_manifest``.
+    """
     name = os.path.basename(plugin_path)
     manifest = load_plugin_manifest(plugin_path)
+    if manifest is None:
+        return None
     plugin = Plugin(name=name, path=plugin_path, manifest=manifest)
 
     # Load rules
@@ -152,6 +184,11 @@ def load_plugins(
 
             plugin = _load_single_plugin(plugin_path)
             seen_names.add(entry)
+            if plugin is None:
+                # SSOT manifest enforcement refused it (already logged). The
+                # name stays in seen_names: a rejected per-workspace plugin
+                # must not silently fall back to a same-named shared one.
+                continue
 
             result.rules.extend(plugin.rules)
             result.prompt_fragments.extend(plugin.prompt_fragments)

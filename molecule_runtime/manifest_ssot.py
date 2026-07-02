@@ -4,11 +4,14 @@ Validates a plugin's ``plugin.yaml`` against the vendored SSOT plugin-manifest
 JSON-Schema (``molecule_runtime/contracts/plugin-manifest.schema.json`` — a
 byte-for-byte mirror of molecule-ai-sdk's
 ``contracts/plugin-manifest/plugin-manifest.schema.json``, see
-``contracts/PROVENANCE.md``). This is the ADVISORY phase: violations are
-LOGGED and returned, but NEVER block a plugin from loading or installing —
-the existing degrade/fail-soft behaviour of ``plugins.load_plugin_manifest``
-and ``plugin_sources.install_declared_plugins`` is unchanged. Fail-closed
-promotion is a later, post-soak PR.
+``contracts/PROVENANCE.md``). The helpers here stay ADVISORY: violations are
+LOGGED and returned, never raised. The FAIL-CLOSED promotion (PR-4 of
+molecule-core#3383) lives at the CALL SITES — ``plugins.load_plugin_manifest``
+and ``plugin_sources.install_declared_plugins`` branch on the returned
+violations when ``enforcement_enabled()`` (default ON, kill-switch
+``MOLECULE_MANIFEST_SSOT_ENFORCE=off``). Carve-out: a MISSING ``plugin.yaml``
+is always advisory-only — manifest-less plugins (bare-SKILL.md dirs) are
+common and legal.
 
 Two call sites:
   * ``plugins.load_plugin_manifest`` — the single manifest-parse chokepoint —
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from importlib import resources
 from pathlib import Path
 
@@ -55,6 +59,49 @@ _MAX_VIOLATIONS = 20
 _SCHEMA_RESOURCE = "contracts/plugin-manifest.schema.json"
 
 _validator = None  # cached Draft202012Validator (schema is static)
+
+# Fail-closed promotion (molecule-core#3383, PR-4): enforcement is ON by
+# default; MOLECULE_MANIFEST_SSOT_ENFORCE=off|false|0 is the escape hatch back
+# to pure-advisory mode. One loud "disabled" warning per process (mirrors the
+# jsonschema-unavailable pattern above — a disabled gate is never silent).
+_ENFORCE_ENV = "MOLECULE_MANIFEST_SSOT_ENFORCE"
+_disabled_logged = False
+
+
+class ManifestSSOTViolation(Exception):
+    """An existing ``plugin.yaml`` violates the SSOT schema under enforcement.
+
+    Carries the offending ``plugin_name`` and the ``violations`` list so
+    callers/handlers can report precisely what was rejected.
+    """
+
+    def __init__(self, plugin_name: str, violations: list[str]):
+        self.plugin_name = plugin_name
+        self.violations = violations
+        super().__init__(
+            f"plugin {plugin_name}: {len(violations)} SSOT manifest "
+            f"violation(s): {'; '.join(violations)}"
+        )
+
+
+def enforcement_enabled() -> bool:
+    """Whether SSOT manifest violations are ENFORCED (fail-closed) — default ON.
+
+    Reads ``MOLECULE_MANIFEST_SSOT_ENFORCE`` from the process env; the values
+    ``off``/``false``/``0`` (case-insensitive) disable enforcement, dropping
+    back to the PR-2 advisory behaviour. When disabled, ONE loud
+    ``logger.warning`` per process announces it.
+    """
+    global _disabled_logged
+    value = (os.environ.get(_ENFORCE_ENV) or "").strip().lower()
+    if value in ("off", "false", "0"):
+        if not _disabled_logged:
+            logger.warning(
+                "SSOT manifest enforcement DISABLED via env — advisory mode"
+            )
+            _disabled_logged = True
+        return False
+    return True
 
 
 def _get_validator():

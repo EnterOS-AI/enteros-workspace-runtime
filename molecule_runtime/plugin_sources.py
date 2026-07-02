@@ -468,14 +468,31 @@ def install_declared_plugins(
                     log.warning("[plugins] copy failed: %s (%s)", source.raw, exc)
                     report.failed.append(source.raw)
                     continue
-            # Advisory phase of molecule-core#3383 (plugin-manifest SSOT):
-            # validate the staged plugin's plugin.yaml against the vendored
-            # SSOT schema. LOG-only — advisory_check never raises and the
-            # result does NOT feed the swap decision below, so fetch/extract/
-            # swap behaviour is byte-for-byte unchanged.
-            manifest_ssot.advisory_check(
-                source.name, dest / "plugin.yaml", log=log, prefix="[plugins] ",
+            # molecule-core#3383 plugin-manifest SSOT gate. advisory_check
+            # never raises; it logs the advisory line and returns the
+            # violations. FAIL-CLOSED promotion (PR-4): when a plugin.yaml is
+            # PRESENT but violating and enforcement is on, the source is
+            # rejected exactly like a failed fetch — which blocks the swap
+            # below, preserving the previous live tree. Carve-out: a MISSING
+            # plugin.yaml (bare-SKILL.md plugins are common and legal) stays
+            # advisory-only, as does everything when
+            # MOLECULE_MANIFEST_SSOT_ENFORCE=off.
+            manifest_file = dest / "plugin.yaml"
+            violations = manifest_ssot.advisory_check(
+                source.name, manifest_file, log=log, prefix="[plugins] ",
             )
+            if (
+                violations
+                and manifest_file.is_file()
+                and manifest_ssot.enforcement_enabled()
+            ):
+                log.warning(
+                    "[plugins] SSOT manifest ENFORCEMENT: rejecting %s: "
+                    "%d violation(s): %s",
+                    source.raw, len(violations), "; ".join(violations),
+                )
+                report.failed.append(source.raw)
+                continue
             log.info("[plugins] staged %s <- %s", source.name, source.raw)
             report.installed.append(source.raw)
 
