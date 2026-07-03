@@ -25,6 +25,26 @@ import pytest
 from molecule_runtime.subprocess_executor import SubprocessA2AExecutor
 
 
+@pytest.fixture(autouse=True)
+def _isolate_workspace_id(monkeypatch):
+    """Deterministic WORKSPACE_ID resolution regardless of test order.
+
+    ``platform_auth.get_workspace_id`` caches the validated WORKSPACE_ID in a
+    module global on first read; an EARLIER test in the full suite can populate
+    that cache (and the ambient env) with a different value. The derive_session_id
+    fallback + env-read assertions below both flow through that cache, so reset it
+    and clear the ambient env before each test — otherwise the leaked value shadows
+    the per-test setup (seen as ``workspace:00…0001 != ctx-1`` in CI). Mirrors the
+    a2a_client cache reset already in tests/conftest.py.
+    """
+    from molecule_runtime import platform_auth
+
+    platform_auth._reset_workspace_id_cache()
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
+    yield
+    platform_auth._reset_workspace_id_cache()
+
+
 # --------------------------------------------------------------------------- #
 # Fakes: minimal shapes the shared helpers read.
 # --------------------------------------------------------------------------- #
