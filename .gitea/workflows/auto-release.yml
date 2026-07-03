@@ -73,9 +73,13 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install test dependencies
-        env:
-          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
-        run: pip install -e . pytest pytest-asyncio
+        # HERMETIC — mirrors ci.yml post-#212: no PIP_INDEX_URL=private
+        # override (every dep is public + the package builds from local
+        # source; the private index served none of them, so a cold cache
+        # 404'd this gate and SKIPPED every release after #212 landed).
+        # The [test] extra adds jsonschema for the workspace-comms
+        # conformance tests, same as ci.yml.
+        run: pip install -e ".[test]" pytest pytest-asyncio
       - name: Run unit tests
         run: pytest -q --ignore=tests/integration
 
@@ -89,9 +93,13 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install test dependencies
-        env:
-          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
-        run: pip install -e . pytest pytest-asyncio
+        # HERMETIC — mirrors ci.yml post-#212: no PIP_INDEX_URL=private
+        # override (every dep is public + the package builds from local
+        # source; the private index served none of them, so a cold cache
+        # 404'd this gate and SKIPPED every release after #212 landed).
+        # The [test] extra adds jsonschema for the workspace-comms
+        # conformance tests, same as ci.yml.
+        run: pip install -e ".[test]" pytest pytest-asyncio
       - name: Run agent-responsiveness-under-load e2e
         env:
           RESP_E2E_A_BUSY_SECONDS: "50"
