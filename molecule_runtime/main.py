@@ -1422,6 +1422,32 @@ async def main():  # pragma: no cover
             )
         )
 
+    # 9c. Plugin-declared channel daemons (issue #215, PR-1). Manifest-declared
+    # long-running sidecars (`contributes.daemons` — e.g. a channel bridge like
+    # lark-channel-molecule) are spawned only AFTER uvicorn binds (same gate as
+    # the poll-delivery starter above: a bridge posting at the local A2A server
+    # must never race the bind) and terminated in the finally below — daemons
+    # die with the workspace. Fail-open for the agent itself: discovery/spawn
+    # failures are logged, never fatal, and zero-daemon workspaces skip the
+    # task entirely. The event socket / provenance lane is PR-2.
+    plugin_daemon_supervisor = None
+    plugin_daemon_task = None
+    try:
+        from molecule_runtime import plugin_daemons
+
+        daemon_specs = plugin_daemons.discover_daemon_specs(
+            workspace_plugins_dir=os.path.join(config_path, "plugins"),
+        )
+        if daemon_specs:
+            plugin_daemon_supervisor = plugin_daemons.DaemonSupervisor(daemon_specs)
+            plugin_daemon_task = asyncio.create_task(
+                plugin_daemons.start_supervisor_when_bound(
+                    server, plugin_daemon_supervisor
+                )
+            )
+    except Exception as e:  # noqa: BLE001 — daemons must never block boot
+        print(f"Plugin daemons: discovery failed (non-fatal): {e}", flush=True)
+
     try:
         await server.serve()
     finally:
@@ -1447,6 +1473,16 @@ async def main():  # pragma: no cover
         # bind-wait (e.g. shutdown during a stalled startup).
         if poll_delivery_task and not poll_delivery_task.done():
             poll_delivery_task.cancel()
+        # Cancel the daemon-supervisor starter if it never got past the
+        # bind-wait, then terminate any spawned plugin daemons (issue #215 —
+        # the workspace owns its channel processes; they die with it).
+        if plugin_daemon_task and not plugin_daemon_task.done():
+            plugin_daemon_task.cancel()
+        if plugin_daemon_supervisor is not None:
+            try:
+                plugin_daemon_supervisor.stop()
+            except Exception as daemon_stop_err:  # noqa: BLE001
+                print(f"Warning: plugin daemon stop failed: {daemon_stop_err}")
         # Gracefully stop the Temporal worker background task on shutdown
         await temporal_wrapper.stop()
 
