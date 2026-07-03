@@ -7,8 +7,8 @@ plugin-manifest contract schema that lives in the `molecule-ai-sdk` repository:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `20d47232a9f7ee95a56f1014e3ac06cc5ccf6dcc` (last commit touching the schema)
-Vendored at sdk HEAD: `8aedf2bc8f820d79de8534e07e0d482ac1c43f4e` (main)
+Source commit:        `02dde7ef1a180b87877f6e313609d6d0e7f3266f` (last commit touching the schema)
+Vendored at sdk HEAD: `ab2322fb4fbbc7fa784c47d82e3e195df897a30e` (main)
 
 ## Why vendored (and not fetched)
 
