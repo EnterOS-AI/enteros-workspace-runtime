@@ -231,8 +231,19 @@ jobs:
           PIP=/tmp/runtime-registry-smoke/bin/pip
           PY=/tmp/runtime-registry-smoke/bin/python
           $PIP install --upgrade --quiet pip
+          # HERMETIC (runtime#219 root cause): the Gitea index does NOT proxy
+          # public PyPI (behavior lost in the 2026-06-28 box migration), so a
+          # bare private --index-url 404s the runtime's PUBLIC transitive deps
+          # (a2a-sdk/starlette/uvicorn/…) — the wheel uploads fine in the step
+          # above, then THIS step fails, which fails the publish job and
+          # SKIPS the propagate job (needs: publish) on every release. The
+          # private index stays primary (it is the only source of the runtime
+          # dist — the name is absent from public PyPI); pypi.org is the extra
+          # index for the public deps, the fleet-standard pattern (#218,
+          # template ci fixes, lark publish.yml).
           $PIP install \
             --index-url "$GITEA_PYPI_SIMPLE_URL" \
+            --extra-index-url "https://pypi.org/simple/" \
             --no-cache-dir \
             "molecules-workspace-runtime==$RUNTIME_VERSION"
           INSTALLED=$($PIP show molecules-workspace-runtime | awk -F': ' '/^Version:/{print $2}')
