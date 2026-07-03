@@ -40,6 +40,11 @@ class PluginManifest:
     prompt_fragments: list[str] = field(default_factory=list)
     adapters: dict = field(default_factory=dict)
     runtimes: list[str] = field(default_factory=list)  # declared supported runtimes
+    # VS-Code-shaped contribution surface (SSOT schema `contributes`, an OPEN
+    # object — unknown contribution points are tolerated). Carried raw so new
+    # contribution points (e.g. `daemons`, issue #215) read from here without
+    # another manifest parse; consumers validate their own point's shape.
+    contributes: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -106,6 +111,7 @@ def load_plugin_manifest(plugin_path: str) -> PluginManifest | None:
             prompt_fragments=raw.get("prompt_fragments", []),
             adapters=raw.get("adapters", {}),
             runtimes=raw.get("runtimes", []),
+            contributes=raw.get("contributes") if isinstance(raw.get("contributes"), dict) else {},
         )
     except Exception as e:
         # An EXISTING but unreadable/unparseable plugin.yaml IS an invalid
