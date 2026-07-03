@@ -506,6 +506,24 @@ async def main():  # pragma: no cover
     if not workspace_id:
         raise SystemExit("FATAL: WORKSPACE_ID env var is not set. Aborting.")
     config_path = os.environ.get("WORKSPACE_CONFIG_PATH", "/configs")
+
+    # 0.0 Config-relay fetch prelude (cf-r2-relay-config-secret-delivery).
+    # When the CP provisions with the R2 relay ENABLED it stages this
+    # workspace's {config.yaml + prompts/* + secrets} to a transient R2 object
+    # and injects MOLECULE_CONFIG_RELAY_URI (a short-TTL presigned GET) + _SHA256
+    # + _ACK_TOKEN. Fetch the bundle over the presigned HTTPS URL, verify its
+    # sha256, unpack it into config_path, then POST /cp/workspaces/<id>/relay-ack
+    # so the CP deletes the object. Fail-CLOSED on a genuine fetch/integrity
+    # failure (a mis-delivered config aborts boot rather than boot a mis-
+    # configured agent); transient/cold-presign failures retry with backoff; the
+    # ack is best-effort (CP reaper + bucket lifecycle are the backstops). INERT
+    # unless MOLECULE_CONFIG_RELAY_URI is present — the CP injects it only when
+    # its MOLECULE_CONFIG_RELAY_ENABLE flag is on, so this is a no-op until the
+    # operator flips that flag. MUST run BEFORE any step reads config_path
+    # (credential helper, npm auth, declared-plugins, load_config).
+    from molecule_runtime.config_relay import run_config_relay_prelude
+    run_config_relay_prelude(workspace_id=workspace_id, config_path=config_path)
+
     # Docker-aware default — host.docker.internal resolves the platform service
     # from inside the Docker network mesh; falls back to localhost for local dev.
     if os.path.exists("/.dockerenv") or os.environ.get("DOCKER_VERSION"):
