@@ -34,8 +34,10 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        env:
-          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+        # HERMETIC (CI-robustness): no PIP_INDEX_URL=private override. Every
+        # dep here is PUBLIC (ruff/build/twine/pytest/a2a-sdk/starlette/uvicorn)
+        # and the package under test is built from LOCAL source — the private
+        # index served none of them, so cold-cache 404d the required gate.
         run: |
           # Install the editable package so CI exercises pyproject.toml's
           # runtime dependency contract. This intentionally catches SDK/API
@@ -94,8 +96,10 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        env:
-          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+        # HERMETIC (CI-robustness): no PIP_INDEX_URL=private override. Every
+        # dep here is PUBLIC (ruff/build/twine/pytest/a2a-sdk/starlette/uvicorn)
+        # and the package under test is built from LOCAL source — the private
+        # index served none of them, so cold-cache 404d the required gate.
         run: |
           # -e . pulls the REAL a2a-sdk[http-server] + starlette + uvicorn +
           # httpx so the e2e exercises the production wire, not stubs.
@@ -127,8 +131,10 @@ jobs:
           cache: pip
 
       - name: Install ruff
-        env:
-          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+        # HERMETIC (CI-robustness): no PIP_INDEX_URL=private override. Every
+        # dep here is PUBLIC (ruff/build/twine/pytest/a2a-sdk/starlette/uvicorn)
+        # and the package under test is built from LOCAL source — the private
+        # index served none of them, so cold-cache 404d the required gate.
         run: pip install ruff
 
       - name: Lint with ruff (syntax + obvious errors only)
@@ -148,8 +154,10 @@ jobs:
           cache: pip
 
       - name: Install build tooling
-        env:
-          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+        # HERMETIC (CI-robustness): no PIP_INDEX_URL=private override. Every
+        # dep here is PUBLIC (ruff/build/twine/pytest/a2a-sdk/starlette/uvicorn)
+        # and the package under test is built from LOCAL source — the private
+        # index served none of them, so cold-cache 404d the required gate.
         run: pip install build twine
 
       - name: Build wheel + sdist
@@ -176,15 +184,19 @@ jobs:
           cache: pip
 
       - name: Build local wheel for smoke install
-        env:
-          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+        # HERMETIC (CI-robustness): no PIP_INDEX_URL=private override. Every
+        # dep here is PUBLIC (ruff/build/twine/pytest/a2a-sdk/starlette/uvicorn)
+        # and the package under test is built from LOCAL source — the private
+        # index served none of them, so cold-cache 404d the required gate.
         run: |
           pip install build
           python -m build --wheel
 
       - name: Install wheel in clean venv + smoke-import
-        env:
-          PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+        # HERMETIC (CI-robustness): no PIP_INDEX_URL=private override. Every
+        # dep here is PUBLIC (ruff/build/twine/pytest/a2a-sdk/starlette/uvicorn)
+        # and the package under test is built from LOCAL source — the private
+        # index served none of them, so cold-cache 404d the required gate.
         run: |
           set -eu
           python -m venv /tmp/smoke-venv
