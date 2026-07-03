@@ -4,31 +4,35 @@ WHY THIS EXISTS (tenant-agent BUG 3 meta-cause)
 ===============================================
 Every subprocess-backed runtime adapter (openclaw, codex, google-adk, …) used to
 REIMPLEMENT ``AgentExecutor.execute()`` in its own template repo, and each one
-silently diverged from the session+history CONTRACT that the platform relies on:
+silently diverged from the session CONTRACT that the platform relies on:
 
-  * the openclaw executor called ``extract_message_text`` ONLY and never injected
-    ``metadata.history`` — so a 2nd turn arrived with no prior context and the
-    agent re-greeted ("fresh session, clean slate"); and
   * it keyed the native session on the per-request ``context_id``, which the
     a2a-sdk mints FRESH every turn when the canvas does not thread one — so the
-    runtime's own SessionManager opened a NEW session on every message.
+    runtime's own SessionManager opened a NEW session on every message and the
+    agent re-greeted ("fresh session, clean slate") every turn.
 
 Fixing this per-runtime is the wrong altitude: the next new runtime would drop
-history/session again. This base moves the contract to the SHARED SSOT SDK so
-EVERY subprocess runtime INHERITS one enforced behavior:
+the session contract again. This base moves the contract to the SHARED SSOT SDK
+so EVERY subprocess runtime INHERITS one enforced behavior:
 
-  1. HISTORY INJECTION — ``build_task_text(user_message, extract_history(context))``
-     prepends the conversation transcript to the task text before the runtime is
-     invoked, so continuity survives even when the runtime has no durable session.
-  2. STABLE SESSION ID — ``derive_session_id`` keys on the WORKSPACE IDENTITY
-     (``WORKSPACE_ID``), NOT the per-request ``context_id``, so the runtime's
-     native SessionManager RESUMES the same session across turns. ``context_id``
-     / ``task_id`` remain only as a fallback for the (rare) no-WORKSPACE_ID case.
+  STABLE SESSION ID — ``derive_session_id`` keys on the WORKSPACE IDENTITY
+  (``WORKSPACE_ID``), NOT the per-request ``context_id``, so the runtime's native
+  SessionManager RESUMES the same session across turns. ``context_id`` / ``task_id``
+  remain only as a fallback for the (rare) no-WORKSPACE_ID case.
+
+CONTINUITY IS THE RUNTIME'S OWN NATIVE SESSION (resumed via that stable id) — NOT
+a force-injected transcript. The base passes ONLY the current user message to
+``run_agent``; it deliberately does NOT prepend ``metadata.history`` to the task
+text. Direct history injection was the previous approach and has been removed: it
+double-fed context (native session + injected transcript), grew the prompt
+unboundedly, and fought the runtime's own memory. Older/other history is retrieved
+only when the agent CHOOSES to (e.g. by calling a platform-workspace MCP tool that
+reads the persisted activity store) — never shoved into every task text.
 
 Subclasses implement ONLY ``run_agent(task_text, session_id, context)`` — the
 actual shell-out — and MAY override ``_decorate_message`` for per-runtime message
 adornments (e.g. openclaw's ``MEDIA:`` lines). They MUST NOT override
-``execute()``; the history+session contract lives here and is guarded by
+``execute()``; the session contract lives here and is guarded by
 ``tests/test_subprocess_executor_contract.py``.
 """
 
@@ -43,8 +47,6 @@ from molecule_runtime.executor_helpers import extract_attached_files
 from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 from molecule_runtime.shared_runtime import (
     brief_task,
-    build_task_text,
-    extract_history,
     extract_message_text,
     set_current_task,
 )
@@ -78,10 +80,13 @@ def _resolve_workspace_id() -> str:
 
 
 class SubprocessA2AExecutor(AgentExecutor):
-    """Base executor that ENFORCES history-injection + a stable session id.
+    """Base executor that ENFORCES a stable, workspace-keyed session id.
 
-    A subprocess/one-shot runtime adapter subclasses this and implements only
-    ``run_agent``. It inherits ``execute()`` — do not override it.
+    Continuity is the runtime's own native session (resumed via that stable id);
+    the base passes ONLY the current user message to ``run_agent`` and does NOT
+    force-inject conversation history. A subprocess/one-shot runtime adapter
+    subclasses this and implements only ``run_agent``. It inherits ``execute()``
+    — do not override it.
     """
 
     # Human-readable label used in error/empty-output fallbacks. Override in the
@@ -112,18 +117,13 @@ class SubprocessA2AExecutor(AgentExecutor):
             await event_queue.enqueue_event(new_text_message("No message provided"))
             return
 
-        # CONTRACT #1 — inject conversation history so a 2nd turn keeps context.
-        history = extract_history(context)
-        if history:
-            logger.info(
-                "%s execute: injecting %d history message(s)",
-                self.runtime_label,
-                len(history),
-            )
-        task_text = build_task_text(user_message, history)
-
-        # CONTRACT #2 — a STABLE session id (workspace-keyed, not per-request).
+        # THE CONTRACT — a STABLE session id (workspace-keyed, not per-request) so
+        # the runtime's native SessionManager RESUMES the prior session. Continuity
+        # is the runtime's OWN memory keyed on this id; conversation history is NOT
+        # force-injected into the task text (that double-fed context and fought the
+        # native session). Only the current user message is passed through.
         session_id = self.derive_session_id(context)
+        task_text = user_message
 
         await set_current_task(self._heartbeat, brief_task(user_message))
         reply: str | None = None
@@ -166,17 +166,20 @@ class SubprocessA2AExecutor(AgentExecutor):
         return "default"
 
     def _decorate_message(self, user_message: str, attached: list) -> str:
-        """Hook: adorn the user message before history is prepended. Default no-op."""
+        """Hook: adorn the current user message. Default no-op."""
         return user_message
 
     async def run_agent(self, task_text: str, session_id: str, context) -> str:
         """Invoke the underlying runtime. Subclasses MUST implement this.
 
         Args:
-            task_text: the current user message with conversation history already
-                prepended (build_task_text) — pass this straight to the runtime.
+            task_text: the CURRENT user message (already decorated / image-enriched).
+                NO conversation history is prepended — pass it straight to the
+                runtime. Continuity comes from the native session resumed via
+                ``session_id``, not from injecting a transcript here.
             session_id: the STABLE, workspace-keyed session id — pass to the
-                runtime's native session flag (e.g. ``--session-id``).
+                runtime's native session flag (e.g. ``--session-id``) so it RESUMES
+                the same conversation across turns.
             context: the raw A2A RequestContext, for any extra needs.
 
         Returns:

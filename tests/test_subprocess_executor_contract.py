@@ -1,15 +1,20 @@
 """Shared-contract guard for SubprocessA2AExecutor (tenant-agent BUG 3).
 
-These tests enforce, at the SHARED SDK layer, the two things every subprocess
-runtime adapter used to get wrong on its own:
+These tests enforce, at the SHARED SDK layer, the session contract every
+subprocess runtime adapter used to get wrong on its own:
 
-  1. conversation HISTORY is injected into the task text (a 2nd turn keeps
-     context), and
-  2. the native session id is STABLE (workspace-keyed), so it does NOT rotate
-     with the per-request context_id the a2a-sdk mints fresh each turn.
+  * the native session id is STABLE (workspace-keyed), so it does NOT rotate
+    with the per-request context_id the a2a-sdk mints fresh each turn — the
+    runtime's native SessionManager RESUMES the same session, which is where
+    continuity comes from.
+
+The base deliberately passes ONLY the current user message to run_agent: it does
+NOT force-inject metadata.history into the task text (that double-fed context and
+grew the prompt unboundedly). These tests pin BOTH properties — the stable
+session id, and the ABSENCE of history injection.
 
 A new runtime that subclasses SubprocessA2AExecutor and implements only
-run_agent() INHERITS both — it cannot silently drop them without overriding
+run_agent() INHERITS the contract — it cannot silently drop it without overriding
 execute(), which this suite also guards against.
 """
 
@@ -68,10 +73,13 @@ def _history(*pairs):
 
 
 # --------------------------------------------------------------------------- #
-# CONTRACT #1 — history injection.
+# CONTRACT #1 — NO history injection: only the current message is passed through.
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_execute_injects_history_into_task_text():
+async def test_execute_does_not_inject_history_into_task_text():
+    # Even when metadata carries prior turns, the base must NOT prepend them:
+    # continuity is the runtime's native session (resumed via the stable
+    # session id), not a force-injected transcript (tenant-agent BUG 3 fix).
     ex = _StubExecutor(workspace_id="ws-abc")
     ctx = _FakeContext(
         "what did I just say?",
@@ -80,12 +88,13 @@ async def test_execute_injects_history_into_task_text():
     await ex.execute(ctx, _RecordingQueue())
 
     assert ex.seen_task_text is not None
-    # The current message AND the prior turns must be present in the task text.
-    assert "what did I just say?" in ex.seen_task_text
-    assert "my name is Ada" in ex.seen_task_text
-    assert "Hello Ada" in ex.seen_task_text
-    # build_task_text framing proves history was PREPENDED, not dropped.
-    assert "Conversation so far:" in ex.seen_task_text
+    # ONLY the current message reaches the runtime — verbatim.
+    assert ex.seen_task_text == "what did I just say?"
+    # The prior turns must NOT be prepended, and none of the old build_task_text
+    # framing ("Conversation so far:") may leak in.
+    assert "my name is Ada" not in ex.seen_task_text
+    assert "Hello Ada" not in ex.seen_task_text
+    assert "Conversation so far:" not in ex.seen_task_text
 
 
 @pytest.mark.asyncio
@@ -138,9 +147,10 @@ def test_workspace_id_read_from_env_when_not_passed(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_run_agent_only_subclass_inherits_the_enforced_execute():
     # The whole point: a subclass implements ONLY run_agent and INHERITS the
-    # base execute() that injects history + derives a stable session id. If a
-    # future runtime overrides execute() it opts out of the shared contract —
-    # this assertion is the tripwire that forces that decision to be explicit.
+    # base execute() that derives a stable, workspace-keyed session id (and does
+    # NOT force-inject history). If a future runtime overrides execute() it opts
+    # out of the shared contract — this assertion is the tripwire that forces
+    # that decision to be explicit.
     assert _StubExecutor.execute is SubprocessA2AExecutor.execute
 
 
