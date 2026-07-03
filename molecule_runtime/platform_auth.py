@@ -205,7 +205,10 @@ def get_token() -> str | None:
     path = _token_file()
     # /configs is the platform-managed, restart-rotated volume → file is the
     # fresh SSOT there. Everywhere else, an explicitly-provided env token wins
-    # over a possibly-stale on-disk file.
+    # over a possibly-stale on-disk file. The boundary is EXACT parent
+    # equality with /configs (the token file is always /configs/.auth_token
+    # in-container, and containers never set CONFIGS_DIR) — deliberately not
+    # a prefix test, so /configsfoo can't masquerade as the platform volume.
     on_platform_configs = path.parent == Path("/configs")
     if env_tok and not on_platform_configs:
         _cached_token = env_tok
@@ -478,11 +481,15 @@ def clear_cache() -> None:
 
 
 def refresh_cache() -> str | None:
-    """Force re-read of the token from disk, discarding the in-process cache.
+    """Re-resolve the token, discarding the in-process cache.
 
     Use this when a 401 response suggests the cached token is stale —
     e.g. after the platform rotates tokens during a restart (issue #1877).
-    Returns the (new) token value or None if not found/error."""
+    Resolution follows get_token(): in-container (/configs) this re-reads
+    the rotated file; on external-runtime hosts an explicitly-set
+    MOLECULE_WORKSPACE_TOKEN wins instead, so the env var is the operator's
+    responsibility to keep current there (file-based 401 recovery does not
+    apply off /configs). Returns the token value or None if not found."""
     global _cached_token
     _cached_token = None
     return get_token()
