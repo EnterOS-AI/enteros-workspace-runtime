@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/plugin-manifest/plugin-manifest.schema.json",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-manifest/plugin-manifest.schema.json",
+  "$comment": "contract-version 0.3.1 — daemons contribution semantics made first-class (skip-not-reject, sdk#51); 0.3.0 added the daemons capture (sdk#50); $id repointed from the archived molecule-contracts repo to this SSOT (fold: ai-sdk#41).",
   "title": "Marketplace Plugin Manifest Contract",
   "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace plugin manifest — the publishable shape of a `plugin.yaml` artifact (molecule-ai-plugin-* repos), authored marketplace-side per RFC molecule-core#3285 (Tool-Contract SSOT & Codegen). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-plugin-molecule-careful-bash/plugin.yaml, image-gen/plugin.yaml, gh-identity/plugin.yaml, molecule-hitl/plugin.yaml, validated by each plugin repo's `.molecule-ci/scripts/validate-plugin.py` (required: name/version/description; runtimes must be a list; content is one of SKILL.md/hooks/skills/rules). The design is VS-Code-shaped: `engines` pins the minimum host version (like engines.vscode), and `contributes` is the OPEN, forward-compatible contribution surface — its KNOWN keys (skills/hooks/rules/mcpServers/commands, v1) are validated by shape while UNKNOWN contribution points (e.g. future themes/tabs/canvasElements) are tolerated (additionalProperties:true at the contributes level), so a newer plugin never fails this schema on an additive contribution point. The top-level `skills`/`hooks`/`rules` string lists mirror the real plugin.yaml v0 shorthand and remain accepted alongside the richer `contributes`. CANONICAL RUNTIMES: the `runtimes` enum is the SSOT reconciliation of the cross-artifact drift — the canonical form is the HYPHEN spelling (`claude-code`, matching the workspace/org templates and validate-workspace-template.py's known set); the legacy plugin UNDERSCORE spellings (`claude_code`, `gemini_cli`) used by today's plugin.yaml files are accepted as aliases (normalize to the hyphen form). The enum INCLUDES every runtime in use — claude-code, codex, hermes, openclaw, langgraph, autogen, crewai, deepagents, gemini-cli, google-adk, external — including deepagents/langgraph/autogen, which today's validate-plugin.py does not (it does not check the runtime enum) but real plugins already declare (gh-identity, molecule-hitl).",
   "type": "object",
@@ -115,7 +116,7 @@
     "contributes": {
       "type": "object",
       "additionalProperties": true,
-      "description": "The contribution surface. KNOWN keys (v1) below are validated by shape. UNKNOWN keys (future contribution points such as `themes`, `tabs`, `canvasElements`) are explicitly TOLERATED via additionalProperties:true — adding a new contribution point MUST NOT fail validation against this schema (forward-compat).",
+      "description": "The contribution surface. KNOWN keys (skills/hooks/rules/mcpServers/commands v1; daemons per runtime#216) below are validated by shape. UNKNOWN keys (future contribution points such as `themes`, `tabs`, `canvasElements`) are explicitly TOLERATED via additionalProperties:true — adding a new contribution point MUST NOT fail validation against this schema (forward-compat). `daemons` itself landed exactly this way: the runtime shipped it as an additive point tolerated by this open object, and this schema now captures its shape descriptively.",
       "properties": {
         "skills": {
           "type": "array",
@@ -141,6 +142,22 @@
           "type": "array",
           "description": "Slash-command contributions.",
           "items": { "$ref": "#/$defs/commandContribution" }
+        },
+        "daemons": {
+          "description": "Long-running daemon contributions (ADDITIVE contribution point, captured from reality per molecule-ai-workspace-runtime#216): the workspace runtime (molecule_runtime/plugin_daemons.py) spawns each declared daemon at boot, restarts it on crash with exponential backoff (circuit breaker after 10 consecutive fast failures), and kills it with the workspace — e.g. a channel bridge like lark-channel-molecule's `lark-bridge`. The entry shape deliberately mirrors `mcpServerContribution` (name + command/args?/env?) rather than inventing a new descriptor. VALIDATION SEMANTICS — deliberately UNCONSTRAINED here, mirroring the runtime exactly: the runtime NEVER rejects a manifest over `daemons`. A non-list value, non-mapping entries, missing/blank `name`/`command`, non-string `args` items, or a non-mapping `env` are SKIPPED with a loud warning at daemon discovery (`_entry_problem`) — never a boot crash, never a manifest-validation failure. Daemons are auxiliary; a typo here must not brick the plugin at the (future fail-closed) install gate, so schema-constraining this property would CHANGE runtime semantics rather than capture them (proven: runtime test test_malformed_entries_skipped_valid_kept fails against a strict version of this property). `$defs/daemonContribution` documents the canonical WELL-FORMED entry the runtime actually spawns — the shape emitters should produce and codegen consumers should use.",
+          "anyOf": [
+            {
+              "type": "array",
+              "items": { "$ref": "#/$defs/daemonContribution" },
+              "description": "The canonical, well-formed form — what emitters MUST produce. Kept as a live ref so the shape stays discoverable and $defs/daemonContribution is never orphaned."
+            },
+            {
+              "description": "Anything else — tolerated by design: the runtime skips non-conforming values/entries at spawn discovery with a warning instead of failing manifest validation. This branch makes the anyOf always-satisfiable, which IS the contract."
+            }
+          ],
+          "examples": [
+            [ { "name": "lark-bridge", "command": "bash", "args": ["daemon-bootstrap.sh"] } ]
+          ]
         }
       }
     },
@@ -195,6 +212,40 @@
           "description": "Optional environment map (var->value) for the MCP server process."
         },
         "privileged": { "type": "boolean", "description": "Whether this MCP server is the privileged management surface." }
+      }
+    },
+    "daemonContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name", "command"],
+      "description": "A single contributed long-running daemon, exactly the shape molecule-ai-workspace-runtime's plugin_daemons.py parses (runtime#216): `{name, command, args?, env?, cwd?}`. The runtime spawns `[command, *args]` in its own session/process group, with the workspace process env overlaid with `env`, in `cwd` (plugin-dir-relative; default: the plugin dir itself). Requiredness and item types mirror the runtime's `_entry_problem` checks verbatim: non-mapping entry, missing/whitespace-only `name` or `command`, non-string-list `args`, and non-mapping `env` are what the runtime SKIPS (with a warning) — everything else it accepts. First real consumer: lark-channel-molecule's `plugin.yaml` (`{name: lark-bridge, command: bash, args: [daemon-bootstrap.sh]}`).",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Daemon name (required, non-blank — the runtime rejects a missing/empty/whitespace-only name). Namespaced by the owning plugin into the supervisor key `<plugin>/<name>`, so two plugins may both declare a daemon called `bridge`."
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Launch command (required, non-blank), e.g. `bash` or `python`. The spawned argv is `[command, *args]`."
+        },
+        "args": {
+          "type": "array",
+          "description": "Optional command arguments. Must be a list of strings — the runtime skips the entry on any non-string item.",
+          "items": { "type": "string", "description": "A single argument, e.g. `daemon-bootstrap.sh` or `-m`." }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "description": "An environment variable value." },
+          "description": "Optional environment map (var→value) overlaid on the workspace process env for the daemon. The runtime rejects only a non-mapping `env`; it str()-coerces non-string VALUES rather than rejecting them — string values are the canonical form. An explicitly-null `env` is treated as absent by the runtime (YAML `env:` with no value), though this schema's canonical form is to omit the key."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Optional working directory, resolved against the plugin dir when relative (default: the plugin dir itself). The runtime never validates `cwd` — a non-string value is str()-coerced rather than rejected; a string path is the canonical form."
+        }
       }
     },
     "commandContribution": {
