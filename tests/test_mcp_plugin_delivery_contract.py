@@ -257,8 +257,7 @@ def test_runtime_matrix_contract_present():
     runtimes = CONTRACT["runtimes"]
     assert runtimes["claude_code"]["status"] == "implemented"
     assert runtimes["codex"]["status"] == "implemented"
-    # gemini/hermes are explicitly marked unverified, not silently absent.
-    assert runtimes["gemini_cli"]["status"].startswith("todo")
+    # hermes is explicitly marked unverified, not silently absent.
     assert runtimes["hermes"]["status"].startswith("todo")
 
 
@@ -323,20 +322,14 @@ def test_codex_render_preserves_handwritten_config(tmp_path):
     assert "molecule-platform" in parsed["mcp_servers"]
 
 
-@pytest.mark.parametrize("renderer_name", ["render_gemini_settings", "render_hermes_config"])
+@pytest.mark.parametrize("renderer_name", ["render_hermes_config"])
 def test_unverified_runtimes_are_explicit_stubs(tmp_path, renderer_name):
-    """gemini/hermes renderers are honest NotImplementedError stubs (format
+    """The hermes renderer is an honest NotImplementedError stub (format
     unverified) — NOT a silent wrong write. Implement concretely once the
     native format is pinned against a live runtime (#3159 follow-up)."""
     renderer = getattr(mcp_render, renderer_name)
     with pytest.raises(NotImplementedError):
         renderer(tmp_path / "out", "molecule-platform", _PLATFORM_SPEC)
-
-
-@pytest.mark.skip(reason="gemini-cli native MCP config format unverified (#3159 follow-up)")
-def test_gemini_render_writes_native_config(tmp_path):
-    """TODO(#3159): assert gemini-cli renderer writes ~/.gemini/settings.json
-    (and NOT .claude/settings.json) once the format is confirmed live."""
 
 
 @pytest.mark.skip(reason="hermes native MCP descriptor format unverified (#3159 follow-up)")

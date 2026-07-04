@@ -17,19 +17,17 @@ Shape taxonomy (one class per shape; add more as the ecosystem evolves):
   ``references/`` + ``assets/``), plus Molecule AI's optional ``rules/`` and
   root-level prompt fragments at the plugin level. Works on every runtime
   we support (the spec's filesystem layout makes activation trivial on
-  Claude Code, our adapter code does the equivalent on DeepAgents /
-  LangGraph / etc.). **This is the default and covers the common case.**
+  Claude Code, and our adapter code does the equivalent on the other
+  runtimes we support). **This is the default and covers the common case.**
 
 Planned as the ecosystem matures (none are implemented yet — rule of
 three: promote a class here only after 3+ plugins ship the same custom
 shape via their own ``adapters/<runtime>.py``):
 
 * :class:`MCPServerAdaptor` — install a plugin as an MCP server ✅ (issue #847)
-* ``DeepAgentsSubagentAdaptor`` — register a DeepAgents sub-agent
-  (runtime-locked to deepagents) *(backlog — no concrete timeline)*
-* ``LangGraphSubgraphAdaptor`` — install a LangGraph sub-graph *(backlog)*
+* ``SubagentAdaptor`` — register a runtime-native sub-agent *(backlog)*
 * ``RAGPipelineAdaptor`` — wire a retriever + index *(backlog)*
-* ``SwarmAdaptor`` — bind an OpenAI-swarm / AutoGen-swarm *(backlog)*
+* ``SwarmAdaptor`` — bind a multi-agent swarm *(backlog)*
 * ``WebhookAdaptor`` — register an event handler *(backlog)*
 
 Plugins whose shape doesn't match any built-in ship their own adapter
@@ -142,8 +140,8 @@ class AgentskillsAdaptor:
     marker (best-effort — if the user edited CLAUDE.md manually, only the
     marker line itself is removed).
 
-    For shapes other than agentskills (MCP server, DeepAgents sub-agent,
-    LangGraph sub-graph, RAG pipeline, swarm, webhook handler, etc.), see
+    For shapes other than agentskills (MCP server, sub-agent, RAG pipeline,
+    swarm, webhook handler, etc.), see
     the module docstring for the planned sibling adapters, or ship a custom
     adapter class in the plugin's ``adapters/<runtime>.py``.
     """

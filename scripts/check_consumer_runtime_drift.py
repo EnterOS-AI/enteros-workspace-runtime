@@ -27,23 +27,19 @@ from urllib.parse import urlsplit
 # Dockerfile installs ``molecule-ai-workspace-runtime==${RUNTIME_VERSION}`` (where
 # RUNTIME_VERSION is read from its ``.runtime-version`` file) belongs here, plus
 # molecule-core (installs the wheel; carries no .runtime-version pin but must not
-# vendor the source). This list was previously only the four templates the
-# runtime#91 propagation bot bumps + molecule-core, which created a SILENT BLIND
-# SPOT: langgraph/autogen/google-adk/crewai/deepagents/gemini-cli all pin
-# .runtime-version and build images from it, but were omitted here, so the guard
-# stayed green while those pins drifted (16-26 releases behind). The
-# ``reconcile_org_consumers`` check below now makes any future omission LOUD.
+# vendor the source). This list was previously only a hand-maintained subset of
+# templates the runtime#91 propagation bot bumps + molecule-core, which created a
+# SILENT BLIND SPOT: google-adk/crewai also pin .runtime-version and build images
+# from it, but were omitted here, so the guard stayed green while those pins
+# drifted (16-26 releases behind). The ``reconcile_org_consumers`` check below now
+# makes any future omission LOUD.
 DEFAULT_CONSUMERS = (
     "molecule-ai-workspace-template-claude-code",
     "molecule-ai-workspace-template-hermes",
     "molecule-ai-workspace-template-openclaw",
     "molecule-ai-workspace-template-codex",
-    "molecule-ai-workspace-template-langgraph",
-    "molecule-ai-workspace-template-autogen",
     "molecule-ai-workspace-template-google-adk",
     "molecule-ai-workspace-template-crewai",
-    "molecule-ai-workspace-template-deepagents",
-    "molecule-ai-workspace-template-gemini-cli",
     "molecule-core",
 )
 

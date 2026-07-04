@@ -248,8 +248,8 @@ class _ScriptedAgent:
     Single-flight contention (the real blocking mechanism)
     ------------------------------------------------------
     A production runtime agent graph is single-flight per ``context_id``
-    (LangGraph state is keyed by ``thread_id == context_id``); two turns for
-    the same context cannot drive the graph concurrently. We model this
+    (the runtime's graph/session state is keyed by ``thread_id == context_id``);
+    two turns for the same context cannot drive the graph concurrently. We model this
     deterministically with a per-context ``asyncio.Lock`` acquired for the
     WHOLE turn: while A holds it (busy 90 s), any *other* turn that actually
     enters the agent loop for the same context (i.e. the legacy BLOCKING

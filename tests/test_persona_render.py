@@ -27,7 +27,6 @@ EXPECTED_NATIVE_FILE = {
     "codex": "AGENTS.md",
     "google-adk": "GEMINI.md",
     "gemini": "GEMINI.md",
-    "gemini-cli": "GEMINI.md",
 }
 
 PERSONA = "# You are test7 — the Org Concierge\n\nYou orchestrate; you don't do the work yourself."

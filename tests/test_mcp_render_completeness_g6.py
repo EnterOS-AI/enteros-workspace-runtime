@@ -26,9 +26,9 @@ from molecule_runtime import mcp_render
 # The kind=platform runtime allowlist (task #80): the runtimes a concierge is
 # allowed to run on AND that have been pinned against a live CLI. claude-code is
 # the base; codex (#142) and openclaw (#179 / phase P4) graduated to concrete
-# renderers in the de-bake. gemini_cli / hermes are intentionally EXCLUDED — they
-# remain fail-loud stubs (format unverified) and a concierge must not be
-# provisioned on them until their renderer is pinned.
+# renderers in the de-bake. hermes is intentionally EXCLUDED — it remains a
+# fail-loud stub (format unverified) and a concierge must not be provisioned on
+# it until its renderer is pinned.
 PLATFORM_RUNTIME_ALLOWLIST = ("claude-code", "codex", "openclaw")
 
 
@@ -59,7 +59,7 @@ def test_platform_runtime_has_concrete_render_spec(runtime):
 def test_platform_runtime_renderer_is_not_a_failloud_stub(runtime):
     """A concrete entry must have a REAL renderer, not a fail-loud stub.
 
-    ``is_runtime_supported`` is False for the deliberate gemini/hermes stubs
+    ``is_runtime_supported`` is False for the deliberate hermes stub
     (whose renderer raises NotImplementedError). Every allowlisted platform
     runtime must be supported."""
     assert mcp_render.is_runtime_supported(runtime) is True, (
