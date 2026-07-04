@@ -547,30 +547,50 @@ async def capture_loaded_mcp_tools_with_retry(
     runtime: str,
     config_path: str | os.PathLike,
     *,
-    max_attempts: int = 20,
-    interval_seconds: float = 15.0,
+    max_attempts: int = 40,
+    interval_seconds: float = 2.0,
+    max_interval_seconds: float = 30.0,
+    backoff_factor: float = 1.7,
     force: bool = False,
 ) -> list[str] | None:
-    """Retry :func:`capture_loaded_mcp_tools_at_init` until it observes tools.
+    """Retry :func:`capture_loaded_mcp_tools_at_init` until it observes tools,
+    with DYNAMIC (exponential + jittered) backoff on the real signal.
 
     WHY (the timing fix). The one-shot init enumeration runs at early boot, but
     the management ``molecule-platform`` MCP isn't necessarily *connectable* yet
     at that moment — the gate signal ``mcp_server_present()`` may not have flipped
-    true, and/or ``npx @molecule-ai/mcp-server`` is still cold-starting. A single
-    attempt therefore often finds nothing and the concierge sits ``degraded``
-    until a user turn triggers the per-turn capture (validated 2026-06-25:
-    provisioning→online→degraded, then a turn flips it online). This retry waits
-    for the MCP to become ready so a fresh concierge reaches ``online`` **without
-    any turn** — the "heartbeat verifies it, not a user" behaviour.
+    true, and/or the ``npx @molecule-ai/mcp-server`` process is still starting. A
+    single attempt therefore often finds nothing and the concierge would sit
+    ``provisioning``/``degraded`` until a user turn triggers the per-turn capture.
+    This retry waits for the MCP to become ready so a fresh concierge reaches
+    ``online`` **without any turn** — the "heartbeat verifies it, not a user"
+    behaviour.
+
+    DYNAMIC BACKOFF (not a fixed cadence). With the runtime image now PRE-BAKING
+    @molecule-ai/mcp-server into the npm cache, ``npx --prefer-offline`` resolves
+    the management MCP from cache with ZERO network pull and the enumeration
+    typically succeeds on the FIRST attempt in ~1s. So we poll on a FAST initial
+    cadence (``interval_seconds``) to catch that common case immediately, then
+    back off EXPONENTIALLY (``backoff_factor``, capped at ``max_interval_seconds``)
+    with full jitter — robust against a genuinely-slow connect without hot-spinning
+    the enumeration (each attempt spawns the boot-safe probe subprocess). The wait
+    is driven by the REAL loaded_mcp_tools signal: it returns the instant a real
+    observation lands, never on a wall-clock verdict.
 
     Each attempt re-evaluates the ``_is_platform_agent()`` gate (so a concierge
     whose MCP is declared a bit late is still picked up) and re-runs the bounded,
     boot-safe enumeration. Returns the observed ids on the first success (the
-    producer is set as a side effect), or ``None`` when the window elapses — in
-    which case the per-turn capture remains the fallback (degraded-until-turn).
-    This coroutine is meant to run as a BACKGROUND task (it must NOT block boot);
-    it never raises (a failed attempt is swallowed and retried).
+    producer is set as a side effect), or ``None`` when the attempt budget is
+    exhausted — in which case the per-turn capture remains the fallback. This
+    coroutine is meant to run as a BACKGROUND task (it must NOT block boot); it
+    never raises (a failed attempt is swallowed and retried). NOTE: exhausting the
+    attempt budget is NOT a readiness verdict — core owns the readiness terminal
+    (health + liveness), so this task simply stops re-probing; it never fails the
+    concierge.
     """
+    import random
+
+    delay = max(0.0, interval_seconds)
     for attempt in range(1, max_attempts + 1):
         try:
             observed = await capture_loaded_mcp_tools_at_init(
@@ -590,11 +610,16 @@ async def capture_loaded_mcp_tools_with_retry(
             )
             return observed
         if attempt < max_attempts:
-            await asyncio.sleep(interval_seconds)
+            # Equal-jitter exponential backoff: sleep [delay/2, delay] so we keep a
+            # guaranteed minimum spacing (never hot-spin) while decorrelating
+            # concurrent concierges' probes, then grow the delay for the next miss.
+            await asyncio.sleep(random.uniform(delay * 0.5, delay) if delay > 0 else 0.0)
+            delay = min(max_interval_seconds, delay * backoff_factor)
     logger.info(
-        "loaded_mcp_tools: init enumeration window elapsed (%d attempts x %.0fs) "
-        "without connectable management MCP — producer left unset; the per-turn "
-        "capture will publish on the first turn (degraded-until-turn fallback)",
-        max_attempts, interval_seconds,
+        "loaded_mcp_tools: init enumeration attempt budget elapsed (%d attempts, "
+        "backoff %.1fs→%.0fs) without a connectable management MCP — producer left "
+        "unset; the per-turn capture remains the fallback (core owns the readiness "
+        "terminal via health + liveness, so this is not a failure verdict)",
+        max_attempts, interval_seconds, max_interval_seconds,
     )
     return None
