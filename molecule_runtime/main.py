@@ -793,6 +793,28 @@ async def main():  # pragma: no cover
         default_output_modes=["text/plain", "application/json"],
     )
 
+    # 5b. Materialize the workspace's CANONICAL PERSONA into the ACTIVE runtime's
+    # native identity file (system-prompt.md / SOUL.md / AGENTS.md / GEMINI.md),
+    # so a workspace on ANY runtime boots with its intended identity — even
+    # runtimes (openclaw) whose gateway reads a native file and never consumes
+    # config.system_prompt. Runtime-agnostic: dispatches on adapter.name() via the
+    # persona-materialization PORT. Runs BEFORE setup() so openclaw's setup-time
+    # ``/configs/*.md`` -> gateway-workspace copy picks up the freshly written
+    # SOUL.md (+ cleared BOOTSTRAP/AGENTS placeholders). This is the runtime half
+    # of core #3418's provision half: the delivered persona
+    # (config.prompt_files, e.g. prompts/concierge.md) becomes the model's actual
+    # on-disk identity for the real runtime, not just claude-code. Best-effort +
+    # idempotent + no-op when no persona is delivered, so nothing regresses.
+    try:
+        materialized_persona_path = adapter.materialize_persona(adapter_config)
+        if materialized_persona_path is not None:
+            print(
+                f"Persona: materialized canonical identity into "
+                f"{materialized_persona_path} (runtime={runtime})"
+            )
+    except Exception as _persona_err:  # noqa: BLE001 — persona is best-effort
+        print(f"Warning: persona materialization failed (non-fatal): {_persona_err}")
+
     # 6. Setup adapter and create executor
     # On failure: log + continue. The card route stays mounted (above);
     # the JSON-RPC route below returns -32603 "agent not configured" until

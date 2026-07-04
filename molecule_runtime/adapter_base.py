@@ -501,6 +501,60 @@ class BaseAdapter(ABC):
 
         return management_mcp_present_for(self.name(), config.config_path, MANAGEMENT_MCP_NAME)
 
+    def materialize_persona(self, config: "AdapterConfig") -> "Any":
+        """Materialize the workspace's CANONICAL PERSONA into THIS runtime's
+        native identity file (the persona-materialization PORT).
+
+        DISPATCHES on the active runtime (``self.name()``) through
+        :func:`molecule_runtime.persona_render.materialize_persona_for`, so a
+        workspace on ANY runtime boots with its intended identity — even runtimes
+        whose gateway/CLI reads a native identity file and never consumes the
+        base-assembled ``config.system_prompt`` (openclaw → SOUL.md, codex →
+        AGENTS.md, gemini/google-adk → GEMINI.md, claude-code → system-prompt.md).
+
+        The canonical persona is read runtime-agnostically from the delivered
+        ``config.prompt_files`` (a concierge's ``prompts/concierge.md``; a member's
+        role prompt), so this is the runtime half of core #3418's provision half:
+        the delivered persona actually becomes the model's on-disk identity for the
+        ACTUAL runtime, not just claude-code.
+
+        Best-effort by design: returns ``None`` (no-op) when no persona is
+        delivered, and downgrades an unverified-runtime ``NotImplementedError``
+        (hermes) to a warning — a persona is not a privileged capability like the
+        management MCP, so a missing native convention must never brick the boot.
+        Returns the path written, or ``None``.
+        """
+        from molecule_runtime import persona_render
+
+        persona = persona_render.read_canonical_persona(
+            config.config_path, config.prompt_files
+        )
+        if not (persona or "").strip():
+            logger.info(
+                "materialize_persona: no canonical persona delivered for runtime "
+                "%s — leaving the runtime's native default untouched",
+                self.name(),
+            )
+            return None
+        try:
+            target = persona_render.materialize_persona_for(
+                self.name(), config.config_path, persona
+            )
+        except NotImplementedError as exc:
+            logger.warning(
+                "materialize_persona: runtime %s has no verified native persona "
+                "convention — persona NOT materialized (%s). The delivered persona "
+                "still reaches any runtime that consumes config.system_prompt.",
+                self.name(), exc,
+            )
+            return None
+        if target is not None:
+            logger.info(
+                "materialize_persona: wrote %s persona (%d chars) to %s",
+                self.name(), len(persona), target,
+            )
+        return target
+
     def append_to_memory_hook(self, config: AdapterConfig, filename: str, content: str) -> None:
         """Append text to the durable memory file if the marker isn't present.
 
