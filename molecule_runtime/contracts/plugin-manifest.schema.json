@@ -3,7 +3,7 @@
   "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-manifest/plugin-manifest.schema.json",
   "$comment": "contract-version 0.3.1 — daemons contribution semantics made first-class (skip-not-reject, sdk#51); 0.3.0 added the daemons capture (sdk#50); $id repointed from the archived molecule-contracts repo to this SSOT (fold: ai-sdk#41).",
   "title": "Marketplace Plugin Manifest Contract",
-  "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace plugin manifest — the publishable shape of a `plugin.yaml` artifact (molecule-ai-plugin-* repos), authored marketplace-side per RFC molecule-core#3285 (Tool-Contract SSOT & Codegen). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-plugin-molecule-careful-bash/plugin.yaml, image-gen/plugin.yaml, gh-identity/plugin.yaml, molecule-hitl/plugin.yaml, validated by each plugin repo's `.molecule-ci/scripts/validate-plugin.py` (required: name/version/description; runtimes must be a list; content is one of SKILL.md/hooks/skills/rules). The design is VS-Code-shaped: `engines` pins the minimum host version (like engines.vscode), and `contributes` is the OPEN, forward-compatible contribution surface — its KNOWN keys (skills/hooks/rules/mcpServers/commands, v1) are validated by shape while UNKNOWN contribution points (e.g. future themes/tabs/canvasElements) are tolerated (additionalProperties:true at the contributes level), so a newer plugin never fails this schema on an additive contribution point. The top-level `skills`/`hooks`/`rules` string lists mirror the real plugin.yaml v0 shorthand and remain accepted alongside the richer `contributes`. CANONICAL RUNTIMES: the `runtimes` enum is the SSOT reconciliation of the cross-artifact drift — the canonical form is the HYPHEN spelling (`claude-code`, matching the workspace/org templates and validate-workspace-template.py's known set); the legacy plugin UNDERSCORE spellings (`claude_code`, `gemini_cli`) used by today's plugin.yaml files are accepted as aliases (normalize to the hyphen form). The enum INCLUDES every runtime in use — claude-code, codex, hermes, openclaw, langgraph, autogen, crewai, deepagents, gemini-cli, google-adk, external — including deepagents/langgraph/autogen, which today's validate-plugin.py does not (it does not check the runtime enum) but real plugins already declare (gh-identity, molecule-hitl).",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace plugin manifest — the publishable shape of a `plugin.yaml` artifact (molecule-ai-plugin-* repos), authored marketplace-side per RFC molecule-core#3285 (Tool-Contract SSOT & Codegen). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-plugin-molecule-careful-bash/plugin.yaml, image-gen/plugin.yaml, gh-identity/plugin.yaml, molecule-hitl/plugin.yaml, validated by each plugin repo's `.molecule-ci/scripts/validate-plugin.py` (required: name/version/description; runtimes must be a list; content is one of SKILL.md/hooks/skills/rules). The design is VS-Code-shaped: `engines` pins the minimum host version (like engines.vscode), and `contributes` is the OPEN, forward-compatible contribution surface — its KNOWN keys (skills/hooks/rules/mcpServers/commands, v1) are validated by shape while UNKNOWN contribution points (e.g. future themes/tabs/canvasElements) are tolerated (additionalProperties:true at the contributes level), so a newer plugin never fails this schema on an additive contribution point. The top-level `skills`/`hooks`/`rules` string lists mirror the real plugin.yaml v0 shorthand and remain accepted alongside the richer `contributes`. CANONICAL RUNTIMES: the `runtimes` enum is the SSOT reconciliation of the cross-artifact drift — the canonical form is the HYPHEN spelling (`claude-code`, matching the workspace/org templates and validate-workspace-template.py's known set); the legacy plugin UNDERSCORE spelling (`claude_code`) used by today's plugin.yaml files is accepted as an alias (normalizes to the hyphen form). The enum is the SUPPORTED runtime set — claude-code, codex, hermes, openclaw, crewai, google-adk, external.",
   "type": "object",
   "additionalProperties": true,
   "required": ["name", "version", "description"],
@@ -85,21 +85,16 @@
   "$defs": {
     "runtimeId": {
       "type": "string",
-      "description": "CANONICAL runtime identifier. Hyphen form is canonical (`claude-code`); underscore forms (`claude_code`, `gemini_cli`) are accepted legacy aliases that normalize to the hyphen form. The enum is the union of the canonical set and those two aliases, and INCLUDES deepagents/langgraph/autogen (which real plugins declare).",
+      "description": "CANONICAL runtime identifier. Hyphen form is canonical (`claude-code`); the underscore form (`claude_code`) is an accepted legacy alias that normalizes to the hyphen form. The enum is the supported runtime set plus that alias.",
       "enum": [
         "claude-code",
         "codex",
         "hermes",
         "openclaw",
-        "langgraph",
-        "autogen",
         "crewai",
-        "deepagents",
-        "gemini-cli",
         "google-adk",
         "external",
-        "claude_code",
-        "gemini_cli"
+        "claude_code"
       ]
     },
     "engines": {
