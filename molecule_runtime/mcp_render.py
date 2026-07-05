@@ -6,8 +6,6 @@ reads MCP servers from a different native config file in a different format:
 
   * Claude Code → ``<configs>/.claude/settings.json`` ``mcpServers`` map (JSON).
   * Codex       → ``~/.codex/config.toml`` ``[mcp_servers.<name>]`` tables (TOML).
-  * Gemini CLI  → ``~/.gemini/settings.json`` ``mcpServers`` map (JSON) — TODO,
-                  format unverified.
   * Hermes      → ``platforms.*`` / entry-point descriptor — TODO, format
                   unverified.
 
@@ -173,27 +171,6 @@ def render_codex_config(config_path: Path, name: str, spec: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gemini CLI — ~/.gemini/settings.json  (TODO: format unverified)
-# ---------------------------------------------------------------------------
-
-def render_gemini_settings(settings_path: Path, name: str, spec: dict) -> None:
-    """TODO(#3159): Gemini CLI's native MCP config shape is unverified.
-
-    Public Gemini CLI docs describe a ``~/.gemini/settings.json`` with an
-    ``mcpServers`` map that looks JSON-identical to Claude's, but the
-    command/args/env field names have NOT been confirmed against a real
-    install, and Gemini may use ``httpUrl``/``url`` transports we don't model
-    here. Rather than guess and ship a config a gemini concierge silently can't
-    read (the exact #3159 failure mode), this is left as a marked stub with a
-    skipped render-matrix test. Implement concretely once the format is pinned
-    against a live gemini-cli runtime.
-    """
-    raise NotImplementedError(
-        "gemini-cli MCP render not implemented — format unverified (#3159 follow-up)"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Hermes — platforms.* / entry-point descriptor (TODO: format unverified)
 # ---------------------------------------------------------------------------
 
@@ -297,10 +274,6 @@ def _codex_path(config_path: str | os.PathLike) -> Path:
     return Path(os.path.expanduser("~")) / ".codex" / "config.toml"
 
 
-def _gemini_path(config_path: str | os.PathLike) -> Path:
-    return Path(os.path.expanduser("~")) / ".gemini" / "settings.json"
-
-
 def _openclaw_path(config_path: str | os.PathLike) -> Path:
     # OpenClaw reads ~/.openclaw/openclaw.json (the file `openclaw mcp set`
     # mutates). config_path is unused (openclaw resolves $HOME), but the
@@ -359,7 +332,6 @@ def _openclaw_config_has(config_path: Path, name: str) -> bool:
 _RUNTIME_SPECS: dict[str, tuple] = {
     "claude_code": (_claude_path, render_claude_settings, _json_settings_has),
     "codex": (_codex_path, render_codex_config, _codex_config_has),
-    "gemini_cli": (_gemini_path, render_gemini_settings, _json_settings_has),
     # hermes: native path unverified; fail-loud render, never falsely present.
     "hermes": (_claude_path, render_hermes_config, lambda p, n: False),
     # openclaw (phase P4): CONCRETE renderer + present-reader pinned against a
@@ -379,7 +351,7 @@ _DEFAULT_RUNTIME = "claude_code"
 # Runtimes whose renderer is a deliberate fail-loud stub (format unverified).
 # openclaw graduated out (phase P4): it now has a concrete renderer +
 # present-reader verified against a live openclaw runtime.
-_UNVERIFIED_RUNTIMES = frozenset({"gemini_cli", "hermes"})
+_UNVERIFIED_RUNTIMES = frozenset({"hermes"})
 
 
 def _spec_for(runtime: str) -> tuple:
@@ -390,8 +362,8 @@ def is_runtime_supported(runtime: str) -> bool:
     """True when this runtime has a CONCRETE (non-stub) renderer mapped.
 
     Unmapped runtimes fall back to the claude renderer (supported); the
-    gemini/hermes stubs are mapped but their renderer raises, so they are
-    reported unsupported."""
+    hermes stub is mapped but its renderer raises, so it is reported
+    unsupported."""
     return normalize_runtime(runtime) not in _UNVERIFIED_RUNTIMES
 
 
@@ -404,7 +376,7 @@ def render_for_runtime(runtime: str, config_path: str | os.PathLike, name: str, 
     """Render ``name -> spec`` into the given runtime's native MCP config.
 
     Returns the path written. Raises NotImplementedError for an unverified
-    runtime (gemini/hermes) — the caller decides whether that's fatal (it is for
+    runtime (hermes) — the caller decides whether that's fatal (it is for
     the privileged management MCP)."""
     path_fn, render_fn, _ = _spec_for(runtime)
     target = path_fn(config_path)
@@ -434,7 +406,7 @@ def management_mcp_present_for(runtime: str, config_path: str | os.PathLike, nam
 
 
 def _read_json_mcp_servers(settings_path: Path) -> dict:
-    """Read the ``mcpServers`` map from a JSON settings file (claude, gemini)."""
+    """Read the ``mcpServers`` map from a JSON settings file (claude)."""
     try:
         data = json.loads(Path(settings_path).read_text())
     except (OSError, ValueError):
@@ -472,13 +444,12 @@ def _read_openclaw_mcp_servers(config_path: Path) -> dict:
 
 # runtime -> native-config reader. Mirrors _RUNTIME_SPECS (same path resolver +
 # native format), but returns the FULL {name: spec} map rather than a single
-# present-bool. Unverified runtimes (gemini/hermes) get a reader that returns {}
-# — their format is not pinned, so the producer reports nothing for them rather
-# than guessing (the same fail-loud-vs-fail-silent stance as their renderers).
+# present-bool. The unverified runtime (hermes) gets a reader that returns {}
+# — its format is not pinned, so the producer reports nothing for it rather
+# than guessing (the same fail-loud-vs-fail-silent stance as its renderer).
 _RUNTIME_READERS: dict[str, callable] = {
     "claude_code": _read_json_mcp_servers,
     "codex": _read_codex_mcp_servers,
-    "gemini_cli": lambda _p: {},
     "hermes": lambda _p: {},
     "openclaw": _read_openclaw_mcp_servers,
 }

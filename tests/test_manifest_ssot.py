@@ -53,7 +53,7 @@ def _valid_manifest() -> dict:
         "name": "test-plugin",
         "version": "1.2.0",
         "description": "A conformant test plugin.",
-        "runtimes": ["claude-code", "deepagents", "langgraph", "autogen"],
+        "runtimes": ["claude-code", "codex", "crewai", "google-adk"],
         "kind": "env-mutator",
     }
 

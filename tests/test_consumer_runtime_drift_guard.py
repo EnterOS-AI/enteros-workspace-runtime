@@ -124,12 +124,8 @@ def test_default_consumers_cover_all_shipping_templates() -> None:
     import check_consumer_runtime_drift as guard
 
     for repo in (
-        "molecule-ai-workspace-template-langgraph",
-        "molecule-ai-workspace-template-autogen",
         "molecule-ai-workspace-template-google-adk",
         "molecule-ai-workspace-template-crewai",
-        "molecule-ai-workspace-template-deepagents",
-        "molecule-ai-workspace-template-gemini-cli",
     ):
         assert repo in guard.DEFAULT_CONSUMERS, f"{repo} missing from DEFAULT_CONSUMERS"
 
@@ -143,7 +139,7 @@ def test_reconcile_flags_unenumerated_pinned_template(monkeypatch: pytest.Monkey
         guard,
         "_org_template_repos",
         lambda gitea_url, token, org="molecule-ai": [
-            "molecule-ai-workspace-template-langgraph",  # enumerated -> ok
+            "molecule-ai-workspace-template-crewai",  # enumerated -> ok
             "molecule-ai-workspace-template-seo-agent",  # exempt -> ok
             "molecule-ai-workspace-template-newruntime",  # NOT accounted for
         ],
@@ -169,7 +165,7 @@ def test_reconcile_clean_when_all_accounted(monkeypatch: pytest.MonkeyPatch) -> 
         guard,
         "_org_template_repos",
         lambda gitea_url, token, org="molecule-ai": [
-            "molecule-ai-workspace-template-langgraph",
+            "molecule-ai-workspace-template-crewai",
             "molecule-ai-workspace-template-seo-agent",
         ],
     )

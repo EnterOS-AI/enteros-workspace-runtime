@@ -7,8 +7,8 @@ plugin-manifest contract schema that lives in the `molecule-ai-sdk` repository:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `02dde7ef1a180b87877f6e313609d6d0e7f3266f` (last commit touching the schema)
-Vendored at sdk HEAD: `ab2322fb4fbbc7fa784c47d82e3e195df897a30e` (main)
+Source commit:        `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` (last commit touching the schema — ai-sdk#53 dropped langgraph/autogen/gemini-cli/deepagents from the runtime enum)
+Vendored at sdk HEAD: `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` (main)
 
 ## Why vendored (and not fetched)
 

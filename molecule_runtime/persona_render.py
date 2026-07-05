@@ -27,7 +27,7 @@ convention:
   * Codex       → ``<configs>/AGENTS.md`` — the AAIF / AGENTS.md convention codex
                   reads from its project directory.
   * Gemini / google-adk → ``<configs>/GEMINI.md`` — the Gemini context-file
-                  convention (``gemini``/``gemini-cli``/``google-adk`` all map here).
+                  convention (``gemini`` / ``google-adk`` map here).
   * Hermes      → native convention unverified — deliberate fail-loud stub.
 
 The bug this closes
@@ -87,7 +87,7 @@ OPENCLAW_CLEARED_FILES = ("BOOTSTRAP.md", "AGENTS.md")
 # Codex reads the AAIF-standard AGENTS.md from its project directory.
 CODEX_PERSONA_FILE = "AGENTS.md"
 
-# Gemini CLI / google-adk read GEMINI.md as their durable context / identity file.
+# Gemini / google-adk read GEMINI.md as their durable context / identity file.
 GEMINI_PERSONA_FILE = "GEMINI.md"
 
 # Fallback persona source when a workspace declares no ``prompt_files`` — the same
@@ -197,7 +197,7 @@ def materialize_codex_persona(config_path: Path, persona: str) -> Path:
 
 
 def materialize_gemini_persona(config_path: Path, persona: str) -> Path:
-    """Gemini CLI / google-adk — write the persona to ``<configs>/GEMINI.md``
+    """Gemini / google-adk — write the persona to ``<configs>/GEMINI.md``
     (the Gemini context-file convention)."""
     target = Path(config_path) / GEMINI_PERSONA_FILE
     _write_persona_file(target, persona)
@@ -253,9 +253,8 @@ _RUNTIME_PERSONA: dict[str, tuple] = {
     "claude_code": (_claude_persona_path, materialize_claude_persona),
     "openclaw": (_openclaw_persona_path, materialize_openclaw_persona),
     "codex": (_codex_persona_path, materialize_codex_persona),
-    # Gemini has several runtime spellings across the platform; all share GEMINI.md.
+    # Gemini and google-adk share the GEMINI.md context-file convention.
     "gemini": (_gemini_persona_path, materialize_gemini_persona),
-    "gemini_cli": (_gemini_persona_path, materialize_gemini_persona),
     "google_adk": (_gemini_persona_path, materialize_gemini_persona),
     # hermes: native identity convention unverified — fail-loud stub.
     "hermes": (_claude_persona_path, materialize_hermes_persona),

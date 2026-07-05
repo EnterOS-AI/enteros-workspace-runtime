@@ -10,8 +10,8 @@ from a2a.server.agent_execution import RequestContext
 # SSOT (runtime #2914): `set_current_task` previously had a SECOND, divergent
 # definition here that opened a raw `httpx.AsyncClient` and posted the
 # heartbeat UNAUTHENTICATED. Every adapter that imports through
-# `shared_runtime` (langgraph + claude-code via a2a_executor, autogen via
-# adapters.shared_runtime) silently used that un-auth'd path. The canonical,
+# `shared_runtime` (claude-code via a2a_executor, and the subprocess-backed
+# adapters via adapters.shared_runtime) silently used that un-auth'd path. The canonical,
 # authenticated implementation lives in `executor_helpers` (it routes through
 # the shared `get_http_client()` and attaches `platform_auth.auth_headers()`).
 # Re-export it here so there is exactly one implementation and every caller

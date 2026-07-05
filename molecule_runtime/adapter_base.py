@@ -444,8 +444,8 @@ class BaseAdapter(ABC):
         Dispatches on the active runtime via
         :func:`molecule_runtime.mcp_render.mcp_settings_path_for` —
         ``.claude/settings.json`` for Claude Code, ``~/.codex/config.toml`` for
-        codex, ``~/.gemini/settings.json`` for gemini-cli, etc. An unmapped
-        runtime falls back to the Claude path (the base runtime). Tied to the
+        codex, etc. An unmapped runtime falls back to the Claude path (the base
+        runtime). Tied to the
         cross-repo delivery contract's per-runtime ``settings_path`` map."""
         from molecule_runtime.mcp_render import mcp_settings_path_for
         return str(mcp_settings_path_for(self.name(), config.config_path))
@@ -462,7 +462,7 @@ class BaseAdapter(ABC):
         codex concierge got the management MCP written to ``.claude/settings.json``
         (a file its runtime never reads) and so booted without ``create_workspace``.
 
-        An unverified runtime (gemini/hermes) renders via a deliberate
+        An unverified runtime (hermes) renders via a deliberate
         NotImplementedError stub — caught by ``MCPServerAdaptor.install``, which
         fails the privileged management-MCP install LOUDLY rather than booting a
         silently capability-less concierge. An adapter for such a runtime may
