@@ -583,6 +583,20 @@ async def main():  # pragma: no cover
     except Exception as e:  # noqa: BLE001 — boot-install must never block boot
         print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
 
+    # 0.2d Self-reprovision wake detection (design §5.2 — proactive wake).
+    # Diff the plugins tree boot-install just (re)built against last boot's
+    # durable record. READ-ONLY when there are additions: the diff is NOT
+    # consumed here — consumption is staged at 10b2 (attempt-marked once the
+    # adapter is known ready, consumed on send success, replay bounded by
+    # MAX_WAKE_ATTEMPTS) so a misconfigured or slow boot DEFERS the
+    # announcement instead of eating it. First boot / no-additions boots
+    # refresh the state silently (greeting territory, not ours).
+    # MUST run right here: after install_declared_plugins (the tree is
+    # final) and before load_config may reassign config_path (the state
+    # file lives beside the env-resolved plugins dir it describes).
+    from molecule_runtime.reprovision_wake import prepare_wake_plan
+    wake_plan = prepare_wake_plan()
+
     # 0.3 Pre-commit hook installer — refuses commits that add internal-flavored
     # paths or known secret shapes to any git repo the workspace touches. Lifted
     # into runtime so all templates get the gate without per-Dockerfile wiring.
@@ -1287,6 +1301,47 @@ async def main():  # pragma: no cover
 
         initial_prompt_task = asyncio.create_task(_send_initial_prompt())
 
+    # 10b2. Self-reprovision wake note (design §5.2 step 3 — never silent).
+    # When step 0.2d detected plugins newly added since the last boot, the
+    # agent's FIRST act after this reprovision is announcing them to the
+    # user, via the same platform-proxy self-message seam as initial_prompt.
+    # Staged consumption (review 2026-07-05): the pending announcement is
+    # attempt-marked HERE (only once the adapter is known ready — a
+    # misconfigured boot leaves the state untouched, so the note re-arms on
+    # the next healthy boot) and consumed inside the send task only on send
+    # SUCCESS. Replay is bounded by MAX_WAKE_ATTEMPTS; a failed attempt-mark
+    # persist (read-only volume) skips the send entirely so an unbounded
+    # announce-every-boot loop is impossible.
+    reprovision_wake_task = None
+    if wake_plan.additions:
+        if adapter_ready:
+            from molecule_runtime.reprovision_wake import (
+                mark_wake_attempt,
+                send_wake_note_when_ready,
+            )
+            if mark_wake_attempt(wake_plan):
+                reprovision_wake_task = asyncio.create_task(
+                    send_wake_note_when_ready(
+                        wake_plan,
+                        port=port,
+                        platform_url=platform_url,
+                        workspace_id=workspace_id,
+                    )
+                )
+            else:
+                print(
+                    "Reprovision wake: could not persist the attempt marker — "
+                    f"skipping announcement for {wake_plan.additions} (unbounded-replay guard)",
+                    flush=True,
+                )
+        else:
+            print(
+                "Reprovision wake: newly installed plugin(s) detected "
+                f"({wake_plan.additions}) but the adapter is not ready — deferring "
+                "the announcement to the next healthy boot (state not consumed)",
+                flush=True,
+            )
+
     # 10c. Idle loop — reflection-on-completion / backlog-pull pattern.
     # Fires config.idle_prompt every config.idle_interval_seconds while the
     # workspace has no active task. This turns every role from "waits for cron"
@@ -1506,6 +1561,12 @@ async def main():  # pragma: no cover
         # Cancel initial prompt if still running
         if initial_prompt_task and not initial_prompt_task.done():
             initial_prompt_task.cancel()
+        # Cancel the reprovision wake note if still in flight. Staged
+        # consumption: the pending state is only cleared on send success,
+        # so a cancel here re-arms the announcement on the next boot —
+        # bounded by MAX_WAKE_ATTEMPTS, never an unbounded replay.
+        if reprovision_wake_task and not reprovision_wake_task.done():
+            reprovision_wake_task.cancel()
         # Cancel idle loop if running
         if idle_loop_task and not idle_loop_task.done():
             idle_loop_task.cancel()
