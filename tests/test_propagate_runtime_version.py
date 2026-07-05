@@ -327,3 +327,37 @@ def test_open_bump_pr_uses_http_with_retry_for_pr_post(monkeypatch: pytest.Monke
     assert len(set(pre_post_calls)) == 3, (
         f"pre-POST calls were retried (not expected): {pre_post_calls}"
     )
+
+
+def test_requirements_pin_regex_matches_canonical_dist_name() -> None:
+    """RC 2026-07-05: the dist rename (`molecule-ai-workspace-runtime` ->
+    `molecules-workspace-runtime`, dependency-confusion fix) left the
+    requirements-pin regex matching only the LEGACY name, so dual-pin
+    templates (codex, google-adk) received .runtime-version-only bumps
+    while requirements.txt stayed frozen on registry-purged versions and
+    their template validation failed on 'No matching distribution found'.
+    The regex must bump the canonical name."""
+    content = (
+        "# Molecule AI workspace runtime\n"
+        "molecules-workspace-runtime==0.3.70\n"
+        "a2a-sdk==1.0.3\n"
+    )
+    updated = prop._update_requirements_content(content, "0.3.85")
+    assert updated is not None, "canonical dist-name pin not recognized"
+    assert "molecules-workspace-runtime==0.3.85" in updated
+    assert "a2a-sdk==1.0.3" in updated, "unrelated pins must be untouched"
+
+
+def test_requirements_pin_regex_still_matches_legacy_dist_name() -> None:
+    """Straggler templates still on the pre-rename name keep receiving
+    atomic dual-pin bumps."""
+    content = "molecule-ai-workspace-runtime==0.3.26\n"
+    updated = prop._update_requirements_content(content, "0.3.85")
+    assert updated is not None
+    assert updated.strip() == "molecule-ai-workspace-runtime==0.3.85"
+
+
+def test_requirements_pin_regex_returns_none_when_no_pin() -> None:
+    """No runtime pin present -> None (nothing to update), unchanged from
+    the historical contract."""
+    assert prop._update_requirements_content("a2a-sdk==1.0.3\n", "0.3.85") is None

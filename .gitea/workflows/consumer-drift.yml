@@ -3,6 +3,10 @@ name: consumer-drift
 on:
   push:
     branches: [main]
+  # Drift is best caught at change time: run as a per-PR gate (and on
+  # push:main) instead of a daily cron (no-nightly/no-cron CI policy).
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
