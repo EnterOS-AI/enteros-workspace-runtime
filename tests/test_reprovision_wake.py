@@ -126,6 +126,46 @@ def test_replay_bounded_by_max_attempts(tmp_path: Path):
     assert "pending" not in st and "beta" in st["plugins"]
 
 
+def test_exhausted_pending_removed_new_addition_gets_fresh_budget(tmp_path: Path):
+    """Review repro (e), zero-attempt drop: pending plugin-x exhausts its
+    budget and is removed, while plugin-y lands fresh — y must be announced
+    with a FULL budget, never dropped with zero delivery attempts."""
+    plugins = tmp_path / "plugins"
+    _mk_plugin(plugins, "alpha")
+    _plan(tmp_path)
+    _mk_plugin(plugins, "plugin-x")
+    for _ in range(MAX_WAKE_ATTEMPTS):  # x burns its whole budget
+        plan = _plan(tmp_path)
+        assert plan.additions == ["plugin-x"]
+        assert mark_wake_attempt(plan)
+
+    import shutil
+
+    shutil.rmtree(plugins / "plugin-x")  # x removed...
+    _mk_plugin(plugins, "plugin-y")  # ...y newly installed
+
+    plan = _plan(tmp_path)
+    assert plan.additions == ["plugin-y"]
+    assert plan.attempts == 0  # fresh budget, not x's exhausted one
+
+
+def test_new_addition_resets_attempt_budget(tmp_path: Path):
+    """Review repro (e), budget inheritance: a new plugin joining a partly
+    burned pending batch resets the counter so it gets its full budget."""
+    plugins = tmp_path / "plugins"
+    _mk_plugin(plugins, "alpha")
+    _plan(tmp_path)
+    _mk_plugin(plugins, "plugin-x")
+    for _ in range(2):  # x burns 2 of its 3 attempts
+        plan = _plan(tmp_path)
+        assert mark_wake_attempt(plan)
+
+    _mk_plugin(plugins, "plugin-y")
+    plan = _plan(tmp_path)
+    assert plan.additions == ["plugin-x", "plugin-y"]
+    assert plan.attempts == 0  # reset — y gets a full budget (x rides along)
+
+
 def test_pending_plugin_since_removed_is_not_reannounced(tmp_path: Path):
     plugins = tmp_path / "plugins"
     _mk_plugin(plugins, "alpha")

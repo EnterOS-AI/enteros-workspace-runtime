@@ -1561,8 +1561,10 @@ async def main():  # pragma: no cover
         # Cancel initial prompt if still running
         if initial_prompt_task and not initial_prompt_task.done():
             initial_prompt_task.cancel()
-        # Cancel the reprovision wake note if still in flight (the consumed
-        # state means it will NOT replay next boot — deliberate, see #71).
+        # Cancel the reprovision wake note if still in flight. Staged
+        # consumption: the pending state is only cleared on send success,
+        # so a cancel here re-arms the announcement on the next boot —
+        # bounded by MAX_WAKE_ATTEMPTS, never an unbounded replay.
         if reprovision_wake_task and not reprovision_wake_task.done():
             reprovision_wake_task.cancel()
         # Cancel idle loop if running

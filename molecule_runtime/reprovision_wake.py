@@ -227,6 +227,18 @@ def prepare_wake_plan(
 
         additions = sorted(set(current) - set(previous) | set(pending_additions))
 
+        # The attempts budget belongs to the PENDING announcement, not to the
+        # batch as a whole. Any genuinely-new addition (not part of the
+        # carried-over pending set) resets the counter — otherwise a fresh
+        # install could inherit an exhausted/partial budget and be dropped
+        # with ZERO delivery attempts (e.g. pending plugin-x at attempts=3
+        # gets removed while plugin-y lands: y must get its full budget).
+        # A surviving pending plugin riding along with a new one gets extra
+        # budget — bounded per composition change, and strictly better than
+        # silently losing the new plugin's announcement.
+        if set(additions) - set(pending_additions):
+            attempts = 0
+
         if not additions:
             _write_state(s_path, current)  # refresh; clears stale pending
             return WakePlan(current=current, state_path=str(s_path))
