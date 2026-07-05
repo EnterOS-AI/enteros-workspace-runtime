@@ -583,6 +583,18 @@ async def main():  # pragma: no cover
     except Exception as e:  # noqa: BLE001 — boot-install must never block boot
         print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
 
+    # 0.2d Self-reprovision wake detection (design §5.2 — proactive wake).
+    # Diff the plugins tree boot-install just (re)built against last boot's
+    # durable record and CONSUME the diff (state rewritten up front, #71
+    # pattern). Non-empty additions schedule the wake self-message at step
+    # 10b2 below — the agent announces what it installed instead of waking
+    # silent. First boot records silently (greeting territory, not ours).
+    # MUST run right here: after install_declared_plugins (the tree is
+    # final) and before load_config may reassign config_path (the state
+    # file lives beside the env-resolved plugins dir it describes).
+    from molecule_runtime.reprovision_wake import record_and_diff
+    newly_installed_plugins = record_and_diff()
+
     # 0.3 Pre-commit hook installer — refuses commits that add internal-flavored
     # paths or known secret shapes to any git repo the workspace touches. Lifted
     # into runtime so all templates get the gate without per-Dockerfile wiring.
@@ -1287,6 +1299,29 @@ async def main():  # pragma: no cover
 
         initial_prompt_task = asyncio.create_task(_send_initial_prompt())
 
+    # 10b2. Self-reprovision wake note (design §5.2 step 3 — never silent).
+    # When step 0.2d detected plugins newly added since the last boot, the
+    # agent's FIRST act after this reprovision is announcing them to the
+    # user, via the same platform-proxy self-message seam as initial_prompt.
+    # The diff was already consumed at 0.2d (state rewritten), so a crash
+    # here never replays the announcement on the next boot. Gated on
+    # adapter_ready exactly like initial_prompt: on a misconfigured boot
+    # the self-message would just 404 into the not-configured handler.
+    reprovision_wake_task = None
+    if adapter_ready and newly_installed_plugins:
+        from molecule_runtime.reprovision_wake import (
+            build_wake_note,
+            send_wake_note_when_ready,
+        )
+        reprovision_wake_task = asyncio.create_task(
+            send_wake_note_when_ready(
+                build_wake_note(newly_installed_plugins),
+                port=port,
+                platform_url=platform_url,
+                workspace_id=workspace_id,
+            )
+        )
+
     # 10c. Idle loop — reflection-on-completion / backlog-pull pattern.
     # Fires config.idle_prompt every config.idle_interval_seconds while the
     # workspace has no active task. This turns every role from "waits for cron"
@@ -1506,6 +1541,10 @@ async def main():  # pragma: no cover
         # Cancel initial prompt if still running
         if initial_prompt_task and not initial_prompt_task.done():
             initial_prompt_task.cancel()
+        # Cancel the reprovision wake note if still in flight (the consumed
+        # state means it will NOT replay next boot — deliberate, see #71).
+        if reprovision_wake_task and not reprovision_wake_task.done():
+            reprovision_wake_task.cancel()
         # Cancel idle loop if running
         if idle_loop_task and not idle_loop_task.done():
             idle_loop_task.cancel()
