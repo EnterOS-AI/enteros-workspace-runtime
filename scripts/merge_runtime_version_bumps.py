@@ -157,6 +157,14 @@ class GiteaClient:
         headers = {
             "Authorization": f"token {token}",
             "Accept": "application/json",
+            # CF edge 403s the default python-urllib UA (error 1010); send a
+            # curl UA so calls through the CF-fronted git.moleculesai.app
+            # succeed. Same workaround as propagate_runtime_version.py:133 and
+            # check_consumer_runtime_drift.py:137 — the sweeper was the ONLY
+            # one of the three scripts missing it, which 1010-blocked its very
+            # first live API call (GET /user) the moment the tokens were
+            # finally provisioned (2026-07-05).
+            "User-Agent": "curl/8.4.0",
         }
         data: bytes | None = None
         if body is not None:

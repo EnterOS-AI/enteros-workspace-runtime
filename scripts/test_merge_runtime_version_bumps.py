@@ -252,6 +252,32 @@ class Constants(unittest.TestCase):
         self.assertFalse(hasattr(_mod, "BOT_AUTHOR_USERNAME"))
         self.assertFalse(hasattr(_mod, "REVIEWER_USERNAME"))
 
+    def test_requests_carry_curl_user_agent(self) -> None:
+        # CF-1010 regression (2026-07-05): the CF edge 403-bans the default
+        # python-urllib UA. propagate_runtime_version.py and
+        # check_consumer_runtime_drift.py both send a curl UA; the sweeper
+        # was the only script missing it, which blocked its first live API
+        # call (GET /user) the moment the tokens were provisioned. Pin the
+        # header at the Request-construction layer.
+        import urllib.request
+
+        captured: list[urllib.request.Request] = []
+
+        def fake_urlopen(req, timeout=30):  # noqa: ANN001
+            captured.append(req)
+            raise ConnectionError("stop after capturing the request")
+
+        client = _mod.GiteaClient("https://example.invalid", "m", "r", "molecule-ai")
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            with self.assertRaises(ConnectionError):
+                client._request("GET", "/api/v1/user")
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].get_header("User-agent"), "curl/8.4.0")
+
     def test_whoami_reads_user_endpoint(self) -> None:
         # The dynamic identity resolution reads GET /api/v1/user with the
         # chosen token and returns '' on failure (run() then hard-fails).
