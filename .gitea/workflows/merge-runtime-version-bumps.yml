@@ -9,12 +9,16 @@ name: merge-runtime-version-bumps
 # automation that was missing.
 #
 # Tightly scoped:
-#   - only `molecule-runtime-release-bot` (the identity the propagate
-#     script uses, per scripts/auto_release_runtime.py)
+#   - only PRs authored by the opener identity — resolved dynamically as
+#     whoami(DISPATCH_TOKEN), the same Infisical /shared/runtime-bot
+#     credential the propagate script opens the PRs with (never a
+#     hardcoded username; identity-drift RC 2026-07-05)
 #   - only `.runtime-version` and `requirements.txt` (the dual-pin
 #     templates bump both atomically; nothing else is allowed)
-#   - only when both `validate-runtime` + `t4-conformance` commit
-#     statuses are `success` on the head
+#   - only when the head's combined commit status is `success` AND the
+#     universal wheel-install gate ("Template validation (runtime)")
+#     posted success (substring-matched; the old exact names never
+#     matched what the template CIs actually emit)
 #   - per-repo opt-out via `.gitea/REPO.yaml`'s `runtime-merge-bumps: false`
 #
 # Replaces the manual approve+merge that had to happen every release

@@ -205,8 +205,19 @@ def find_runtime_drift(repo_name: str, repo_path: Path, runtime_root: Path | Non
 
 
 def _org_template_repos(gitea_url: str, token: str, *, org: str = "molecule-ai") -> list[str]:
-    """Enumerate ``molecule-ai-workspace-template-*`` repos in the org via the
-    Gitea API (paginated). Returns repo names. Raises on a hard API failure."""
+    """Enumerate LIVE ``molecule-ai-workspace-template-*`` repos in the org via
+    the Gitea API (paginated). Returns repo names. Raises on a hard API failure.
+
+    ARCHIVED repos are excluded: archiving makes a Gitea repo read-only, so a
+    ``.runtime-version`` pin in an archived repo is frozen by definition — a
+    propagation bump PR cannot land there, and the repo is no longer a live
+    wheel consumer. Flagging it as a "blind spot" would demand an action
+    (enumerate or exempt) that can never converge back to green via the pin
+    itself. Concrete instance: the four retired-runtime templates
+    (langgraph / autogen / deepagents / gemini-cli) were archived org-wide on
+    2026-07-04 as part of the 4-runtime removal, still carry their last-frozen
+    pin, and painted runtime main red until this filter.
+    """
     import json
     import urllib.request
     import urllib.error
@@ -235,6 +246,10 @@ def _org_template_repos(gitea_url: str, token: str, *, org: str = "molecule-ai")
         if not isinstance(batch, list) or not batch:
             break
         for repo in batch:
+            if repo.get("archived"):
+                # Read-only: pin frozen, bump PRs impossible — not a live
+                # consumer (see docstring).
+                continue
             name = repo.get("name", "")
             if name.startswith("molecule-ai-workspace-template-"):
                 names.append(name)
