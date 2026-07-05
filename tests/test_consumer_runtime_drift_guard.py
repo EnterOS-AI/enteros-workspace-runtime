@@ -205,6 +205,48 @@ def test_org_listing_403_raises_reconcile_unavailable(monkeypatch: pytest.Monkey
         guard._org_template_repos("https://git.moleculesai.app", "scopeless-token")
 
 
+def test_org_listing_skips_archived_repos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Archived template repos are read-only: their .runtime-version pin is
+    frozen and a propagation bump PR can never land, so they are NOT live wheel
+    consumers and must not trip the blind-spot reconcile. Regression for the
+    2026-07-05 main red: the four retired-runtime templates (langgraph/autogen/
+    deepagents/gemini-cli, archived 2026-07-04) still carry frozen pins and
+    painted runtime main red until the org scan learned to skip archived."""
+    import json
+    import urllib.request
+
+    import check_consumer_runtime_drift as guard
+
+    batch = [
+        {"name": "molecule-ai-workspace-template-crewai", "archived": False},
+        {"name": "molecule-ai-workspace-template-langgraph", "archived": True},
+        {"name": "molecule-ai-workspace-template-gemini-cli", "archived": True},
+        # archived flag absent -> treated as live (defensive default)
+        {"name": "molecule-ai-workspace-template-hermes"},
+        # non-template org repo, never included regardless
+        {"name": "molecule-core", "archived": False},
+    ]
+
+    class FakeResp(io.BytesIO):
+        status = 200
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *exc):  # noqa: ANN002, ANN204
+            return False
+
+    def fake_urlopen(req, timeout=15):  # noqa: ANN001
+        return FakeResp(json.dumps(batch).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    repos = guard._org_template_repos("https://git.moleculesai.app", "some-token")
+    assert repos == [
+        "molecule-ai-workspace-template-crewai",
+        "molecule-ai-workspace-template-hermes",
+    ], "archived template repos must be excluded from the org consumer scan"
+
+
 def test_main_warns_and_skips_reconcile_on_scope_gap(monkeypatch: pytest.MonkeyPatch, capsys, tmp_path) -> None:
     """When the org-scan reconcile is unavailable (token scope), main() must NOT
     fail: it warns and falls through to the pin-drift check, which passes here."""
