@@ -87,9 +87,22 @@ TEMPLATE_CONSUMERS = tuple(
 )
 
 # Regex for the runtime pin line in requirements.txt. Matches lines like:
-#   molecule-ai-workspace-runtime==0.3.26
+#   molecules-workspace-runtime==0.3.84     (canonical dist name)
+#   molecule-ai-workspace-runtime==0.3.26   (legacy pre-rename name)
+#
+# RC 2026-07-05: the dist was renamed `molecule-ai-workspace-runtime` ->
+# `molecules-workspace-runtime` (dependency-confusion fix, 2026-07-03) but
+# this regex still matched only the LEGACY name, so dual-pin templates
+# (codex, google-adk) kept getting `.runtime-version`-only bump PRs while
+# their requirements.txt stayed frozen on versions the registry retention
+# had already purged (0.3.75 / 0.3.70) — template validation then failed on
+# `No matching distribution found`, the bump PRs could never merge, and the
+# consumer-drift gate on runtime main went red. Both names stay matched so
+# any straggler template still on the legacy name keeps receiving atomic
+# dual-pin bumps.
 RUNTIME_PIN_RE = re.compile(
-    r"^(molecule-ai-workspace-runtime==)([0-9]+\.[0-9]+\.[0-9]+(?:[a-zA-Z0-9.-]*))",
+    r"^((?:molecules-workspace-runtime|molecule-ai-workspace-runtime)==)"
+    r"([0-9]+\.[0-9]+\.[0-9]+(?:[a-zA-Z0-9.-]*))",
     re.MULTILINE,
 )
 
@@ -202,8 +215,9 @@ def read_pinned_version(repo: str, *, gitea_url: str, token: str | None = None) 
 def read_requirements_pin(repo: str, *, gitea_url: str, token: str | None = None) -> str | None:
     """Read a consumer's requirements.txt runtime pin, if any.
 
-    Returns the pinned version string (e.g. "0.3.26") if a
-    ``molecule-ai-workspace-runtime==<ver>`` line exists, else None.
+    Returns the pinned version string (e.g. "0.3.84") if a
+    ``molecules-workspace-runtime==<ver>`` (or legacy
+    ``molecule-ai-workspace-runtime==<ver>``) line exists, else None.
     Returns None on 404 (no requirements.txt).
     """
     url = f"{gitea_url}/api/v1/repos/{ORG}/{repo}/raw/requirements.txt"
