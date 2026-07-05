@@ -94,7 +94,8 @@ jobs:
       # (scripts/check_platform_comm_contract.py) was RETIRED — replaced by an
       # in-repo, offline schema-conformance gate that validates the REAL
       # register/heartbeat/A2A wire payloads against the SSOT JSON-Schema
-      # (molecule-contracts/workspace-comms), run as part of the normal unit-test
+      # (molecule-ai-sdk/contracts/workspace-comms — vendored byte-for-byte, with
+      # each $id retaining the historical molecule-contracts URL), run as part of the normal unit-test
       # lane (tests/test_workspace_comms_conformance.py in ci.yml). That gate is
       # strictly stronger (real bytes vs code structure), needs no cross-repo
       # clone or token, and never silently SKIPs. The SDK side carries a sibling

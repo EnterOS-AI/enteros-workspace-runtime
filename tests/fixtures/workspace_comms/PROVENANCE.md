@@ -1,12 +1,17 @@
 # Vendored workspace-comms JSON-Schemas (SSOT mirror)
 
 These `*.schema.json` files are **byte-for-byte copies** of the SSOT contract
-schemas that live in the `molecule-contracts` repository:
+schemas that live in the `molecule-ai-sdk` repository (the contracts SSOT moved
+there when `molecule-contracts` was archived — the schemas were folded in
+byte-for-byte, so each schema's `$id` still carries the historical
+`molecule-contracts/workspace-comms/...` URL, which is intentional and must NOT
+be rewritten here):
 
-    molecule-contracts/workspace-comms/{register,heartbeat,a2a-envelope,agent-card}.schema.json
+    molecule-ai-sdk/contracts/workspace-comms/{register,heartbeat,a2a-envelope,agent-card}.schema.json
 
-Source commit: `6193798eaaccba700ec271c42acb6cfa15538427`
-Source repo:   https://git.moleculesai.app/molecule-ai/molecule-contracts
+Source commit: `d7c95119e9977d7c14bd37419c6472ea2929cfc7` (last commit touching the workspace-comms schemas in molecule-ai-sdk)
+Source repo:   https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
+Source path:   contracts/workspace-comms/
 
 ## Why vendored (and not fetched)
 
@@ -17,9 +22,16 @@ no network — so the schemas are vendored here rather than fetched from the
 contracts repo or an installed package.
 
 These copies are the SSOT mirror, not a fork. They MUST stay byte-identical to
-the contracts repo. The conformance test asserts each schema's `$id` matches the
-canonical contracts URL as a tripwire against silent edits; to update them, copy
-the files again from the contracts repo at a new commit and bump the SHA above.
+the `molecule-ai-sdk` originals. The conformance test asserts each schema's `$id`
+matches the canonical (historical `molecule-contracts`) URL as a tripwire against
+silent edits; to update them, re-fetch the files from `molecule-ai-sdk` at a new
+commit and bump the SHA above:
+
+    for s in register heartbeat a2a-envelope agent-card; do
+      curl -fsS -A "curl/8.4.0" \
+        "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/workspace-comms/$s.schema.json" \
+        -o "tests/fixtures/workspace_comms/$s.schema.json"
+    done
 
 This vendored conformance gate REPLACES the old AST drift-checker
 (`scripts/check_platform_comm_contract.py`): instead of statically pattern-matching

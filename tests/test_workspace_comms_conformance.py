@@ -4,15 +4,18 @@ This REPLACES the old AST drift-checker (``scripts/check_platform_comm_contract.
 + its ``tests/test_platform_comm_contract*.py``). Rather than statically
 pattern-matching code structure, it captures the ACTUAL register + heartbeat +
 A2A-envelope payloads the runtime puts on the wire and validates each against the
-SSOT JSON-Schema (draft 2020-12) promoted into
-``molecule-contracts/workspace-comms``. That is strictly stronger than the AST
-guard: it checks the real produced bytes (driven through the real builders /
-POST sites), not a code shape a refactor could satisfy while still emitting a
+SSOT JSON-Schema (draft 2020-12) that lives in
+``molecule-ai-sdk/contracts/workspace-comms`` (the contracts SSOT moved there
+when ``molecule-contracts`` was archived; the schemas were folded in
+byte-for-byte, so each ``$id`` still carries the historical
+``molecule-contracts`` URL). That is strictly stronger than the AST guard: it
+checks the real produced bytes (driven through the real builders / POST sites),
+not a code shape a refactor could satisfy while still emitting a
 non-conformant body.
 
 The schemas are vendored under ``tests/fixtures/workspace_comms/`` (byte-for-byte
-copies of the contracts SSOT — see PROVENANCE.md) so the gate runs fully offline
-in CI with no cross-repo clone, no token, and no network.
+copies of the molecule-ai-sdk SSOT — see PROVENANCE.md) so the gate runs fully
+offline in CI with no cross-repo clone, no token, and no network.
 
 Each contract instance models BOTH directions (``request`` + ``response``); the
 runtime is the REQUEST producer, so we validate the captured bodies against the
@@ -33,6 +36,11 @@ from referencing.jsonschema import DRAFT202012
 
 SCHEMA_DIR = Path(__file__).parent / "fixtures" / "workspace_comms"
 
+# The vendored schemas' ``$id`` deliberately retains the HISTORICAL
+# molecule-contracts URL (the byte-for-byte fold-in into molecule-ai-sdk did not
+# rewrite it — see PROVENANCE.md), so this prefix stays as-is even though the live
+# SSOT now lives in molecule-ai-sdk/contracts/workspace-comms. It is an identifier
+# tripwire, not a fetch URL — nothing here reaches the archived repo.
 CANONICAL_ID_PREFIX = (
     "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-comms/"
 )

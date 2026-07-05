@@ -1,0 +1,10 @@
+# The vendored SSOT-mirror JSON-Schemas are BYTE-FOR-BYTE copies of the
+# molecule-ai-sdk (contracts/) originals, enforced offline/at-drift by
+# scripts/check-schemas-in-sync.sh and tests/test_workspace_comms_conformance.py
+# (see the PROVENANCE.md next to each). The sdk serves them LF over the raw
+# endpoint, so the vendored copies MUST stay LF on every platform — pin them so
+# an autocrlf=true (Windows) checkout can't smudge them to CRLF and trip the
+# byte-identical gate.
+molecule_runtime/contracts/*.schema.json text eol=lf
+tests/fixtures/workspace_comms/*.schema.json text eol=lf
+scripts/check-schemas-in-sync.sh text eol=lf
