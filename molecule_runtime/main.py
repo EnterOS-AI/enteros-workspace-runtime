@@ -585,15 +585,17 @@ async def main():  # pragma: no cover
 
     # 0.2d Self-reprovision wake detection (design §5.2 — proactive wake).
     # Diff the plugins tree boot-install just (re)built against last boot's
-    # durable record and CONSUME the diff (state rewritten up front, #71
-    # pattern). Non-empty additions schedule the wake self-message at step
-    # 10b2 below — the agent announces what it installed instead of waking
-    # silent. First boot records silently (greeting territory, not ours).
+    # durable record. READ-ONLY when there are additions: the diff is NOT
+    # consumed here — consumption is staged at 10b2 (attempt-marked once the
+    # adapter is known ready, consumed on send success, replay bounded by
+    # MAX_WAKE_ATTEMPTS) so a misconfigured or slow boot DEFERS the
+    # announcement instead of eating it. First boot / no-additions boots
+    # refresh the state silently (greeting territory, not ours).
     # MUST run right here: after install_declared_plugins (the tree is
     # final) and before load_config may reassign config_path (the state
     # file lives beside the env-resolved plugins dir it describes).
-    from molecule_runtime.reprovision_wake import record_and_diff
-    newly_installed_plugins = record_and_diff()
+    from molecule_runtime.reprovision_wake import prepare_wake_plan
+    wake_plan = prepare_wake_plan()
 
     # 0.3 Pre-commit hook installer — refuses commits that add internal-flavored
     # paths or known secret shapes to any git repo the workspace touches. Lifted
@@ -1303,24 +1305,42 @@ async def main():  # pragma: no cover
     # When step 0.2d detected plugins newly added since the last boot, the
     # agent's FIRST act after this reprovision is announcing them to the
     # user, via the same platform-proxy self-message seam as initial_prompt.
-    # The diff was already consumed at 0.2d (state rewritten), so a crash
-    # here never replays the announcement on the next boot. Gated on
-    # adapter_ready exactly like initial_prompt: on a misconfigured boot
-    # the self-message would just 404 into the not-configured handler.
+    # Staged consumption (review 2026-07-05): the pending announcement is
+    # attempt-marked HERE (only once the adapter is known ready — a
+    # misconfigured boot leaves the state untouched, so the note re-arms on
+    # the next healthy boot) and consumed inside the send task only on send
+    # SUCCESS. Replay is bounded by MAX_WAKE_ATTEMPTS; a failed attempt-mark
+    # persist (read-only volume) skips the send entirely so an unbounded
+    # announce-every-boot loop is impossible.
     reprovision_wake_task = None
-    if adapter_ready and newly_installed_plugins:
-        from molecule_runtime.reprovision_wake import (
-            build_wake_note,
-            send_wake_note_when_ready,
-        )
-        reprovision_wake_task = asyncio.create_task(
-            send_wake_note_when_ready(
-                build_wake_note(newly_installed_plugins),
-                port=port,
-                platform_url=platform_url,
-                workspace_id=workspace_id,
+    if wake_plan.additions:
+        if adapter_ready:
+            from molecule_runtime.reprovision_wake import (
+                mark_wake_attempt,
+                send_wake_note_when_ready,
             )
-        )
+            if mark_wake_attempt(wake_plan):
+                reprovision_wake_task = asyncio.create_task(
+                    send_wake_note_when_ready(
+                        wake_plan,
+                        port=port,
+                        platform_url=platform_url,
+                        workspace_id=workspace_id,
+                    )
+                )
+            else:
+                print(
+                    "Reprovision wake: could not persist the attempt marker — "
+                    f"skipping announcement for {wake_plan.additions} (unbounded-replay guard)",
+                    flush=True,
+                )
+        else:
+            print(
+                "Reprovision wake: newly installed plugin(s) detected "
+                f"({wake_plan.additions}) but the adapter is not ready — deferring "
+                "the announcement to the next healthy boot (state not consumed)",
+                flush=True,
+            )
 
     # 10c. Idle loop — reflection-on-completion / backlog-pull pattern.
     # Fires config.idle_prompt every config.idle_interval_seconds while the

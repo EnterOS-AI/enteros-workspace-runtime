@@ -7,28 +7,48 @@ re-establishes ``<config_path>/plugins`` from the desired-set on the fresh
 boot. On WAKE the agent must NOT come back silent — it proactively tells the
 user what it installed, then resumes prior work.
 
-Detection — durable plugin-set diff, consumed once
-==================================================
+Detection — durable plugin-set diff
+===================================
 The runtime records the post-boot-install plugin set in a small JSON state
 file on the durable ``/configs`` volume (the same durability class as the
-``.initial_prompt_done`` marker — survives a local-docker reprovision, gone
-on a wiped-disk reprovision, which safely degrades to "record silently").
-On every boot, AFTER boot-install has swapped the plugins tree, we diff the
-current set against the recorded one:
+``.initial_prompt_done`` marker). On every boot, AFTER boot-install has
+swapped the plugins tree, ``prepare_wake_plan`` diffs the current set
+against the recorded one. Diffing the DURABLE RESULT of boot-install
+(rather than trusting a marker a specific installer left) means every path
+that grows the plugin set across a reprovision — mgmt-MCP ``install_plugin``
+self-install, a user-driven canvas install, a template update — produces an
+announcement, and none of them can double-fire.
 
-  * no state file (first boot / upgraded runtime / wiped disk) → record the
-    current set SILENTLY — first contact is the greeting's job, not ours;
-  * additions present → rewrite the state FIRST (consume-once, the same
-    up-front-marker pattern as initial_prompt #71: a crash after the state
-    write never replays the announcement on the next boot), then return the
-    added names so ``main`` schedules the wake self-message;
-  * removals / no change → state refreshed, nothing announced.
+Consumption contract — never silently lost, never a groundhog-day loop
+======================================================================
+The failure modes pull in opposite directions:
 
-Diffing the DURABLE RESULT of boot-install (rather than trusting a marker a
-specific installer left) means every path that grows the plugin set across a
-reprovision — mgmt-MCP ``install_plugin`` self-install, a user-driven canvas
-install, a template update — produces exactly one proactive announcement,
-and none of them can double-fire.
+  * consume UP FRONT (the plain ``initial_prompt`` #71 pattern) and any
+    boot that cannot send — adapter not ready (misconfigured creds), the
+    A2A server slow past a probe window — eats the announcement FOREVER,
+    violating the feature's own "never wake silent" contract;
+  * consume only on success with NO bound and a note whose send crashes
+    the box replays every boot — the exact #71 crash-loop.
+
+So consumption is staged, and every stage is bounded:
+
+  1. ``prepare_wake_plan`` (boot step 0.2d) is a READ + refresh: when there
+     is nothing to announce (first boot, no additions, removals only) it
+     refreshes the state and returns an empty plan. When there ARE
+     additions it does NOT touch the pending announcement — a boot that
+     never reaches the scheduling step (adapter not ready, crash) leaves
+     the diff intact for the next boot.
+  2. ``mark_wake_attempt`` (called only once the adapter is READY, right
+     before scheduling the send) persists the pending announcement with an
+     incremented attempt counter — the #71 up-front marker, but per-attempt
+     instead of forever. If this persist FAILS (read-only volume), the
+     caller must NOT send: an unpersisted attempt cannot be bounded.
+  3. ``send_wake_note_when_ready`` probes the local A2A server (generous
+     window — a trip DEFERS to the next boot, it no longer loses the note),
+     sends through the platform proxy, and CONSUMES the pending state only
+     on send success.
+  4. A pending announcement that has burned ``MAX_WAKE_ATTEMPTS`` boots is
+     dropped LOUDLY by the next ``prepare_wake_plan`` — bounded replay.
 
 Kept as a standalone module (no heavy imports at module scope) so the state
 logic is unit-testable without standing up the workspace runtime, mirroring
@@ -41,15 +61,44 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# State file recording last boot's plugin set. Lives NEXT TO the plugins dir
-# (i.e. on the same durable volume boot-install writes), so state and plugins
-# always share one lifetime: a disk wipe drops both together and the diff
-# can never announce from stale state against a fresh tree.
+# State file recording last boot's plugin set + any pending announcement.
+# Lives NEXT TO the plugins dir (same durable volume boot-install writes),
+# so state and plugins share one lifetime: a disk wipe drops both together
+# and the diff can never announce from stale state against a fresh tree.
 STATE_FILENAME = ".molecule_plugins_boot_state.json"
+
+# An announcement that could not be delivered re-arms on the next boot, at
+# most this many times, then is dropped loudly. Bounds the #71-style replay
+# (a note whose send crashes the box) while never silently eating the first
+# failure.
+MAX_WAKE_ATTEMPTS = 3
+
+# A2A-server readiness probe window for the send (1s per attempt). This is
+# a SAFETY NET, not a deadline the success path waits out — the probe
+# proceeds the moment the server answers. Generous (vs initial_prompt's 30)
+# because tripping it defers the announcement to the next boot; overridable
+# for tests / constrained boxes.
+_READY_PROBE_ATTEMPTS_ENV = "MOLECULE_WAKE_READY_PROBE_ATTEMPTS"
+_DEFAULT_READY_PROBE_ATTEMPTS = 300
+
+
+@dataclass
+class WakePlan:
+    """One boot's announcement plan, produced by ``prepare_wake_plan``.
+
+    ``additions`` empty ⇒ nothing to announce this boot. ``attempts`` is how
+    many boots have already tried to deliver this same announcement.
+    """
+
+    additions: list[str] = field(default_factory=list)
+    attempts: int = 0
+    current: list[str] = field(default_factory=list)
+    state_path: str = ""
 
 
 def _resolve_config_path(env=None) -> Path:
@@ -68,9 +117,8 @@ def resolve_state_path(env=None) -> Path:
 def _current_plugin_set(plugins_dir: Path) -> list[str]:
     """Sorted plugin names = non-hidden subdirectories of ``plugins_dir``.
 
-    Hidden entries are skipped: boot-install's staging/backup siblings
-    (``.plugins.staging-*`` live one level up, but ``.complete`` markers and
-    relay drops are dot-prefixed) must never read as installed plugins.
+    Hidden entries are skipped: relay drops and marker files are
+    dot-prefixed and must never read as installed plugins.
     """
     try:
         if not plugins_dir.is_dir():
@@ -85,12 +133,12 @@ def _current_plugin_set(plugins_dir: Path) -> list[str]:
         return []
 
 
-def _read_previous_plugin_set(state_path: Path) -> list[str] | None:
-    """Previous boot's plugin set, or None when absent/corrupt (= first boot).
+def _read_state(state_path: Path) -> dict | None:
+    """Parsed state dict, or None when absent/corrupt (= first boot).
 
     Corrupt state is treated exactly like a missing file: record silently.
-    Announcing from unparseable state risks a wrong or repeated announcement;
-    staying silent for one boot is the safe failure.
+    Announcing from unparseable state risks a wrong or repeated
+    announcement; staying silent for one boot is the safe failure.
     """
     try:
         raw = state_path.read_text()
@@ -103,18 +151,21 @@ def _read_previous_plugin_set(state_path: Path) -> list[str] | None:
         data = json.loads(raw)
         plugins = data.get("plugins")
         if isinstance(plugins, list) and all(isinstance(x, str) for x in plugins):
-            return plugins
+            return data
     except (ValueError, AttributeError):
         pass
     log.warning("[wake] corrupt state %s — treating as first boot", state_path)
     return None
 
 
-def _write_plugin_set(state_path: Path, plugins: list[str]) -> bool:
-    """Atomically (tmp + ``os.replace``) persist the current plugin set."""
+def _write_state(state_path: Path, plugins: list[str], pending: dict | None = None) -> bool:
+    """Atomically (tmp + ``os.replace``) persist the state. True on success."""
+    doc: dict = {"plugins": plugins, "recorded_at": time.time()}
+    if pending:
+        doc["pending"] = pending
     tmp = state_path.with_name(f"{state_path.name}.tmp-{os.getpid()}-{time.time_ns()}")
     try:
-        tmp.write_text(json.dumps({"plugins": plugins, "recorded_at": time.time()}))
+        tmp.write_text(json.dumps(doc))
         os.replace(tmp, state_path)
         return True
     except OSError as exc:
@@ -126,20 +177,21 @@ def _write_plugin_set(state_path: Path, plugins: list[str]) -> bool:
         return False
 
 
-def record_and_diff(
+def prepare_wake_plan(
     plugins_dir: str | Path | None = None,
     state_path: str | Path | None = None,
     env=None,
-) -> list[str]:
-    """Record the current plugin set; return names NEWLY ADDED since last boot.
+) -> WakePlan:
+    """Compute this boot's announcement plan. Call ONCE per boot, after
+    ``install_declared_plugins`` has (re)built the plugins tree.
 
-    Call ONCE per boot, after ``install_declared_plugins`` has (re)built the
-    plugins tree. Consume-once: the state is rewritten BEFORE the additions
-    are returned, so the announcement can never replay on a later boot even
-    if the send crashes (the initial_prompt #71 up-front-marker trade-off,
-    deliberately mirrored). First boot (no/corrupt state) records silently
-    and returns ``[]``. Never raises — a wake note is never worth blocking
-    boot over.
+    Returns an empty plan (and refreshes the durable state) when there is
+    nothing to announce: first boot / corrupt state (record silently —
+    first contact is the greeting's job), no additions, removals only, or a
+    pending announcement that has exhausted ``MAX_WAKE_ATTEMPTS`` (dropped
+    LOUDLY). When there ARE additions the state is left UNTOUCHED — a boot
+    that cannot deliver (adapter not ready, crash before scheduling)
+    re-detects the same diff next boot. Never raises.
     """
     if env is None:
         env = os.environ
@@ -152,25 +204,72 @@ def record_and_diff(
         s_path = Path(state_path) if state_path is not None else resolve_state_path(env)
 
         current = _current_plugin_set(p_dir)
-        previous = _read_previous_plugin_set(s_path)
+        state = _read_state(s_path)
 
-        if not _write_plugin_set(s_path, current):
-            # State didn't persist → the same diff would fire again next
-            # boot. Fail SILENT (no announcement) rather than risk a
-            # groundhog-day announcement loop on a read-only volume.
-            return []
-
-        if previous is None:
+        if state is None:
+            _write_state(s_path, current)
             log.info("[wake] first boot state recorded (%d plugin(s)) — no announcement", len(current))
-            return []
+            return WakePlan(current=current, state_path=str(s_path))
 
-        additions = sorted(set(current) - set(previous))
-        if additions:
-            log.info("[wake] newly installed since last boot: %s", ", ".join(additions))
-        return additions
+        previous = state.get("plugins") or []
+        pending = state.get("pending") if isinstance(state.get("pending"), dict) else None
+        pending_additions: list[str] = []
+        attempts = 0
+        if pending:
+            raw_adds = pending.get("additions")
+            if isinstance(raw_adds, list):
+                # Only re-announce pending plugins that are STILL present.
+                pending_additions = [a for a in raw_adds if isinstance(a, str) and a in current]
+            try:
+                attempts = int(pending.get("attempts") or 0)
+            except (TypeError, ValueError):
+                attempts = 0
+
+        additions = sorted(set(current) - set(previous) | set(pending_additions))
+
+        if not additions:
+            _write_state(s_path, current)  # refresh; clears stale pending
+            return WakePlan(current=current, state_path=str(s_path))
+
+        if attempts >= MAX_WAKE_ATTEMPTS:
+            log.warning(
+                "[wake] DROPPING announcement for %s after %d failed delivery attempt(s) — "
+                "bounded replay (see MAX_WAKE_ATTEMPTS)",
+                ", ".join(additions), attempts,
+            )
+            _write_state(s_path, current)
+            return WakePlan(current=current, state_path=str(s_path))
+
+        log.info("[wake] newly installed since last boot: %s (delivery attempts so far: %d)",
+                 ", ".join(additions), attempts)
+        return WakePlan(additions=additions, attempts=attempts, current=current, state_path=str(s_path))
     except Exception as exc:  # noqa: BLE001 — never block boot
-        log.warning("[wake] record_and_diff failed (non-fatal): %s", exc)
-        return []
+        log.warning("[wake] prepare_wake_plan failed (non-fatal): %s", exc)
+        return WakePlan()
+
+
+def mark_wake_attempt(plan: WakePlan) -> bool:
+    """Persist the pending announcement with an incremented attempt counter.
+
+    Call ONLY once the adapter is ready and the send is about to be
+    scheduled. Returns False when the persist failed — the caller MUST NOT
+    send in that case (an unpersisted attempt cannot be bounded, and an
+    unbounded announce-every-boot loop is worse than one deferred note).
+    """
+    if not plan.additions or not plan.state_path:
+        return False
+    return _write_state(
+        Path(plan.state_path),
+        plan.current,
+        pending={"additions": plan.additions, "attempts": plan.attempts + 1},
+    )
+
+
+def consume_wake_note(plan: WakePlan) -> bool:
+    """Clear the pending announcement (send succeeded). True on success."""
+    if not plan.state_path:
+        return False
+    return _write_state(Path(plan.state_path), plan.current)
 
 
 def build_wake_note(additions: list[str]) -> str:
@@ -185,26 +284,42 @@ def build_wake_note(additions: list[str]) -> str:
     )
 
 
+def _ready_probe_attempts(env=None) -> int:
+    if env is None:
+        env = os.environ
+    try:
+        v = int(env.get(_READY_PROBE_ATTEMPTS_ENV) or _DEFAULT_READY_PROBE_ATTEMPTS)
+        return v if v > 0 else _DEFAULT_READY_PROBE_ATTEMPTS
+    except (TypeError, ValueError):
+        return _DEFAULT_READY_PROBE_ATTEMPTS
+
+
 async def send_wake_note_when_ready(
-    note: str,
+    plan: WakePlan,
     *,
     port: int,
     platform_url: str,
     workspace_id: str,
 ) -> bool:
-    """Send the wake note as a self-message once the A2A server is up.
+    """Send the wake note as a self-message once the A2A server is up, and
+    CONSUME the pending announcement on success.
 
     Same transport contract as main's ``_send_initial_prompt``: probe the
-    local agent-card route until ready, then POST through the platform A2A
-    proxy with ``self_source_headers`` (tags the row source=agent) and
-    retry with backoff. Returns True when the send completed.
+    local agent-card route until ready (the success path proceeds the
+    moment the server answers; the window is a generous safety net whose
+    trip DEFERS the note to the next boot rather than losing it), then POST
+    through the platform A2A proxy with ``self_source_headers`` (tags the
+    row source=agent), retrying with backoff. Returns True when the send
+    completed and the state was consumed.
     """
     import httpx  # local import — keep module import light for unit tests
 
     from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 
+    note = build_wake_note(plan.additions)
+
     ready = False
-    for _attempt in range(30):
+    for _attempt in range(_ready_probe_attempts()):
         await asyncio.sleep(1)
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -218,7 +333,11 @@ async def send_wake_note_when_ready(
             continue
 
     if not ready:
-        print("Reprovision wake: server not ready after 30s, skipping", flush=True)
+        print(
+            "Reprovision wake: server not ready within the probe window — "
+            "deferring announcement to the next boot (pending state kept)",
+            flush=True,
+        )
         return False
 
     import uuid as _uuid
@@ -263,9 +382,23 @@ async def send_wake_note_when_ready(
                         flush=True,
                     )
                     _time.sleep(delay)
-        print(f"Reprovision wake: failed after {max_retries} attempts", flush=True)
+        print(
+            f"Reprovision wake: failed after {max_retries} attempts — "
+            "pending state kept, will re-announce next boot",
+            flush=True,
+        )
         return False
 
     print("Reprovision wake: sending via platform proxy...", flush=True)
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _do_send_sync)
+    sent = await loop.run_in_executor(None, _do_send_sync)
+    if sent:
+        if consume_wake_note(plan):
+            print("Reprovision wake: pending state consumed", flush=True)
+        else:
+            print(
+                "Reprovision wake: WARNING — sent but could not consume pending state; "
+                "a bounded re-announcement may occur next boot",
+                flush=True,
+            )
+    return sent
