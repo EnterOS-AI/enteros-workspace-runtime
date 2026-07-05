@@ -115,22 +115,21 @@ jobs:
           echo "SHA256: $HASH"
 
       # KMS migration (RFC: Gitea-Actions-secrets -> Infisical/KMS): source the
-      # Gitea PyPI publisher credentials from the Infisical SSOT via the CI
-      # machine identity instead of the duplicated Gitea Actions repo secrets,
-      # mirroring the proven REST-fetch pattern (#971 / #3274 and the
-      # molecule-app sop-checklist-gate wave-2 pilot). Both values live in the
-      # prod /ci/gitea-pypi-publisher folder. They are exported to $GITHUB_ENV
-      # so the publish step below references them via env.* in the SAME job.
+      # canonical Gitea package-publisher token from the Infisical SSOT via the
+      # CI machine identity, mirroring the proven REST-fetch pattern (#971 /
+      # #3274 and the molecule-app sop-checklist-gate wave-2 pilot). The
+      # consolidated least-privilege credential is MOL_PACKAGE_TOKEN (a Gitea PAT
+      # with `write:package` scope owned by the `pypi-publisher` persona) in the
+      # prod /ci/gitea-pypi-publisher folder. It is exported to $GITHUB_ENV so
+      # the publish step below references it via env.* in the SAME job.
       #
-      # POSITIVE CONTROL: Infisical is now the AUTHORITATIVE source for these
-      # two credentials, so this step uses `set -uo pipefail`, a null-safe
-      # JSON extractor, and an explicit non-empty assertion to HARD-FAIL on a
-      # broken/empty/404/auth-failure fetch. We do NOT fall back to the Gitea
+      # POSITIVE CONTROL: Infisical is the AUTHORITATIVE source for this
+      # credential, so this step uses `set -uo pipefail`, a null-safe JSON
+      # extractor, and an explicit non-empty assertion to HARD-FAIL on a
+      # broken/empty/404/auth-failure fetch. We do NOT fall back to a Gitea
       # secret here: a broken authoritative fetch must surface loudly rather
-      # than be silently masked. The Gitea repo secrets are RETAINED for now;
-      # validate-before-delete happens AFTER this PR merges and a real publish
-      # run proves the fetch is live.
-      - name: Fetch Gitea PyPI publisher creds from Infisical SSOT
+      # than be silently masked.
+      - name: Fetch Gitea package-publisher token from Infisical SSOT
         id: pypi_publisher_creds
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
@@ -159,33 +158,29 @@ jobs:
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); print(v if isinstance(v,str) and v else "")'
           }
-          MOLECULE_PYPI_GITEA_PUBLISHER_USER=$(read_secret MOLECULE_PYPI_GITEA_PUBLISHER_USER %2Fci%2Fgitea-pypi-publisher)
-          MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN=$(read_secret MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN %2Fci%2Fgitea-pypi-publisher)
-          if [ -z "${MOLECULE_PYPI_GITEA_PUBLISHER_USER}" ]; then
-            echo "::error::Infisical returned empty for MOLECULE_PYPI_GITEA_PUBLISHER_USER at /ci/gitea-pypi-publisher (prod) -- authoritative fetch failed; failing loudly"
+          MOL_PACKAGE_TOKEN=$(read_secret MOL_PACKAGE_TOKEN %2Fci%2Fgitea-pypi-publisher)
+          if [ -z "${MOL_PACKAGE_TOKEN}" ]; then
+            echo "::error::Infisical returned empty for MOL_PACKAGE_TOKEN at /ci/gitea-pypi-publisher (prod) -- authoritative fetch failed; failing loudly"
             exit 1
           fi
-          if [ -z "${MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN}" ]; then
-            echo "::error::Infisical returned empty for MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN at /ci/gitea-pypi-publisher (prod) -- authoritative fetch failed; failing loudly"
-            exit 1
-          fi
-          echo "::add-mask::$MOLECULE_PYPI_GITEA_PUBLISHER_USER"
-          echo "::add-mask::$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN"
-          echo "MOLECULE_PYPI_GITEA_PUBLISHER_USER=$MOLECULE_PYPI_GITEA_PUBLISHER_USER" >> "$GITHUB_ENV"
-          echo "MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN=$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" >> "$GITHUB_ENV"
+          echo "::add-mask::$MOL_PACKAGE_TOKEN"
+          echo "MOL_PACKAGE_TOKEN=$MOL_PACKAGE_TOKEN" >> "$GITHUB_ENV"
           # Sentinel: prove non-empty without ever printing a value (length only).
-          echo "Gitea PyPI publisher creds loaded from Infisical (user len=${#MOLECULE_PYPI_GITEA_PUBLISHER_USER}, token len=${#MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN})"
+          echo "Gitea package-publisher token loaded from Infisical (token len=${#MOL_PACKAGE_TOKEN})"
 
       - name: Publish to Gitea package registry
         env:
           # KMS migration: consumed from $GITHUB_ENV (written by the Infisical
-          # fetch step above) rather than the duplicated Gitea Actions secrets.
-          MOLECULE_PYPI_GITEA_PUBLISHER_USER: ${{ env.MOLECULE_PYPI_GITEA_PUBLISHER_USER }}
-          MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN: ${{ env.MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN }}
+          # fetch step above) rather than a duplicated Gitea Actions secret.
+          MOL_PACKAGE_TOKEN: ${{ env.MOL_PACKAGE_TOKEN }}
         run: |
           set -eu
-          if [ -z "${MOLECULE_PYPI_GITEA_PUBLISHER_USER:-}" ] || [ -z "${MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN:-}" ]; then
-            echo "::error::Gitea package registry publisher creds are not set (Infisical fetch step did not export them)"
+          # Canonical least-privilege publisher identity (write:package). The
+          # Gitea package registry authenticates the token; the username is the
+          # token owner (`pypi-publisher`).
+          PUBLISHER_USER="pypi-publisher"
+          if [ -z "${MOL_PACKAGE_TOKEN:-}" ]; then
+            echo "::error::Gitea package registry publisher token is not set (Infisical fetch step did not export it)"
             exit 1
           fi
           # Idempotent publish: a re-run of this workflow (e.g. to re-execute the
@@ -199,7 +194,7 @@ jobs:
           for f in dist/*; do
             base=$(basename "$f")
             pkg=$(printf %s "$base" | cut -d- -f1 | tr _ -)
-            if curl -fsS -u "$MOLECULE_PYPI_GITEA_PUBLISHER_USER:$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" \
+            if curl -fsS -u "$PUBLISHER_USER:$MOL_PACKAGE_TOKEN" \
                  "$SIMPLE_BASE/$pkg/" 2>/dev/null | grep -qF "$base"; then
               echo "::notice::$base already in registry"
             else
@@ -211,8 +206,8 @@ jobs:
           else
             python -m twine upload \
               --repository-url "$GITEA_PYPI_UPLOAD_URL" \
-              --username "$MOLECULE_PYPI_GITEA_PUBLISHER_USER" \
-              --password "$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" \
+              --username "$PUBLISHER_USER" \
+              --password "$MOL_PACKAGE_TOKEN" \
               dist/*
           fi
 
