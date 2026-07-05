@@ -24,9 +24,9 @@ jobs:
       # the Infisical SSOT (/shared/runtime-bot, key RUNTIME_BOT_TOKEN) via the CI
       # machine identity, instead of the per-repo Gitea Actions secret
       # DISPATCH_TOKEN. The fetched value is exported to $GITHUB_ENV under
-      # GITEA_TOKEN — the exact env var name the two consumer steps below (and
-      # check_consumer_runtime_drift.py / check_platform_comm_contract.py) already
-      # read — so nothing downstream changes.
+      # GITEA_TOKEN — the exact env var name the consumer step below
+      # (check_consumer_runtime_drift.py) already reads — so nothing downstream
+      # changes.
       #
       # ABSENT -> SKIP DEGRADE PRESERVED (runtime#83): a missing token is a config
       # gap, not a runtime regression. If the bootstrap INFISICAL_CI_* creds are
@@ -88,12 +88,12 @@ jobs:
             python scripts/check_consumer_runtime_drift.py
           fi
 
-      - name: Check platform communication contract
-        env:
-          GITEA_TOKEN: ${{ env.GITEA_TOKEN }}
-        run: |
-          if [ -z "${GITEA_TOKEN:-}" ]; then
-            echo "::warning::RUNTIME_BOT_TOKEN unavailable (Infisical fetch skipped on absent bootstrap creds); skipping cross-repo communication contract check. Provision INFISICAL_CI_* to enable it (runtime#83)."
-          else
-            python scripts/check_platform_comm_contract.py
-          fi
+      # NOTE: the cross-repo platform-communication-contract AST guard
+      # (scripts/check_platform_comm_contract.py) was RETIRED — replaced by an
+      # in-repo, offline schema-conformance gate that validates the REAL
+      # register/heartbeat/A2A wire payloads against the SSOT JSON-Schema
+      # (molecule-contracts/workspace-comms), run as part of the normal unit-test
+      # lane (tests/test_workspace_comms_conformance.py in ci.yml). That gate is
+      # strictly stronger (real bytes vs code structure), needs no cross-repo
+      # clone or token, and never silently SKIPs. The SDK side carries a sibling
+      # conformance test in molecule-ai-sdk.

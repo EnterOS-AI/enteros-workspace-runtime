@@ -27,23 +27,19 @@ from urllib.parse import urlsplit
 # Dockerfile installs ``molecule-ai-workspace-runtime==${RUNTIME_VERSION}`` (where
 # RUNTIME_VERSION is read from its ``.runtime-version`` file) belongs here, plus
 # molecule-core (installs the wheel; carries no .runtime-version pin but must not
-# vendor the source). This list was previously only the four templates the
-# runtime#91 propagation bot bumps + molecule-core, which created a SILENT BLIND
-# SPOT: langgraph/autogen/google-adk/crewai/deepagents/gemini-cli all pin
-# .runtime-version and build images from it, but were omitted here, so the guard
-# stayed green while those pins drifted (16-26 releases behind). The
-# ``reconcile_org_consumers`` check below now makes any future omission LOUD.
+# vendor the source). This list was previously only a hand-maintained subset of
+# templates the runtime#91 propagation bot bumps + molecule-core, which created a
+# SILENT BLIND SPOT: google-adk/crewai also pin .runtime-version and build images
+# from it, but were omitted here, so the guard stayed green while those pins
+# drifted (16-26 releases behind). The ``reconcile_org_consumers`` check below now
+# makes any future omission LOUD.
 DEFAULT_CONSUMERS = (
     "molecule-ai-workspace-template-claude-code",
     "molecule-ai-workspace-template-hermes",
     "molecule-ai-workspace-template-openclaw",
     "molecule-ai-workspace-template-codex",
-    "molecule-ai-workspace-template-langgraph",
-    "molecule-ai-workspace-template-autogen",
     "molecule-ai-workspace-template-google-adk",
     "molecule-ai-workspace-template-crewai",
-    "molecule-ai-workspace-template-deepagents",
-    "molecule-ai-workspace-template-gemini-cli",
     "molecule-core",
 )
 
@@ -138,6 +134,7 @@ def _latest_release_version() -> str:
     token = os.environ.get("GITEA_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
     url = "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-workspace-runtime/tags?limit=50"
     headers = {"Authorization": f"token {token}"} if token else {}
+    headers.setdefault("User-Agent", "curl/8.4.0")  # CF edge 403s python-urllib UA (error 1010)
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -218,7 +215,7 @@ def _org_template_repos(gitea_url: str, token: str, *, org: str = "molecule-ai")
     page = 1
     while True:
         url = f"{gitea_url}/api/v1/orgs/{org}/repos?limit=50&page={page}"
-        req = urllib.request.Request(url, headers={"Authorization": f"token {token}"} if token else {})
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0", **({"Authorization": f"token {token}"} if token else {})})
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 batch = json.load(resp)
@@ -253,7 +250,7 @@ def _repo_has_runtime_version(repo: str, gitea_url: str, token: str, *, org: str
     import urllib.error
 
     url = f"{gitea_url}/api/v1/repos/{org}/{repo}/raw/.runtime-version"
-    req = urllib.request.Request(url, headers={"Authorization": f"token {token}"} if token else {})
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0", **({"Authorization": f"token {token}"} if token else {})})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200

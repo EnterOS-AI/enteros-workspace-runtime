@@ -29,6 +29,19 @@ few times per second; reading the env var + one ``stat()`` call is
 cheap, and the existing call sites read ``os.environ`` live so tests
 that monkeypatch ``CONFIGS_DIR`` between cases keep working.
 
+Relationship to :mod:`molecule_runtime.mailbox_dir`
+---------------------------------------------------
+``/configs`` is the PROVISIONER-OWNED config volume: param-rendered
+``config.yaml`` + prompt files (read for the system prompt), plus the
+short-lived auth artifacts ``.auth_token`` / ``.platform_inbound_secret``.
+It is rewritten on every provision, so it is NOT a safe home for evolving
+agent state. Under the mailbox kernel (``MOLECULE_MAILBOX_KERNEL``), durable
+agent state — inbox cursor, pre-stop snapshot, delegation cursor/tombstones,
+consolidated memory — moves OUT of here to the durable ``/workspace/.molecule``
+volume via :func:`molecule_runtime.mailbox_dir.resolve`. When the kernel is off,
+``mailbox_dir.resolve()`` returns THIS directory, so nothing moves and the
+proven flow is byte-identical.
+
 Issue: Molecule-AI/molecule-core#2458.
 """
 from __future__ import annotations

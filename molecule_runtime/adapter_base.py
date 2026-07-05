@@ -444,8 +444,8 @@ class BaseAdapter(ABC):
         Dispatches on the active runtime via
         :func:`molecule_runtime.mcp_render.mcp_settings_path_for` —
         ``.claude/settings.json`` for Claude Code, ``~/.codex/config.toml`` for
-        codex, ``~/.gemini/settings.json`` for gemini-cli, etc. An unmapped
-        runtime falls back to the Claude path (the base runtime). Tied to the
+        codex, etc. An unmapped runtime falls back to the Claude path (the base
+        runtime). Tied to the
         cross-repo delivery contract's per-runtime ``settings_path`` map."""
         from molecule_runtime.mcp_render import mcp_settings_path_for
         return str(mcp_settings_path_for(self.name(), config.config_path))
@@ -462,14 +462,21 @@ class BaseAdapter(ABC):
         codex concierge got the management MCP written to ``.claude/settings.json``
         (a file its runtime never reads) and so booted without ``create_workspace``.
 
-        An unverified runtime (gemini/hermes) renders via a deliberate
+        An unverified runtime (hermes) renders via a deliberate
         NotImplementedError stub — caught by ``MCPServerAdaptor.install``, which
         fails the privileged management-MCP install LOUDLY rather than booting a
         silently capability-less concierge. An adapter for such a runtime may
         override this method once its native format is verified.
         """
         from molecule_runtime.mcp_render import render_for_runtime
+        from molecule_runtime.privileged_mcp_env import inject_privileged_env
 
+        # F2 belt-and-suspenders: enrich the privileged MCP spec for any caller
+        # that invokes this hook DIRECTLY (e.g. the ensure_management_mcp_in_settings
+        # self-heal), not only via install_plugins_via_registry's funnel. No-op for
+        # non-management names; idempotent + descriptor-wins, so re-running over an
+        # already-enriched spec changes nothing.
+        spec = inject_privileged_env(name, spec)
         target = render_for_runtime(self.name(), config.config_path, name, spec)
         logger.info("register_mcp_server_hook: wired MCP %r into %s (runtime=%s)",
                     name, target, self.name())
@@ -494,15 +501,83 @@ class BaseAdapter(ABC):
 
         return management_mcp_present_for(self.name(), config.config_path, MANAGEMENT_MCP_NAME)
 
+    def materialize_persona(self, config: "AdapterConfig") -> "Any":
+        """Materialize the workspace's CANONICAL PERSONA into THIS runtime's
+        native identity file (the persona-materialization PORT).
+
+        DISPATCHES on the active runtime (``self.name()``) through
+        :func:`molecule_runtime.persona_render.materialize_persona_for`, so a
+        workspace on ANY runtime boots with its intended identity — even runtimes
+        whose gateway/CLI reads a native identity file and never consumes the
+        base-assembled ``config.system_prompt`` (openclaw → SOUL.md, codex →
+        AGENTS.md, gemini/google-adk → GEMINI.md, claude-code → system-prompt.md).
+
+        The canonical persona is read runtime-agnostically from the delivered
+        ``config.prompt_files`` (a concierge's ``prompts/concierge.md``; a member's
+        role prompt), so this is the runtime half of core #3418's provision half:
+        the delivered persona actually becomes the model's on-disk identity for the
+        ACTUAL runtime, not just claude-code.
+
+        Best-effort by design: returns ``None`` (no-op) when no persona is
+        delivered, and downgrades an unverified-runtime ``NotImplementedError``
+        (hermes) to a warning — a persona is not a privileged capability like the
+        management MCP, so a missing native convention must never brick the boot.
+        Returns the path written, or ``None``.
+        """
+        from molecule_runtime import persona_render
+
+        persona = persona_render.read_canonical_persona(
+            config.config_path, config.prompt_files
+        )
+        if not (persona or "").strip():
+            logger.info(
+                "materialize_persona: no canonical persona delivered for runtime "
+                "%s — leaving the runtime's native default untouched",
+                self.name(),
+            )
+            return None
+        try:
+            target = persona_render.materialize_persona_for(
+                self.name(), config.config_path, persona
+            )
+        except NotImplementedError as exc:
+            logger.warning(
+                "materialize_persona: runtime %s has no verified native persona "
+                "convention — persona NOT materialized (%s). The delivered persona "
+                "still reaches any runtime that consumes config.system_prompt.",
+                self.name(), exc,
+            )
+            return None
+        if target is not None:
+            logger.info(
+                "materialize_persona: wrote %s persona (%d chars) to %s",
+                self.name(), len(persona), target,
+            )
+        return target
+
     def append_to_memory_hook(self, config: AdapterConfig, filename: str, content: str) -> None:
-        """Append text to /configs/<filename> if the marker isn't already present.
+        """Append text to the durable memory file if the marker isn't present.
+
+        MUST-FIX (memory WRITE-path reconciliation): with the mailbox kernel ON
+        this writes to the durable mailbox memory dir
+        (``/workspace/.molecule/memory/<filename>``) — the SAME directory
+        ``prompt.py`` READS memory snapshots from — so plugin-injected memory
+        survives a restart and is never shadowed by a stale ``/configs`` copy.
+        Kernel OFF keeps the legacy ``/configs/<filename>`` target so the flow
+        is byte-identical.
 
         Idempotent: looks for the first line of `content` as a marker so a
         re-install doesn't duplicate the block. Adaptors should pass content
         beginning with a unique header (e.g. ``# Plugin: molecule-dev-conventions``).
         """
         import os
-        target = os.path.join(config.config_path, filename)
+
+        import molecule_runtime.mailbox_dir as mailbox_dir
+
+        if mailbox_dir.kernel_enabled():
+            target = str(mailbox_dir.memory_file(filename))
+        else:
+            target = os.path.join(config.config_path, filename)
         marker = content.splitlines()[0].strip() if content else ""
         existing = ""
         if os.path.exists(target):
@@ -536,6 +611,7 @@ class BaseAdapter(ABC):
         from pathlib import Path
         from molecule_runtime.plugins_registry import InstallContext, resolve
         from molecule_runtime.plugins_registry.builtins import _PRIVILEGED_MCP_PLUGIN
+        from molecule_runtime.privileged_mcp_env import inject_privileged_env
 
         results = []
         runtime = self.name().replace("-", "_")  # e.g. "claude-code" -> "claude_code"
@@ -550,7 +626,14 @@ class BaseAdapter(ABC):
                 memory_filename=self.memory_filename(),
                 register_tool=self.register_tool_hook,
                 register_subagent=self.register_subagent_hook,
-                register_mcp_server=lambda n, s, _cfg=config: self.register_mcp_server_hook(_cfg, n, s),
+                # F2: enrich the privileged MCP spec at the ONE base funnel all
+                # adapters share, BEFORE dispatch — so even an overriding hook
+                # (openclaw) receives the pre-merged org-admin env. inject_privileged_env
+                # no-ops for any name != the management MCP and is descriptor-wins +
+                # idempotent, so ordinary MCP specs and the proven flow are unchanged.
+                register_mcp_server=lambda n, s, _cfg=config: self.register_mcp_server_hook(
+                    _cfg, n, inject_privileged_env(n, s)
+                ),
                 append_to_memory=lambda fn, c, _cfg=config: self.append_to_memory_hook(_cfg, fn, c),
             )
             try:
@@ -692,12 +775,32 @@ class BaseAdapter(ABC):
         if coordinator_prompt:
             extra_prompts.append(coordinator_prompt)
 
+        # Orchestrator-only guardrail gate (platform/concierge ONLY). A concierge
+        # (kind='platform') has the org-management MCP wired in; a normal worker
+        # does not. mcp_server_present() is the runtime-side platform-ness signal
+        # (baked binary OR the active adapter's management-MCP probe, registered
+        # in main.py BEFORE setup()). True → inject the never-self-do guardrail so
+        # the concierge orchestrates instead of self-executing, EVEN on a stale
+        # template. False (every worker) → no guardrail; workers must do real work.
+        # Defensive: a predicate error must never gag a worker nor crash boot, so
+        # default to False (worker) on any exception.
+        try:
+            from molecule_runtime.platform_agent_identity import mcp_server_present
+            is_platform_agent = mcp_server_present()
+        except Exception:  # noqa: BLE001 — never let the gate crash boot
+            logger.exception(
+                "orchestrator-guardrail: mcp_server_present() raised; "
+                "defaulting to worker (no guardrail injected)"
+            )
+            is_platform_agent = False
+
         system_prompt = build_system_prompt(
             config.config_path, config.workspace_id, loaded_skills, peers,
             prompt_files=config.prompt_files,
             plugin_rules=plugins.rules,
             plugin_prompts=extra_prompts,
             platform_instructions=platform_instructions,
+            platform_guardrail=is_platform_agent,
         )
 
         # SSOT: publish the single base-built system prompt (which honors

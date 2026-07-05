@@ -173,27 +173,46 @@ def _token_file() -> Path:
 
 
 def get_token() -> str | None:
-    """Return the cached token, reading it from disk on first call.
+    """Return the cached token, reading it from disk / env on first call.
 
-    Resolution order:
-        1. In-process cache (hot path)
-        2. ``${CONFIGS_DIR}/.auth_token`` file (in-container default —
-           the platform writes this on provision and rotates it on
-           restart)
-        3. ``MOLECULE_WORKSPACE_TOKEN`` env var (external-runtime path —
-           operators running the universal MCP server outside a
-           container have no /configs volume to populate, so they pass
-           the token via env)
+    Resolution order depends on WHERE the token file lives:
 
-    File-first preserves in-container behavior unchanged: containers
-    always have /configs/.auth_token on disk, env-var fallback only
-    fires when there's no file. This is additive — no existing caller
-    sees a behavior change.
+    In-container (the token file is ``/configs/.auth_token``):
+        1. In-process cache
+        2. ``/configs/.auth_token`` file — PROVISIONER-OWNED and ROTATED on
+           restart, so it is the fresh SSOT; an env var captured at container
+           start may be stale → file wins.
+        3. ``MOLECULE_WORKSPACE_TOKEN`` env (only if the file is missing/empty)
+
+    External-runtime (the token file is ``~/.molecule-workspace/.auth_token``
+    or under an explicit non-``/configs`` ``CONFIGS_DIR``):
+        1. In-process cache
+        2. ``MOLECULE_WORKSPACE_TOKEN`` env — the operator passes the CURRENT
+           token here; any on-disk ``.auth_token`` may be a LEFTOVER from a
+           prior session and must NOT shadow it. Before this fix a stale file
+           silently 401'd the inbox poller while the heartbeat used env (a
+           split-brain), and it disagreed with ``mcp_target_resolution`` (which
+           is already env-first). Off ``/configs``, env wins.
+        3. ``.auth_token`` file (only if env is unset)
+
+    In-container behavior is unchanged (file-first on ``/configs``); only the
+    external path changes — env now beats a stale file.
     """
     global _cached_token
     if _cached_token is not None:
         return _cached_token
+    env_tok = os.environ.get("MOLECULE_WORKSPACE_TOKEN", "").strip()
     path = _token_file()
+    # /configs is the platform-managed, restart-rotated volume → file is the
+    # fresh SSOT there. Everywhere else, an explicitly-provided env token wins
+    # over a possibly-stale on-disk file. The boundary is EXACT parent
+    # equality with /configs (the token file is always /configs/.auth_token
+    # in-container, and containers never set CONFIGS_DIR) — deliberately not
+    # a prefix test, so /configsfoo can't masquerade as the platform volume.
+    on_platform_configs = path.parent == Path("/configs")
+    if env_tok and not on_platform_configs:
+        _cached_token = env_tok
+        return env_tok
     if path.exists():
         try:
             tok = path.read_text().strip()
@@ -203,8 +222,7 @@ def get_token() -> str | None:
         if tok:
             _cached_token = tok
             return tok
-    # File missing or empty — fall back to env (external-runtime path).
-    env_tok = os.environ.get("MOLECULE_WORKSPACE_TOKEN", "").strip()
+    # File missing/empty (or in-container with no file) — fall back to env.
     if env_tok:
         _cached_token = env_tok
         return env_tok
@@ -463,11 +481,15 @@ def clear_cache() -> None:
 
 
 def refresh_cache() -> str | None:
-    """Force re-read of the token from disk, discarding the in-process cache.
+    """Re-resolve the token, discarding the in-process cache.
 
     Use this when a 401 response suggests the cached token is stale —
     e.g. after the platform rotates tokens during a restart (issue #1877).
-    Returns the (new) token value or None if not found/error."""
+    Resolution follows get_token(): in-container (/configs) this re-reads
+    the rotated file; on external-runtime hosts an explicitly-set
+    MOLECULE_WORKSPACE_TOKEN wins instead, so the env var is the operator's
+    responsibility to keep current there (file-based 401 recovery does not
+    apply off /configs). Returns the token value or None if not found."""
     global _cached_token
     _cached_token = None
     return get_token()

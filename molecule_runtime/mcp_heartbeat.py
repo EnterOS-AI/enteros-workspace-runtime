@@ -22,6 +22,19 @@ import os
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # SSOT typed payloads (molecule-contracts / RFC molecule-core#3285),
+    # published as `molecule-ai-contracts` on the gitea PyPI registry. Imported
+    # under TYPE_CHECKING ONLY — no hard runtime dependency (see the same block
+    # in heartbeat.py and the `[contracts]` extra in pyproject.toml). Mirrors
+    # molecule-ai-sdk #36 so both Python consumers type-check their
+    # register/heartbeat bodies against ONE source of shapes.
+    from molecule_ai_contracts.workspace_comms_gen import (
+        HeartbeatRequest,
+        RegisterRequest,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +132,9 @@ def platform_register(platform_url: str, workspace_id: str, token: str) -> None:
         # surface the real error.
         return
 
-    payload = {
+    # Typed against the SSOT contract (molecule-contracts RegisterRequest) for
+    # drift-prevention; the wire payload is unchanged.
+    payload: RegisterRequest = {
         "id": workspace_id,
         "url": "",
         "agent_card": build_agent_card(workspace_id),
@@ -183,7 +198,9 @@ def heartbeat_loop(
     start_time = time.time()
     consecutive_auth_failures = 0
     while True:
-        body = {
+        # Typed against the SSOT contract (molecule-contracts HeartbeatRequest);
+        # same plain dict on the wire.
+        body: HeartbeatRequest = {
             "workspace_id": workspace_id,
             "error_rate": 0.0,
             "sample_error": "",

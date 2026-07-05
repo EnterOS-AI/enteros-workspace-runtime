@@ -25,6 +25,20 @@ import uuid as _uuid
 from molecule_runtime.builtin_tools.telemetry import setup_telemetry, make_trace_middleware
 from molecule_runtime.policies.namespaces import resolve_awareness_namespace
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # SSOT typed payload (molecule-contracts / RFC molecule-core#3285), published
+    # as `molecule-ai-contracts` on the gitea PyPI registry. Imported under
+    # TYPE_CHECKING ONLY — no hard runtime dependency (see the `[contracts]` extra
+    # in pyproject.toml). Only `RegisterRequest` is pulled in here to avoid a name
+    # clash with the unrelated `a2a.types.AgentCard` imported above. The boot
+    # register body below is type-checked against the SSOT contract; mirrors the
+    # molecule-ai-sdk #36 adoption. NOTE: `register_body` is a function-local
+    # annotation, which CPython never evaluates at runtime, so this stays a pure
+    # type-checker-only reference even without `from __future__ import annotations`.
+    from molecule_ai_contracts.workspace_comms_gen import RegisterRequest
+
 # Holds the background loaded_mcp_tools init-enumeration task so it is not
 # garbage-collected before it completes (asyncio only keeps weak refs to tasks).
 _LOADED_MCP_TOOLS_BG_TASK = None  # type: "asyncio.Task | None"
@@ -77,6 +91,10 @@ from molecule_runtime.initial_prompt import (
     resolve_initial_prompt_marker,
 )
 from molecule_runtime.a2a_client import build_message_send_params
+from molecule_runtime.a2a_executor import (
+    A2A_MESSAGE_SOURCE_TYPE,
+    A2A_SOURCE_SELF_IDLE,
+)
 from molecule_runtime.platform_agent_identity import identity_gate_payload
 from molecule_runtime.platform_auth import auth_headers, self_source_headers
 from molecule_runtime.transcript_auth import transcript_authorized as _transcript_authorized
@@ -143,10 +161,12 @@ def _check_delegation_results_pending() -> bool:
     The extracted form lets unit tests call this directly rather than mirroring
     the logic (anti-pattern flagged as #401).
     """
-    from molecule_runtime.heartbeat import DELEGATION_RESULTS_FILE
+    # RC #203: resolve the SAME queue the heartbeat writer and the executor
+    # reader use — kernel-ON the durable mailbox queue, kernel-OFF legacy /tmp.
+    from molecule_runtime.heartbeat import _delegation_results_file
 
     try:
-        with open(DELEGATION_RESULTS_FILE) as rf:
+        with open(_delegation_results_file()) as rf:
             rf.seek(0)
             return bool(rf.read().strip())
     except FileNotFoundError:
@@ -162,6 +182,7 @@ async def register_with_platform(
     agent_card: dict,
     headers: dict,
     max_attempts: int = 8,
+    delivery_mode: str = "push",
 ) -> bool:
     """POST the boot registration to ``/registry/register`` with bounded
     exponential backoff until it gets a 2xx.
@@ -201,14 +222,25 @@ async def register_with_platform(
     last_detail = "no attempts made"
     for attempt in range(max_attempts):
         try:
+            # Typed against the SSOT contract (molecule-contracts RegisterRequest)
+            # for drift-prevention; the wire payload is unchanged.
+            register_body: RegisterRequest = {
+                "id": workspace_id,
+                "url": workspace_url,
+                "agent_card": agent_card,
+                **identity_gate_payload(),
+            }
+            # E1: declare poll delivery so the platform stages inbound A2A in
+            # activity_logs (for main()'s poller to pull) instead of POSTing to
+            # our URL. RegisterRequest already permits the key (mcp_heartbeat.py
+            # sets exactly this for the standalone path) — no contract change.
+            # Only added in poll mode, so the default push registration is
+            # byte-for-byte unchanged.
+            if delivery_mode == "poll":
+                register_body["delivery_mode"] = "poll"
             resp = await client.post(
                 f"{platform_url}/registry/register",
-                json={
-                    "id": workspace_id,
-                    "url": workspace_url,
-                    "agent_card": agent_card,
-                    **identity_gate_payload(),
-                },
+                json=register_body,
                 headers=headers,
             )
             status = resp.status_code
@@ -278,11 +310,220 @@ async def register_with_platform(
     return False
 
 
+# ---------------------------------------------------------------------------
+# E1 — poll-mode inbound delivery (opt-in; default is push).
+# ---------------------------------------------------------------------------
+# Host of the LOCAL executor the poll consumer posts to. MUST be loopback: a
+# post to the platform proxy (/workspaces/<id>/a2a) would write a NEW
+# a2a_receive activity row that the poller re-fetches => infinite loop. A direct
+# 127.0.0.1 post hits the boot_routes DefaultRequestHandler -> executor and
+# creates no activity row, so the cursor advances exactly once (no echo).
+LOCAL_EXECUTOR_HOST = "127.0.0.1"
+
+# Pre-bind retry budget for the local self-POST. The inbox poller fires its
+# first poll the instant its daemon thread starts; if uvicorn hasn't finished
+# binding 127.0.0.1:{port} yet, the consumer's self-POST raises ConnectError
+# (connection refused). We retry with a bounded backoff so a message staged in
+# that pre-bind window is held in-flight until the local executor is listening
+# — never dropped while the inbox cursor advances past it (the E1 startup-race
+# fix). Bounded so a genuinely dead executor can't wedge the poller callback
+# forever: 40 * 0.25s ≈ 10s, comfortably longer than a normal uvicorn bind.
+_LOCAL_POST_CONNECT_RETRIES = 40
+_LOCAL_POST_CONNECT_BACKOFF_SECONDS = 0.25
+
+
+def resolve_delivery_mode(env: Mapping[str, str], config_delivery_mode: str | None) -> str:
+    """Resolve the effective inbound delivery mode.
+
+    Precedence (env override wins, mirroring the LOG_LEVEL pattern): the
+    ``MOLECULE_DELIVERY_MODE`` env var, then ``config.a2a.delivery_mode``, else
+    ``"push"``. Lower-cased so ``"Poll"`` / ``"PUSH"`` resolve consistently.
+    """
+    return (env.get("MOLECULE_DELIVERY_MODE") or config_delivery_mode or "push").strip().lower()
+
+
+async def _post_polled_message_to_local_executor(port: int, workspace_id: str, text: str):
+    """POST one polled inbox message to the LOCAL executor as a JSON-RPC
+    ``message/send`` — NEVER the platform proxy (see LOCAL_EXECUTOR_HOST).
+
+    Same envelope shape the direct-peer delegate path uses (a2a_client) so the
+    boot_routes DefaultRequestHandler accepts it. No self-source ``source_type``
+    marker is stamped: a polled peer/canvas message is a real inbound turn, not a
+    routine self-ping, so it must not be dropped by the non-blocking fast-path.
+    """
+    url = f"http://{LOCAL_EXECUTOR_HOST}:{port}/"
+    body = {
+        "jsonrpc": "2.0",
+        "id": str(_uuid.uuid4()),
+        "method": "message/send",
+        "params": build_message_send_params(text),
+    }
+    headers = {"Content-Type": "application/json", **self_source_headers(workspace_id)}
+    # Retry on connection-refused (uvicorn not bound yet). A ConnectError here is
+    # the pre-bind window, not a real delivery failure — backing off and retrying
+    # keeps the staged message from being lost while the inbox cursor advances.
+    # Any non-connection error (e.g. a real 4xx/5xx from the executor) returns on
+    # the first attempt as before. See _LOCAL_POST_CONNECT_* for the bound.
+    last_exc: Exception | None = None
+    for _attempt in range(_LOCAL_POST_CONNECT_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                return resp.status_code
+        except httpx.ConnectError as exc:
+            last_exc = exc
+            await asyncio.sleep(_LOCAL_POST_CONNECT_BACKOFF_SECONDS)
+    # Budget exhausted — the executor never came up. Log + give up (best-effort;
+    # the caller's run_coroutine_threadsafe must never see this crash the poller).
+    print(
+        f"poll-consumer: local executor {LOCAL_EXECUTOR_HOST}:{port} unreachable "
+        f"after {_LOCAL_POST_CONNECT_RETRIES} attempts ({last_exc}); message dropped",
+        flush=True,
+    )
+    return None
+
+
+def make_poll_inbox_consumer(port: int, workspace_id: str, loop):
+    """Build the inbox notification callback for poll mode.
+
+    The callback runs on the poller DAEMON thread (``inbox.record`` fires it),
+    so it marshals the httpx post onto the main asyncio ``loop`` via
+    ``run_coroutine_threadsafe`` — the post then shares the event loop instead of
+    racing it (the same marshalling rationale as the idle/initial-prompt
+    self-sends). Best-effort: a scheduling failure logs and returns so the poller
+    thread never crashes.
+    """
+    def _consume(msg: dict) -> None:
+        text = (msg or {}).get("text") or ""
+        if not text:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _post_polled_message_to_local_executor(port, workspace_id, text),
+                loop,
+            )
+        except Exception as exc:  # noqa: BLE001 — callback must never crash the poller
+            print(f"poll-consumer: failed to schedule local executor post: {exc}", flush=True)
+
+    return _consume
+
+
+def maybe_start_poll_delivery(
+    delivery_mode: str,
+    platform_url: str,
+    workspace_id: str,
+    port: int,
+    loop,
+    *,
+    start_pollers=None,
+    set_callback=None,
+) -> bool:
+    """Start poll-mode inbound delivery when ``delivery_mode == "poll"``.
+
+    Registers the inbox consumer (drives the local executor) then starts the
+    pollers via the SAME SSOT helper the standalone path uses
+    (``mcp_inbox_pollers.start_inbox_pollers``) so cursor-file semantics,
+    activation idempotency and multi-workspace handling are identical. Returns
+    True when poll delivery was started, False for push (default) — in push mode
+    this whole branch is dead code, preserving the never-run-both invariant
+    (inbox.py module docstring). ``start_pollers`` / ``set_callback`` are
+    injectable for tests.
+    """
+    if delivery_mode != "poll":
+        return False
+    if start_pollers is None:
+        from molecule_runtime.mcp_inbox_pollers import start_inbox_pollers
+        start_pollers = start_inbox_pollers
+    if set_callback is None:
+        from molecule_runtime.inbox import set_notification_callback
+        set_callback = set_notification_callback
+    set_callback(make_poll_inbox_consumer(port, workspace_id, loop))
+    start_pollers(platform_url, [workspace_id])
+    print(
+        f"Delivery mode: poll — inbox poller started for {workspace_id} "
+        f"(consumer posts to {LOCAL_EXECUTOR_HOST}:{port})",
+        flush=True,
+    )
+    return True
+
+
+async def start_poll_delivery_when_bound(
+    server,
+    delivery_mode: str,
+    platform_url: str,
+    workspace_id: str,
+    port: int,
+    loop,
+    *,
+    poll_interval: float = 0.05,
+    max_wait_seconds: float = 60.0,
+    start_pollers=None,
+    set_callback=None,
+) -> bool:
+    """Start poll-mode inbound delivery, but ONLY after uvicorn has bound.
+
+    The E1 startup-race fix. The inbox poller fires its first poll the instant
+    its daemon thread starts; if that happens before uvicorn binds
+    ``127.0.0.1:{port}`` the consumer's local self-POST hits a closed socket and
+    the staged message is dropped while the inbox cursor advances past it.
+    ``uvicorn.Server`` flips ``started`` True once its socket is bound and
+    accepting, so gating the poller on it guarantees the consumer only ever posts
+    to a listening executor — no staged message is lost.
+
+    No-op (returns False) in push mode (default), preserving the never-run-both
+    invariant. ``max_wait_seconds`` is a defensive bound: if startup somehow
+    stalls we still start the poller (the consumer's bounded connection-refused
+    retry is the backstop) rather than never delivering. ``poll_interval`` /
+    ``start_pollers`` / ``set_callback`` are injectable for tests.
+    """
+    if delivery_mode != "poll":
+        return False
+    waited = 0.0
+    while not getattr(server, "started", False):
+        if waited >= max_wait_seconds:
+            print(
+                "Delivery mode: poll — uvicorn not reported bound after "
+                f"{max_wait_seconds:.0f}s; starting poller anyway "
+                "(consumer retries connection-refused as backstop)",
+                flush=True,
+            )
+            break
+        await asyncio.sleep(poll_interval)
+        waited += poll_interval
+    return maybe_start_poll_delivery(
+        delivery_mode,
+        platform_url,
+        workspace_id,
+        port,
+        loop,
+        start_pollers=start_pollers,
+        set_callback=set_callback,
+    )
+
+
 async def main():  # pragma: no cover
     workspace_id = os.environ.get("WORKSPACE_ID", "")
     if not workspace_id:
         raise SystemExit("FATAL: WORKSPACE_ID env var is not set. Aborting.")
     config_path = os.environ.get("WORKSPACE_CONFIG_PATH", "/configs")
+
+    # 0.0 Config-relay fetch prelude (cf-r2-relay-config-secret-delivery).
+    # When the CP provisions with the R2 relay ENABLED it stages this
+    # workspace's {config.yaml + prompts/* + secrets} to a transient R2 object
+    # and injects MOLECULE_CONFIG_RELAY_URI (a short-TTL presigned GET) + _SHA256
+    # + _ACK_TOKEN. Fetch the bundle over the presigned HTTPS URL, verify its
+    # sha256, unpack it into config_path, then POST /cp/workspaces/<id>/relay-ack
+    # so the CP deletes the object. Fail-CLOSED on a genuine fetch/integrity
+    # failure (a mis-delivered config aborts boot rather than boot a mis-
+    # configured agent); transient/cold-presign failures retry with backoff; the
+    # ack is best-effort (CP reaper + bucket lifecycle are the backstops). INERT
+    # unless MOLECULE_CONFIG_RELAY_URI is present — the CP injects it only when
+    # its MOLECULE_CONFIG_RELAY_ENABLE flag is on, so this is a no-op until the
+    # operator flips that flag. MUST run BEFORE any step reads config_path
+    # (credential helper, npm auth, declared-plugins, load_config).
+    from molecule_runtime.config_relay import run_config_relay_prelude
+    run_config_relay_prelude(workspace_id=workspace_id, config_path=config_path)
+
     # Docker-aware default — host.docker.internal resolves the platform service
     # from inside the Docker network mesh; falls back to localhost for local dev.
     if os.path.exists("/.dockerenv") or os.environ.get("DOCKER_VERSION"):
@@ -325,6 +566,23 @@ async def main():  # pragma: no cover
     from molecule_runtime.npm_auth import install_npm_gitea_auth
     install_npm_gitea_auth()
 
+    # 0.2c Declared-plugins boot-install (RFC#2843 #32 — base-runtime hoist).
+    # Port of the proven shell block (wt-claude-code/entrypoint.sh:214-284) into
+    # a Python source-provider module so EVERY runtime gets the boot-install
+    # uniformly — no per-template fork. Runs AFTER npm_auth (so a plugin setup.sh
+    # that does an npm fetch is already authed) and BEFORE load_config /
+    # adapter.setup, so the plugins land on disk before _common_setup's
+    # load_plugins reads <config_path>/plugins and install_plugins_via_registry
+    # wires their MCP/skills. No-op when MOLECULE_DECLARED_PLUGINS is empty;
+    # fail-soft (never raises into boot). During the template cutover BOTH this
+    # and the shell block run idempotently (shell first as root pre-gosu, this
+    # second as the agent uid here) — the second simply rebuilds the same tree.
+    from molecule_runtime.plugin_sources import install_declared_plugins
+    try:
+        print(install_declared_plugins().summary(), flush=True)
+    except Exception as e:  # noqa: BLE001 — boot-install must never block boot
+        print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
+
     # 0.3 Pre-commit hook installer — refuses commits that add internal-flavored
     # paths or known secret shapes to any git repo the workspace touches. Lifted
     # into runtime so all templates get the gate without per-Dockerfile wiring.
@@ -341,6 +599,17 @@ async def main():  # pragma: no cover
     # isn't root (template's own start.sh should have handled it there).
     from molecule_runtime.executor_helpers import ensure_workspace_writable
     ensure_workspace_writable()
+
+    # 0b. Mailbox kernel wiring (MUST-FIX 1/2/5). Gated on MOLECULE_MAILBOX_KERNEL:
+    # when ON this arms the process-global turn lease (so the executor's
+    # tool-activity touches have somewhere to land) and logs the durable base
+    # dir; when OFF it installs nothing and every kernel helper stays a no-op,
+    # so the proven push / hard-gate flow is byte-identical. The runaway-guard
+    # should_halt() pre-check (MUST-FIX 2) is kept in the idle loop below AND is
+    # centralized in kernel.should_inject_autonomous_turn for any new autonomous
+    # injector; active_tasks increment/decrement is preserved throughout.
+    from molecule_runtime import kernel as _mailbox_kernel
+    _mailbox_kernel.install()
 
     # 1. Load config
     config = load_config(config_path)
@@ -366,6 +635,12 @@ async def main():  # pragma: no cover
     # Runs before preflight so required-env checks see the normalised shape.
     print(normalise_llm_env(provider=getattr(config, "provider", "")).summary())
     port = config.a2a.port
+    # E1: resolve inbound delivery mode once (env override wins over config;
+    # default "push"). Push (default) keeps the existing uvicorn-route-only
+    # inbound; "poll" tells the platform to stage A2A in activity_logs and starts
+    # the inbox poller below. The proven push concierge never sets this, so the
+    # entire poll branch is dead code for it.
+    delivery_mode = resolve_delivery_mode(os.environ, config.a2a.delivery_mode)
     preflight = run_preflight(config, config_path)
     render_preflight_report(preflight)
 
@@ -517,6 +792,28 @@ async def main():  # pragma: no cover
         default_input_modes=["text/plain", "application/json"],
         default_output_modes=["text/plain", "application/json"],
     )
+
+    # 5b. Materialize the workspace's CANONICAL PERSONA into the ACTIVE runtime's
+    # native identity file (system-prompt.md / SOUL.md / AGENTS.md / GEMINI.md),
+    # so a workspace on ANY runtime boots with its intended identity — even
+    # runtimes (openclaw) whose gateway reads a native file and never consumes
+    # config.system_prompt. Runtime-agnostic: dispatches on adapter.name() via the
+    # persona-materialization PORT. Runs BEFORE setup() so openclaw's setup-time
+    # ``/configs/*.md`` -> gateway-workspace copy picks up the freshly written
+    # SOUL.md (+ cleared BOOTSTRAP/AGENTS placeholders). This is the runtime half
+    # of core #3418's provision half: the delivered persona
+    # (config.prompt_files, e.g. prompts/concierge.md) becomes the model's actual
+    # on-disk identity for the real runtime, not just claude-code. Best-effort +
+    # idempotent + no-op when no persona is delivered, so nothing regresses.
+    try:
+        materialized_persona_path = adapter.materialize_persona(adapter_config)
+        if materialized_persona_path is not None:
+            print(
+                f"Persona: materialized canonical identity into "
+                f"{materialized_persona_path} (runtime={runtime})"
+            )
+    except Exception as _persona_err:  # noqa: BLE001 — persona is best-effort
+        print(f"Warning: persona materialization failed (non-fatal): {_persona_err}")
 
     # 6. Setup adapter and create executor
     # On failure: log + continue. The card route stays mounted (above);
@@ -720,12 +1017,20 @@ async def main():  # pragma: no cover
             workspace_url=workspace_url,
             agent_card=agent_card_dict,
             headers=auth_headers(),
+            delivery_mode=delivery_mode,
         )
 
     heartbeat.agent_card = agent_card_dict
 
     # 9. Start heartbeat
     heartbeat.start()
+
+    # 9a. E1 — poll-mode inbound delivery is started LATER, gated on uvicorn
+    # having bound (see the start_poll_delivery_when_bound task created just
+    # before server.serve() below). Starting the poller here — before the server
+    # socket is listening — would race: the poller's first poll could pull a
+    # staged message and self-POST to 127.0.0.1:{port} before uvicorn binds,
+    # dropping it while the inbox cursor advances. No-op in push mode (default).
 
     # 9b. Start skills hot-reload watcher (background task)
     # When a skill file changes the watcher reloads the skill module and calls
@@ -1018,6 +1323,26 @@ async def main():  # pragma: no cover
                 except asyncio.CancelledError:
                     return
 
+                # Autonomous-loop circuit breaker (runaway self-fire incident
+                # 2026-06-29). Once the replay guard has tripped — N consecutive
+                # identical / no-new-info self-fired outputs — STOP firing the
+                # idle prompt entirely. The workspace is already marked degraded
+                # via runtime_wedge; continuing to self-wake would just keep
+                # re-emitting the same stale replay and burning tokens. A
+                # workspace restart clears the wedge and resumes idle behavior.
+                try:
+                    from molecule_runtime.autonomous_loop_guard import should_halt as _loop_should_halt
+
+                    if _loop_should_halt():
+                        print(
+                            "Idle loop: circuit breaker OPEN — halting self-fire "
+                            "(runtime degraded by replay guard; restart to resume)",
+                            flush=True,
+                        )
+                        return
+                except Exception:
+                    pass  # guard import/lookup must never crash the idle loop
+
                 # Local idle check — no platform API call, no LLM call.
                 # heartbeat.active_tasks == 0 means no in-flight work.
                 if heartbeat.active_tasks > 0:
@@ -1054,6 +1379,12 @@ async def main():  # pragma: no cover
                     "params": build_message_send_params(
                         config.idle_prompt,
                         message_id=f"idle-{_uuid.uuid4().hex[:8]}",
+                        # Stamp the typed self-ping marker so the executor (a)
+                        # drops the idle fire instead of queuing it behind an
+                        # in-flight turn, and (b) subjects its output to the
+                        # autonomous-loop replay guard. Idle self-wake was the
+                        # driver of the runaway replay incident.
+                        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
                     ),
                 }).encode()
 
@@ -1110,6 +1441,53 @@ async def main():  # pragma: no cover
 
         idle_loop_task = asyncio.create_task(_run_idle_loop())
 
+    # 9a (deferred). E1 — poll-mode inbound delivery, gated on uvicorn bind.
+    # Created as a task so it can wait for server.started (flipped True once the
+    # socket is bound) before starting the inbox poller; this closes the
+    # startup race where a message staged in the pre-bind window would be
+    # self-POSTed to a not-yet-listening 127.0.0.1:{port} and lost while the
+    # inbox cursor advanced. No-op in push mode (the proven default path is
+    # byte-for-byte unchanged). Captures the running loop so the poller-thread
+    # consumer can marshal its post onto this event loop.
+    poll_delivery_task = None
+    if delivery_mode == "poll":
+        poll_delivery_task = asyncio.create_task(
+            start_poll_delivery_when_bound(
+                server,
+                delivery_mode,
+                platform_url,
+                workspace_id,
+                port,
+                asyncio.get_running_loop(),
+            )
+        )
+
+    # 9c. Plugin-declared channel daemons (issue #215, PR-1). Manifest-declared
+    # long-running sidecars (`contributes.daemons` — e.g. a channel bridge like
+    # lark-channel-molecule) are spawned only AFTER uvicorn binds (same gate as
+    # the poll-delivery starter above: a bridge posting at the local A2A server
+    # must never race the bind) and terminated in the finally below — daemons
+    # die with the workspace. Fail-open for the agent itself: discovery/spawn
+    # failures are logged, never fatal, and zero-daemon workspaces skip the
+    # task entirely. The event socket / provenance lane is PR-2.
+    plugin_daemon_supervisor = None
+    plugin_daemon_task = None
+    try:
+        from molecule_runtime import plugin_daemons
+
+        daemon_specs = plugin_daemons.discover_daemon_specs(
+            workspace_plugins_dir=os.path.join(config_path, "plugins"),
+        )
+        if daemon_specs:
+            plugin_daemon_supervisor = plugin_daemons.DaemonSupervisor(daemon_specs)
+            plugin_daemon_task = asyncio.create_task(
+                plugin_daemons.start_supervisor_when_bound(
+                    server, plugin_daemon_supervisor
+                )
+            )
+    except Exception as e:  # noqa: BLE001 — daemons must never block boot
+        print(f"Plugin daemons: discovery failed (non-fatal): {e}", flush=True)
+
     try:
         await server.serve()
     finally:
@@ -1131,6 +1509,20 @@ async def main():  # pragma: no cover
         # Cancel idle loop if running
         if idle_loop_task and not idle_loop_task.done():
             idle_loop_task.cancel()
+        # Cancel the deferred poll-delivery starter if it never got past the
+        # bind-wait (e.g. shutdown during a stalled startup).
+        if poll_delivery_task and not poll_delivery_task.done():
+            poll_delivery_task.cancel()
+        # Cancel the daemon-supervisor starter if it never got past the
+        # bind-wait, then terminate any spawned plugin daemons (issue #215 —
+        # the workspace owns its channel processes; they die with it).
+        if plugin_daemon_task and not plugin_daemon_task.done():
+            plugin_daemon_task.cancel()
+        if plugin_daemon_supervisor is not None:
+            try:
+                plugin_daemon_supervisor.stop()
+            except Exception as daemon_stop_err:  # noqa: BLE001
+                print(f"Warning: plugin daemon stop failed: {daemon_stop_err}")
         # Gracefully stop the Temporal worker background task on shutdown
         await temporal_wrapper.stop()
 

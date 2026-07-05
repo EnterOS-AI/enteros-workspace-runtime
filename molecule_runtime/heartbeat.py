@@ -8,14 +8,20 @@ Every 30 seconds:
 Resilient: recreates HTTP client on failure, auto-restarts on crash.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import threading
 import time
+from typing import TYPE_CHECKING
+
 import httpx
 
+import molecule_runtime.mailbox_dir as mailbox_dir
+from molecule_runtime import kernel
 from molecule_runtime.a2a_client import build_message_send_params
 from molecule_runtime.platform_agent_identity import identity_gate_payload
 from molecule_runtime.a2a_executor import (
@@ -23,6 +29,44 @@ from molecule_runtime.a2a_executor import (
     A2A_SOURCE_SELF_HARVESTER,
 )
 from molecule_runtime.platform_auth import auth_headers, refresh_cache, self_source_headers
+
+
+def _kernel_allows_autonomous_injection(kind: str) -> bool:
+    """Kernel-gated pre-injection circuit-breaker check for an autonomous
+    self-wake (MUST-FIX 2).
+
+    Kernel OFF -> always ``True`` (allow), so the self-wake fires EXACTLY as it
+    did before the mailbox kernel — byte-identical. Kernel ON -> route through
+    :func:`kernel.should_inject_autonomous_turn`, which consults the
+    autonomous-loop circuit breaker (:func:`autonomous_loop_guard.should_halt`)
+    and returns ``False`` when it is OPEN, so the runaway breaker gates the
+    injection BEFORE another replay is enqueued. Fails OPEN (allow) on any
+    error — a guard hiccup must never silence the delegation-result harvester.
+    """
+    try:
+        if not mailbox_dir.kernel_enabled():
+            return True
+        return kernel.should_inject_autonomous_turn(kind)
+    except Exception:  # noqa: BLE001
+        return True
+
+if TYPE_CHECKING:
+    # SSOT typed payloads (molecule-contracts / RFC molecule-core#3285),
+    # published as `molecule-ai-contracts` on the gitea PyPI registry and
+    # generated from molecule-contracts/workspace-comms. Imported under
+    # TYPE_CHECKING ONLY: these are TypedDicts (plain dicts at runtime),
+    # `from __future__ import annotations` keeps every annotation a string, and
+    # the runtime's `pip install` / wheel smoke-test resolves from plain PyPI
+    # (which does not carry this package). So there is NO hard runtime
+    # dependency — the wire payloads below stay byte-identical dicts, now
+    # checked against the SSOT contract shapes by a type checker for
+    # drift-prevention. Install the `contracts` extra (gitea index) to
+    # type-check against it locally. This is the SAME pattern molecule-ai-sdk
+    # adopted in #36; the runtime is the reference consumer of the contract.
+    from molecule_ai_contracts.workspace_comms_gen import (
+        HeartbeatRequest,
+        HeartbeatRuntimeMetadata,
+    )
 
 # Typed marker for activity-log rows that represent backpressure echoes rather
 # than genuine peer results. The platform sets this on "queued: target busy"
@@ -84,7 +128,9 @@ def _runtime_metadata_payload() -> dict:
         adapter_cls = get_adapter("")
         adapter = adapter_cls()
         caps = adapter.capabilities()
-        meta: dict = {"capabilities": caps.to_dict()}
+        # Typed against the SSOT contract sub-shape (molecule-contracts
+        # HeartbeatRuntimeMetadata) for drift-prevention; same plain dict on the wire.
+        meta: HeartbeatRuntimeMetadata = {"capabilities": caps.to_dict()}
         idle = adapter.idle_timeout_override()
         # Only include the override when it's a positive integer. None /
         # zero / negative falls through to the platform's global default
@@ -157,7 +203,38 @@ _DELEGATION_PREFIX = "Delegation completed:"
 # Shared path — adapter executors (in their template repos) read this
 # same file via executor_helpers.read_delegation_results so heartbeat-
 # delivered async delegation results land in the next agent turn.
-DELEGATION_RESULTS_FILE = os.environ.get("DELEGATION_RESULTS_FILE", "/tmp/delegation_results.jsonl")
+#
+# RC #203 (durability): the harvested result is appended here BEFORE the durable
+# harvest tombstone is committed (_commit_harvested). The queue must therefore be
+# at least as durable as the tombstone — a /tmp (tmpfs) queue while the tombstone
+# lives on the mailbox volume would let a restart lose the queued result but keep
+# the tombstone, suppressing the result forever. So when the mailbox kernel is ON
+# the queue lives on the durable mailbox volume (mailbox_dir.delegation_results_file);
+# kernel OFF keeps the legacy /tmp default (byte-identical). An explicit
+# DELEGATION_RESULTS_FILE env — captured at import here — or a test monkeypatch of
+# this module attribute still wins verbatim; when left at the import-time default
+# _delegation_results_file() routes it to the durable mailbox queue under the kernel.
+_LEGACY_DELEGATION_RESULTS_FILE = os.environ.get(
+    "DELEGATION_RESULTS_FILE", "/tmp/delegation_results.jsonl"
+)
+DELEGATION_RESULTS_FILE = _LEGACY_DELEGATION_RESULTS_FILE
+
+
+def _delegation_results_file() -> str:
+    """Live path to the delegation-results queue (RC #203 durable when kernel-ON).
+
+    An explicit override — ``DELEGATION_RESULTS_FILE`` set in the environment at
+    import (reflected in the module attribute) or a test monkeypatch of that
+    attribute — wins verbatim. Otherwise defer to
+    :func:`mailbox_dir.delegation_results_file`, which returns the DURABLE mailbox
+    queue when the kernel is on and the legacy ``/tmp`` default when it is off
+    (byte-identical). Resolving live keeps the writer, the executor reader
+    (``executor_helpers.read_delegation_results``) and the idle-loop guard
+    (``main._check_delegation_results_pending``) all pointed at the SAME queue.
+    """
+    if DELEGATION_RESULTS_FILE != _LEGACY_DELEGATION_RESULTS_FILE:
+        return DELEGATION_RESULTS_FILE
+    return mailbox_dir.delegation_results_file()
 # Cursor file for tracking activity_log IDs processed from the a2a_receive path
 # (delegations fired via tool_delegate_task → POST /workspaces/:id/a2a proxy, not
 # POST /workspaces/:id/delegate). Persisted to disk so heartbeat restarts
@@ -166,6 +243,134 @@ _ACTIVITY_DELEGATION_CURSOR_FILE = os.environ.get(
     "DELEGATION_ACTIVITY_CURSOR_FILE",
     "/tmp/delegation_activity_cursor",
 )
+
+
+def _activity_delegation_cursor_file() -> str:
+    """Resolve the a2a_receive delegation cursor path (MUST-FIX 5).
+
+    Kernel ON: durable mailbox dir (``/workspace/.molecule``) so a restart
+    resumes where it left off instead of re-scanning ``/tmp`` (wiped on a fresh
+    container) — unless ``DELEGATION_ACTIVITY_CURSOR_FILE`` overrides it.
+    Kernel OFF: the module-level ``_ACTIVITY_DELEGATION_CURSOR_FILE`` (env at
+    import, monkeypatchable) — byte-identical to the pre-migration behavior.
+    """
+    if mailbox_dir.kernel_enabled():
+        explicit = os.environ.get("DELEGATION_ACTIVITY_CURSOR_FILE", "").strip()
+        if explicit:
+            return explicit
+        return str(mailbox_dir.resolve() / ".delegation_activity_cursor")
+    return _ACTIVITY_DELEGATION_CURSOR_FILE
+
+
+# Durable (kernel-on) harvest tombstone file: one "delegation_id<TAB>status"
+# per line. See HeartbeatLoop._is_harvested / _commit_harvested for the rationale.
+def _harvest_tombstone_file() -> str:
+    if mailbox_dir.kernel_enabled():
+        return str(mailbox_dir.resolve() / ".delegation_tombstones")
+    return ""
+
+
+# Cap the durable tombstone set so a long-lived workspace can't grow it without
+# bound; oldest lines are dropped on overflow.
+_MAX_HARVEST_TOMBSTONES = 4096
+
+# ── Active-await scoping for the delegation-result harvester ─────────────────
+# Root fix for the recurring delegation-result RE-NARRATION loop (supersedes
+# the watermark band-aid). The harvester (_check_delegations) used to surface
+# EVERY completed/failed delegation row where source_id==self, deduped only by
+# the IN-MEMORY _seen_delegation_ids set. Because that set is process-scoped,
+# every restart re-read the tenant's full backlog of historical completed
+# PR-review delegation rows (178 on the agents-team concierge) and fired a
+# self-message that woke the concierge to NARRATE the whole backlog again —
+# an endless re-narration loop across restarts, and a path that also harvested
+# a peer's autonomous/scheduled sweep results (codex-reviewer's
+# org-pr-review-sweep) the concierge never asked to be woken for.
+#
+# The concierge must auto-harvest + self-wake-narrate a delegation result ONLY
+# when it has an OPEN IN-FLIGHT AWAIT for that delegation — a delegation IT
+# initiated this process and is still tracking (genuinely awaiting on behalf of
+# a live task). The "open await set" is the UNION of:
+#   (a) the in-container in-flight delegation registry the concierge maintains
+#       (builtin_tools.delegation._delegations), populated by delegate_task_async
+#       — read defensively, never mutated, so this scoping needs no change to
+#       the delegation tool; and
+#   (b) ids explicitly registered via register_awaited_delegation() — the public
+#       seam other delegation paths (or tests) use to opt a delegation into
+#       heartbeat auto-harvest.
+#
+# Both layers are PROCESS-SCOPED (empty on a fresh boot), which is exactly what
+# kills the loop at the SOURCE: a (re)booted concierge has ZERO open awaits, so
+# the historical backlog is never re-read/re-narrated, and a peer's autonomous
+# sweep — which the concierge holds no await for — is never harvested. A
+# genuinely user-awaited delegation the concierge initiated IS still delivered
+# exactly once (it is in the open-await set, and _seen_delegation_ids dedupes
+# the within-process re-poll). Mirrors the one-platform-agent-per-process
+# posture of runtime_wedge / autonomous_loop_guard.
+_REGISTERED_AWAIT_IDS: "dict[str, None]" = {}
+_REGISTERED_AWAIT_LOCK = threading.Lock()
+# Cap so a long-lived process can't grow the registry unbounded; evicts the
+# oldest-inserted half on overflow (dict preserves insertion order).
+_MAX_REGISTERED_AWAIT_IDS = 512
+
+
+def register_awaited_delegation(delegation_id: str) -> None:
+    """Record that the concierge is actively AWAITING this delegation's result,
+    so the heartbeat harvester is allowed to surface it (once) when it
+    completes. Idempotent; no-op on an empty id. Bounded.
+
+    The in-container builtin delegate path is covered automatically (the
+    harvester also reads builtin_tools.delegation._delegations), so this seam is
+    for delegation paths that do NOT register there — e.g. the MCP/platform
+    delegate path — plus tests."""
+    if not delegation_id:
+        return
+    with _REGISTERED_AWAIT_LOCK:
+        _REGISTERED_AWAIT_IDS[delegation_id] = None
+        if len(_REGISTERED_AWAIT_IDS) > _MAX_REGISTERED_AWAIT_IDS:
+            drop = len(_REGISTERED_AWAIT_IDS) - _MAX_REGISTERED_AWAIT_IDS // 2
+            for k in list(_REGISTERED_AWAIT_IDS)[:drop]:
+                _REGISTERED_AWAIT_IDS.pop(k, None)
+
+
+def discard_awaited_delegation(delegation_id: str) -> None:
+    """Drop an await id once its result has been delivered (await satisfied)."""
+    if not delegation_id:
+        return
+    with _REGISTERED_AWAIT_LOCK:
+        _REGISTERED_AWAIT_IDS.pop(delegation_id, None)
+
+
+def reset_awaited_delegations_for_test() -> None:
+    """Test-only: clear the registered-await set between cases."""
+    with _REGISTERED_AWAIT_LOCK:
+        _REGISTERED_AWAIT_IDS.clear()
+
+
+def _in_flight_delegation_ids() -> set[str]:
+    """Delegation ids the concierge initiated this process and is tracking,
+    read READ-ONLY from the in-container in-flight delegation registry
+    (builtin_tools.delegation._delegations, populated by delegate_task_async).
+
+    Defensive: returns an empty set if that module isn't importable (partial
+    install / mid-deploy) — i.e. a missing registry fails CLOSED (no harvest),
+    the safe direction for the loop fix (better to miss a rare async result the
+    agent can still poll for than to re-enter the re-narration loop)."""
+    try:
+        from molecule_runtime.builtin_tools.delegation import _delegations
+
+        return {tid for tid in _delegations if tid}
+    except Exception:
+        return set()
+
+
+def _active_await_delegation_ids() -> set[str]:
+    """The concierge's set of OPEN in-flight delegation awaits — the union of
+    explicitly-registered awaits and the in-container in-flight registry. The
+    harvester surfaces a delegation result ONLY when its delegation_id is in
+    this set."""
+    with _REGISTERED_AWAIT_LOCK:
+        registered = set(_REGISTERED_AWAIT_IDS)
+    return registered | _in_flight_delegation_ids()
 
 
 class HeartbeatLoop:
@@ -227,6 +432,11 @@ class HeartbeatLoop:
         # Loaded lazily from cursor file on first poll to avoid blocking startup.
         self._seen_activity_ids: set[str] = set()
         self._activity_cursor_loaded = False
+        # MUST-FIX 4: durable (kernel-on) harvest tombstones keyed by
+        # (delegation_id, status). Loaded lazily; only materialized when the
+        # mailbox kernel is on (else _is_harvested/_commit_harvested are no-ops).
+        self._harvest_tombstones: set[tuple[str, str]] = set()
+        self._harvest_tombstones_loaded = False
 
     @property
     def error_rate(self) -> float:
@@ -279,7 +489,16 @@ class HeartbeatLoop:
         URL, same payload, same 401-refresh-and-retry-once, same
         platform_inbound_secret persistence. Raises on transport/HTTP error
         so the caller can track consecutive failures."""
-        body: dict = {
+        # Typed against the SSOT contract (molecule-contracts HeartbeatRequest)
+        # for drift-prevention; the wire payload is unchanged. This is the
+        # reference HeartbeatPayload: identity_gate_payload() layers in the
+        # contract's mcp_server_present + loaded_mcp_tools tri-states, and the
+        # _runtime_state_payload / _runtime_metadata_payload merges below add
+        # runtime_state + runtime_metadata. (platform_mcp_diag is a runtime-only
+        # diagnostic not yet promoted into the schema — see the contracts repo's
+        # heartbeat divergence notes; a type checker surfacing it is correct drift
+        # signal, not a regression.)
+        body: HeartbeatRequest = {
             "workspace_id": self.workspace_id,
             "error_rate": self.error_rate,
             "sample_error": self.sample_error,
@@ -457,6 +676,84 @@ class HeartbeatLoop:
                     except Exception:
                         pass
 
+    def _load_harvest_tombstones(self) -> None:
+        """Lazily load durable (delegation_id, status) harvest tombstones."""
+        if self._harvest_tombstones_loaded:
+            return
+        self._harvest_tombstones_loaded = True
+        path = _harvest_tombstone_file()
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    did, _, status = line.strip().partition("\t")
+                    if did:
+                        self._harvest_tombstones.add((did, status))
+        except OSError:
+            pass  # Absent / corrupt — start fresh (dedup degrades, never crashes)
+
+    def _save_harvest_tombstones(self) -> None:
+        """Persist harvest tombstones, evicting oldest half on overflow."""
+        path = _harvest_tombstone_file()
+        if not path:
+            return
+        if len(self._harvest_tombstones) > _MAX_HARVEST_TOMBSTONES:
+            keep = list(self._harvest_tombstones)[_MAX_HARVEST_TOMBSTONES // 2:]
+            self._harvest_tombstones = set(keep)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for did, status in self._harvest_tombstones:
+                    f.write(f"{did}\t{status}\n")
+        except OSError:
+            pass  # Best-effort; a lost tombstone only risks one extra harvest
+
+    def _is_harvested(self, delegation_id: str, status: str) -> bool:
+        """Kernel-gated DURABLE dedup CHECK keyed by (delegation_id, status).
+
+        MUST-FIX 4: the completed/failed delegation-result tombstones go DURABLE
+        (mailbox volume) so a restart never re-harvests a delegation the
+        concierge already surfaced — belt-and-braces on top of the
+        process-scoped active-await scoping. The ``(id, status)`` key makes a
+        status-flip (completed -> failed) a DISTINCT tombstone, so the FAILED
+        branch is harvested exactly once even after a COMPLETED harvest.
+
+        RC #203 (correctness): this is CHECK-ONLY — it never records. The
+        tombstone is committed by :meth:`_commit_harvested` ONLY after the
+        result is durably queued AND the self-wake is sent/scheduled, so a
+        transient delivery failure (result-file write or wake POST) leaves the
+        tombstone UNcommitted and the result is re-harvested on the next pass /
+        after restart instead of being permanently suppressed. No-op (returns
+        False) when the mailbox kernel is off, so the default flow is
+        byte-identical.
+        """
+        if not mailbox_dir.kernel_enabled():
+            return False
+        self._load_harvest_tombstones()
+        return (delegation_id, status) in self._harvest_tombstones
+
+    def _commit_harvested(self, keys: "list[tuple[str, str]]") -> None:
+        """Durably record harvest tombstones AFTER delivery is confirmed.
+
+        RC #203: called only once the harvested results were durably written to
+        ``DELEGATION_RESULTS_FILE`` AND the self-wake was sent (or deliberately
+        deferred by cooldown/breaker — both leave the result durably queued for
+        the next turn's context injection). A result whose delivery RAISED is
+        never passed here, so its tombstone stays uncommitted and it re-harvests
+        on the next pass / restart — never silently dropped. No-op when the
+        mailbox kernel is off (byte-identical).
+        """
+        if not mailbox_dir.kernel_enabled() or not keys:
+            return
+        self._load_harvest_tombstones()
+        changed = False
+        for key in keys:
+            if key not in self._harvest_tombstones:
+                self._harvest_tombstones.add(key)
+                changed = True
+        if changed:
+            self._save_harvest_tombstones()
+
     async def _check_delegations(self, client: httpx.AsyncClient):
         """Check for completed delegations and store results for the agent."""
         try:
@@ -471,12 +768,32 @@ class HeartbeatLoop:
             if not isinstance(delegations, list):
                 return
 
+            # Active-await scoping (root loop fix): only surface results the
+            # concierge has an OPEN in-flight await for. Computed once per poll.
+            # On a fresh boot this is EMPTY, so a backlog of historical
+            # completed rows is never re-read/re-narrated, and a peer's
+            # autonomous/scheduled sweep (which the concierge holds no await
+            # for) is never harvested. See the module-level rationale above
+            # register_awaited_delegation().
+            active_awaits = _active_await_delegation_ids()
+
             new_results = []
+            # RC #203: (id, status) keys whose durable tombstone is committed
+            # ONLY after delivery is confirmed (see _commit_harvested below), so
+            # a failed delivery re-harvests instead of being suppressed.
+            pending_tombstones: list[tuple[str, str]] = []
             for d in delegations:
                 did = d.get("delegation_id", "")
                 status = d.get("status", "")
 
                 if not did or did in self._seen_delegation_ids:
+                    continue
+
+                # Skip any row the concierge is NOT actively awaiting: no
+                # self-wake, no narration. Deliberately NOT marked seen, so a
+                # result that lands just before its await is registered can
+                # still be delivered on a later poll once the await exists.
+                if did not in active_awaits:
                     continue
 
                 if status in ("completed", "failed"):
@@ -495,6 +812,20 @@ class HeartbeatLoop:
                         continue
 
                     self._seen_delegation_ids.add(did)
+                    # Await satisfied — drop it from the registered-await set so
+                    # the registry stays bounded (within-process re-poll is
+                    # already deduped by _seen_delegation_ids).
+                    discard_awaited_delegation(did)
+                    # MUST-FIX 4: durable (delegation_id, status) dedup. No-op
+                    # when the mailbox kernel is off (byte-identical); when on it
+                    # prevents a restart or a duplicate delegate_result row from
+                    # re-harvesting a result already surfaced for this status.
+                    # RC #203: CHECK-ONLY here — the tombstone is committed by
+                    # _commit_harvested AFTER delivery is confirmed, so a failed
+                    # result-file write or self-wake POST re-harvests instead of
+                    # being permanently suppressed.
+                    if self._is_harvested(did, status):
+                        continue
                     new_results.append({
                         "delegation_id": did,
                         "target_id": d.get("target_id", ""),
@@ -505,6 +836,7 @@ class HeartbeatLoop:
                         "error": d.get("error", ""),
                         "timestamp": time.time(),
                     })
+                    pending_tombstones.append((did, status))
 
             # Evict old seen IDs if over limit
             if len(self._seen_delegation_ids) > MAX_SEEN_DELEGATION_IDS:
@@ -512,11 +844,17 @@ class HeartbeatLoop:
                 self._seen_delegation_ids = set(list(self._seen_delegation_ids)[MAX_SEEN_DELEGATION_IDS // 2:])
 
             if new_results:
-                # Append to results file for context injection on next message
-                with open(DELEGATION_RESULTS_FILE, "a") as f:
+                # Append to results file for context injection on next message.
+                # RC #203: if this durable write raises, control jumps to the
+                # outer except and the pending tombstones are NEVER committed, so
+                # the results are re-harvested on the next pass / after restart.
+                with open(_delegation_results_file(), "a") as f:
                     for r in new_results:
                         f.write(json.dumps(r) + "\n")
                 logger.info("Heartbeat: %d new delegation results — triggering self-message", len(new_results))
+                # Result is now durably queued. Assume the wake path is
+                # confirmed/scheduled unless the self-wake POST below raises.
+                delivery_confirmed = True
 
                 # Build a summary message for the agent.
                 # Fix B (Cycle 5): do NOT embed raw response_preview text in
@@ -577,13 +915,24 @@ class HeartbeatLoop:
                 now = time.time()
                 if now - self._last_self_message_time < SELF_MESSAGE_COOLDOWN:
                     logger.debug("Heartbeat: self-message cooldown (60s), will retry next cycle")
+                elif not _kernel_allows_autonomous_injection(kernel.KIND_DELEGATION_RESULT):
+                    # MUST-FIX 2 (kernel-ON): route this delegation-result
+                    # self-wake through the kernel's pre-injection circuit-breaker
+                    # check. When the autonomous-loop breaker is OPEN we DROP the
+                    # self-wake instead of injecting another replay (the runaway
+                    # incident driver). Kernel OFF -> the guard short-circuits to
+                    # allow -> byte-identical (this branch is never taken).
+                    logger.info(
+                        "Heartbeat: autonomous-loop breaker OPEN — dropping "
+                        "delegation-result self-wake (kernel)"
+                    )
                 else:
                     self._last_self_message_time = now
                     try:
                         # self_source_headers() adds X-Workspace-ID so the
                         # platform tags this row source=agent, not canvas
                         # — see platform_auth.py for the full rationale.
-                        await client.post(
+                        wake_resp = await client.post(
                             f"{self.platform_url}/workspaces/{self.workspace_id}/a2a",
                             json={
                                 "method": "message/send",
@@ -598,9 +947,38 @@ class HeartbeatLoop:
                             headers=self_source_headers(self.workspace_id),
                             timeout=120.0,
                         )
-                        logger.info("Heartbeat: self-message sent to process delegation results")
+                        # RC #203 (Finding 2): httpx does NOT raise on a 4xx/5xx —
+                        # only on transport errors. A non-2xx self-wake means the
+                        # agent was NOT woken, so it MUST be treated as a failed
+                        # delivery (same family as the tombstone bugs already fixed
+                        # on this branch): leave the tombstone UNcommitted so the
+                        # result re-harvests next pass / after restart instead of
+                        # being silently suppressed forever. Confirm on 2xx ONLY.
+                        if 200 <= wake_resp.status_code < 300:
+                            logger.info("Heartbeat: self-message sent to process delegation results")
+                        else:
+                            logger.warning(
+                                "Heartbeat: self-wake POST returned HTTP %s — leaving "
+                                "delegation tombstone uncommitted for re-harvest",
+                                wake_resp.status_code,
+                            )
+                            delivery_confirmed = False
                     except Exception as e:
                         logger.warning("Heartbeat: failed to send self-message: %s", e)
+                        # RC #203: the wake POST failed — do NOT commit the
+                        # tombstones, so the result is re-harvested next pass /
+                        # after restart rather than silently suppressed.
+                        delivery_confirmed = False
+
+                # RC #203: commit the durable harvest tombstones ONLY now — after
+                # the result was durably written AND the self-wake was sent or
+                # deliberately deferred (cooldown/breaker still leave the result
+                # queued for the next turn's injection). A failed result-file
+                # write (outer except, never reaches here) or a failed wake POST
+                # leaves the tombstone uncommitted so the result is re-harvested,
+                # never silently dropped. No-op when the kernel is off.
+                if delivery_confirmed:
+                    self._commit_harvested(pending_tombstones)
 
                 # Also push notification to user via canvas, but ONLY for
                 # failure-class statuses. Success rows are agent-only — the
@@ -641,8 +1019,9 @@ class HeartbeatLoop:
             if not self._activity_cursor_loaded:
                 self._activity_cursor_loaded = True
                 try:
-                    if os.path.exists(_ACTIVITY_DELEGATION_CURSOR_FILE):
-                        cursor = open(_ACTIVITY_DELEGATION_CURSOR_FILE).read().strip()
+                    _cursor_file = _activity_delegation_cursor_file()
+                    if os.path.exists(_cursor_file):
+                        cursor = open(_cursor_file).read().strip()
                         if cursor:
                             self._seen_activity_ids = set(cursor.split(","))
                 except Exception:
@@ -742,7 +1121,7 @@ class HeartbeatLoop:
             # Persist cursor so restarts don't re-process these rows.
             if last_id:
                 try:
-                    with open(_ACTIVITY_DELEGATION_CURSOR_FILE, "w") as f:
+                    with open(_activity_delegation_cursor_file(), "w") as f:
                         # Keep cursor as comma-joined IDs; truncate if over 100KB.
                         cursor_str = ",".join(sorted(self._seen_activity_ids))
                         if len(cursor_str) > 102_400:
@@ -755,7 +1134,8 @@ class HeartbeatLoop:
                     pass  # Non-fatal; next cycle will retry
 
             # Append to results file and trigger self-message (mirrors _check_delegations).
-            with open(DELEGATION_RESULTS_FILE, "a") as f:
+            # RC #203: durable-queue resolution (kernel-ON) via _delegation_results_file().
+            with open(_delegation_results_file(), "a") as f:
                 for r in new_results:
                     f.write(json.dumps(r) + "\n")
             logger.info(
@@ -818,6 +1198,13 @@ class HeartbeatLoop:
                 logger.debug(
                     "Heartbeat: self-message cooldown active; "
                     "a2a_receive results will be retried next cycle"
+                )
+            elif not _kernel_allows_autonomous_injection(kernel.KIND_DELEGATION_RESULT):
+                # MUST-FIX 2 (kernel-ON): same pre-injection breaker gate as the
+                # /delegations harvester above. Kernel OFF -> allow -> byte-identical.
+                logger.info(
+                    "Heartbeat: autonomous-loop breaker OPEN — dropping "
+                    "a2a_receive delegation-result self-wake (kernel)"
                 )
             else:
                 self._last_self_message_time = now

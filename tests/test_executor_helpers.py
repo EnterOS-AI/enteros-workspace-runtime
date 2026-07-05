@@ -2011,3 +2011,60 @@ def test_capabilities_preamble_empty_for_cli_runtime():
     # directive rides the MCP preamble; CLI agents get their own prompt
     # shape and must not be handed MCP tool-name vocabulary.
     assert eh.get_capabilities_preamble(mcp=False) == ""
+
+
+# ── Tool-activity liveness file: private per-turn path (activity-file
+#    liveness bypass fix). Kernel OFF stays on the legacy /tmp default
+#    (byte-identical); kernel ON moves it under the mailbox dir with
+#    restrictive perms and exports it for cross-repo subprocess executors.
+
+
+def test_tool_activity_file_legacy_tmp_when_kernel_off(monkeypatch):
+    """Kernel OFF: byte-identical legacy /tmp default; explicit override wins."""
+    monkeypatch.delenv("MOLECULE_MAILBOX_KERNEL", raising=False)
+    monkeypatch.delenv("MOLECULE_TOOL_ACTIVITY_FILE", raising=False)
+    assert eh.tool_activity_file() == eh.DEFAULT_TOOL_ACTIVITY_FILE
+    monkeypatch.setenv("MOLECULE_TOOL_ACTIVITY_FILE", "/custom/act")
+    assert eh.tool_activity_file() == "/custom/act"
+
+
+def test_tool_activity_file_private_under_mailbox_when_kernel_on(tmp_path, monkeypatch):
+    """Kernel ON: the default activity path is a PRIVATE file under the mailbox
+    dir (not world-writable /tmp), created 0600 with a 0700 parent, and EXPORTED
+    via MOLECULE_TOOL_ACTIVITY_FILE so subprocess executors follow it."""
+    import stat
+
+    monkeypatch.setenv("MOLECULE_MAILBOX_KERNEL", "1")
+    monkeypatch.setenv("MOLECULE_MAILBOX_DIR", str(tmp_path / "mbox"))
+    # ensure_tool_activity_file() raw-sets MOLECULE_TOOL_ACTIVITY_FILE via
+    # os.environ (the EXPORT) which monkeypatch can't auto-revert; snapshot +
+    # restore so it can't leak into other tests.
+    _saved = os.environ.get("MOLECULE_TOOL_ACTIVITY_FILE")
+    os.environ.pop("MOLECULE_TOOL_ACTIVITY_FILE", None)
+    try:
+        path = eh.ensure_tool_activity_file()
+        mbox = str(tmp_path / "mbox")
+        # Private path is UNDER the configured mailbox dir, and is NOT the
+        # world-writable legacy default that ANY workspace process could
+        # pre-create / tamper with / forge liveness on — the whole point of the
+        # kernel-ON path.
+        #
+        # (Do NOT assert "not under /tmp": pytest's ``tmp_path`` is itself under
+        # /tmp on Linux CI, so the configured mailbox dir legitimately lives
+        # there in this test. The portable invariant is "not the DEFAULT
+        # location", not "not under /tmp".)
+        assert path.startswith(mbox), path
+        assert path != eh.DEFAULT_TOOL_ACTIVITY_FILE, path
+        assert not path.startswith(eh.DEFAULT_TOOL_ACTIVITY_FILE), path
+        assert os.path.isfile(path)
+        # Exported so cross-repo subprocess executors inherit the same path.
+        assert os.environ["MOLECULE_TOOL_ACTIVITY_FILE"] == path
+        # Restrictive perms — skipped on Windows (no POSIX mode bits).
+        if os.name != "nt":
+            assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+            assert stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode) == 0o700
+    finally:
+        if _saved is None:
+            os.environ.pop("MOLECULE_TOOL_ACTIVITY_FILE", None)
+        else:
+            os.environ["MOLECULE_TOOL_ACTIVITY_FILE"] = _saved

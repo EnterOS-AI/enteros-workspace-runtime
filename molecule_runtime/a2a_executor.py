@@ -47,6 +47,7 @@ import logging
 import os
 import uuid
 
+from molecule_runtime import turn_lease as _turn_lease
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
@@ -62,10 +63,12 @@ from molecule_runtime.executor_helpers import (
     build_user_content_with_files,
     collect_outbound_files,
     error_detail_for_external,
+    ensure_tool_activity_file,
     extract_attached_files,
     read_delegation_results,
     sanitize_agent_error,
     task_state_value,
+    tool_activity_file,
 )
 from molecule_runtime.attachment_vision import append_image_descriptions
 from molecule_runtime.runtime_inbox import (
@@ -214,14 +217,43 @@ def _extract_chunk_text(content) -> list[str]:
 A2A_MESSAGE_SOURCE_TYPE = "source_type"
 A2A_SOURCE_SELF_CRON = "self-cron"
 A2A_SOURCE_SELF_HARVESTER = "self-harvester"
+# Idle self-wake (main.py _run_idle_loop): periodically re-pokes the agent
+# while the workspace is idle. Marked as a routine self-ping so (a) it drops
+# rather than queues behind an in-flight turn, and (b) its output is subject
+# to the autonomous-loop replay guard — the idle self-wake was the driver of
+# the 2026-06-29 runaway delegation-result replay incident.
+A2A_SOURCE_SELF_IDLE = "self-idle"
 
-# Routine self-pings the runtime sends to ITSELF: the platform cron tick and
-# the heartbeat delegation-results harvester. Under the non-blocking fast-path
-# these must NOT queue behind (or interrupt) a long in-flight turn — the cron
-# recurs every cycle and delegation results are injected from
-# DELEGATION_RESULTS_FILE at the next turn, so dropping a mid-turn routine ping
-# loses nothing while avoiding both task-interruption and ping pile-up.
-_ROUTINE_SELF_SOURCE_TYPES = (A2A_SOURCE_SELF_CRON, A2A_SOURCE_SELF_HARVESTER)
+# Mailbox-kernel autonomous self-turn kinds (gated behind MOLECULE_MAILBOX_KERNEL,
+# injected via molecule_runtime.kernel). Each is a ROUTINE SELF-PING — same class
+# as cron/idle/harvester — so it drops rather than queues behind an in-flight
+# turn AND its output runs through the UNCHANGED evaluate_autonomous_output
+# replay guard (registration in _ROUTINE_SELF_SOURCE_TYPES below is what wires
+# that governance; NO new suppression code is added anywhere).
+#   scheduler   — mailbox scheduler tick
+#   goal-nudge  — goal / plan re-engagement nudge
+#   delegation  — explicit delegation-result harvest self-turn
+A2A_SOURCE_SELF_SCHEDULER = "self-scheduler"
+A2A_SOURCE_SELF_GOAL_NUDGE = "self-goal-nudge"
+A2A_SOURCE_SELF_DELEGATION = "self-delegation-result"
+
+# Routine self-pings the runtime sends to ITSELF: the platform cron tick, the
+# heartbeat delegation-results harvester, and the idle self-wake. Under the
+# non-blocking fast-path these must NOT queue behind (or interrupt) a long
+# in-flight turn — the cron/idle recur every cycle and delegation results are
+# injected from DELEGATION_RESULTS_FILE at the next turn, so dropping a
+# mid-turn routine ping loses nothing while avoiding both task-interruption
+# and ping pile-up. These are also the ONLY turns the autonomous-loop replay
+# guard governs — a user-directed turn is never suppressed.
+_ROUTINE_SELF_SOURCE_TYPES = (
+    A2A_SOURCE_SELF_CRON,
+    A2A_SOURCE_SELF_HARVESTER,
+    A2A_SOURCE_SELF_IDLE,
+    # Mailbox-kernel kinds — governed identically to the legacy self-pings.
+    A2A_SOURCE_SELF_SCHEDULER,
+    A2A_SOURCE_SELF_GOAL_NUDGE,
+    A2A_SOURCE_SELF_DELEGATION,
+)
 
 # Deprecated text-prefix fallback. Wording drift has already been observed
 # (cron ticks no longer start with the registered literal), so new senders
@@ -330,6 +362,14 @@ class RuntimeA2AExecutor(AgentExecutor):
           3. Message(final_text)                      — terminal event
         """
         user_input = _extract_plain_message_text(context)
+        # Classify ROUTINE SELF-PING (idle self-wake / cron tick / delegation
+        # harvester) up front, from the ORIGINAL message — before the
+        # delegation-result injection below rewrites user_input. Only these
+        # autonomous turns are governed by the replay guard at the end of the
+        # turn; a user-directed turn is never suppressed. (Detection prefers
+        # the typed source_type marker, so the later injection is irrelevant —
+        # capturing here keeps the text-prefix fallback honest too.)
+        _is_routine_turn = _is_routine_self_message(context, user_input)
         # Inject delegation results from prior turns. Heartbeat writes
         # completed delegation rows to DELEGATION_RESULTS_FILE and sends
         # a self-message to wake the agent; this consumes the file and
@@ -473,6 +513,11 @@ class RuntimeA2AExecutor(AgentExecutor):
                     return ""
                 _inbox_entry.turn_in_flight = True
 
+            # Turn-lease activity watcher handle (MUST-FIX 1/3). Initialized
+            # here — before anything in the try body can raise — so the finally
+            # can always reference it. Stays None on the kernel-off path (no
+            # lease installed), so its cancellation is a no-op there.
+            _lease_watcher_task = None
             try:
                 # set_current_task INSIDE the try so active_tasks is always
                 # decremented by the finally block even if CancelledError hits
@@ -589,6 +634,38 @@ class RuntimeA2AExecutor(AgentExecutor):
                     # — is terminated so a `bash -c "sleep 600"` doesn't
                     # block the new turn.
                     _idle_cap = float(os.environ.get("A2A_COMPLETION_IDLE_TIMEOUT_SECONDS", "900"))
+                    # Arm the turn lease (MUST-FIX 1). Pinned to _idle_cap by
+                    # default so the lease and the idle-cap complement rather
+                    # than fight. No-op when the mailbox kernel is off.
+                    _turn_lease.reset_current()
+                    # MUST-FIX 1/3: resolve the subprocess tool-activity file and
+                    # (kernel-on only) start a background watcher that refreshes
+                    # the lease from it. A codex/openclaw/hermes/gemini turn whose
+                    # child is churning tools bumps this file even when astream
+                    # emits no native event, so the watcher keeps the lease fresh
+                    # and the idle-cap handler below does NOT mistake a live
+                    # subprocess for a stall. When the kernel is off no lease is
+                    # installed -> watch_activity_file returns immediately and
+                    # _lease_watcher_task stays None -> default flow byte-identical.
+                    _tool_activity_path = tool_activity_file()
+                    if _turn_lease.current() is not None and _lease_watcher_task is None:
+                        # Kernel ON: materialize a PRIVATE per-turn activity file
+                        # (parent 0700, file 0600) under the mailbox dir and
+                        # EXPORT it via MOLECULE_TOOL_ACTIVITY_FILE so subprocess
+                        # executors write to the SAME path instead of a
+                        # world-writable /tmp file any process could touch to
+                        # forge liveness. Kernel OFF: this block is skipped and
+                        # _tool_activity_path keeps the legacy /tmp default
+                        # (byte-identical, and never read since the lease is None).
+                        _tool_activity_path = ensure_tool_activity_file()
+                        try:
+                            _lease_watcher_task = asyncio.create_task(
+                                _turn_lease.watch_activity_file(_tool_activity_path)
+                            )
+                        except RuntimeError:
+                            # No running loop (shouldn't happen inside execute) —
+                            # fall back to the boundary-feed in the handler below.
+                            _lease_watcher_task = None
                     while True:
                         _astream_iter = self.agent.astream_events(
                             {"messages": messages},
@@ -597,21 +674,75 @@ class RuntimeA2AExecutor(AgentExecutor):
                         )
                         _stopped = False
                         _aiter = _astream_iter.__aiter__()
+                        # Kernel-ON non-destructive idle-cap (MUST-FIX 1): the
+                        # pending __anext__ pull is kept as a task so an idle-cap
+                        # timeout does NOT cancel a live subprocess turn. Reset per
+                        # astream (re)start. Unused on the kernel-off path.
+                        _pending_next = None
                         while True:
-                            try:
-                                event = await asyncio.wait_for(_aiter.__anext__(), _idle_cap)
-                            except StopAsyncIteration:
-                                break
-                            except asyncio.TimeoutError:
-                                # No runtime event for _idle_cap s: the completion stalled.
-                                # Fail the turn as a NORMAL error (not a wedge) so the
-                                # single-threaded executor returns and serves the next
-                                # request instead of hanging until a watchdog restart.
+                            if _turn_lease.current() is None:
+                                # ── Kernel OFF: EXACT original idle-cap path,
+                                # byte-identical to the proven push/openclaw flow. ──
                                 try:
-                                    await _astream_iter.aclose()
-                                except Exception:  # noqa: BLE001
-                                    pass
-                                raise TimeoutError("completion stalled: no runtime event for %ss" % _idle_cap)
+                                    event = await asyncio.wait_for(_aiter.__anext__(), _idle_cap)
+                                except StopAsyncIteration:
+                                    break
+                                except asyncio.TimeoutError:
+                                    # No runtime event for _idle_cap s: the completion stalled.
+                                    # Fail the turn as a NORMAL error (not a wedge) so the
+                                    # single-threaded executor returns and serves the next
+                                    # request instead of hanging until a watchdog restart.
+                                    try:
+                                        await _astream_iter.aclose()
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    raise TimeoutError("completion stalled: no runtime event for %ss" % _idle_cap)
+                            else:
+                                # ── Kernel ON: NON-destructive idle-cap. Wait on the
+                                # pending pull WITHOUT cancelling it, so a subprocess
+                                # churning tools (refreshing the lease via
+                                # MOLECULE_TOOL_ACTIVITY_FILE, source C) is NOT killed
+                                # at the cap. A stall is declared ONLY when the lease
+                                # has ALSO gone stale (no tool activity for the TTL,
+                                # pinned to the idle-cap) — "neither declares a stall
+                                # earlier than the other" (MUST-FIX 1). An explicit
+                                # Stop (interrupt_event, set out-of-band by cancel())
+                                # still ends the turn even if no event has flowed. ──
+                                if _pending_next is None:
+                                    _pending_next = asyncio.ensure_future(_aiter.__anext__())
+                                _done, _ = await asyncio.wait({_pending_next}, timeout=_idle_cap)
+                                if not _done:
+                                    _interrupted = (
+                                        _inbox_entry is not None
+                                        and _inbox_entry.interrupt_event.is_set()
+                                    )
+                                    if not _interrupted and _turn_lease.turn_is_alive_despite_idle(
+                                        _tool_activity_path
+                                    ):
+                                        logger.debug(
+                                            "SSE: idle-cap elapsed but turn lease is live "
+                                            "(subprocess tool activity) — continuing turn"
+                                        )
+                                        continue
+                                    # Real stall (or Stop): cancel the pending pull,
+                                    # close the stream, and fail exactly as the
+                                    # kernel-off idle-cap does above.
+                                    _pending_next.cancel()
+                                    try:
+                                        await _pending_next
+                                    except BaseException:  # noqa: BLE001 — swallow the cancellation
+                                        pass
+                                    try:
+                                        await _astream_iter.aclose()
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    raise TimeoutError("completion stalled: no runtime event for %ss" % _idle_cap)
+                                try:
+                                    event = _pending_next.result()
+                                except StopAsyncIteration:
+                                    break
+                                finally:
+                                    _pending_next = None
                             # Cooperative interrupt check — runs between
                             # every runtime event so even a long
                             # tool-call iteration can be aborted by an
@@ -676,6 +807,12 @@ class RuntimeA2AExecutor(AgentExecutor):
                                         tool_name=tool_name,
                                         context_id=context_id,
                                     )
+                                # MUST-FIX 1 (turn lease): a tool call is
+                                # liveness. Touch the process-global lease so a
+                                # long tool-running turn is not mistaken for a
+                                # stall. No-op when the mailbox kernel is off
+                                # (no lease installed) — default flow unchanged.
+                                _turn_lease.touch_current()
 
                             elif kind == "on_tool_end":
                                 tool_end_name = event.get("name", "?")
@@ -686,6 +823,9 @@ class RuntimeA2AExecutor(AgentExecutor):
                                 entry = tool_trace_by_run.get(tool_run_id) if tool_run_id else None
                                 if entry is not None:
                                     entry["output_preview"] = str(tool_output)[:300] if tool_output else ""
+                                # Turn lease: 'resets on ANY tool call' — the
+                                # end event is activity too. No-op when kernel off.
+                                _turn_lease.touch_current()
 
                             elif kind == "on_chat_model_end":
                                 # Capture the last completed AIMessage for token telemetry
@@ -821,6 +961,44 @@ class RuntimeA2AExecutor(AgentExecutor):
                             context_id=context_id,
                         )
 
+                # ── Autonomous-loop replay guard ─────────────────────────────
+                # Incident 2026-06-29: a platform agent's idle/cron/harvester
+                # self-wake re-emitted the SAME delegation-result replay on
+                # ~every turn (counter-bumping "Idempotency now N records", a
+                # STALE "PR #195 not merged" verdict) until the session hit
+                # ~130 messages and the workspace flipped to DEGRADED. Govern
+                # ONLY routine self-pings (never a user turn): suppress an
+                # already-delivered / no-new-info replay instead of re-
+                # broadcasting it, and after N consecutive such no-ops trip a
+                # circuit breaker that halts the loop + marks the runtime
+                # degraded (the idle loop reads should_halt() and stops
+                # firing). This is the enforce — not merely observe — gate.
+                if _is_routine_turn:
+                    from molecule_runtime import autonomous_loop_guard as _loop_guard
+
+                    _decision = _loop_guard.evaluate_autonomous_output(final_text)
+                    if _decision == _loop_guard.HALT:
+                        logger.warning(
+                            "A2A execute: autonomous-loop circuit breaker OPEN for "
+                            "context_id=%s — halting self-fire (%s)",
+                            context_id, _loop_guard.halt_reason(),
+                        )
+                        final_text = (
+                            "[autonomous loop halted — "
+                            + _loop_guard.halt_reason()
+                            + "]"
+                        )
+                    elif _decision == _loop_guard.SUPPRESS:
+                        logger.info(
+                            "A2A execute: suppressing duplicate autonomous replay for "
+                            "context_id=%s (already delivered / no new info) — ending turn",
+                            context_id,
+                        )
+                        final_text = (
+                            "[autonomous replay suppressed — delegation result already "
+                            "delivered; no new info, ending turn]"
+                        )
+
                 # ── OTEL: task_complete span ─────────────────────────────────
                 with tracer.start_as_current_span("task_complete") as done_span:
                     done_span.set_attribute(WORKSPACE_ID_ATTR, _WORKSPACE_ID)
@@ -922,6 +1100,17 @@ class RuntimeA2AExecutor(AgentExecutor):
                 )
             finally:
                 await set_current_task(self._heartbeat, "")
+                # MUST-FIX 1/3: stop the turn-lease activity watcher. None on
+                # the kernel-off path (never started), so this is a no-op there
+                # — default flow byte-identical.
+                if _lease_watcher_task is not None:
+                    _lease_watcher_task.cancel()
+                    try:
+                        await _lease_watcher_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:  # noqa: BLE001
+                        pass
                 # Task #378: release the inbox slot so the next POST
                 # for this context_id starts a fresh turn. Done in the
                 # finally so a mid-turn exception can't leak

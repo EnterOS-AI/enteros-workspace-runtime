@@ -591,7 +591,8 @@ class TestReadMcpServersFor:
         from molecule_runtime.mcp_render import read_mcp_servers_for
 
         assert read_mcp_servers_for("hermes", str(tmp_path)) == {}
-        assert read_mcp_servers_for("gemini-cli", str(tmp_path)) == {}
+        # An unmapped/unknown runtime also fails closed to {}.
+        assert read_mcp_servers_for("some-unmapped-runtime", str(tmp_path)) == {}
 
     def test_missing_config_reads_empty(self, tmp_path):
         from molecule_runtime.mcp_render import read_mcp_servers_for

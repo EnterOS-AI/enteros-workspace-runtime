@@ -57,12 +57,8 @@ CONSUMER_TEMPLATE_REPOS: tuple[str, ...] = (
     "molecule-ai-workspace-template-hermes",
     "molecule-ai-workspace-template-openclaw",
     "molecule-ai-workspace-template-codex",
-    "molecule-ai-workspace-template-langgraph",
-    "molecule-ai-workspace-template-autogen",
     "molecule-ai-workspace-template-google-adk",
     "molecule-ai-workspace-template-crewai",
-    "molecule-ai-workspace-template-deepagents",
-    "molecule-ai-workspace-template-gemini-cli",
 )
 
 # Files that count as "runtime-version bump only" — the propagate script

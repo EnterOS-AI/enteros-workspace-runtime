@@ -37,6 +37,30 @@ CONSOLIDATION_INTERVAL = float(os.environ.get("CONSOLIDATION_INTERVAL", "300")) 
 CONSOLIDATION_THRESHOLD = int(os.environ.get("CONSOLIDATION_THRESHOLD", "10"))  # min memories before consolidating
 
 
+def _mirror_consolidated_to_mailbox(text: str) -> None:
+    """Append a consolidated-memory line to the durable mailbox memory snapshot.
+
+    MUST-FIX (memory WRITE-path reconciliation): consolidation's primary sink
+    is the platform ``/memories`` API, from which the platform pushes snapshots
+    to ``/configs`` — a path that can go stale between provisions. With the
+    mailbox kernel ON we ALSO append the consolidated fact to
+    ``/workspace/.molecule/memory/MEMORY.md`` (the durable dir ``prompt.py``
+    reads), so consolidated knowledge is injected on the next session even if
+    the ``/configs`` push is stale, and a stale ``/configs`` copy can never
+    shadow it. Best-effort + kernel-gated: no-op / never raises when off.
+    """
+    import molecule_runtime.mailbox_dir as mailbox_dir
+
+    if not mailbox_dir.kernel_enabled():
+        return
+    try:
+        target = mailbox_dir.memory_file("MEMORY.md")
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(f"- [Consolidated] {text}\n")
+    except OSError as exc:
+        logger.warning("Consolidation: could not mirror to mailbox memory: %s", exc)
+
+
 class ConsolidationLoop:
     """Background loop that consolidates local memories when idle."""
 
@@ -122,6 +146,8 @@ class ConsolidationLoop:
                                     headers=auth_headers(),
                                 )
                             logger.info("Consolidated %d memories into team knowledge", len(memories))
+                            # Also persist to durable mailbox memory (kernel-on).
+                            _mirror_consolidated_to_mailbox(summary)
                         else:
                             logger.warning("Consolidation POST failed (status %d) — keeping originals", resp.status_code)
                 except Exception as e:
@@ -148,6 +174,8 @@ class ConsolidationLoop:
                     )
                 else:
                     logger.info("Consolidated %d memories via concatenation fallback", len(memories))
+                    # Also persist to durable mailbox memory (kernel-on).
+                    _mirror_consolidated_to_mailbox(combined)
 
     def stop(self):
         self._running = False
