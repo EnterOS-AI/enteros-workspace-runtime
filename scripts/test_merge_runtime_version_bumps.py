@@ -34,15 +34,33 @@ _spec.loader.exec_module(_mod)
 
 is_runtime_bump_pr = _mod.is_runtime_bump_pr
 all_required_statuses_success = _mod.all_required_statuses_success
-BOT_AUTHOR_USERNAME = _mod.BOT_AUTHOR_USERNAME
 ALLOWED_BUMP_FILES = _mod.ALLOWED_BUMP_FILES
-REQUIRED_STATUS_CONTEXTS = _mod.REQUIRED_STATUS_CONTEXTS
+REQUIRED_STATUS_SUBSTRINGS = _mod.REQUIRED_STATUS_SUBSTRINGS
 CONSUMER_TEMPLATE_REPOS = _mod.CONSUMER_TEMPLATE_REPOS
+
+# The opener identity is resolved at runtime as whoami(read_token) — the
+# 2026-07-05 identity-drift RC replaced the stale hardcode
+# ("molecule-runtime-release-bot" vs the credential's actual owner
+# `core-devops`, which no-opped the sweeper for weeks). Tests pass an
+# explicit author the way run() does.
+OPENER = "core-devops"
+
+# Real context names as emitted by the six consumer-template CIs (verified
+# against live bump-PR heads 2026-07-05) — what the substring gate must
+# match. The old exact names ("validate-runtime", "t4-conformance") matched
+# none of these.
+REAL_CONTEXTS_GREEN = [
+    "CI / Template validation (static) (pull_request)",
+    "CI / Template validation (runtime) (pull_request)",
+    "CI / T4 tier-4 conformance (live) (pull_request)",
+    "CI / Adapter unit tests (pull_request)",
+    "Secret scan / Scan diff for credential-shaped strings (pull_request)",
+]
 
 
 def _pr(
     *,
-    user_login: str = BOT_AUTHOR_USERNAME,
+    user_login: str = OPENER,
     number: int = 1,
     head_branch: str = "bump-runtime-0.3.23",
 ) -> dict:
@@ -55,109 +73,144 @@ def _pr(
 
 
 class IsRuntimeBumpPr(unittest.TestCase):
-    def test_bot_author_plus_dot_runtime_version_alone_is_a_bump(self) -> None:
+    def test_opener_author_plus_dot_runtime_version_alone_is_a_bump(self) -> None:
         pr = _pr()
-        self.assertTrue(is_runtime_bump_pr(pr, [".runtime-version"]))
+        self.assertTrue(is_runtime_bump_pr(pr, [".runtime-version"], OPENER))
 
-    def test_bot_author_plus_dual_pin_is_a_bump(self) -> None:
+    def test_opener_author_plus_dual_pin_is_a_bump(self) -> None:
         # codex-style templates bump .runtime-version + requirements.txt
         # atomically (per scripts/propagate_runtime_version.py).
         pr = _pr()
-        self.assertTrue(is_runtime_bump_pr(pr, [".runtime-version", "requirements.txt"]))
-
-    def test_bot_author_with_extra_file_is_NOT_a_bump(self) -> None:
-        # If a hand-edit added an unrelated change, the sweeper MUST
-        # skip — the bot's PR is no longer "runtime-version bump only".
-        pr = _pr()
-        self.assertFalse(
-            is_runtime_bump_pr(pr, [".runtime-version", "README.md"])
+        self.assertTrue(
+            is_runtime_bump_pr(pr, [".runtime-version", "requirements.txt"], OPENER)
         )
 
-    def test_non_bot_author_is_NOT_a_bump(self) -> None:
-        # A non-bot PR (e.g. a human's hand-bump) must not be auto-merged
+    def test_opener_author_with_extra_file_is_NOT_a_bump(self) -> None:
+        # If a hand-edit added an unrelated change, the sweeper MUST
+        # skip — the opener's PR is no longer "runtime-version bump only".
+        pr = _pr()
+        self.assertFalse(
+            is_runtime_bump_pr(pr, [".runtime-version", "README.md"], OPENER)
+        )
+
+    def test_non_opener_author_is_NOT_a_bump(self) -> None:
+        # A non-opener PR (e.g. a human's hand-bump) must not be auto-merged
         # even if the diff is only .runtime-version.
         pr = _pr(user_login="devops-engineer")
-        self.assertFalse(is_runtime_bump_pr(pr, [".runtime-version"]))
+        self.assertFalse(is_runtime_bump_pr(pr, [".runtime-version"], OPENER))
+
+    def test_stale_hardcoded_bot_name_is_NOT_trusted(self) -> None:
+        # Identity-drift regression: the historical hardcode must not be
+        # silently trusted when the resolved opener is a different account.
+        pr = _pr(user_login="molecule-runtime-release-bot")
+        self.assertFalse(is_runtime_bump_pr(pr, [".runtime-version"], OPENER))
+
+    def test_empty_expected_author_is_NOT_a_bump(self) -> None:
+        # An unresolved opener identity must never widen to "any author".
+        pr = _pr()
+        self.assertFalse(is_runtime_bump_pr(pr, [".runtime-version"], ""))
 
     def test_empty_files_is_NOT_a_bump(self) -> None:
         # A PR with no changed files is degenerate; the Gitea API
         # would return [] but the sweeper must refuse rather than guess.
         pr = _pr()
-        self.assertFalse(is_runtime_bump_pr(pr, []))
+        self.assertFalse(is_runtime_bump_pr(pr, [], OPENER))
 
     def test_wrong_user_payload_shape_is_NOT_a_bump(self) -> None:
         # Defensive: if the API returns a malformed PR (no `user` dict),
         # the sweeper must not crash and must not treat it as a bump.
         bad = {"number": 1, "head": {"ref": "bump-runtime-0.3.23"}}
-        self.assertFalse(is_runtime_bump_pr(bad, [".runtime-version"]))
-        self.assertFalse(is_runtime_bump_pr(None, [".runtime-version"]))  # type: ignore[arg-type]
+        self.assertFalse(is_runtime_bump_pr(bad, [".runtime-version"], OPENER))
+        self.assertFalse(is_runtime_bump_pr(None, [".runtime-version"], OPENER))  # type: ignore[arg-type]
 
 
 class AllRequiredStatusesSuccess(unittest.TestCase):
-    def test_all_green(self) -> None:
+    def test_all_green_real_context_names(self) -> None:
+        # Context-name-drift regression (2026-07-05): the gate must pass on
+        # the names the template CIs ACTUALLY emit.
         combined = {
             "state": "success",
-            "statuses": [
-                {"context": ctx, "state": "success"}
-                for ctx in REQUIRED_STATUS_CONTEXTS
-            ],
+            "statuses": [{"context": ctx, "status": "success"} for ctx in REAL_CONTEXTS_GREEN],
         }
         self.assertTrue(all_required_statuses_success(combined))
 
-    def test_one_required_is_failure(self) -> None:
-        # A failure on any required context fails closed.
-        statuses = [
-            {"context": REQUIRED_STATUS_CONTEXTS[0], "state": "success"},
-            {"context": REQUIRED_STATUS_CONTEXTS[1], "state": "failure"},
-        ]
-        combined = {"state": "failure", "statuses": statuses}
+    def test_push_suffixed_contexts_also_satisfy(self) -> None:
+        # hermes/openclaw-style repos dual-post (push) + (pull_request)
+        # rows; either suffix satisfies the substring anchor.
+        combined = {
+            "state": "success",
+            "statuses": [{"context": "CI / Template validation (runtime) (push)", "status": "success"}],
+        }
+        self.assertTrue(all_required_statuses_success(combined))
+
+    def test_old_exact_names_alone_do_NOT_satisfy(self) -> None:
+        # The retired exact names are not what CIs emit; a payload carrying
+        # ONLY them must not pass the wheel-install anchor.
+        combined = {
+            "state": "success",
+            "statuses": [
+                {"context": "validate-runtime", "status": "success"},
+                {"context": "t4-conformance", "status": "success"},
+            ],
+        }
         self.assertFalse(all_required_statuses_success(combined))
 
-    def test_one_required_is_pending(self) -> None:
-        # Pending is not success. Even if the combined-state reports
-        # `success` (because no failures), a missing required context
-        # is treated as not-yet-green.
-        statuses = [
-            {"context": REQUIRED_STATUS_CONTEXTS[0], "state": "success"},
-            {"context": REQUIRED_STATUS_CONTEXTS[1], "state": "pending"},
-        ]
-        combined = {"state": "success", "statuses": statuses}
+    def test_anchor_gate_is_failure(self) -> None:
+        # A failure on the wheel-install gate fails closed (combined
+        # flips off success too).
+        combined = {
+            "state": "failure",
+            "statuses": [
+                {"context": "CI / Template validation (runtime) (pull_request)", "status": "failure"},
+            ],
+        }
         self.assertFalse(all_required_statuses_success(combined))
 
-    def test_required_context_missing_entirely(self) -> None:
-        # If the PR has only some of the required contexts posted
-        # (e.g. validate-runtime posted, t4-conformance never ran), we
-        # fail closed. The bot's bump PRs should always post both
-        # because the propagate job waits for the same; this is a
-        # belt-and-suspenders.
-        statuses = [{"context": REQUIRED_STATUS_CONTEXTS[0], "state": "success"}]
-        combined = {"state": "success", "statuses": statuses}
+    def test_anchor_gate_is_pending(self) -> None:
+        # Pending is not success — even defensively when the combined
+        # state (mistakenly) reads success.
+        combined = {
+            "state": "success",
+            "statuses": [
+                {"context": "CI / Template validation (runtime) (pull_request)", "status": "pending"},
+            ],
+        }
+        self.assertFalse(all_required_statuses_success(combined))
+
+    def test_anchor_gate_missing_entirely(self) -> None:
+        # Guards the just-pushed window: combined may read success while
+        # the real gates have not registered their contexts yet.
+        combined = {
+            "state": "success",
+            "statuses": [
+                {"context": "Secret scan / Scan diff for credential-shaped strings (pull_request)", "status": "success"},
+            ],
+        }
         self.assertFalse(all_required_statuses_success(combined))
 
     def test_extra_failing_unrelated_context_fails(self) -> None:
-        # The sweeper requires the COMBINED state to be `success` AND
-        # the required contexts to be `success`. A failing unrelated
-        # context still flips combined to `failure` — we fail closed
-        # rather than proceed (a green-light from the sweeper that
-        # the merge would later reject is a worse failure mode than
-        # a deliberate skip).
-        statuses = [
-            {"context": REQUIRED_STATUS_CONTEXTS[0], "state": "success"},
-            {"context": REQUIRED_STATUS_CONTEXTS[1], "state": "success"},
-            {"context": "some-other-check", "state": "failure"},
-        ]
-        combined = {"state": "failure", "statuses": statuses}
+        # The sweeper requires the COMBINED state to be `success` — a
+        # failing unrelated context (T4 wherever a template defines it,
+        # secret-scan, ...) flips combined to `failure` and we fail
+        # closed rather than proceed.
+        combined = {
+            "state": "failure",
+            "statuses": [
+                {"context": "CI / Template validation (runtime) (pull_request)", "status": "success"},
+                {"context": "CI / T4 tier-4 conformance (live) (pull_request)", "status": "failure"},
+            ],
+        }
         self.assertFalse(all_required_statuses_success(combined))
 
     def test_extra_pending_unrelated_context_fails(self) -> None:
-        # Same as above but pending. A pending non-required context
-        # also flips combined off `success`.
-        statuses = [
-            {"context": REQUIRED_STATUS_CONTEXTS[0], "state": "success"},
-            {"context": REQUIRED_STATUS_CONTEXTS[1], "state": "success"},
-            {"context": "some-other-check", "state": "pending"},
-        ]
-        combined = {"state": "pending", "statuses": statuses}
+        # Same as above but pending: combined goes `pending`, gate fails.
+        combined = {
+            "state": "pending",
+            "statuses": [
+                {"context": "CI / Template validation (runtime) (pull_request)", "status": "success"},
+                {"context": "CI / validate (pull_request)", "status": "pending"},
+            ],
+        }
         self.assertFalse(all_required_statuses_success(combined))
 
     def test_empty_combined(self) -> None:
@@ -165,48 +218,57 @@ class AllRequiredStatusesSuccess(unittest.TestCase):
         self.assertFalse(all_required_statuses_success({}))
         self.assertFalse(all_required_statuses_success({"state": "unknown", "statuses": []}))
 
-    def test_gitea_status_field_shape_all_green(self) -> None:
-        # RC 13421 regression: Gitea's combined-status CHILD rows carry the
-        # per-context result in `status` (the top-level combined uses `state`).
-        # The earlier code read only `state` on children, so against REAL Gitea
-        # payloads every child evaluated false → the sweeper skipped genuinely
-        # green bump PRs and never merged them. A real Gitea-shaped payload
-        # (child field `status`=`success`) must evaluate True.
+    def test_state_field_child_shape_still_accepted(self) -> None:
+        # RC 13421 regression (kept): child rows may carry `state` instead
+        # of `status` across payload shapes; both are accepted.
         combined = {
             "state": "success",
             "statuses": [
-                {"context": ctx, "status": "success"}
-                for ctx in REQUIRED_STATUS_CONTEXTS
+                {"context": "CI / Template validation (runtime) (pull_request)", "state": "success"},
             ],
         }
         self.assertTrue(all_required_statuses_success(combined))
 
-    def test_gitea_status_field_required_failure(self) -> None:
-        # Gitea-shaped children where a required context is not success must
-        # still fail closed.
-        statuses = [
-            {"context": REQUIRED_STATUS_CONTEXTS[0], "status": "success"},
-            {"context": REQUIRED_STATUS_CONTEXTS[1], "status": "failure"},
-        ]
-        combined = {"state": "failure", "statuses": statuses}
-        self.assertFalse(all_required_statuses_success(combined))
-
 
 class Constants(unittest.TestCase):
     """Pin the SSOT constants so a future drift in the consumer list
-    or the required-status set triggers a loud test failure rather
+    or the required-status gate triggers a loud test failure rather
     than a silent change in auto-merge behavior."""
 
-    def test_required_statuses_non_empty(self) -> None:
-        # The sweeper is tightly scoped on this set; reducing it would
-        # weaken the safety gate silently.
-        self.assertGreaterEqual(len(REQUIRED_STATUS_CONTEXTS), 2)
+    def test_required_substrings_anchor_wheel_install_gate(self) -> None:
+        # The sweeper is tightly scoped on this anchor; dropping it would
+        # let a zero-status head read as mergeable.
+        self.assertGreaterEqual(len(REQUIRED_STATUS_SUBSTRINGS), 1)
+        self.assertIn("Template validation (runtime)", REQUIRED_STATUS_SUBSTRINGS)
 
     def test_consumer_list_non_empty(self) -> None:
         self.assertGreaterEqual(len(CONSUMER_TEMPLATE_REPOS), 5)
 
-    def test_bot_author_is_set(self) -> None:
-        self.assertEqual(BOT_AUTHOR_USERNAME, "molecule-runtime-release-bot")
+    def test_no_hardcoded_author_identity_remains(self) -> None:
+        # Identity-drift regression (2026-07-05): the expected author is
+        # resolved as whoami(read_token) at runtime; a reintroduced
+        # hardcode would silently no-op the sweeper again on the next
+        # credential rotation.
+        self.assertFalse(hasattr(_mod, "BOT_AUTHOR_USERNAME"))
+        self.assertFalse(hasattr(_mod, "REVIEWER_USERNAME"))
+
+    def test_whoami_reads_user_endpoint(self) -> None:
+        # The dynamic identity resolution reads GET /api/v1/user with the
+        # chosen token and returns '' on failure (run() then hard-fails).
+        client = _mod.GiteaClient("https://example.invalid", "m-tok", "r-tok", "molecule-ai")
+        calls: list[tuple[str, str, bool]] = []
+
+        def fake_request(method, path, body=None, params=None, *, use_merge_token=False):
+            calls.append((method, path, use_merge_token))
+            return 200, {"login": "devops-engineer" if use_merge_token else "core-devops"}
+
+        client._request = fake_request  # type: ignore[method-assign]
+        self.assertEqual(client.whoami(), "core-devops")
+        self.assertEqual(client.whoami(use_merge_token=True), "devops-engineer")
+        self.assertEqual(calls, [("GET", "/api/v1/user", False), ("GET", "/api/v1/user", True)])
+
+        client._request = lambda *a, **k: (401, {"message": "unauthorized"})  # type: ignore[method-assign]
+        self.assertEqual(client.whoami(), "")
 
     def test_allowed_bump_files_minimal(self) -> None:
         # The set MUST be minimal — every extra filename widens the

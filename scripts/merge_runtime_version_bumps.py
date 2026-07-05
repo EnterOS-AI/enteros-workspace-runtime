@@ -8,17 +8,19 @@ so the bumps pile up unmerged and the consumer-drift check on runtime
 main goes red until someone hand-merges them.
 
 This script closes the loop: for each consumer template, find open
-PRs authored by `molecule-runtime-release-bot` whose diff touches ONLY
-`.runtime-version` (and optionally `requirements.txt` for templates that
-pin there too — propagate_runtime_version.py bumps both atomically), and
-the combined commit status is `success`. Approve as `devops-engineer`
-(if not already) and merge. Close any superseded older-version bump PRs
-to prevent downgrades (e.g. three stacked bumps → close the two older
-ones once the latest lands; the system holds at the latest only).
+PRs authored by the OPENER identity (resolved dynamically as the account
+behind the read/DISPATCH token — the same Infisical /shared/runtime-bot
+credential propagate_runtime_version.py opens the PRs with) whose diff
+touches ONLY `.runtime-version` (and optionally `requirements.txt` for
+templates that pin there too — propagate bumps both atomically), and the
+combined commit status is `success`. Approve as the (distinct) merge
+identity (if not already) and merge. Close any superseded older-version
+bump PRs to prevent downgrades (e.g. three stacked bumps → close the two
+older ones once the latest lands; the system holds at the latest only).
 
 Tightly scoped:
-  - only `molecule-runtime-release-bot` (the identity the propagate
-    script uses, per scripts/auto_release_runtime.py)
+  - only PRs authored by the opener identity (whoami of the read token;
+    never hardcoded — see the identity-drift RC note below)
   - only `.runtime-version` (and optionally `requirements.txt` for the
     dual-pin templates)
   - only all-green commit status
@@ -72,27 +74,36 @@ ALLOWED_BUMP_FILES: frozenset[str] = frozenset({
     "requirements.txt",
 })
 
-# Bot identity that the propagate script uses to open the PR. The
-# devops-engineer approves on its behalf (server-side; the bot can't
-# approve its own PR on any of the consumer repos that require
-# 1 approval).
-BOT_AUTHOR_USERNAME = "molecule-runtime-release-bot"
+# NOTE (RC 2026-07-05, identity drift): the expected bump-PR author is NOT
+# hardcoded any more. It is resolved at runtime as `whoami(read_token)` — by
+# construction the same identity the propagate script opens the PRs with,
+# because both workflows feed the same Infisical /shared/runtime-bot
+# credential. The previous hardcode ("molecule-runtime-release-bot") went
+# stale when the credential was consolidated onto `core-devops`: the sweeper
+# matched zero PRs and no-opped green while consumer pins drifted 5+
+# releases. The merge identity is likewise resolved dynamically and the
+# sweeper refuses to run if opener == merger (non-author contract,
+# runtime#131).
 
-# The reviewer identity that will approve + merge. Must be:
-#   1. a non-author identity (per Gitea self-approval policy on every
-#      template repo that requires 1 approval)
-#   2. a member of the repo's required-reviewers team (the same
-#      devops-engineer identity that the sweeper uses for force-merge
-#      cleanup; same credentials throughout the runtime fleet)
-REVIEWER_USERNAME = "devops-engineer"
-
-# Required commit status contexts — both must be `success` to be
-# mergeable. The propagate script's bump PRs are deliberately tiny
-# (single-file pin bumps) so the test surface is small; these two
-# gates cover the main risk surfaces.
-REQUIRED_STATUS_CONTEXTS: tuple[str, ...] = (
-    "validate-runtime",
-    "t4-conformance",
+# Required commit-status gate for a bump PR, matched by SUBSTRING against
+# the posted context names. Exact names went stale immediately: the old
+# tuple ("validate-runtime", "t4-conformance") never matched the names the
+# template CIs actually emit ("CI / Template validation (runtime)
+# (pull_request)", "CI / T4 tier-4 conformance (live) (push)", ...), so
+# even an eligible PR would have been skipped forever (RC 2026-07-05).
+#
+# Semantics: the combined status must be `success` (Gitea computes it over
+# the latest status per context, so ANY posted failure/pending — including
+# T4 conformance wherever a template defines it — blocks) AND at least one
+# posted-success context must contain each substring below. The substring
+# anchor guards the just-pushed window where CI has not registered yet
+# (zero/few statuses could otherwise read as mergeable). "Template
+# validation (runtime)" is the universal wheel-install gate every consumer
+# template defines — the core risk surface of a pin bump; T4 conformance is
+# not anchored because not every template has a T4 lane (crewai), but where
+# it exists the combined state already enforces it.
+REQUIRED_STATUS_SUBSTRINGS: tuple[str, ...] = (
+    "Template validation (runtime)",
 )
 
 
@@ -102,9 +113,10 @@ class GiteaClient:
     Two distinct token identities are used (runtime#131):
       - `merge_token` (default: `CONSUMER_BUMP_MERGE_TOKEN`): the
         non-author identity that performs approve+merge+close on the
-        consumer template repos. Must be a non-author of the bump PR
-        (the bot opens them as `molecule-runtime-release-bot`, so
-        `devops-engineer` is the natural choice). If absent the sweeper
+        consumer template repos. Must be a non-author of the bump PR;
+        run() resolves BOTH identities via whoami() and refuses to run
+        when they coincide, so the contract holds regardless of which
+        accounts the credentials are rotated onto. If absent the sweeper
         exits 0 with a loud warning (no green-light for ops to notice).
       - `read_token` (default: `DISPATCH_TOKEN`): used for read-only
         API calls (listing open PRs, fetching files, combined status,
@@ -167,43 +179,27 @@ class GiteaClient:
             except (json.JSONDecodeError, ValueError):
                 return exc.code, raw
 
-    def _request(
-        self,
-        method: str,
-        path: str,
-        body: dict[str, Any] | None = None,
-        params: dict[str, str] | None = None,
-        *,
-        use_merge_token: bool = False,
-    ) -> tuple[int, Any]:
-        url = f"{self.base_url}{path}"
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        token = self.merge_token if use_merge_token else self.read_token
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/json",
-        }
-        data: bytes | None = None
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read()
-                if not raw:
-                    return resp.status, None
-                try:
-                    return resp.status, json.loads(raw)
-                except json.JSONDecodeError:
-                    return resp.status, raw
-        except urllib.error.HTTPError as exc:
-            raw = exc.read()
-            try:
-                return exc.code, json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                return exc.code, raw
+    def whoami(self, *, use_merge_token: bool = False) -> str:
+        """Login of the identity behind the chosen token; '' on failure.
+
+        Used to resolve the EXPECTED bump-PR author dynamically (the opener
+        identity = whoever holds the read/DISPATCH token, i.e. the same
+        Infisical /shared/runtime-bot credential the propagate script opens
+        the PRs with) and to enforce opener != merger (the runtime#131
+        non-author contract) without hardcoding usernames that silently
+        drift when the credential is rotated to a different account
+        (RC 2026-07-05: RUNTIME_BOT_TOKEN was consolidated onto
+        `core-devops`, the sweeper still filtered on
+        `molecule-runtime-release-bot`, matched zero PRs, and no-opped
+        green while consumer pins drifted 5+ releases).
+        """
+        status, payload = self._request(
+            "GET", "/api/v1/user", use_merge_token=use_merge_token
+        )
+        if status != 200 or not isinstance(payload, dict):
+            return ""
+        login = payload.get("login")
+        return login if isinstance(login, str) else ""
 
     def list_open_prs(self, repo: str) -> list[dict[str, Any]]:
         """All open PRs on a repo, newest first. Pages through the default
@@ -254,9 +250,10 @@ class GiteaClient:
 
     def approve_pr(self, repo: str, pr_number: int) -> int:
         # Approve uses the merge token (the non-author identity doing
-        # the approve). Self-approval is impossible because the bot
-        # author is `molecule-runtime-release-bot` and the merge token
-        # belongs to a different identity (typically devops-engineer).
+        # the approve). Self-approval is impossible because run()
+        # verifies whoami(read_token) != whoami(merge_token) before any
+        # mutation — the guard travels with the credentials, not with
+        # hardcoded usernames.
         status, _ = self._request(
             "POST",
             f"/api/v1/repos/{self.owner}/{repo}/pulls/{pr_number}/reviews",
@@ -309,16 +306,22 @@ class GiteaClient:
 def is_runtime_bump_pr(
     pr: dict[str, Any],
     files: list[str],
+    expected_author: str,
 ) -> bool:
-    """True iff the PR is a propagation bump — bot-authored and the
-    only files changed are .runtime-version (+ optionally requirements.txt
-    for dual-pin templates)."""
+    """True iff the PR is a propagation bump — authored by the opener
+    identity (resolved dynamically as whoami(read_token); see the identity
+    note above) and the only files changed are .runtime-version
+    (+ optionally requirements.txt for dual-pin templates)."""
     if not isinstance(pr, dict):
+        return False
+    if not expected_author:
+        # Never fall back to "any author": an unresolved opener identity
+        # must have been caught in run() before we get here.
         return False
     user = pr.get("user") or {}
     if not isinstance(user, dict):
         return False
-    if user.get("login") != BOT_AUTHOR_USERNAME:
+    if user.get("login") != expected_author:
         return False
     if not files:
         return False
@@ -327,12 +330,18 @@ def is_runtime_bump_pr(
 
 def all_required_statuses_success(
     combined: dict[str, Any],
-    required: tuple[str, ...] = REQUIRED_STATUS_CONTEXTS,
+    required_substrings: tuple[str, ...] = REQUIRED_STATUS_SUBSTRINGS,
 ) -> bool:
-    """True iff every context in `required` posted success on the PR's
-    head. The combined-state being 'success' is necessary but not
-    sufficient — a required context may be `pending` and the combined
-    is still `success` if the only failures are unrelated contexts."""
+    """True iff the head is genuinely mergeable status-wise:
+
+    1. the combined state is `success` — Gitea computes it over the latest
+       status per context, so any posted failure/error/pending context
+       (T4 conformance included, wherever a template defines one) blocks;
+    2. for each required substring, at least one posted-SUCCESS context
+       name contains it — guarding the just-pushed window where CI has not
+       registered its contexts yet and the combined state alone could read
+       as mergeable with the real gates simply absent.
+    """
     if combined.get("state") != "success":
         return False
     posted: set[str] = set()
@@ -346,7 +355,9 @@ def all_required_statuses_success(
         # Accept both for robustness across payload shapes.
         if (s.get("status") or s.get("state")) == "success":
             posted.add(s.get("context", ""))
-    return all(ctx in posted for ctx in required)
+    return all(
+        any(sub in ctx for ctx in posted) for sub in required_substrings
+    )
 
 
 def is_repo_opted_in(repo: str, client: GiteaClient) -> bool:
@@ -418,8 +429,48 @@ def run() -> int:
 
     client = GiteaClient(args.base_url, merge_token, read_token, args.owner)
 
+    # Resolve BOTH identities dynamically (see the identity-drift note at the
+    # top): the opener identity is whatever account holds the read/DISPATCH
+    # token — the exact same credential the propagate script opens the bump
+    # PRs with — and the merge identity is whatever account holds the merge
+    # token. Fail LOUD (non-zero) if either cannot be resolved or if they
+    # coincide: a sweeper that guesses the author or can self-approve is
+    # worse than a delayed sweep.
+    expected_author = client.whoami()
+    if not expected_author:
+        print(
+            f"::error::cannot resolve the opener identity (GET /user with "
+            f"{args.read_token_env} failed); refusing to guess the bump-PR "
+            f"author.",
+            file=sys.stderr,
+        )
+        return 2
+    merge_identity = "" if args.dry_run and not merge_token else client.whoami(use_merge_token=True)
+    if not args.dry_run:
+        if not merge_identity:
+            print(
+                f"::error::cannot resolve the merge identity (GET /user with "
+                f"{args.merge_token_env} failed); refusing to approve+merge "
+                f"blind.",
+                file=sys.stderr,
+            )
+            return 2
+        if merge_identity == expected_author:
+            print(
+                f"::error::opener and merger resolve to the SAME identity "
+                f"({expected_author!r}) — the runtime#131 non-author "
+                f"approve+merge contract is violated; fix the token wiring "
+                f"({args.read_token_env} vs {args.merge_token_env}).",
+                file=sys.stderr,
+            )
+            return 2
+
     repos = tuple(args.repos) if args.repos else CONSUMER_TEMPLATE_REPOS
-    print(f"runtime#131 sweep: {len(repos)} consumer repos, mode={'DRY-RUN' if args.dry_run else 'MERGE'}")
+    print(
+        f"runtime#131 sweep: {len(repos)} consumer repos, "
+        f"mode={'DRY-RUN' if args.dry_run else 'MERGE'}, "
+        f"opener={expected_author!r}, merger={merge_identity or '<dry-run>'!r}"
+    )
 
     total_merged = 0
     total_closed = 0
@@ -451,7 +502,7 @@ def run() -> int:
             if not isinstance(pr_number, int):
                 continue
             files = client.get_pr_files(repo, pr_number)
-            if not is_runtime_bump_pr(pr, files):
+            if not is_runtime_bump_pr(pr, files, expected_author):
                 continue
             # Extract version from branch name. The propagate script's
             # actual branch grammar (per scripts/propagate_runtime_version.py)
@@ -520,10 +571,10 @@ def run() -> int:
             total_skipped += 1
             continue
 
-        # Approve if not already approved by the reviewer.
+        # Approve if not already approved by the merge identity.
         already_approved = any(
             isinstance(r, dict)
-            and r.get("user", {}).get("login") == REVIEWER_USERNAME
+            and r.get("user", {}).get("login") == merge_identity
             and r.get("state") == "APPROVED"
             for r in (client._request("GET", f"/api/v1/repos/{args.owner}/{repo}/pulls/{latest_pr}/reviews") or ([], None))[1] or []
         )
