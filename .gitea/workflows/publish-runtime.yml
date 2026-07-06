@@ -100,9 +100,34 @@ jobs:
 
       - name: Build wheel + sdist
         run: |
+          set -eu
           pip install build twine
           python -m build
           python -m twine check dist/*
+          # SUPPLY-CHAIN GUARD — stop registry shadowing at the source. The
+          # publish step must ship ONLY this project's own wheel + sdist, never a
+          # dependency closure. `python -m build` emits just our two artifacts,
+          # but a dirty runner workspace or a stray `pip download` could leave a
+          # PUBLIC dependency wheel (pyyaml, httpx, ...) in dist/, which a
+          # `twine upload dist/*` would then SHADOW inside our private registry
+          # (a dependency-confusion footgun). Derive our canonical dist filename
+          # prefix from pyproject (PEP 503/427: runs of - _ . collapse to _) and
+          # FAIL LOUD if dist/ holds anything else.
+          DIST_NAME=$(grep -E '^name[[:space:]]*=' pyproject.toml | head -1 \
+            | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/' \
+            | sed -E 's/[-_.]+/_/g' | tr '[:upper:]' '[:lower:]')
+          if [ -z "$DIST_NAME" ]; then
+            echo "::error::could not derive package dist name from pyproject.toml"
+            exit 1
+          fi
+          echo "DIST_NAME=$DIST_NAME" >> "$GITHUB_ENV"
+          unexpected=$(ls dist/ | grep -viE "^${DIST_NAME}-.*\.(whl|tar\.gz)$" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::dist/ holds non-package artifacts -- a dependency closure here would shadow public PyPI packages in our registry. Refusing to publish:"
+            echo "$unexpected"
+            exit 1
+          fi
+          echo "dist/ contains only ${DIST_NAME} wheel + sdist (no dependency closure)"
 
       - name: Capture wheel SHA256
         id: wheel_hash
@@ -190,8 +215,15 @@ jobs:
           # Instead pre-check the registry simple index for every dist file and
           # skip the upload when all are already present.
           SIMPLE_BASE="${GITEA_PYPI_UPLOAD_URL%/}/simple"
+          # Publish ONLY our own wheel + sdist -- never `dist/*`. If a stray
+          # dependency wheel ever reached dist/, `dist/*` would upload it and
+          # shadow the public PyPI package inside our registry. DIST_NAME was
+          # derived from pyproject in the build step (exported via $GITHUB_ENV)
+          # and the build step already hard-failed on any non-package artifact.
+          set -- "dist/${DIST_NAME}-"*.whl "dist/${DIST_NAME}-"*.tar.gz
           missing=0
-          for f in dist/*; do
+          for f in "$@"; do
+            [ -e "$f" ] || { echo "::error::expected artifact not found: $f"; exit 1; }
             base=$(basename "$f")
             pkg=$(printf %s "$base" | cut -d- -f1 | tr _ -)
             if curl -fsS -u "$PUBLISHER_USER:$MOL_PACKAGE_TOKEN" \
@@ -208,7 +240,7 @@ jobs:
               --repository-url "$GITEA_PYPI_UPLOAD_URL" \
               --username "$PUBLISHER_USER" \
               --password "$MOL_PACKAGE_TOKEN" \
-              dist/*
+              "$@"
           fi
 
       - name: Verify install from Gitea registry
