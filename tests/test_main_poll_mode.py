@@ -3,7 +3,9 @@
 Locks in:
   * ``A2AConfig.delivery_mode`` parse + default "push";
   * ``resolve_delivery_mode`` precedence (env override wins over config);
-  * ``register_with_platform`` adds ``delivery_mode=poll`` ONLY in poll mode;
+  * ``register_with_platform`` ALWAYS declares the resolved ``delivery_mode``
+    (push AND poll — the sticky-poll fix; omission would let a stale poll row
+    on the platform silently swallow all inbound A2A for a push runtime);
   * ``maybe_start_poll_delivery`` starts the SSOT poller + registers the consumer
     in poll mode, and is a NO-OP in push mode (never-run-both invariant);
   * the consumer posts to 127.0.0.1 (the LOCAL executor) — NOT the platform
@@ -70,7 +72,7 @@ def test_resolve_delivery_mode_env_override_wins():
 
 
 # ---------------------------------------------------------------------------
-# register_with_platform — delivery_mode only added in poll
+# register_with_platform — delivery_mode ALWAYS declared (sticky-poll fix)
 # ---------------------------------------------------------------------------
 class _FakeResp:
     def __init__(self, status=200):
@@ -90,7 +92,12 @@ class _CapturingClient:
 
 
 @pytest.mark.asyncio
-async def test_register_body_omits_delivery_mode_in_push(monkeypatch):
+async def test_register_body_declares_delivery_mode_in_push(monkeypatch):
+    """Sticky-poll fix (prod agents-team 2026-07-05): push MUST be declared
+    explicitly. An omitted delivery_mode resolves to the row's EXISTING value
+    on the platform side, so a workspace whose row was ever poll could never
+    heal back to push by re-registering — the tenant staged all inbound A2A
+    for a poller the push runtime never starts (silently deaf agent)."""
     monkeypatch.setattr(m, "identity_gate_payload", lambda: {})
     client = _CapturingClient()
     ok = await m.register_with_platform(
@@ -101,6 +108,26 @@ async def test_register_body_omits_delivery_mode_in_push(monkeypatch):
         agent_card={},
         headers={},
         delivery_mode="push",
+    )
+    assert ok is True
+    assert client.bodies[0]["delivery_mode"] == "push"
+
+
+@pytest.mark.asyncio
+async def test_register_body_omits_delivery_mode_when_unrecognized(monkeypatch):
+    """An unrecognized resolved mode is NOT forwarded — the platform 400s
+    invalid values, which would turn a local misconfig into a boot-register
+    failure. Omission falls back to the server-side resolution instead."""
+    monkeypatch.setattr(m, "identity_gate_payload", lambda: {})
+    client = _CapturingClient()
+    ok = await m.register_with_platform(
+        client,
+        platform_url="http://p",
+        workspace_id="ws",
+        workspace_url="http://ws",
+        agent_card={},
+        headers={},
+        delivery_mode="carrier-pigeon",
     )
     assert ok is True
     assert "delivery_mode" not in client.bodies[0]

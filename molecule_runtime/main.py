@@ -230,14 +230,26 @@ async def register_with_platform(
                 "agent_card": agent_card,
                 **identity_gate_payload(),
             }
-            # E1: declare poll delivery so the platform stages inbound A2A in
-            # activity_logs (for main()'s poller to pull) instead of POSTing to
-            # our URL. RegisterRequest already permits the key (mcp_heartbeat.py
-            # sets exactly this for the standalone path) — no contract change.
-            # Only added in poll mode, so the default push registration is
-            # byte-for-byte unchanged.
-            if delivery_mode == "poll":
-                register_body["delivery_mode"] = "poll"
+            # E1 + sticky-poll fix (prod agents-team incident 2026-07-05):
+            # ALWAYS declare the resolved delivery mode — push AND poll.
+            # RegisterRequest already permits the key (mcp_heartbeat.py sets
+            # exactly this for the standalone path) — no contract change, and
+            # the server validates both values (registry.go IsValidDeliveryMode).
+            #
+            # The old shape only declared "poll" and stayed silent for push.
+            # The platform's resolveDeliveryMode gives an EMPTY payload value
+            # the row's existing delivery_mode — so a workspace whose row was
+            # ever set to poll (an earlier poll-mode run, an external bridge
+            # experiment) could NEVER heal back to push by re-registering.
+            # Live consequence: the tenant staged every inbound A2A in
+            # activity_logs for a poller the push-mode runtime never starts —
+            # the agent was silently deaf to all chat/A2A until a manual DB
+            # flip. Declaring the actual mode on every boot makes the row
+            # converge to the runtime's real behavior instead of wedging on
+            # a stale value. (External laptop bridges register through their
+            # own path and still declare poll explicitly — unaffected.)
+            if delivery_mode in ("push", "poll"):
+                register_body["delivery_mode"] = delivery_mode
             resp = await client.post(
                 f"{platform_url}/registry/register",
                 json=register_body,
