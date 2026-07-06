@@ -109,6 +109,107 @@ _MCP_ENUMERATION_TIMEOUT_SECONDS = 45.0
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 
 
+# ── #1027 CRITICAL launch-failure alarm (GUARD D, task #229 / #228) ─────────
+# The DEGRADE-SAFE contract above deliberately absorbs a *transient stall* (a
+# server that spawns but is slow/unreachable) into core's grace window. But a
+# HARD LAUNCH-FAILURE is a different animal and must NOT be treated the same:
+# when the platform-mcp plugin pins @molecule-ai/mcp-server@<PIN> AHEAD of the
+# version pre-baked into this image, the runtime's
+#   npx --prefer-offline @molecule-ai/mcp-server@<PIN>
+# MISSES the cache and cold-pulls <PIN>; under CF-WAF throttling that hard-fails
+# `ETARGET` and the child process EXITS NON-ZERO before answering a single MCP
+# message. That is deterministic — it will NEVER self-heal on this image — so
+# silently degrading for the whole grace window (and then flapping) is exactly
+# the #228 false-ready. Instead we (a) emit a LOUD #1027 CRITICAL alarm the
+# moment we see it, and (b) record a REFUSE-ONLINE reason so the boot/heartbeat
+# path can fail-closed loudly instead of waiting the grace window out.
+#
+# stderr is captured (PIPE, not DEVNULL) so npm/npx's error code is visible;
+# these are the signatures that mark "the server binary died before handshaking
+# because its version could not be resolved/executed", not "slow control plane".
+_LAUNCH_FAILURE_SIGNATURES = (
+    "ETARGET", "ENOTCACHED", "ERESOLVE", "E404",
+    "no matching version", "could not determine executable",
+    "npm error", "npm ERR!",
+)
+
+# Runtime-side REFUSE-ONLINE signal. Non-None once a hard MCP launch-failure has
+# been observed on this image; consulted by the boot/heartbeat path to fail
+# closed LOUDLY rather than sit degraded for the grace window.
+_launch_failure_reason = None  # type: str | None
+
+
+def record_launch_failure(reason):
+    """Set (or clear, with None) the last hard MCP launch-failure reason."""
+    global _launch_failure_reason
+    _launch_failure_reason = reason
+
+
+def launch_failure_reason():
+    """Return the last hard MCP launch-failure reason (e.g. ``npx ETARGET``), or
+    None. A non-None value means the management MCP could NOT be launched AT ALL
+    on this image (its pinned version is unresolvable), so the concierge must
+    REFUSE to report online — fail-closed loudly — rather than absorb it into the
+    degrade grace window (#228). Idempotent read; ``record_launch_failure(None)``
+    clears it (used by tests / a successful re-probe)."""
+    return _launch_failure_reason
+
+
+def _classify_launch_failure(returncode, stderr_text):
+    """Classify a completed child as a hard launch-failure, or None if it isn't.
+
+    A launch-failure is a child that EXITED NON-ZERO (returncode not None and
+    != 0). A still-running child (returncode None — the stall case) is NOT a
+    launch-failure and returns None so the grace window keeps handling it. When a
+    known npm/npx signature is present it is named in the reason; a bare non-zero
+    exit is still reported (the binary died before handshaking) with a truncated
+    stderr snippet.
+    """
+    if returncode is None or returncode == 0:
+        return None
+    hay = stderr_text or ""
+    low = hay.lower()
+    for sig in _LAUNCH_FAILURE_SIGNATURES:
+        if sig.lower() in low:
+            return "exit=%s %s" % (returncode, sig)
+    snippet = " ".join(hay.split())[:200]
+    return "exit=%s" % returncode + ((" " + snippet) if snippet else "")
+
+
+async def _maybe_alarm_launch_failure(proc, server: str) -> None:
+    """When a handshake yielded None because the child DIED (not stalled), emit
+    the #1027 CRITICAL alarm and record the refuse-online reason. No-op for a
+    still-running (stalled) child or a clean exit — never a false alarm."""
+    if proc is None:
+        return
+    stderr_text = ""
+    try:
+        if getattr(proc, "stderr", None) is not None:
+            data = await asyncio.wait_for(proc.stderr.read(), timeout=2.0)
+            stderr_text = data.decode("utf-8", "replace") if data else ""
+    except Exception:  # noqa: BLE001 — alarm path must never crash boot
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=1.0)
+    except Exception:  # noqa: BLE001
+        pass
+    reason = _classify_launch_failure(proc.returncode, stderr_text)
+    if reason is None:
+        return
+    record_launch_failure("%s: %s" % (server, reason))
+    logger.critical(
+        "#1027 CRITICAL: management MCP %r FAILED TO LAUNCH (%s) — this is a HARD "
+        "npx launch-failure (e.g. ETARGET: the platform-mcp plugin pins an "
+        "@molecule-ai/mcp-server version AHEAD of the version baked into this "
+        "image), NOT a transient control-plane stall. It will not self-heal on "
+        "this image, so the concierge must REFUSE online (fail-closed) instead of "
+        "sitting degraded for the grace window. FIX: rebuild this runtime image "
+        "in lockstep with the plugin pin (Guard D lint) so the pinned mcp-server "
+        "is pre-baked.",
+        server, reason,
+    )
+
+
 def _normalize_tool_id(server: str, tool_name: str) -> str:
     """Return the canonical ``mcp__<server>__<tool>`` dispatcher id.
 
@@ -309,7 +410,11 @@ async def _list_tools_from_mcp_server(server: str, spec: dict) -> list[str] | No
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                # Capture stderr (was DEVNULL) so a hard npx launch-failure's
+                # error code (ETARGET, ENOTCACHED, …) is visible to the #1027
+                # alarm classifier below. npx's failure output is tiny and the
+                # child exits fast, so the PIPE never back-pressures the handshake.
+                stderr=asyncio.subprocess.PIPE,
                 env=child_env,
             )
         except (OSError, ValueError) as exc:
@@ -317,14 +422,30 @@ async def _list_tools_from_mcp_server(server: str, spec: dict) -> list[str] | No
                 "loaded_mcp_tools: failed to spawn server %r (%s) — treating as not-loaded",
                 server, exc,
             )
+            # The binary itself was not runnable (missing/exec error): a hard
+            # launch-failure, not a stall. Alarm loudly + refuse-online.
+            record_launch_failure("%s: spawn error: %s" % (server, exc))
+            logger.critical(
+                "#1027 CRITICAL: management MCP %r could not be SPAWNED (%s) — hard "
+                "launch-failure; concierge must REFUSE online (Guard D / #228).",
+                server, exc,
+            )
             return None
 
         # HARD per-server deadline over the whole handshake. A server that
         # answers initialize then stalls on tools/list trips either the per-read
         # timeout (inside _handshake) or this outer ceiling, whichever first.
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             _handshake(proc, server), timeout=_MCP_HANDSHAKE_TIMEOUT_SECONDS
         )
+        # A None result means the handshake produced no usable tools/list. That
+        # is EITHER a transient stall (child still running — absorbed by the
+        # grace window) OR a hard launch-failure (child already EXITED non-zero,
+        # e.g. npx ETARGET). Only the latter fires the loud #1027 alarm +
+        # refuse-online signal; _maybe_alarm_launch_failure discriminates.
+        if result is None:
+            await _maybe_alarm_launch_failure(proc, server)
+        return result
     except asyncio.TimeoutError:
         logger.warning(
             "loaded_mcp_tools: server %r handshake timed out (per-read %.0fs / "
