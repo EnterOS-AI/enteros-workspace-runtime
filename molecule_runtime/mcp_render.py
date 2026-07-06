@@ -34,6 +34,10 @@ import json
 import os
 from pathlib import Path
 
+# SSOT for the operator-default runtime — the ONLY value an unmapped runtime may
+# fall back to (never a hand-set ``claude_code``). See live_runtimes.py.
+from molecule_runtime.live_runtimes import DEFAULT_RUNTIME as _SSOT_DEFAULT_RUNTIME
+
 # The settings.json map key under which MCP servers live for the JSON runtimes
 # (Claude Code, Gemini CLI). Tied to the cross-repo contract ``key``.
 MCPSERVERS_KEY = "mcpServers"
@@ -189,6 +193,28 @@ def render_hermes_config(config_path: Path, name: str, spec: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Gemini / google-adk — native MCP-wiring convention UNVERIFIED (fail-loud stub)
+# ---------------------------------------------------------------------------
+
+def render_gemini_config(config_path: Path, name: str, spec: dict) -> None:
+    """Fail-loud stub for the gemini / google-adk MCP-wiring convention.
+
+    google-adk wires MCP through its own toolset config (an ADK ``McpToolset`` /
+    connection descriptor), and the Gemini CLI reads ``mcpServers`` from its own
+    settings file — but neither native location has been pinned against a live
+    runtime in this repo. Rather than GUESS and silently render into a file the
+    runtime never reads (the exact #3159 mis-attribution — which is what the old
+    silent ``claude_code`` fallback did for these unmapped runtimes), this raises,
+    matching the ``builtins.py`` install path that already anticipates a
+    "gemini/hermes" MCP stub. Implement concretely once the native format is
+    verified against a live gemini / google-adk CLI."""
+    raise NotImplementedError(
+        "gemini/google-adk MCP render not implemented — native MCP convention "
+        "unverified (no silent claude_code fallback; pin against a live CLI)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # OpenClaw — ~/.openclaw/openclaw.json  mcp.servers.<name>  (phase P4)
 # ---------------------------------------------------------------------------
 # Native format PINNED against a live ``openclaw@2026.5.7`` CLI (phase P4).
@@ -281,6 +307,14 @@ def _openclaw_path(config_path: str | os.PathLike) -> Path:
     return Path(os.path.expanduser("~")) / ".openclaw" / "openclaw.json"
 
 
+def _gemini_path(config_path: str | os.PathLike) -> Path:
+    # gemini / google-adk native MCP file is UNVERIFIED — this best-guess path
+    # (the Gemini CLI ~/.gemini/settings.json convention) exists only so
+    # mcp_settings_path_for returns a non-claude path; the renderer itself
+    # fail-loud raises before this file is ever written. Do NOT rely on it.
+    return Path(os.path.expanduser("~")) / ".gemini" / "settings.json"
+
+
 def _json_settings_has(settings_path: Path, name: str) -> bool:
     try:
         data = json.loads(Path(settings_path).read_text())
@@ -334,6 +368,14 @@ _RUNTIME_SPECS: dict[str, tuple] = {
     "codex": (_codex_path, render_codex_config, _codex_config_has),
     # hermes: native path unverified; fail-loud render, never falsely present.
     "hermes": (_claude_path, render_hermes_config, lambda p, n: False),
+    # gemini / google-adk: native MCP convention UNVERIFIED — fail-loud stub,
+    # never falsely present. Registered EXPLICITLY (not left to the default
+    # fallback) so an MCP install on these runtimes fails loud instead of
+    # silently rendering into a file they never read (the old claude_code creep
+    # for these unmapped runtimes — the #3159 class of bug). Matches the
+    # builtins.py install path that already anticipates a "gemini/hermes" stub.
+    "gemini": (_gemini_path, render_gemini_config, lambda p, n: False),
+    "google_adk": (_gemini_path, render_gemini_config, lambda p, n: False),
     # openclaw (phase P4): CONCRETE renderer + present-reader pinned against a
     # live openclaw@2026.5.7. Renders the stdio descriptor into
     # ~/.openclaw/openclaw.json mcp.servers.<name> (the file `openclaw mcp set`
@@ -341,21 +383,37 @@ _RUNTIME_SPECS: dict[str, tuple] = {
     "openclaw": (_openclaw_path, render_openclaw_config, _openclaw_config_has),
 }
 
-# The runtime used when the active runtime isn't mapped above. Claude Code is
-# the base runtime, so an unmapped runtime keeps today's behavior rather than
-# crashing — EXCEPT the privileged management MCP, whose install path fails loud
-# on a runtime it can't prove it rendered for.
-_DEFAULT_RUNTIME = "claude_code"
+# The runtime an UNMAPPED runtime falls back to. Derived from the LIVE_RUNTIMES
+# SSOT (``openclaw`` — the operator default), NEVER hand-set to ``claude_code``:
+# a new/unknown runtime renders into the OPERATOR default's convention, so the
+# "reference runtime" can't silently creep back to claude-code. Every LIVE
+# runtime is still REQUIRED (by the Guard A meta-gate) to have its OWN concrete
+# entry or a documented fail-loud exemption — the fallback is only a safety net
+# for genuinely-unknown (non-live) runtimes, not a substitute for registration.
+_DEFAULT_RUNTIME = _SSOT_DEFAULT_RUNTIME
 
 
 # Runtimes whose renderer is a deliberate fail-loud stub (format unverified).
 # openclaw graduated out (phase P4): it now has a concrete renderer +
-# present-reader verified against a live openclaw runtime.
-_UNVERIFIED_RUNTIMES = frozenset({"hermes"})
+# present-reader verified against a live openclaw runtime. gemini/google-adk are
+# fail-loud until their native MCP convention is pinned against a live CLI.
+_UNVERIFIED_RUNTIMES = frozenset({"hermes", "gemini", "google_adk"})
 
 
 def _spec_for(runtime: str) -> tuple:
-    return _RUNTIME_SPECS.get(normalize_runtime(runtime), _RUNTIME_SPECS[_DEFAULT_RUNTIME])
+    """Resolve a runtime to its ``(path, render, present)`` spec.
+
+    A mapped runtime returns its OWN concrete entry. An unmapped runtime falls
+    back to the operator-default runtime (``_DEFAULT_RUNTIME`` = openclaw) — never
+    to claude-code. Total by construction: if the default key itself is somehow
+    absent (only reachable in a monkeypatched self-test that pops it), it degrades
+    to the base ``claude_code`` entry so callers never hit a KeyError; this final
+    degradation is exactly what the G5 mis-attribution self-test exercises."""
+    key = normalize_runtime(runtime)
+    spec = _RUNTIME_SPECS.get(key)
+    if spec is not None:
+        return spec
+    return _RUNTIME_SPECS.get(_DEFAULT_RUNTIME) or _RUNTIME_SPECS["claude_code"]
 
 
 def is_runtime_supported(runtime: str) -> bool:
@@ -451,6 +509,10 @@ _RUNTIME_READERS: dict[str, callable] = {
     "claude_code": _read_json_mcp_servers,
     "codex": _read_codex_mcp_servers,
     "hermes": lambda _p: {},
+    # gemini/google-adk native MCP format unverified — report nothing rather
+    # than guessing (same fail-loud-vs-fail-silent stance as their renderer).
+    "gemini": lambda _p: {},
+    "google_adk": lambda _p: {},
     "openclaw": _read_openclaw_mcp_servers,
 }
 

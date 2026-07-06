@@ -68,6 +68,10 @@ from pathlib import Path
 # so ``claude-code`` -> ``claude_code`` normalizes identically in both ports.
 from molecule_runtime.mcp_render import normalize_runtime
 
+# SSOT for the operator-default runtime — the unmapped-runtime fallback, shared
+# with mcp_render so neither port silently creeps back to ``claude_code``.
+from molecule_runtime.live_runtimes import DEFAULT_RUNTIME as _SSOT_DEFAULT_RUNTIME
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -260,17 +264,30 @@ _RUNTIME_PERSONA: dict[str, tuple] = {
     "hermes": (_claude_persona_path, materialize_hermes_persona),
 }
 
-# The runtime used when the active runtime isn't mapped above. Claude Code is the
-# base runtime, so an unmapped runtime keeps base behavior (materialize into
-# system-prompt.md) rather than failing.
-_DEFAULT_RUNTIME = "claude_code"
+# The runtime an UNMAPPED runtime falls back to. Derived from the LIVE_RUNTIMES
+# SSOT (``openclaw`` — the operator default), NEVER hand-set to ``claude_code``:
+# an unmapped runtime materializes into the OPERATOR default's identity file
+# (SOUL.md) rather than silently creeping to claude-code's system-prompt.md.
+# Every LIVE runtime still needs its OWN concrete entry or a documented fail-loud
+# exemption (enforced by the Guard A meta-gate).
+_DEFAULT_RUNTIME = _SSOT_DEFAULT_RUNTIME
 
 # Runtimes whose materializer is a deliberate fail-loud stub (convention unverified).
 _UNVERIFIED_RUNTIMES = frozenset({"hermes"})
 
 
 def _spec_for(runtime: str) -> tuple:
-    return _RUNTIME_PERSONA.get(normalize_runtime(runtime), _RUNTIME_PERSONA[_DEFAULT_RUNTIME])
+    """Resolve a runtime to its ``(path, materializer)`` spec.
+
+    A mapped runtime returns its OWN concrete entry; an unmapped runtime falls
+    back to the operator-default runtime (``openclaw``) — never to claude-code.
+    Total by construction (degrades to the base ``claude_code`` entry only if the
+    default key is monkeypatched away, so callers never hit a KeyError)."""
+    key = normalize_runtime(runtime)
+    spec = _RUNTIME_PERSONA.get(key)
+    if spec is not None:
+        return spec
+    return _RUNTIME_PERSONA.get(_DEFAULT_RUNTIME) or _RUNTIME_PERSONA["claude_code"]
 
 
 def is_persona_supported(runtime: str) -> bool:
