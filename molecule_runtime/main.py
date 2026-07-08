@@ -94,6 +94,7 @@ from molecule_runtime.a2a_client import build_message_send_params
 from molecule_runtime.a2a_executor import (
     A2A_MESSAGE_SOURCE_TYPE,
     A2A_SOURCE_SELF_IDLE,
+    A2A_SOURCE_SELF_LIFECYCLE,
 )
 from molecule_runtime.platform_agent_identity import identity_gate_payload
 from molecule_runtime.platform_auth import auth_headers, self_source_headers
@@ -1265,6 +1266,11 @@ async def main():  # pragma: no cover
                     "params": build_message_send_params(
                         config.initial_prompt,
                         message_id=f"initial-{_uuid.uuid4().hex[:8]}",
+                        # task #219 §5: stamp the lifecycle-wake source so the
+                        # first-boot greeting is guard-governed (a runaway
+                        # re-greet trips the replay breaker) instead of the
+                        # unstamped guard-bypass it was before.
+                        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_LIFECYCLE},
                     ),
                 }).encode()
 

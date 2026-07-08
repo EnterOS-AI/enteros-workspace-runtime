@@ -355,6 +355,10 @@ async def send_wake_note_when_ready(
     import uuid as _uuid
 
     from molecule_runtime.a2a_client import build_message_send_params
+    from molecule_runtime.a2a_executor import (
+        A2A_MESSAGE_SOURCE_TYPE,
+        A2A_SOURCE_SELF_LIFECYCLE,
+    )
     from molecule_runtime.platform_auth import self_source_headers
 
     def _do_send_sync() -> bool:
@@ -367,6 +371,11 @@ async def send_wake_note_when_ready(
                 "params": build_message_send_params(
                     note,
                     message_id=f"reprovision-wake-{_uuid.uuid4().hex[:8]}",
+                    # task #219 §5: stamp the lifecycle-wake source so the
+                    # reprovision announcement is guard-governed (a restart loop
+                    # re-announcing trips the replay breaker) instead of the
+                    # unstamped guard-bypass it was before.
+                    metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_LIFECYCLE},
                 ),
             }
         ).encode()

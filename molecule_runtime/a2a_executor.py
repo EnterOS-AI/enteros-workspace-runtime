@@ -236,6 +236,14 @@ A2A_SOURCE_SELF_IDLE = "self-idle"
 A2A_SOURCE_SELF_SCHEDULER = "self-scheduler"
 A2A_SOURCE_SELF_GOAL_NUDGE = "self-goal-nudge"
 A2A_SOURCE_SELF_DELEGATION = "self-delegation-result"
+# Lifecycle wake-up calls (task #219 §5): the boot initial_prompt + the
+# reprovision-wake announcement. Previously stamped NO source_type, so they
+# bypassed the replay guard and queued behind in-flight turns. Registering the
+# type here makes every lifecycle wake guard-governed like the other self-pings
+# (a runaway greeting/announce loop trips the breaker), and drop-not-queue on
+# the non-blocking fast-path (harmless — lifecycle wakes fire at boot/restart
+# when no turn is in flight).
+A2A_SOURCE_SELF_LIFECYCLE = "self-lifecycle"
 
 # Routine self-pings the runtime sends to ITSELF: the platform cron tick, the
 # heartbeat delegation-results harvester, and the idle self-wake. Under the
@@ -253,6 +261,7 @@ _ROUTINE_SELF_SOURCE_TYPES = (
     A2A_SOURCE_SELF_SCHEDULER,
     A2A_SOURCE_SELF_GOAL_NUDGE,
     A2A_SOURCE_SELF_DELEGATION,
+    A2A_SOURCE_SELF_LIFECYCLE,
 )
 
 # Deprecated text-prefix fallback. Wording drift has already been observed

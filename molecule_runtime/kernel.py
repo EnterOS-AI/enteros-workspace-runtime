@@ -38,6 +38,7 @@ from molecule_runtime.a2a_executor import (
     A2A_SOURCE_SELF_GOAL_NUDGE,
     A2A_SOURCE_SELF_HARVESTER,
     A2A_SOURCE_SELF_IDLE,
+    A2A_SOURCE_SELF_LIFECYCLE,
     A2A_SOURCE_SELF_SCHEDULER,
 )
 
@@ -50,6 +51,11 @@ KIND_SCHEDULER = "scheduler"
 KIND_GOAL_NUDGE = "goal_nudge"
 KIND_DELEGATION_RESULT = "delegation_result"
 KIND_HARVESTER = "harvester"
+# Lifecycle wake-up calls (task #219 §5): first-creation greeting, session
+# reset, restart/reprovision, plugin-install, idle reactivation — all stamped
+# through one typed source so they are guard-governed like every other
+# autonomous turn (never the unstamped guard-bypass they were before).
+KIND_LIFECYCLE_WAKE = "lifecycle_wake"
 
 _KIND_TO_SOURCE_TYPE = {
     KIND_IDLE: A2A_SOURCE_SELF_IDLE,
@@ -57,6 +63,7 @@ _KIND_TO_SOURCE_TYPE = {
     KIND_GOAL_NUDGE: A2A_SOURCE_SELF_GOAL_NUDGE,
     KIND_DELEGATION_RESULT: A2A_SOURCE_SELF_DELEGATION,
     KIND_HARVESTER: A2A_SOURCE_SELF_HARVESTER,
+    KIND_LIFECYCLE_WAKE: A2A_SOURCE_SELF_LIFECYCLE,
 }
 
 
