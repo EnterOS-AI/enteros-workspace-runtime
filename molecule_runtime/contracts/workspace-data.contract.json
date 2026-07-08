@@ -26,7 +26,7 @@
     "default_on_gated_on": [
       "wire-local-and-aws-providers-to-datapersist",
       "r2-bucket-policy-denies-box-ecr-principal-cross-prefix-writes",
-      "nightly-e2e-snapshot-restore-proven",
+      "per-merge-e2e-snapshot-restore-proven",
       "staging-first-then-production"
     ]
   },

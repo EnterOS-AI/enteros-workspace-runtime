@@ -83,8 +83,8 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/workspace-data/workspace-data.contract.json
-Source commit:        `7682ab0f8938f05254a3383f6d6ea63eb0a12a75` (ai-sdk#60 — initial workspace-data SSOT)
-Vendored at sdk HEAD: `7682ab0f8938f05254a3383f6d6ea63eb0a12a75` (main)
+Source commit:        `aac88bd0227f690d9b0e37c6a3f7a338aa4845b9` (ai-sdk#61 — verify per-merge not nightly; supersedes #60)
+Vendored at sdk HEAD: `aac88bd0227f690d9b0e37c6a3f7a338aa4845b9` (main)
 
 Why vendored: `molecule_runtime/mailbox_dir.py` `verify_durability` reads the
 provider-agnostic snapshot-durability signals from the **instance** —
