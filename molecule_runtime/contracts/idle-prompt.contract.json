@@ -1,0 +1,277 @@
+{
+  "schema_version": "idle-prompt/v1",
+  "contract_layer": "idle-prompt",
+  "ownership": {
+    "shape_owner": "molecule-ai-sdk",
+    "assembler_owner": "molecule_runtime"
+  },
+  "wake": {
+    "idle_fire_after_seconds": 300,
+    "stall_lease_is_separate": true,
+    "renew_on": ["tool-call", "inbound-message", "user-wake"],
+    "fire_preconditions": [
+      "no-turn-in-flight",
+      "silence-window-elapsed",
+      "body-non-empty",
+      "content-hash-changed",
+      "atomic-recheck-no-new-inbound-since-assembly"
+    ],
+    "external_workspace_signal": "MCP-channel silence marks the digest pending; the external SDK owns a client-side lease, pulls the digest via a fetch tool, and a lease-renew ping suppresses firing during long local operations. Delivery != wake: offline agents receive the pending digest on reconnect."
+  },
+  "sort": {
+    "formula": "pinned-band-then-urgent-band-then-base-tier-ascending",
+    "bands": ["pinned", "urgent", "base"],
+    "base_tier_order": "ascending"
+  },
+  "delta": {
+    "hash_algorithm": "sha256",
+    "hash_serialization": ["provider_id", "tier", "urgency", "count", "summary", "age_band", "item_ids"],
+    "provider_hash_role": "advisory",
+    "baseline": "post-on-included-recompute-at-last-successful-fire",
+    "stale_escalation_thresholds_seconds": [3600, 86400],
+    "raw_time_fields_forbidden": true
+  },
+  "empty": {
+    "mode": "sleep",
+    "header_counts_toward_emptiness": false,
+    "rearm_events": [
+      "inbound-mail",
+      "task-row-written",
+      "goal-set",
+      "provider-registered",
+      "user-wake",
+      "config-change"
+    ],
+    "scheduler_time_exception": "sleep-until-next-due"
+  },
+  "limits": {
+    "max_envelopes_per_provider": 8,
+    "max_summary_bytes": 512,
+    "max_digest_bytes": 16384,
+    "max_preview_items_per_envelope": 5,
+    "truncation": "drop-lowest-band-tier-first-keep-counts-and-pulls"
+  },
+  "failure": {
+    "provider_timeout_seconds": 5,
+    "on_error": "skip-and-render-degraded-marker",
+    "failed_sections_excluded_from_hash": true,
+    "max_consecutive_failures": 3
+  },
+  "trust": {
+    "reserved_provider_ids": [
+      "identity-capabilities",
+      "task-queue",
+      "sent-folder",
+      "inbound-a2a",
+      "delegation-results",
+      "scheduler",
+      "goal-state"
+    ],
+    "pinned_reserved_to": "identity-capabilities",
+    "third_party_default_tier": 6,
+    "urgency_grant": "operator-approved-manifest",
+    "pull_tools": "whitelisted-mcp-only",
+    "state_folder_jailing": true
+  },
+  "callbacks": {
+    "on_included_required": true
+  },
+  "header": {
+    "voice": "second-person",
+    "lines": ["you_are", "responsibility", "priorities", "native_tools"],
+    "native_tool_groups": ["workspace_mcp", "platform_mcp", "from_plugins"],
+    "platform_mcp_condition": "platform-agent-workspaces-only",
+    "capability_list_style": "names-only-capped-with-counts"
+  },
+  "providers": [
+    {
+      "provider_id": "identity-capabilities",
+      "band": "pinned",
+      "base_tier": 0,
+      "official": true,
+      "phase": 1,
+      "covers": ["you-are", "responsibility", "priorities", "native-mcp-tools"],
+      "summary": "Pinned second-person header: who you are, your responsibility, what matters, and your natively available MCP tools grouped by origin."
+    },
+    {
+      "provider_id": "task-queue",
+      "band": "base",
+      "base_tier": 1,
+      "official": true,
+      "phase": 1,
+      "covers": ["current", "queued", "paused", "blocked", "awaiting-user", "user-origin-rows", "lifecycle-resume-rows"],
+      "summary": "The durable work ledger: current task, user-origin requests, blocked/paused work, queued next tasks, and agent-to-user asks awaiting the user."
+    },
+    {
+      "provider_id": "sent-folder",
+      "band": "base",
+      "base_tier": 2,
+      "official": true,
+      "phase": 2,
+      "covers": ["outstanding-sends", "unanswered-asks", "dead-recipient-bounce"],
+      "summary": "Outstanding sent mail awaiting reply with age-band escalation; dead recipients bounce and the task survives."
+    },
+    {
+      "provider_id": "inbound-a2a",
+      "band": "base",
+      "base_tier": 3,
+      "official": true,
+      "phase": 2,
+      "covers": ["peer-messages", "fresh-delegations"],
+      "summary": "Fresh peer messages and delegations awaiting a reply — the inbox."
+    },
+    {
+      "provider_id": "delegation-results",
+      "band": "base",
+      "base_tier": 4,
+      "official": true,
+      "phase": 2,
+      "covers": ["delegated-work-results"],
+      "summary": "Results returned from work delegated out; the pull marks a result consumed."
+    },
+    {
+      "provider_id": "scheduler",
+      "band": "base",
+      "base_tier": 5,
+      "official": true,
+      "phase": 2,
+      "covers": ["missed-runs", "coalesced-schedules"],
+      "summary": "Coalesced missed runs with catch-up / run-once / consolidate / delegate actions, queued as tasks."
+    },
+    {
+      "provider_id": "goal-state",
+      "band": "base",
+      "base_tier": 7,
+      "official": true,
+      "phase": 1,
+      "covers": ["long-term-goal", "background-loop"],
+      "summary": "The standing background objective, surfaced only when nothing above is pending; the cadence band keeps the loop alive under the delta gate."
+    }
+  ],
+  "task_queue": {
+    "store_owner": "runtime",
+    "single_current": true,
+    "envelopes": [
+      "E1-urgent: open user-origin rows (queued/paused/blocked; current excluded) + open lifecycle resume rows",
+      "E2-base-tier-1: current/paused/blocked/queued summary + awaiting-user asks from the requests index"
+    ],
+    "urgent_open_definition": "queued-paused-blocked-current-excluded",
+    "kernel_gated_writes": true,
+    "tombstone_retention_days": 14,
+    "status_enum": ["current", "queued", "paused", "blocked", "awaiting_user", "done", "dropped"],
+    "origin_enum": ["user", "agent", "a2a", "scheduler", "lifecycle"],
+    "sample_row": {
+      "id": "task-123",
+      "origin": "user",
+      "status": "paused",
+      "title": "Rotate the org bot token",
+      "next_action": "Mint and verify the new token",
+      "request_id": "req-88",
+      "resume_payload": "",
+      "created_at": "2026-07-07T12:20:00Z",
+      "updated_at": "2026-07-07T13:05:00Z"
+    }
+  },
+  "goal_state": {
+    "cadence_default_seconds": 3600,
+    "cadence_min_seconds": 300,
+    "cadence_band_rides_age_band": true,
+    "never_urgent": true,
+    "migration_marker": ".migrated",
+    "migration_overwrite_rule": "may-overwrite-fleet-persona-default-never-workspace-mcp",
+    "source_enum": ["workspace-mcp", "legacy-idle-prompt-migration", "fleet-persona-default"],
+    "sample_goal": {
+      "goal": "Pull the next real backlog item: open-PR RC fixes first, then the smallest labeled-ready issue. Never fabricate work.",
+      "source": "fleet-persona-default",
+      "set_by": "provision",
+      "set_at": "2026-07-07T00:00:00Z",
+      "cadence_seconds": 3600,
+      "last_included_at": "2026-07-07T14:35:00Z"
+    }
+  },
+  "correlation": {
+    "minted_on": "send-with-expects-reply",
+    "echoed_on": "reply",
+    "fallback_matchers": ["delegation_id", "reply-threading", "manual-close-tool"],
+    "carried_by_bounce": true
+  },
+  "lifecycle_wakes": {
+    "typed_source_required": true,
+    "resume_row_before_restart": true,
+    "wake_kinds": ["first-creation", "session-reset", "restart-reprovision", "plugin-install", "idle-reactivation"]
+  },
+  "sample_contributions": [
+    {
+      "provider_id": "identity-capabilities",
+      "band": "pinned",
+      "tier": 0,
+      "urgency": "normal",
+      "count": 46,
+      "summary": "You are core-devops — fleet infrastructure engineer for the molecule-ai org. Your responsibility: keep CI, deploys, and fleet infra healthy — fix what is yours, route what is not. Priorities: user first; then tasks, sent, inbox, results, schedules, plugin work, goal. Your available MCP tools (native): workspace MCP (43): delegate_task, check_task_status, task_list, goal_get, ... from plugins: gitea, grafana, telegram.",
+      "age_band": "none",
+      "item_ids": [],
+      "pull": {
+        "tool": "list_installed_plugins",
+        "instruction": "Pull plugin detail if you need more than the capability names.",
+        "max_items": 20
+      }
+    },
+    {
+      "provider_id": "task-queue",
+      "band": "urgent",
+      "tier": 1,
+      "urgency": "urgent",
+      "count": 1,
+      "summary": "1 open user ask: rotate the org bot token — paused at step 2/4 after the Infisical write; next: mint + verify the new token.",
+      "age_band": "1h-1d",
+      "item_ids": ["task-123:paused"],
+      "pull": {
+        "tool": "task_list",
+        "instruction": "Pull bounded task detail before resuming the user ask.",
+        "max_items": 5
+      },
+      "rearm_signals": ["task-row-written"],
+      "preview_items": [
+        {
+          "item_id": "task-123",
+          "status": "paused",
+          "summary": "Rotate the org bot token — step 2/4 done.",
+          "age_band": "1h-1d",
+          "next_action": "Mint and verify the new token."
+        }
+      ]
+    },
+    {
+      "provider_id": "task-queue",
+      "band": "base",
+      "tier": 1,
+      "urgency": "normal",
+      "count": 5,
+      "summary": "1 current/paused (surfaced above), 2 queued (next up: nightly backup audit), 1 blocked (CP deploy fix — waiting on staging access), 1 awaiting user (confirm the canary window?).",
+      "age_band": "over-1d",
+      "item_ids": ["task-123:paused", "task-124:queued", "task-125:queued", "task-126:blocked", "req-88:awaiting_user"],
+      "pull": {
+        "tool": "task_list",
+        "instruction": "Pull bounded current and queued task detail before deciding what to resume or re-route.",
+        "max_items": 5
+      },
+      "rearm_signals": ["task-row-written"]
+    },
+    {
+      "provider_id": "goal-state",
+      "band": "base",
+      "tier": 7,
+      "urgency": "normal",
+      "count": 1,
+      "summary": "Background objective — work it only if nothing above is pending: pull the next real backlog item; open-PR RC fixes first, then the smallest labeled-ready issue; never fabricate work.",
+      "age_band": "due",
+      "item_ids": ["goal:1f9c2a7d:fleet-persona-default"],
+      "pull": {
+        "tool": "goal_get",
+        "instruction": "Pull the full objective text and history before starting background work.",
+        "max_items": 1
+      },
+      "rearm_signals": ["goal-set"]
+    }
+  ]
+}
