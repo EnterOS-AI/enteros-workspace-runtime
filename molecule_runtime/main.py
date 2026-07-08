@@ -1371,9 +1371,132 @@ async def main():  # pragma: no cover
     # workspaces upgrade opt-in — set idle_prompt in org.yaml defaults or
     # per-workspace to enable.
     idle_loop_task = None
+
+    # 10c-kernel. Contract-driven idle DIGEST (task #219, MOLECULE_MAILBOX_KERNEL
+    # only). When the mailbox kernel is on, the static idle_prompt self-post
+    # below is replaced by the assembled provider digest (identity header +
+    # task-queue + goal-state). Kernel-OFF (the fleet default) keeps the legacy
+    # loop below byte-identical. The whole block is wrapped so a wiring fault
+    # degrades to "no idle loop", never a boot crash. The controller LOGIC is
+    # unit-tested (tests/test_idle_controller.py); the boot-integration path is
+    # validated by `make dev` before the flag is flipped on a workspace (the
+    # operator-gated §7.2 rollout).
+    _idle_digest_enabled = False
+    if adapter_ready:
+        try:
+            from molecule_runtime import mailbox_dir as _mbox
+
+            _idle_digest_enabled = _mbox.kernel_enabled()
+        except Exception:
+            _idle_digest_enabled = False
+
+    if _idle_digest_enabled:
+        try:
+            from molecule_runtime.idle_digest import (
+                IdleDigestController as _IDC,
+                Policy as _IdlePolicy,
+                build_default_providers as _build_idle_providers,
+            )
+
+            _idle_policy = _IdlePolicy.default()
+            _idle_providers = _build_idle_providers(
+                config_path=config.config_path,
+                prompt_files=config.prompt_files,
+                workspace_name=config.name,
+                runtime_kind=config.runtime,
+            )
+            # goal-state first-boot migration of a legacy config.idle_prompt value
+            for _gp in _idle_providers:
+                if _gp.provider_id == "goal-state":
+                    try:
+                        _gp.migrate_from_config(config.idle_prompt)
+                    except Exception:
+                        pass
+                    break
+
+            import json as _idle_json
+            from urllib import request as _idle_urlreq
+
+            _IDLE_FIRE_TIMEOUT = max(60, min(300, _idle_policy.idle_fire_after_seconds))
+
+            async def _digest_poster(_text: str) -> None:
+                _payload = _idle_json.dumps({
+                    "method": "message/send",
+                    "params": build_message_send_params(
+                        _text,
+                        message_id=f"idle-{_uuid.uuid4().hex[:8]}",
+                        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
+                    ),
+                }).encode()
+
+                def _post():
+                    _headers = {
+                        "Content-Type": "application/json",
+                        **self_source_headers(workspace_id),
+                    }
+                    _req = _idle_urlreq.Request(
+                        f"{platform_url}/workspaces/{workspace_id}/a2a",
+                        data=_payload,
+                        headers=_headers,
+                    )
+                    with _idle_urlreq.urlopen(_req, timeout=_IDLE_FIRE_TIMEOUT) as _r:
+                        _r.read()
+
+                await asyncio.get_running_loop().run_in_executor(None, _post)
+
+            _idle_controller = _IDC(
+                providers=_idle_providers,
+                policy=_idle_policy,
+                poster=_digest_poster,
+                # #381: skip the digest while unconsumed delegation results wait
+                skip_check=_check_delegation_results_pending,
+                # atomic-fire recheck: only fire when no turn is in flight
+                pre_fire_check=lambda: heartbeat.active_tasks == 0,
+            )
+
+            async def _run_idle_digest_loop():
+                await asyncio.sleep(min(_idle_policy.idle_fire_after_seconds, 60))
+                while True:
+                    try:
+                        await asyncio.sleep(_idle_policy.idle_fire_after_seconds)
+                    except asyncio.CancelledError:
+                        return
+                    # same circuit breaker as the static loop (runaway 2026-06-29)
+                    try:
+                        from molecule_runtime.autonomous_loop_guard import (
+                            should_halt as _loop_should_halt,
+                        )
+
+                        if _loop_should_halt():
+                            print(
+                                "Idle digest: circuit breaker OPEN — halting "
+                                "(runtime degraded; restart to resume)",
+                                flush=True,
+                            )
+                            return
+                    except Exception:
+                        pass
+                    if heartbeat.active_tasks > 0:
+                        continue
+                    try:
+                        _outcome = await _idle_controller.tick()
+                        if _outcome == "fired":
+                            print("Idle digest: fired", flush=True)
+                    except Exception as _e:  # pragma: no cover — never crash the loop
+                        print(f"Idle digest: tick error — {_e}", flush=True)
+
+            idle_loop_task = asyncio.create_task(_run_idle_digest_loop())
+            print(
+                "Idle digest: contract-driven digest loop armed (mailbox kernel on)",
+                flush=True,
+            )
+        except Exception as _e:  # pragma: no cover — degrade to no idle loop
+            print(f"Idle digest: wiring failed, no idle loop — {_e}", flush=True)
+            idle_loop_task = None
+
     # Skipped on misconfigured boots — the self-fire would route to the
     # -32603 handler in a tight loop and consume cycles for no useful work.
-    if adapter_ready and config.idle_prompt:
+    if adapter_ready and config.idle_prompt and not _idle_digest_enabled:
         # Idle-fire HTTP timeout. Kept tight relative to the fire cadence so a
         # hung platform doesn't accumulate dangling requests — a fire that
         # takes longer than the idle interval itself is almost certainly stuck.
