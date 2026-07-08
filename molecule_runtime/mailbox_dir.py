@@ -50,8 +50,10 @@ without a reset hook.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+from importlib import resources
 from pathlib import Path
 
 import molecule_runtime.configs_dir as configs_dir
@@ -110,19 +112,31 @@ def resolve() -> Path:
 # --- Durability guard --------------------------------------------------------
 #
 # The kernel relocates durable state onto ``/workspace`` on the assumption that
-# ``/workspace`` is a persistent volume. On a flavor where it is only a
-# directory on the ephemeral root disk that assumption is silently false — the
-# ``mkdir`` above succeeds, writes succeed, and the state is lost on the next
-# instance recreate / auto-heal (cp#326). :func:`verify_durability` probes the
-# resolved base once at kernel-on boot and classifies it so a non-durable
-# deployment is caught and surfaced rather than losing data quietly.
+# ``/workspace`` is durable. That is a DEPLOYMENT + PROVIDER property, not a
+# given, and it holds in TWO provider-agnostic ways:
+#   1. a distinct persistent MOUNT (AWS EBS data volume, Docker named volume) —
+#      zero-loss across recreate; detected by ``st_dev`` != ``/``;
+#   2. R2 SNAPSHOT/RESTORE (Hetzner/GCP boot disk + the workspace-data contract):
+#      ``/workspace`` is on the ephemeral boot disk (same ``st_dev`` as ``/``)
+#      but is tar+zstd'd to object storage on a timer and restored before the
+#      container mounts it — durable across recreate, but PERIODIC (bounded loss).
+# On a flavor where NEITHER holds, ``/workspace`` is the ephemeral root disk and
+# kernel state is silently lost on the next recreate / auto-heal (cp#326).
+# :func:`verify_durability` probes the resolved base once at kernel-on boot and
+# classifies it so a non-durable deployment is caught and surfaced rather than
+# losing data quietly. The snapshot signal is read from the vendored
+# ``workspace-data`` contract SSOT (``molecule_runtime/contracts``).
 
 #: Base sits on a distinct, persistent mounted volume (different ``st_dev`` from
 #: ``/``) and is writable — durable across instance recreate / auto-heal.
 DURABILITY_DURABLE = "durable"
+#: Base is on the boot disk (same ``st_dev`` as ``/``) but durable via the R2
+#: snapshot/restore mechanism (workspace-data contract) — durable across recreate
+#: but PERIODIC: state since the last snapshot is lost on a hard recreate.
+DURABILITY_SNAPSHOT = "snapshot-durable"
 #: Base is writable but lives on the SAME device as ``/`` (the root filesystem),
-#: i.e. it is a plain directory on the ephemeral root disk — state is lost on
-#: instance recreate / auto-heal. This is the case the guard exists to catch.
+#: i.e. it is a plain directory on the ephemeral root disk with NO snapshot
+#: backing — state is lost on instance recreate / auto-heal. The case to catch.
 DURABILITY_EPHEMERAL = "ephemeral"
 #: Base cannot be written (read-only mount, permissions, missing parent) — the
 #: kernel's durable writes will fail outright.
@@ -131,6 +145,60 @@ DURABILITY_UNWRITABLE = "unwritable"
 DURABILITY_NA = "n/a"
 
 _PROBE_FILENAME = ".molecule-durability-probe"
+
+#: Vendored workspace-data contract SSOT (byte-for-byte mirror of molecule-ai-sdk
+#: contracts/workspace-data; see molecule_runtime/contracts/PROVENANCE.md). Read
+#: for the snapshot-durability signal — the persisted-path set and the box env
+#: var CP injects when it wires R2 snapshot/restore for a workspace.
+_WORKSPACE_DATA_RESOURCE = "contracts/workspace-data.contract.json"
+_workspace_data_cache: dict | None = None
+
+
+def _workspace_data() -> dict:
+    """Load the vendored workspace-data contract instance (cached). ``{}`` on any
+    failure — a missing/corrupt mirror must never crash the guard; it just means
+    no snapshot-durability credit (the conservative, LOUD-warn direction)."""
+    global _workspace_data_cache
+    if _workspace_data_cache is None:
+        try:
+            raw = (
+                resources.files("molecule_runtime")
+                .joinpath(_WORKSPACE_DATA_RESOURCE)
+                .read_text(encoding="utf-8")
+            )
+            loaded = json.loads(raw)
+            _workspace_data_cache = loaded if isinstance(loaded, dict) else {}
+        except Exception:  # pragma: no cover - defensive I/O
+            _workspace_data_cache = {}
+    return _workspace_data_cache
+
+
+def _path_under(base: Path, root: str) -> bool:
+    """True iff ``base`` is at or under ``root`` (normalized string compare, no I/O)."""
+    b = os.path.normpath(str(base))
+    r = os.path.normpath(root)
+    return b == r or b.startswith(r.rstrip(os.sep) + os.sep)
+
+
+def _snapshot_durable_signal(base: Path) -> bool:
+    """In-container signal that ``base`` is durable via R2 snapshot/restore.
+
+    Per the workspace-data contract: the base lives under a ``persisted_paths``
+    entry AND the CP-injected snapshot-PUT env var (``box_env.snapshot_uri``) is
+    present — proving CP wired R2 snapshot for this workspace. The host-side
+    ``ws-snapshot-disabled`` marker is NOT container-visible, so this credits
+    *configured* snapshot-durability, not live health (a box whose restore failed
+    still reads as snapshot-durable — an acceptable, rare miss vs. a false EPHEMERAL
+    warning on every healthy boot-disk box). Contract-driven: no hardcoded paths.
+    """
+    wd = _workspace_data()
+    snap_env = (wd.get("box_env") or {}).get("snapshot_uri")
+    paths = wd.get("persisted_paths")
+    if not snap_env or not isinstance(paths, list) or not paths:
+        return False  # contract unavailable → no credit (stay conservative)
+    if not os.environ.get(snap_env, "").strip():
+        return False  # CP did not wire an R2 snapshot PUT for this workspace
+    return any(_path_under(base, p) for p in paths if isinstance(p, str))
 
 #: Last durability status computed by :func:`verify_durability`, exposed for
 #: observability (e.g. a heartbeat field) without re-probing the filesystem.
@@ -193,11 +261,16 @@ def probe_durability(base: Path | None = None) -> str:
     if not _is_writable(base):
         return DURABILITY_UNWRITABLE
     on_root = _is_on_root_device(base)
-    if on_root is None:
-        # Undeterminable device — treat as non-durable so the operator is warned
-        # rather than lulled. Writable but unverifiable is not "durable".
-        return DURABILITY_EPHEMERAL
-    return DURABILITY_EPHEMERAL if on_root else DURABILITY_DURABLE
+    if on_root is False:
+        # Distinct persistent mount (EBS data volume / Docker named volume).
+        return DURABILITY_DURABLE
+    # on_root True (boot disk) or None (undeterminable) is NOT a live durable
+    # mount — but R2 snapshot/restore may still make it durable (Hetzner/GCP).
+    # Credit snapshot-durability when the workspace-data contract signals it,
+    # else it is genuinely ephemeral (warn).
+    if _snapshot_durable_signal(base):
+        return DURABILITY_SNAPSHOT
+    return DURABILITY_EPHEMERAL
 
 
 def last_durability_status() -> str:
@@ -230,6 +303,18 @@ def verify_durability() -> str:
     _last_durability_status = status
     if status == DURABILITY_DURABLE:
         logger.info("mailbox durability: OK — %s is a distinct persistent mount", base)
+    elif status == DURABILITY_SNAPSHOT:
+        snap_env = (_workspace_data().get("box_env") or {}).get(
+            "snapshot_uri", "MOLECULE_WORKSPACE_SNAPSHOT_URI"
+        )
+        logger.info(
+            "mailbox durability: OK (snapshot) — %s is on the boot disk but is durable "
+            "via R2 snapshot/restore (%s wired); state is restored on recreate. NOTE: "
+            "snapshot durability is PERIODIC — state written since the last snapshot is "
+            "lost on a hard recreate (unlike a live persistent mount).",
+            base,
+            snap_env,
+        )
     elif status == DURABILITY_EPHEMERAL:
         logger.error(
             "mailbox durability: EPHEMERAL — %s is on the root filesystem, NOT a "

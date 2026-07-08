@@ -72,3 +72,36 @@ Re-vendoring (schema + instance):
         "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/idle-prompt/idle-prompt.$f.json" \
         -o "molecule_runtime/contracts/idle-prompt.$f.json"
     done
+
+---
+
+## `workspace-data.contract.json`
+
+Byte-for-byte copy of:
+
+    molecule-ai-sdk/contracts/workspace-data/workspace-data.contract.json
+
+Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
+Source path:          contracts/workspace-data/workspace-data.contract.json
+Source commit:        `7682ab0f8938f05254a3383f6d6ea63eb0a12a75` (ai-sdk#60 — initial workspace-data SSOT)
+Vendored at sdk HEAD: `7682ab0f8938f05254a3383f6d6ea63eb0a12a75` (main)
+
+Why vendored: `molecule_runtime/mailbox_dir.py` `verify_durability` reads the
+provider-agnostic snapshot-durability signals from the **instance** —
+`persisted_paths` (does the mailbox base live under an archived path?),
+`box_env.snapshot_uri` (the in-container env var proving CP wired R2 snapshot for
+this workspace), and `durability_signal.disabled_marker` — to credit a third
+`snapshot-durable` state, so the guard does not false-warn EPHEMERAL on a
+boot-disk provider (Hetzner/GCP) whose `/workspace` is durable via R2
+snapshot/restore rather than a live block mount. Loaded offline via
+`importlib.resources`; the contract is the SSOT for these constants.
+
+Instance only (no schema mirror): the runtime reads constants, it does not
+JSON-Schema-validate this contract at boot. On the drift gate
+(`check-schemas-in-sync.sh`), so the mirror stays byte-identical to sdk main.
+
+Re-vendoring (instance):
+
+    curl -fsS -A "curl/8.4.0" \
+      "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/workspace-data/workspace-data.contract.json" \
+      -o "molecule_runtime/contracts/workspace-data.contract.json"

@@ -29,7 +29,9 @@ import molecule_runtime.mailbox_dir as mailbox_dir  # noqa: E402
 def _clean_env(monkeypatch):
     monkeypatch.delenv(mailbox_dir.KERNEL_FLAG_ENV, raising=False)
     monkeypatch.delenv(mailbox_dir.MAILBOX_DIR_ENV, raising=False)
+    monkeypatch.delenv("MOLECULE_WORKSPACE_SNAPSHOT_URI", raising=False)
     mailbox_dir._last_durability_status = mailbox_dir.DURABILITY_NA
+    mailbox_dir._workspace_data_cache = None  # re-read the vendored contract per test
     yield
 
 
@@ -178,3 +180,78 @@ def test_kernel_install_invokes_guard(monkeypatch, tmp_path):
         assert mailbox_dir.last_durability_status() == mailbox_dir.DURABILITY_EPHEMERAL
     finally:
         kernel.uninstall()
+
+
+# --- snapshot-durability (provider-agnostic R2 snapshot/restore) --------------
+
+_SNAP_ENV = "MOLECULE_WORKSPACE_SNAPSHOT_URI"
+
+
+def test_vendored_workspace_data_contract_loads():
+    """The vendored workspace-data SSOT is present + carries the signals we read."""
+    wd = mailbox_dir._workspace_data()
+    assert wd, "vendored contracts/workspace-data.contract.json must load"
+    assert wd["box_env"]["snapshot_uri"] == _SNAP_ENV
+    assert "/workspace" in wd["persisted_paths"]
+
+
+def test_path_under():
+    assert mailbox_dir._path_under(Path("/workspace/.molecule"), "/workspace") is True
+    assert mailbox_dir._path_under(Path("/workspace"), "/workspace") is True
+    assert mailbox_dir._path_under(Path("/home/agent/.claude/x"), "/home/agent/.claude") is True
+    assert mailbox_dir._path_under(Path("/configs"), "/workspace") is False
+    assert mailbox_dir._path_under(Path("/workspace-other"), "/workspace") is False  # not a prefix-match
+
+
+def test_snapshot_signal_requires_env_and_persisted_path(monkeypatch):
+    base = Path("/workspace/.molecule")
+    # No snapshot URI in env -> not credited.
+    assert mailbox_dir._snapshot_durable_signal(base) is False
+    # URI present + base under a persisted path -> credited.
+    monkeypatch.setenv(_SNAP_ENV, "https://r2.example/put?sig=abc")
+    assert mailbox_dir._snapshot_durable_signal(base) is True
+    # URI present but base NOT under a persisted path -> not credited.
+    assert mailbox_dir._snapshot_durable_signal(Path("/configs/x")) is False
+
+
+def test_snapshot_signal_false_when_contract_missing(monkeypatch):
+    monkeypatch.setenv(_SNAP_ENV, "https://r2.example/put")
+    monkeypatch.setattr(mailbox_dir, "_workspace_data", lambda: {})  # simulate absent mirror
+    # Conservative: no contract -> no snapshot credit (stays EPHEMERAL/loud).
+    assert mailbox_dir._snapshot_durable_signal(Path("/workspace/.molecule")) is False
+
+
+def test_probe_credits_snapshot_on_boot_disk(monkeypatch):
+    """Boot disk (on_root=True) + R2 snapshot wired -> snapshot-durable, not ephemeral."""
+    monkeypatch.setenv(_SNAP_ENV, "https://r2.example/put?sig=abc")
+    monkeypatch.setattr(mailbox_dir, "_is_writable", lambda b: True)
+    monkeypatch.setattr(mailbox_dir, "_is_on_root_device", lambda b: True)
+    assert mailbox_dir.probe_durability(Path("/workspace/.molecule")) == mailbox_dir.DURABILITY_SNAPSHOT
+    # Undeterminable device + snapshot wired is also credited.
+    monkeypatch.setattr(mailbox_dir, "_is_on_root_device", lambda b: None)
+    assert mailbox_dir.probe_durability(Path("/workspace/.molecule")) == mailbox_dir.DURABILITY_SNAPSHOT
+
+
+def test_probe_ephemeral_when_boot_disk_and_no_snapshot(monkeypatch):
+    """Boot disk + NO snapshot wiring is still genuinely ephemeral (warn)."""
+    monkeypatch.setattr(mailbox_dir, "_is_writable", lambda b: True)
+    monkeypatch.setattr(mailbox_dir, "_is_on_root_device", lambda b: True)
+    assert mailbox_dir.probe_durability(Path("/workspace/.molecule")) == mailbox_dir.DURABILITY_EPHEMERAL
+
+
+def test_distinct_mount_beats_snapshot(monkeypatch):
+    """A live persistent mount classifies DURABLE even if snapshot is also wired."""
+    monkeypatch.setenv(_SNAP_ENV, "https://r2.example/put")
+    monkeypatch.setattr(mailbox_dir, "_is_writable", lambda b: True)
+    monkeypatch.setattr(mailbox_dir, "_is_on_root_device", lambda b: False)  # distinct device
+    assert mailbox_dir.probe_durability(Path("/workspace/.molecule")) == mailbox_dir.DURABILITY_DURABLE
+
+
+def test_verify_snapshot_logs_info_not_error(monkeypatch, caplog):
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "1")
+    monkeypatch.setattr(mailbox_dir, "probe_durability", lambda b=None: mailbox_dir.DURABILITY_SNAPSHOT)
+    with caplog.at_level(logging.INFO, logger="molecule_runtime.mailbox_dir"):
+        assert mailbox_dir.verify_durability() == mailbox_dir.DURABILITY_SNAPSHOT
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records), "snapshot-durable must not warn"
+    assert any("OK (snapshot)" in r.getMessage() for r in caplog.records)
+    assert mailbox_dir.last_durability_status() == mailbox_dir.DURABILITY_SNAPSHOT

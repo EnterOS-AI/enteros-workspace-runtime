@@ -1,0 +1,100 @@
+{
+  "schema_version": "workspace-data/v1",
+  "contract_layer": "workspace-data",
+  "_doc": [
+    "Durable-workspace snapshot/restore — the provider-agnostic durability SSOT.",
+    "A box tars the persisted paths (tar+zstd) to object storage (Cloudflare R2) via a",
+    "presigned PUT on a timer, and restores from a presigned GET BEFORE the runtime",
+    "container mounts /workspace — so agent state, INCLUDING the mailbox kernel's",
+    "/workspace/.molecule, survives instance recreate / auto-heal on ANY compute provider.",
+    "The compute provider is irrelevant: durability rides object storage, not per-provider",
+    "block volumes. Implementation: molecule-controlplane internal/workspacedata + the box",
+    "userdata systemd timer. This contract is the SSOT for the constants those consumers",
+    "(and the molecule_runtime durability guard) must agree on."
+  ],
+  "ownership": {
+    "shape_owner": "molecule-ai-sdk",
+    "implementation_owner": "molecule-controlplane",
+    "durability_guard_consumer": "molecule_runtime"
+  },
+  "enable": {
+    "env": "MOLECULE_WORKSPACE_DATA_PERSIST",
+    "kind": "bool",
+    "truthy": ["1", "true", "yes", "on"],
+    "default_today": false,
+    "target_default": true,
+    "default_on_gated_on": [
+      "wire-local-and-aws-providers-to-datapersist",
+      "r2-bucket-policy-denies-box-ecr-principal-cross-prefix-writes",
+      "nightly-e2e-snapshot-restore-proven",
+      "staging-first-then-production"
+    ]
+  },
+  "selector": {
+    "env": "MOLECULE_DATA_PERSISTENCE",
+    "owner": "provision-request.data_persistence",
+    "modes": ["auto", "persist", "ephemeral"],
+    "auto_default": "desktop-control-on-else-org-flag"
+  },
+  "box_env": {
+    "restore_uri": "MOLECULE_WORKSPACE_RESTORE_URI",
+    "snapshot_uri": "MOLECULE_WORKSPACE_SNAPSHOT_URI"
+  },
+  "cp_env": {
+    "bucket": "MOLECULE_WORKSPACE_DATA_BUCKET",
+    "endpoint": "MOLECULE_WORKSPACE_DATA_ENDPOINT",
+    "access_key_id": "MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID",
+    "secret_access_key": "MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY"
+  },
+  "persisted_paths": ["/workspace", "/home/agent/.claude"],
+  "excluded_paths": [
+    {
+      "path": "/configs",
+      "reason": "provisioner-owned; re-rendered from params each boot — persisting it would revert fresh config to a stale copy"
+    }
+  ],
+  "archive": {
+    "format": "tar+zstd",
+    "snapshot_pipeline": "tar -c -C / <relpaths> | zstd | curl PUT <snapshot_uri>",
+    "restore_pipeline": "curl GET <restore_uri> | zstd -d | tar -x -C /"
+  },
+  "key_scheme": {
+    "root": "workspace-data",
+    "prefix_template": "workspace-data/{workspace_id}/",
+    "latest_key_template": "workspace-data/{workspace_id}/latest.tar.zst"
+  },
+  "ttls": {
+    "restore_get_seconds": 1800,
+    "snapshot_put_max_seconds": 604800,
+    "on_demand_seconds": 900
+  },
+  "cadence": {
+    "on_boot_seconds": 600,
+    "on_active_seconds": 600
+  },
+  "restore_ordering": "restore-before-container-mount",
+  "durability_signal": {
+    "credits_snapshot_durable_when": [
+      "guard-base-path-is-under-a-persisted_paths-entry",
+      "box_env.snapshot_uri-present-in-env",
+      "no-ws-snapshot-disabled-marker"
+    ],
+    "disabled_marker": "/var/lib/molecule/ws-snapshot-disabled"
+  },
+  "safety": [
+    "partial-archive-never-overwrites-latest-staged-temp-plus-clean-exit-gate",
+    "failed-restore-drops-disabled-marker-so-timer-refuses-empty-over-good-backup"
+  ],
+  "open": {
+    "retention": "v1-keeps-only-latest-no-timestamped-history",
+    "gc": "no-deprovision-time-snapshot-cleanup-P3",
+    "security": "box-carries-broad-ecr-creds-r2-bucket-policy-MUST-deny-cross-prefix-writes-before-default-on",
+    "provider_wiring": {
+      "hetzner": "wired",
+      "gcp": "wired",
+      "local": "unwired-current-default-backend-needs-work",
+      "aws": "ebs-reattach-not-r2-except-migration-restore-target"
+    },
+    "durability_note": "snapshot-durability-is-periodic-bounded-loss-vs-live-block-volume-zero-loss"
+  }
+}
