@@ -9,24 +9,37 @@ provider timeout) read an env override so tests and staged tenants can retune
 without editing code — exactly the "contract values are production defaults"
 framing the contract pins.
 
-SEQUENCING NOTE: this is a hand-maintained mirror of the contract constants,
-NOT yet loaded from the vendored SDK instance. The follow-up (gated on
-molecule-ai-sdk#57 landing on sdk main) vendors ``idle-prompt.schema.json`` +
-``idle-prompt.contract.json`` into ``molecule_runtime/contracts/`` and switches
-:func:`Policy.default` to load from the vendored instance, with the
-``scripts/check-schemas-in-sync.sh`` drift gate keeping the mirror honest (the
-same pattern ``manifest_ssot.py`` uses for plugin-manifest). Until then the
-values here are the SSOT mirror; :data:`CONTRACT_SCHEMA_VERSION` pins which
-contract revision they mirror.
+:func:`Policy.default` loads the production values from the **vendored contract
+instance** (``molecule_runtime/contracts/idle-prompt.contract.json`` — a
+byte-for-byte mirror of molecule-ai-sdk's, kept honest by the
+``scripts/check-schemas-in-sync.sh`` drift gate; same offline-vendoring pattern
+``manifest_ssot.py`` uses for plugin-manifest). The ``Policy`` field defaults
+below remain a hardcoded MIRROR of those SSOT values — the fail-safe fallback if
+the vendored instance is ever missing/unreadable (loud-degrade, never crash),
+and a fixture the tests assert stays equal to the instance so the mirror can't
+silently drift. :data:`CONTRACT_SCHEMA_VERSION` pins the contract revision.
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
 from dataclasses import dataclass, replace
 from enum import Enum
+from importlib import resources
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 CONTRACT_SCHEMA_VERSION = "idle-prompt/v1"
+
+# The vendored contract INSTANCE (byte-for-byte mirror of molecule-ai-sdk's
+# contracts/idle-prompt/idle-prompt.contract.json — see contracts/PROVENANCE.md
+# and the check-schemas-in-sync.sh drift gate). Policy.default() loads the
+# operator-ruled production values from it; the resource path is relative to the
+# molecule_runtime package root and ships in the wheel via package-data.
+_CONTRACT_INSTANCE_RESOURCE = "contracts/idle-prompt.contract.json"
+_contract_load_failed_logged = False
 
 
 class Band(str, Enum):
@@ -170,10 +183,53 @@ class Policy:
     third_party_default_tier: int = 6
 
     @staticmethod
+    def from_contract_instance() -> Optional["Policy"]:
+        """Build a Policy from the vendored contract instance (the SSOT for the
+        production values). Returns None — logging once — on any missing/malformed
+        instance, so :func:`default` falls back to the hardcoded mirror rather
+        than crashing boot (the manifest_ssot loud-degrade posture)."""
+        global _contract_load_failed_logged
+        try:
+            raw = (
+                resources.files("molecule_runtime")
+                .joinpath(_CONTRACT_INSTANCE_RESOURCE)
+                .read_text(encoding="utf-8")
+            )
+            data = json.loads(raw)
+            wake, delta = data["wake"], data["delta"]
+            limits, failure, trust = data["limits"], data["failure"], data["trust"]
+            return Policy(
+                idle_fire_after_seconds=int(wake["idle_fire_after_seconds"]),
+                stale_escalation_thresholds_seconds=tuple(
+                    int(x) for x in delta["stale_escalation_thresholds_seconds"]
+                ),
+                max_envelopes_per_provider=int(limits["max_envelopes_per_provider"]),
+                max_summary_bytes=int(limits["max_summary_bytes"]),
+                max_digest_bytes=int(limits["max_digest_bytes"]),
+                max_preview_items_per_envelope=int(
+                    limits["max_preview_items_per_envelope"]
+                ),
+                provider_timeout_seconds=int(failure["provider_timeout_seconds"]),
+                max_consecutive_failures=int(failure["max_consecutive_failures"]),
+                third_party_default_tier=int(trust["third_party_default_tier"]),
+            )
+        except Exception:  # noqa: BLE001 — never crash boot on a bad/missing mirror
+            if not _contract_load_failed_logged:
+                logger.error(
+                    "idle-digest: could not load policy from the vendored contract "
+                    "instance %s — falling back to the hardcoded mirror. Re-vendor "
+                    "per molecule_runtime/contracts/PROVENANCE.md.",
+                    _CONTRACT_INSTANCE_RESOURCE,
+                )
+                _contract_load_failed_logged = True
+            return None
+
+    @staticmethod
     def default() -> "Policy":
-        """The production policy with env overrides applied to the
-        test-overridable knobs."""
-        base = Policy()
+        """The production policy: values from the vendored contract instance
+        (SSOT), the hardcoded mirror as fail-safe fallback, then env overrides
+        applied to the test-overridable knobs."""
+        base = Policy.from_contract_instance() or Policy()
         return replace(
             base,
             idle_fire_after_seconds=_env_int(

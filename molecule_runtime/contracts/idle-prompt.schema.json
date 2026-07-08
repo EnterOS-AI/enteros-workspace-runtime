@@ -1,0 +1,685 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/idle-prompt/idle-prompt.schema.json",
+  "$comment": "contract-version 0.1.0 — initial idle-prompt digest contract (task #219, phase 1). Encodes the operator-ruled design SSOT (consolidated-idle-prompt-design v2 2026-07-07 + the three phase-1 provider docs): canonical envelope with band/age_band, assembler-computed hashing with post-on_included baselines, empty-sleep with header exclusion, size/trust/failure policies, second-person header, task-queue row shape, goal-state cadence, correlation rules.",
+  "title": "Idle Prompt Digest Contract",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the consolidated idle-prompt digest. The SDK owns this SHAPE; the one canonical assembler IMPLEMENTATION lives in molecule_runtime and validates against these generated bindings — adapters only materialize the final prompt format. A workspace fires one non-empty, changed idle digest assembled from registered digest-provider plugins; every rendered section (identity header included) is a provider contribution. User prompts are NEVER digest contributions — they are synchronous top-priority input (operator ruling D3). Contributions are pull-not-dump envelopes; the assembler computes all delta hashes itself.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_layer",
+    "ownership",
+    "wake",
+    "sort",
+    "delta",
+    "empty",
+    "limits",
+    "failure",
+    "trust",
+    "callbacks",
+    "header",
+    "providers",
+    "task_queue",
+    "goal_state",
+    "correlation",
+    "lifecycle_wakes",
+    "sample_contributions"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "idle-prompt/v1",
+      "description": "Version of this idle-prompt contract layer."
+    },
+    "contract_layer": {
+      "type": "string",
+      "const": "idle-prompt",
+      "description": "SDK contract layer name, routable separately from workspace-comms/catalog/template layers."
+    },
+    "ownership": { "$ref": "#/$defs/ownership" },
+    "wake": { "$ref": "#/$defs/wakePolicy" },
+    "sort": { "$ref": "#/$defs/sortPolicy" },
+    "delta": { "$ref": "#/$defs/deltaPolicy" },
+    "empty": { "$ref": "#/$defs/emptyPolicy" },
+    "limits": { "$ref": "#/$defs/limitsPolicy" },
+    "failure": { "$ref": "#/$defs/failurePolicy" },
+    "trust": { "$ref": "#/$defs/trustPolicy" },
+    "callbacks": { "$ref": "#/$defs/callbackPolicy" },
+    "header": { "$ref": "#/$defs/headerPolicy" },
+    "providers": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The official default-installed provider roster (settled order). Additional installed providers register through the same declaration shape at runtime; they are not listed here.",
+      "items": { "$ref": "#/$defs/providerDecl" }
+    },
+    "task_queue": { "$ref": "#/$defs/taskQueuePolicy" },
+    "goal_state": { "$ref": "#/$defs/goalStatePolicy" },
+    "correlation": { "$ref": "#/$defs/correlationPolicy" },
+    "lifecycle_wakes": { "$ref": "#/$defs/lifecycleWakePolicy" },
+    "sample_contributions": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Canonical contribution envelopes demonstrating the pinned header, an urgent task-queue envelope, a base task-queue envelope, and the goal-state cadence envelope.",
+      "items": { "$ref": "#/$defs/contribution" }
+    }
+  },
+  "$defs": {
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shape_owner", "assembler_owner"],
+      "description": "The ruled shape-vs-engine split: the SDK owns the contract shape; the canonical assembler implementation lives in the workspace runtime.",
+      "properties": {
+        "shape_owner": {
+          "type": "string",
+          "const": "molecule-ai-sdk",
+          "description": "This repo owns the contract shape and generated bindings."
+        },
+        "assembler_owner": {
+          "type": "string",
+          "const": "molecule_runtime",
+          "description": "The one canonical assembler implementation lives in molecule-ai-workspace-runtime and validates against the generated bindings. No reimplement-per-runtime; adapters only materialize the final prompt format."
+        }
+      }
+    },
+    "wakePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "idle_fire_after_seconds",
+        "stall_lease_is_separate",
+        "renew_on",
+        "fire_preconditions",
+        "external_workspace_signal"
+      ],
+      "description": "Idle-fire policy. The idle-fire threshold is a SECOND consumer of the existing turn lease — one lease, two thresholds.",
+      "properties": {
+        "idle_fire_after_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "description": "Silence window before the digest may fire (settled: 300). Test override permitted via runtime knob; the contract value is the production default."
+        },
+        "stall_lease_is_separate": {
+          "type": "boolean",
+          "const": true,
+          "description": "Load-bearing build gotcha: do NOT retune MOLECULE_TURN_LEASE_TTL_SECONDS (the stall knob, default pinned to the 900s idle-cap; the absolute turn cap defaults to 4x that TTL). The idle controller reads lease age + turn-in-flight state against its own threshold."
+        },
+        "renew_on": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Signals that renew the silence window (implicit keep-alive).",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "fire_preconditions": {
+          "type": "array",
+          "minItems": 1,
+          "description": "ALL must hold at injection time. Includes the atomic-fire recheck: immediately before injecting the KIND_IDLE turn, re-verify no-turn-in-flight AND no new inbound since assembly started; otherwise discard and reassemble next tick.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "external_workspace_signal": {
+          "type": "string",
+          "description": "External/BYO workspaces: platform-observable idleness is MCP-channel silence (weaker, accepted); the SDK owns a client-side lease and pulls the digest; a lease-renew ping suppresses firing during long local operations. Delivery != wake: offline agents receive the pending digest on reconnect."
+        }
+      }
+    },
+    "sortPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formula", "bands", "base_tier_order"],
+      "description": "Render order (operator rulings D1/D2): pinned band first, then the urgent band above ALL base tiers, then base tiers ascending; tier-ordered within each band. NOT lexicographic (tier, urgency).",
+      "properties": {
+        "formula": {
+          "type": "string",
+          "const": "pinned-band-then-urgent-band-then-base-tier-ascending"
+        },
+        "bands": {
+          "type": "array",
+          "minItems": 3,
+          "description": "The three render bands in order.",
+          "items": { "$ref": "#/$defs/band" }
+        },
+        "base_tier_order": {
+          "type": "string",
+          "enum": ["ascending"]
+        }
+      }
+    },
+    "band": {
+      "type": "string",
+      "enum": ["pinned", "urgent", "base"],
+      "description": "Render band. 'pinned' is a reserved capability grantable only to the official identity-capabilities provider; the assembler rejects any other provider declaring it."
+    },
+    "ageBand": {
+      "type": "string",
+      "enum": ["none", "just-included", "due", "under-1h", "1h-1d", "over-1d"],
+      "description": "The ONLY time-derived field in hashed or rendered content — raw timestamps/durations are forbidden (a raw age changes every tick and resurrects the steady-state nag loop). Item ages use under-1h/1h-1d/over-1d; the goal cadence uses just-included/due; 'none' for time-free contributions (e.g. the header)."
+    },
+    "deltaPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hash_algorithm",
+        "hash_serialization",
+        "provider_hash_role",
+        "baseline",
+        "stale_escalation_thresholds_seconds",
+        "raw_time_fields_forbidden"
+      ],
+      "description": "Delta gate: an unchanged digest never re-fires on a timer. ARMED (non-empty body): the idle timer keeps running, each tick re-assembles and fires only on hash change. SLEEPING (empty body): loop off, event-driven re-arm only.",
+      "properties": {
+        "hash_algorithm": {
+          "type": "string",
+          "const": "sha256"
+        },
+        "hash_serialization": {
+          "type": "array",
+          "minItems": 1,
+          "description": "The canonical per-envelope serialization the ASSEMBLER hashes — the fixed tuple (provider_id, tier, urgency, count, summary, age_band, item_ids). 'band' is intentionally excluded: it is fully determined by provider_id (the reserved pinned id) and urgency, so it can neither change independently nor mask a re-fire. Providers cannot add hash inputs; anything that must re-fire the digest must be visible through these fields (e.g. item status serialized inside item ids as 'id:status').",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "provider_hash_role": {
+          "type": "string",
+          "const": "advisory",
+          "description": "A provider-supplied content hash is advisory at most: a buggy provider must not be able to mute itself with a constant hash nor re-fire every tick with a varying one."
+        },
+        "baseline": {
+          "type": "string",
+          "const": "post-on-included-recompute-at-last-successful-fire",
+          "description": "Baselines are the hashes at the last successful fire, RECOMPUTED AFTER the on_included callbacks, then persisted in digest_state.json — so a band that resets on inclusion (goal cadence) is baselined at its post-reset value; baselining at fire-time values would deterministically double-fire one tick after every cadence fire. Ordering: stamp provider on_included state first, then persist baselines; a crash between the two costs at most one guard-governed extra turn."
+        },
+        "stale_escalation_thresholds_seconds": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Age-band boundaries: a stale item re-surfaces when it crosses a threshold (band transition = hash change), not every tick.",
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "raw_time_fields_forbidden": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "emptyPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "header_counts_toward_emptiness", "rearm_events", "scheduler_time_exception"],
+      "description": "Empty => sleep. The pinned header never counts toward emptiness: a header-only digest is empty and must never fire.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "const": "sleep"
+        },
+        "header_counts_toward_emptiness": {
+          "type": "boolean",
+          "const": false
+        },
+        "rearm_events": {
+          "type": "array",
+          "minItems": 1,
+          "description": "In-process notification hooks that wake a SLEEPING controller (inbox handler, task-row writer, goal-state writer, provider registration, user-wake, config change).",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "scheduler_time_exception": {
+          "type": "string",
+          "const": "sleep-until-next-due",
+          "description": "The one permitted time-based re-arm: the controller records the scheduler provider's next-due timestamp and may sleep-until it. No other timer re-arms a sleeping controller."
+        }
+      }
+    },
+    "limitsPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_envelopes_per_provider",
+        "max_summary_bytes",
+        "max_digest_bytes",
+        "max_preview_items_per_envelope",
+        "truncation"
+      ],
+      "description": "Size bounds (test-overridable via runtime knobs; contract values are production defaults). The pinned header's capability lists are names-only.",
+      "properties": {
+        "max_envelopes_per_provider": { "type": "integer", "minimum": 1 },
+        "max_summary_bytes": { "type": "integer", "minimum": 64 },
+        "max_digest_bytes": { "type": "integer", "minimum": 1024 },
+        "max_preview_items_per_envelope": { "type": "integer", "minimum": 1 },
+        "truncation": {
+          "type": "string",
+          "const": "drop-lowest-band-tier-first-keep-counts-and-pulls",
+          "description": "Deterministic truncation when the digest budget is exceeded: drop preview detail from the lowest band/tier upward; counts and pull-instructions are never dropped."
+        }
+      }
+    },
+    "failurePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_timeout_seconds",
+        "on_error",
+        "failed_sections_excluded_from_hash",
+        "max_consecutive_failures"
+      ],
+      "description": "Provider failure semantics during assembly. A hung provider must never stall the tick.",
+      "properties": {
+        "provider_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Hard per-provider invocation timeout."
+        },
+        "on_error": {
+          "type": "string",
+          "const": "skip-and-render-degraded-marker",
+          "description": "Crash/timeout/malformed envelope => skip the section and render a one-line degraded marker."
+        },
+        "failed_sections_excluded_from_hash": {
+          "type": "boolean",
+          "const": true,
+          "description": "Crash/recover must not read as a content change and spuriously re-fire."
+        },
+        "max_consecutive_failures": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "After K consecutive failures the provider is disabled and that fact surfaced once."
+        }
+      }
+    },
+    "trustPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reserved_provider_ids",
+        "pinned_reserved_to",
+        "third_party_default_tier",
+        "urgency_grant",
+        "pull_tools",
+        "state_folder_jailing"
+      ],
+      "description": "Digest text lands directly in the agent's context — provider output is untrusted input.",
+      "properties": {
+        "reserved_provider_ids": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Official ids the assembler rejects collisions/spoofing of.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "pinned_reserved_to": {
+          "type": "string",
+          "const": "identity-capabilities"
+        },
+        "third_party_default_tier": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Additional installed providers default here (below scheduler, above goal) unless an operator-approved manifest grant declares otherwise."
+        },
+        "urgency_grant": {
+          "type": "string",
+          "const": "operator-approved-manifest",
+          "description": "Third-party urgency requires an operator-approved manifest grant; official providers may declare per-envelope urgency."
+        },
+        "pull_tools": {
+          "type": "string",
+          "const": "whitelisted-mcp-only",
+          "description": "Pull-instructions may reference whitelisted MCP tools only."
+        },
+        "state_folder_jailing": {
+          "type": "boolean",
+          "const": true,
+          "description": "Provider state paths are derived from the plugin name by the assembler, never provider-supplied; no provider writes another provider's folder."
+        }
+      }
+    },
+    "callbackPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["on_included_required"],
+      "description": "After a successful fire the assembler notifies each provider whose contribution was included: on_included(fired_at). Consumers: goal-state cadence band; phase-2 sent-folder escalation timing. Providers may ignore it.",
+      "properties": {
+        "on_included_required": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "headerPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["voice", "lines", "native_tool_groups", "platform_mcp_condition", "capability_list_style"],
+      "description": "The pinned identity/capabilities header render contract (operator ruling 2026-07-07): second person, persona/contract-derived, one source two renderings — never authored twice.",
+      "properties": {
+        "voice": {
+          "type": "string",
+          "const": "second-person"
+        },
+        "lines": {
+          "type": "array",
+          "minItems": 4,
+          "description": "Ordered rendered lines: you_are ('You are <name> — <persona role line>'), responsibility ('Your responsibility: ...'), priorities (generated from this contract's provider tier table, never authored), native_tools ('Your available MCP tools (native): ...').",
+          "items": {
+            "type": "string",
+            "enum": ["you_are", "responsibility", "priorities", "native_tools"]
+          }
+        },
+        "native_tool_groups": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Tool groups by origin, in render order.",
+          "items": {
+            "type": "string",
+            "enum": ["workspace_mcp", "platform_mcp", "from_plugins"]
+          }
+        },
+        "platform_mcp_condition": {
+          "type": "string",
+          "const": "platform-agent-workspaces-only",
+          "description": "The platform MCP group renders only when the workspace is the platform agent, derived from the actually-loaded mgmt-MCP inventory (not a declared flag); specialists never render it."
+        },
+        "capability_list_style": {
+          "type": "string",
+          "const": "names-only-capped-with-counts"
+        }
+      }
+    },
+    "providerDecl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "band", "base_tier", "official", "phase", "covers", "summary"],
+      "description": "A digest-provider declaration. Official default-installed providers and additional installed providers use the same shape (installed plugins declare theirs via the plugin-manifest contributes surface).",
+      "properties": {
+        "provider_id": { "type": "string", "minLength": 1 },
+        "band": { "$ref": "#/$defs/band" },
+        "base_tier": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Base rank for non-urgent contributions; lower renders earlier within the base band. 0 for the pinned header (band overrides tier)."
+        },
+        "official": { "type": "boolean" },
+        "phase": {
+          "type": "integer",
+          "enum": [1, 2],
+          "description": "Build phase: 1 = identity-capabilities, task-queue, goal-state; 2 = sent-folder, inbound-a2a, delegation-results, scheduler."
+        },
+        "covers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "summary": { "type": "string", "minLength": 1 }
+      }
+    },
+    "taskQueuePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store_owner",
+        "single_current",
+        "envelopes",
+        "urgent_open_definition",
+        "kernel_gated_writes",
+        "tombstone_retention_days",
+        "status_enum",
+        "origin_enum",
+        "sample_row"
+      ],
+      "description": "The task-queue provider (tier 1) — the durable work ledger where D3 user-pivot rows and lifecycle resume rows live. Platform requests/user_tasks stay authoritative for agent<->user asks (local rows index them); runtime-originated rows are locally authoritative.",
+      "properties": {
+        "store_owner": {
+          "type": "string",
+          "const": "runtime",
+          "description": "The store is runtime-owned, not provider-owned: it survives provider removal, so user-ask durability (operator-ruled D3) is never downgraded by removing a rendering lego."
+        },
+        "single_current": {
+          "type": "boolean",
+          "const": true,
+          "description": "At most one status='current' row, enforced by the writers' library."
+        },
+        "envelopes": {
+          "type": "array",
+          "minItems": 2,
+          "description": "E1 urgent (open user-origin rows + open lifecycle resume rows) and E2 base tier 1 (current/paused/blocked/queued summary + awaiting-user asks).",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "urgent_open_definition": {
+          "type": "string",
+          "const": "queued-paused-blocked-current-excluded",
+          "description": "'Open' for E1 = queued/paused/blocked; the current row is excluded (it renders in E2 only — no double-surface, one hash entry)."
+        },
+        "kernel_gated_writes": {
+          "type": "boolean",
+          "const": true,
+          "description": "The whole D3 row-write + runtime-ack change is gated on MOLECULE_MAILBOX_KERNEL; flag-off is byte-identical legacy."
+        },
+        "tombstone_retention_days": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "done/dropped rows kept as an idempotent re-index guard (the requests indexer must not zombie-re-upsert a locally-completed row while the platform row is still resolving) and for task_list history; absent from envelopes either way."
+        },
+        "status_enum": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/taskStatus" }
+        },
+        "origin_enum": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/taskOrigin" }
+        },
+        "sample_row": { "$ref": "#/$defs/taskRow" }
+      }
+    },
+    "taskStatus": {
+      "type": "string",
+      "enum": ["current", "queued", "paused", "blocked", "awaiting_user", "done", "dropped"],
+      "description": "awaiting_user = requests-index rows (agent->user asks, origin='agent', request_id set); excluded from queued/current counts."
+    },
+    "taskOrigin": {
+      "type": "string",
+      "enum": ["user", "agent", "a2a", "scheduler", "lifecycle"],
+      "description": "'a2a' and 'scheduler' are RESERVED for phase-2 writers. Task-row origin is orthogonal to turn source_type/kernel kinds: all lifecycle wake kinds write origin='lifecycle' rows."
+    },
+    "taskRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "origin", "status", "title", "created_at", "updated_at"],
+      "description": "The durable task row. request_id indexes the platform requests/user_tasks lineage; delegation_id/correlation_id are nullable forward-links to phase-2 providers; resume_payload carries the lifecycle wake-up instruction written BEFORE any self-reprovision.",
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "origin": { "$ref": "#/$defs/taskOrigin" },
+        "status": { "$ref": "#/$defs/taskStatus" },
+        "title": { "type": "string", "minLength": 1 },
+        "next_action": { "type": "string" },
+        "request_id": { "type": "string" },
+        "delegation_id": { "type": "string" },
+        "correlation_id": { "type": "string" },
+        "resume_payload": { "type": "string" },
+        "created_at": { "type": "string", "minLength": 1 },
+        "updated_at": { "type": "string", "minLength": 1 },
+        "done_at": { "type": "string" }
+      }
+    },
+    "goalStatePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cadence_default_seconds",
+        "cadence_min_seconds",
+        "cadence_band_rides_age_band",
+        "never_urgent",
+        "migration_marker",
+        "migration_overwrite_rule",
+        "source_enum",
+        "sample_goal"
+      ],
+      "description": "The goal-state provider (lowest tier) — the loop. The cadence band is what keeps a static goal re-firing at its cadence under the delta gate instead of firing once and dying.",
+      "properties": {
+        "cadence_default_seconds": { "type": "integer", "minimum": 300 },
+        "cadence_min_seconds": {
+          "type": "integer",
+          "minimum": 300,
+          "description": "Cadence values below the idle-fire threshold are clamped."
+        },
+        "cadence_band_rides_age_band": {
+          "type": "boolean",
+          "const": true,
+          "description": "The provider reports its cadence band AS the envelope's age_band (just-included / due) and a goal-version id (hash of goal text + source) as its item id — every input flows through the assembler's existing hash tuple with zero kernel special-casing."
+        },
+        "never_urgent": {
+          "type": "boolean",
+          "const": true,
+          "description": "A background objective never jumps the queue."
+        },
+        "migration_marker": {
+          "type": "string",
+          "const": ".migrated",
+          "description": "Durable one-shot marker in the provider folder guarding the first-kernel-ON-boot migration. The migrator is the SINGLE writer of goal.yaml at migration time (the provisioner never writes the workspace volume); org-template-supplied values arrive already materialized as config.idle_prompt and migrate through this same path."
+        },
+        "migration_overwrite_rule": {
+          "type": "string",
+          "const": "may-overwrite-fleet-persona-default-never-workspace-mcp",
+          "description": "Source-rank overwrite rule keeping precedence workspace-mcp > migrated-legacy > fleet-persona-default even when a provision default was written first."
+        },
+        "source_enum": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/goalSource" }
+        },
+        "sample_goal": { "$ref": "#/$defs/goalDoc" }
+      }
+    },
+    "goalSource": {
+      "type": "string",
+      "enum": ["workspace-mcp", "legacy-idle-prompt-migration", "fleet-persona-default"]
+    },
+    "goalDoc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal", "source", "set_by", "set_at", "cadence_seconds"],
+      "description": "The durable goal.yaml shape (goal_history.jsonl carries the append-only set/clear audit).",
+      "properties": {
+        "goal": { "type": "string", "minLength": 1 },
+        "source": { "$ref": "#/$defs/goalSource" },
+        "set_by": { "type": "string", "minLength": 1 },
+        "set_at": { "type": "string", "minLength": 1 },
+        "cadence_seconds": { "type": "integer", "minimum": 300 },
+        "last_included_at": { "type": "string" }
+      }
+    },
+    "correlationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minted_on", "echoed_on", "fallback_matchers", "carried_by_bounce"],
+      "description": "correlation_id rules (introduced by this contract — it does not exist in any repo today). Only sends with expects_reply=true write sent-folder rows; fire-and-forget messages never accumulate. Platform carriage (a2a_queue field + user-origin marker) is a molecule-core lane sequenced with this contract. SCOPE: this pins only the correlation PLUMBING (mint/echo/fallback/carry), which the design build-plan ratified. The bounce EMISSION and dead-recipient death-authority semantics (deleted vs failed vs paused) remain design-proposal P1, NOT operator-ruled, and are deliberately NOT pinned here. delegation_id single-minting-authority + echo rules are deferred to the phase-2 delegation providers (delegation_id appears here only as a nullable forward-link + reply fallback matcher).",
+      "properties": {
+        "minted_on": {
+          "type": "string",
+          "const": "send-with-expects-reply"
+        },
+        "echoed_on": {
+          "type": "string",
+          "const": "reply"
+        },
+        "fallback_matchers": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Mixed-fleet reality: old-runtime/external/non-SDK recipients never echo correlation_id — without fallbacks every cross-version send becomes a permanently-escalating zombie row.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "carried_by_bounce": {
+          "type": "boolean",
+          "const": true,
+          "description": "The platform-emitted bounce envelope carries the original correlation_id so the sent-folder row closes deterministically."
+        }
+      }
+    },
+    "lifecycleWakePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["typed_source_required", "resume_row_before_restart", "wake_kinds"],
+      "description": "Lifecycle wake-up calls (parent §5): one producer, typed-source-stamped so wakes are replay-guard-governed (today's initial_prompt/reprovision-wake stamp no source_type and bypass the guard).",
+      "properties": {
+        "typed_source_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "resume_row_before_restart": {
+          "type": "boolean",
+          "const": true,
+          "description": "The self-install tool durably writes the task-queue resume row BEFORE triggering reprovision — same invariant family as the delegation-tombstone commit-after-confirmed-delivery ordering."
+        },
+        "wake_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "description": "first-creation, session-reset, restart-reprovision, plugin-install, idle-reactivation.",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "contribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "band", "tier", "urgency", "count", "summary", "age_band", "item_ids", "pull"],
+      "description": "The canonical contribution envelope. A provider MAY return multiple envelopes (item-level urgency per D2 — e.g. inbound-a2a lifts one urgent message into the band while the rest stays at base tier). The ASSEMBLER computes the delta hash over (provider_id, tier, urgency, count, summary, age_band, item_ids); 'band' is carried for rendering but excluded from the hash (it is derived from provider_id + urgency); advisory_content_hash is advisory at most.",
+      "properties": {
+        "provider_id": { "type": "string", "minLength": 1 },
+        "band": { "$ref": "#/$defs/band" },
+        "tier": { "type": "integer", "minimum": 0 },
+        "urgency": {
+          "type": "string",
+          "enum": ["normal", "urgent"],
+          "description": "'urgent' lifts this envelope into the urgent band above ALL base tiers, including tier 1."
+        },
+        "count": { "type": "integer", "minimum": 0 },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Bounded rendered text (max_summary_bytes). Length/charset-constrained; treated as untrusted input."
+        },
+        "age_band": { "$ref": "#/$defs/ageBand" },
+        "item_ids": {
+          "type": "array",
+          "description": "Stable provider-local item ids, serialized as 'id:status' where status changes must re-fire the digest. Empty for id-free contributions (e.g. the header).",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "pull": { "$ref": "#/$defs/pullInstruction" },
+        "advisory_content_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "description": "Optional provider-supplied hash — advisory at most; the assembler always computes its own."
+        },
+        "rearm_signals": {
+          "type": "array",
+          "description": "Provider-owned state transitions that re-arm a sleeping controller.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "preview_items": {
+          "type": "array",
+          "description": "Optional bounded preview rows (max_preview_items_per_envelope); full detail stays behind the pull instruction. Ages render as bands, never raw durations.",
+          "items": { "$ref": "#/$defs/previewItem" }
+        }
+      }
+    },
+    "previewItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "status", "summary", "age_band"],
+      "description": "A bounded preview row. NO raw time fields — age_band only.",
+      "properties": {
+        "item_id": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string", "minLength": 1 },
+        "age_band": { "$ref": "#/$defs/ageBand" },
+        "next_action": { "type": "string" }
+      }
+    },
+    "pullInstruction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "instruction", "max_items"],
+      "description": "How the agent fetches bounded detail. 'tool' must be a whitelisted MCP tool (trust policy).",
+      "properties": {
+        "tool": { "type": "string", "minLength": 1 },
+        "instruction": { "type": "string", "minLength": 1 },
+        "max_items": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
