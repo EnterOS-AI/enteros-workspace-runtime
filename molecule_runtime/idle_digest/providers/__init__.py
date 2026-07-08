@@ -9,5 +9,10 @@ from __future__ import annotations
 
 from .goal import GoalStateProvider
 from .identity import IdentityCapabilitiesProvider
+from .task_queue import TaskQueueProvider
 
-__all__ = ["GoalStateProvider", "IdentityCapabilitiesProvider"]
+__all__ = [
+    "GoalStateProvider",
+    "IdentityCapabilitiesProvider",
+    "TaskQueueProvider",
+]
