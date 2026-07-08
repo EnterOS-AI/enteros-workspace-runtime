@@ -132,6 +132,10 @@ def install() -> None:
         lease.ttl_seconds,
         mailbox_dir.resolve(),
     )
+    # Durability guard: prove the resolved base is actually a persistent volume.
+    # On a flavor where /workspace is only the ephemeral root disk this warns
+    # LOUD (instead of silently losing state on the next auto-heal — cp#326).
+    mailbox_dir.verify_durability()
 
 
 def uninstall() -> None:
