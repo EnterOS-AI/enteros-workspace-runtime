@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from ..contract import AgeBand, Band, Contribution, Urgency
+from ..contract import AgeBand, Band, Contribution, PullInstruction, Urgency
 
 TASK_QUEUE_PROVIDER_ID = "task-queue"
 TASK_TIER = 1
@@ -367,7 +367,11 @@ class TaskQueueProvider:
                     ),
                     age_band=self._envelope_age_band(e1_rows, now),
                     item_ids=tuple(self._item_id(r) for r in e1_rows),
-                    pull=None,  # task_list pull wired when the MCP tool lands
+                    pull=PullInstruction(
+                        tool="task_list",
+                        instruction="Pull bounded task detail before resuming the user ask.",
+                        max_items=5,
+                    ),
                 )
             )
 
@@ -395,7 +399,11 @@ class TaskQueueProvider:
                 summary=_cap("Tasks — " + ("; ".join(parts) or "in flight"), _SUMMARY_CAP),
                 age_band=self._envelope_age_band(e2_rows, now),
                 item_ids=tuple(self._item_id(r) for r in e2_rows),
-                pull=None,
+                pull=PullInstruction(
+                    tool="task_list",
+                    instruction="Pull bounded current/queued task detail before deciding what to resume.",
+                    max_items=5,
+                ),
             )
         )
         return envelopes

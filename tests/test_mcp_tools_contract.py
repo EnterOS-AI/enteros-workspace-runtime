@@ -34,6 +34,13 @@ def test_mcp_tools_export_matches_runtime_server():
         "chat_history",
         "commit_memory",
         "recall_memory",
+        "goal_get",
+        "goal_set",
+        "goal_clear",
+        "task_list",
+        "task_add",
+        "task_update",
+        "task_complete",
     ]
 
 

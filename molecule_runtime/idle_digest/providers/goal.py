@@ -32,7 +32,7 @@ from typing import Callable, Optional
 
 import yaml
 
-from ..contract import AgeBand, Band, Contribution, Urgency
+from ..contract import AgeBand, Band, Contribution, PullInstruction, Urgency
 
 GOAL_STATE_PROVIDER_ID = "goal-state"
 GOAL_TIER = 7  # lowest base tier — surfaced only when nothing above is pending
@@ -305,10 +305,11 @@ class GoalStateProvider:
                 summary=summary,
                 age_band=self._cadence_band(doc, now),  # the loop driver
                 item_ids=(f"goal:{version}",),
-                # No pull yet: the goal one-liner is self-sufficient in the
-                # digest; the goal_get MCP tool (full text + history) + its pull
-                # are a follow-up, so this references no unregistered tool.
-                pull=None,
+                pull=PullInstruction(
+                    tool="goal_get",
+                    instruction="Pull the full objective text + source/cadence before starting background work.",
+                    max_items=1,
+                ),
             )
         ]
 

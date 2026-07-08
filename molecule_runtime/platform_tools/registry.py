@@ -69,6 +69,15 @@ from molecule_runtime.a2a_tools import (
     tool_update_agent_card,
     tool_wait_for_message,
 )
+from molecule_runtime.a2a_tools_idle import (
+    tool_goal_clear,
+    tool_goal_get,
+    tool_goal_set,
+    tool_task_add,
+    tool_task_complete,
+    tool_task_list,
+    tool_task_update,
+)
 from molecule_runtime.a2a_tools_desktop import (
     tool_desktop_click,
     tool_desktop_key,
@@ -888,6 +897,141 @@ _RECALL_MEMORY = ToolSpec(
 
 
 # ---------------------------------------------------------------------------
+# Idle-digest goal + task-queue management (task #219). Durable self-state the
+# idle digest surfaces; grouped under the memory section (agent-owned durable
+# state, like commit/recall memory). goal_get / task_list are the digest's
+# pull targets.
+# ---------------------------------------------------------------------------
+
+_GOAL_GET = ToolSpec(
+    name="goal_get",
+    short="Read this workspace's standing background goal (+ cadence, source).",
+    when_to_use=(
+        "Use to read the background objective the idle digest surfaces when "
+        "nothing else is pending. Returns the goal text, cadence, and source, "
+        "or null if none is set. This is the pull target the idle digest's goal "
+        "line points at."
+    ),
+    input_schema={"type": "object", "properties": {}},
+    impl=tool_goal_get,
+    section=MEMORY_SECTION,
+)
+
+_GOAL_SET = ToolSpec(
+    name="goal_set",
+    short="Set/replace this workspace's standing background goal.",
+    when_to_use=(
+        "Use to set the objective you should work when idle and nothing else "
+        "is pending (e.g. 'pull the next labeled-ready issue'). The idle digest "
+        "re-surfaces it at its cadence (default 1h; pass cadence_seconds to "
+        "override, floor 300s). Distinct from a task: this is the standing "
+        "directive, not a one-off item — use task_add for concrete work."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "The background objective text."},
+            "cadence_seconds": {
+                "type": "integer",
+                "description": "How often the idle digest re-surfaces the goal (>=300).",
+            },
+        },
+        "required": ["goal"],
+    },
+    impl=tool_goal_set,
+    section=MEMORY_SECTION,
+)
+
+_GOAL_CLEAR = ToolSpec(
+    name="goal_clear",
+    short="Clear the standing background goal.",
+    when_to_use=(
+        "Use to remove the background objective — the workspace then goes quiet "
+        "when idle instead of pulling backlog."
+    ),
+    input_schema={"type": "object", "properties": {}},
+    impl=tool_goal_clear,
+    section=MEMORY_SECTION,
+)
+
+_TASK_LIST = ToolSpec(
+    name="task_list",
+    short="List this workspace's active tasks (current/queued/paused/blocked).",
+    when_to_use=(
+        "Use to see your durable work ledger — the tasks the idle digest tracks "
+        "so nothing is forgotten. Pass status to filter. This is the pull "
+        "target the idle digest's task section points at."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Optional status filter."},
+            "limit": {"type": "integer", "description": "Max rows (default 20)."},
+        },
+    },
+    impl=tool_task_list,
+    section=MEMORY_SECTION,
+)
+
+_TASK_ADD = ToolSpec(
+    name="task_add",
+    short="Queue a task on this workspace's own work ledger.",
+    when_to_use=(
+        "Use to write down accepted work so idle never forgets it. Adds a "
+        "queued task; use task_update to set it current or task_complete when "
+        "done. For the standing background objective use goal_set instead."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "The task title."},
+            "next_action": {"type": "string", "description": "Optional next step."},
+        },
+        "required": ["title"],
+    },
+    impl=tool_task_add,
+    section=MEMORY_SECTION,
+)
+
+_TASK_UPDATE = ToolSpec(
+    name="task_update",
+    short="Update a task's status or next action.",
+    when_to_use=(
+        "Use to move a task through its lifecycle (current/queued/paused/"
+        "blocked/done/dropped) or set its next action. Setting status='current' "
+        "pauses the previous current task (single-current invariant)."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "The task id."},
+            "status": {"type": "string", "description": "New status."},
+            "next_action": {"type": "string", "description": "New next action."},
+        },
+        "required": ["task_id"],
+    },
+    impl=tool_task_update,
+    section=MEMORY_SECTION,
+)
+
+_TASK_COMPLETE = ToolSpec(
+    name="task_complete",
+    short="Mark a task done.",
+    when_to_use=(
+        "Use when a task is finished — it drops out of the idle digest on the "
+        "next changed digest."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {"task_id": {"type": "string", "description": "The task id."}},
+        "required": ["task_id"],
+    },
+    impl=tool_task_complete,
+    section=MEMORY_SECTION,
+)
+
+
+# ---------------------------------------------------------------------------
 # Public registry. Keep alphabetically grouped by section for stable
 # adapter listings + diff-friendly review.
 # ---------------------------------------------------------------------------
@@ -920,6 +1064,14 @@ TOOLS: list[ToolSpec] = [
     # HMA
     _COMMIT_MEMORY,
     _RECALL_MEMORY,
+    # Idle-digest goal + task-queue management (task #219)
+    _GOAL_GET,
+    _GOAL_SET,
+    _GOAL_CLEAR,
+    _TASK_LIST,
+    _TASK_ADD,
+    _TASK_UPDATE,
+    _TASK_COMPLETE,
 ]
 
 
