@@ -7,6 +7,7 @@ adds sent-folder, inbound-a2a, delegation-results, and scheduler.
 """
 from __future__ import annotations
 
+from .goal import GoalStateProvider
 from .identity import IdentityCapabilitiesProvider
 
-__all__ = ["IdentityCapabilitiesProvider"]
+__all__ = ["GoalStateProvider", "IdentityCapabilitiesProvider"]
