@@ -27,7 +27,6 @@ MODULES = [
     "molecule_runtime.a2a_executor",
     "molecule_runtime.coordinator",
     "molecule_runtime.prompt",
-    "molecule_runtime.builtin_tools.temporal_workflow",
 ]
 
 

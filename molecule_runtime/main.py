@@ -981,13 +981,6 @@ async def main():  # pragma: no cover
         # reachable-but-misconfigured. Operators can then redeploy with the
         # correct env vars without having to chase a crash-loop.
 
-    # 6.5. Initialise Temporal durable execution wrapper (optional). Only
-    # meaningful when an executor exists; skipped on misconfigured boots.
-    if adapter_ready:
-        from molecule_runtime.builtin_tools.temporal_workflow import create_wrapper as _create_temporal_wrapper
-        temporal_wrapper = _create_temporal_wrapper()
-        await temporal_wrapper.start()
-
     # 7. Wrap in A2A.
     #
     # Route assembly is in workspace/boot_routes.py so the contract —
@@ -1725,9 +1718,6 @@ async def main():  # pragma: no cover
                 plugin_daemon_supervisor.stop()
             except Exception as daemon_stop_err:  # noqa: BLE001
                 print(f"Warning: plugin daemon stop failed: {daemon_stop_err}")
-        # Gracefully stop the Temporal worker background task on shutdown
-        await temporal_wrapper.stop()
-
 
 def main_sync():  # pragma: no cover
     """Synchronous entry point for the `molecule-runtime` console script.
