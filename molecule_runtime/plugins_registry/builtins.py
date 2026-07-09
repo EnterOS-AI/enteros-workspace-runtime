@@ -40,11 +40,16 @@ the class into this module.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -102,6 +107,398 @@ SKIP_ROOT_MD = frozenset({"readme.md", "changelog.md", "license.md", "contributi
 # install loudly rather than leaving a configured-but-missing MCP binary.
 # See molecule-ai-workspace-runtime#151.
 _PRIVILEGED_MCP_PLUGIN = "molecule-platform-mcp"
+_OWNERSHIP_VERSION = 1
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f"{path.name}.tmp-",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.chmod(mode)
+        os.replace(temp_path, path)
+        temp_path = None
+        _fsync_directory(path.parent)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _state_dir(ctx: InstallContext) -> Path:
+    root = ctx.configs_dir.resolve()
+    state_dir = (root / ".molecule").resolve()
+    try:
+        state_dir.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("plugin lifecycle state directory escapes configs_dir") from exc
+    return state_dir
+
+
+def _ownership_path(ctx: InstallContext, plugin_name: str) -> Path:
+    key = hashlib.sha256(plugin_name.encode("utf-8")).hexdigest()[:24]
+    root = ctx.configs_dir.resolve()
+    parent = (_state_dir(ctx) / "plugin-ownership").resolve()
+    try:
+        parent.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("plugin ownership directory escapes configs_dir") from exc
+    return parent / f"{key}.json"
+
+
+@contextmanager
+def _plugin_lifecycle_lock(ctx: InstallContext):
+    state_dir = _state_dir(ctx)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "plugin-lifecycle.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _valid_settings_fragment(fragment: Any) -> bool:
+    if not isinstance(fragment, dict):
+        return False
+    hooks = fragment.get("hooks")
+    if hooks is None:
+        return True
+    if not isinstance(hooks, dict):
+        return False
+    for event, handlers in hooks.items():
+        if not isinstance(event, str) or not isinstance(handlers, list):
+            return False
+        for handler in handlers:
+            if not isinstance(handler, dict):
+                return False
+            commands = handler.get("hooks", [])
+            if not isinstance(commands, list):
+                return False
+            for command in commands:
+                if not isinstance(command, dict):
+                    return False
+                value = command.get("command")
+                if value is not None and not isinstance(value, str):
+                    return False
+    return True
+
+
+def _valid_ownership_state(state: Any, plugin_name: str) -> bool:
+    if (
+        not isinstance(state, dict)
+        or state.get("version") != _OWNERSHIP_VERSION
+        or state.get("plugin_name") != plugin_name
+    ):
+        return False
+    owned_files = state.get("owned_files")
+    if not isinstance(owned_files, dict) or any(
+        not isinstance(relative, str) or not _is_sha256(digest)
+        for relative, digest in owned_files.items()
+    ):
+        return False
+    memory = state.get("memory")
+    if memory is not None and (
+        not isinstance(memory, dict)
+        or not isinstance(memory.get("filename"), str)
+        or not isinstance(memory.get("path"), str)
+        or not isinstance(memory.get("marker"), str)
+        or not _is_sha256(memory.get("sha256"))
+    ):
+        return False
+    settings = state.get("settings")
+    if settings is not None and (
+        not isinstance(settings, dict)
+        or not isinstance(settings.get("path"), str)
+        or not _valid_settings_fragment(settings.get("fragment"))
+        or not isinstance(settings.get("existed_before"), bool)
+    ):
+        return False
+    return True
+
+
+def _load_ownership(ctx: InstallContext, plugin_name: str) -> dict[str, Any] | None:
+    try:
+        path = _ownership_path(ctx, plugin_name)
+    except ValueError as exc:
+        ctx.logger.warning(
+            "%s: unsafe ownership path, preserving installed files: %s",
+            plugin_name,
+            exc,
+        )
+        return None
+    if not path.is_file():
+        return None
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        ctx.logger.warning(
+            "%s: invalid ownership record, preserving installed files: %s",
+            plugin_name,
+            exc,
+        )
+        return None
+    if not _valid_ownership_state(state, plugin_name):
+        ctx.logger.warning(
+            "%s: invalid ownership record, preserving installed files",
+            plugin_name,
+        )
+        return None
+    return state
+
+
+def _write_ownership(
+    ctx: InstallContext,
+    plugin_name: str,
+    state: dict[str, Any],
+) -> None:
+    path = _ownership_path(ctx, plugin_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f"{path.name}.tmp-",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.chmod(0o600)
+        os.replace(temp_path, path)
+        temp_path = None
+        _fsync_directory(path.parent)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _persist_ownership(
+    ctx: InstallContext,
+    plugin_name: str,
+    owned_files: dict[str, str],
+    memory: dict[str, str] | None,
+    settings: dict[str, Any] | None,
+) -> None:
+    state: dict[str, Any] = {
+        "version": _OWNERSHIP_VERSION,
+        "plugin_name": plugin_name,
+        "owned_files": owned_files,
+    }
+    if memory:
+        state["memory"] = memory
+    if settings:
+        state["settings"] = settings
+    _write_ownership(ctx, plugin_name, state)
+
+
+def _owned_path(ctx: InstallContext, relative: str) -> Path | None:
+    if not isinstance(relative, str) or not relative:
+        return None
+    root = ctx.configs_dir.resolve()
+    path = (ctx.configs_dir / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return None
+    return path
+
+
+def _memory_marker(plugin_name: str) -> str:
+    return hashlib.sha256(plugin_name.encode("utf-8")).hexdigest()[:24]
+
+
+def _runtime_memory_path(ctx: InstallContext, filename: str) -> Path | None:
+    candidate = Path(filename)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    try:
+        import molecule_runtime.mailbox_dir as mailbox_dir
+
+        if mailbox_dir.kernel_enabled():
+            root = mailbox_dir.memory_dir().resolve()
+            path = mailbox_dir.memory_file(filename).resolve()
+            path.relative_to(root)
+            return path
+    except Exception:
+        return None
+    root = ctx.configs_dir.resolve()
+    path = (root / filename).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return None
+    return path
+
+
+def _memory_path_from_state(
+    ctx: InstallContext,
+    memory: dict[str, Any],
+) -> Path | None:
+    filename = memory.get("filename")
+    stored = memory.get("path")
+    if not isinstance(filename, str) or not isinstance(stored, str):
+        return None
+    relative = Path(filename)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    configs_root = ctx.configs_dir.resolve()
+    configs_path = (configs_root / relative).resolve()
+    candidates: set[Path] = set()
+    try:
+        configs_path.relative_to(configs_root)
+        candidates.add(configs_path)
+    except ValueError:
+        pass
+    current = _runtime_memory_path(ctx, filename)
+    if current is not None:
+        candidates.add(current)
+    path = Path(stored).resolve()
+    return path if path in candidates else None
+
+
+def _remove_memory_block(
+    path: Path,
+    marker: str,
+    expected_sha256: str,
+) -> bool:
+    if not path.is_file():
+        return False
+    start_marker = f"<!-- molecule-plugin:{marker}:start -->"
+    end_marker = f"<!-- molecule-plugin:{marker}:end -->"
+    text = path.read_text()
+    changed = False
+    cursor = 0
+    while True:
+        start = text.find(start_marker, cursor)
+        if start < 0:
+            break
+        end = text.find(end_marker, start + len(start_marker))
+        if end < 0:
+            break
+        block_end = end + len(end_marker)
+        block = text[start:block_end]
+        if _text_sha256(block) != expected_sha256:
+            cursor = block_end
+            continue
+        after = block_end + (1 if text[block_end:block_end + 1] == "\n" else 0)
+        text = text[:start] + text[after:]
+        changed = True
+        cursor = start
+    if changed:
+        _atomic_write_text(path, text)
+    return changed
+
+
+def _subtract_settings_fragment(
+    existing: dict[str, Any],
+    fragment: dict[str, Any],
+) -> dict[str, Any]:
+    out = json.loads(json.dumps(existing))
+    hooks = out.get("hooks")
+    contributed_hooks = fragment.get("hooks")
+    if isinstance(hooks, dict) and isinstance(contributed_hooks, dict):
+        for event, contributed in contributed_hooks.items():
+            current = hooks.get(event)
+            if not isinstance(current, list) or not isinstance(contributed, list):
+                continue
+            for handler in contributed:
+                try:
+                    current.remove(handler)
+                except ValueError:
+                    pass
+            if not current:
+                hooks.pop(event, None)
+        if not hooks:
+            out.pop("hooks", None)
+    for key, value in fragment.items():
+        if key == "hooks" or key not in out:
+            continue
+        current = out[key]
+        if isinstance(current, dict) and isinstance(value, dict):
+            cleaned = _subtract_mapping(current, value)
+            if cleaned:
+                out[key] = cleaned
+            else:
+                out.pop(key, None)
+        elif current == value:
+            out.pop(key, None)
+    return out
+
+
+def _subtract_mapping(
+    existing: dict[str, Any],
+    contribution: dict[str, Any],
+) -> dict[str, Any]:
+    out = json.loads(json.dumps(existing))
+    for key, value in contribution.items():
+        if key not in out:
+            continue
+        current = out[key]
+        if isinstance(current, dict) and isinstance(value, dict):
+            cleaned = _subtract_mapping(current, value)
+            if cleaned:
+                out[key] = cleaned
+            else:
+                out.pop(key, None)
+        elif current == value:
+            out.pop(key, None)
+    return out
+
+
+def _remove_empty_parents(path: Path, root: Path) -> None:
+    while path != root:
+        try:
+            path.rmdir()
+        except OSError:
+            return
+        path = path.parent
 
 
 def _read_md_files(directory: Path) -> list[tuple[str, str]]:
@@ -140,9 +537,9 @@ class AgentskillsAdaptor:
          activation (Claude Code) pick them up automatically; other runtimes'
          loaders scan the same path.
 
-    Uninstall reverses the file copies and strips the rule/fragment block by
-    marker (best-effort — if the user edited CLAUDE.md manually, only the
-    marker line itself is removed).
+    Install records exact, content-hashed ownership. Reinstall reconciles only
+    unchanged owned files, and uninstall removes only contributions that still
+    match that record. Pre-existing and user-modified content is preserved.
 
     For shapes other than agentskills (MCP server, sub-agent, RAG pipeline,
     swarm, webhook handler, etc.), see
@@ -159,11 +556,19 @@ class AgentskillsAdaptor:
     # ------------------------------------------------------------------
 
     async def install(self, ctx: InstallContext) -> InstallResult:
+        with _plugin_lifecycle_lock(ctx):
+            return self._install(ctx)
+
+    def _install(self, ctx: InstallContext) -> InstallResult:
         result = InstallResult(
             plugin_name=self.plugin_name,
             runtime=self.runtime,
             source="plugin",  # overridden by registry caller if source==registry
         )
+        _ownership_path(ctx, self.plugin_name)
+        previous = _load_ownership(ctx, self.plugin_name) or {}
+        previous_owned_files = previous.get("owned_files") or {}
+        owned_files: dict[str, str] = {}
 
         # 1. Rules — append to memory file.
         rules = _read_md_files(ctx.plugin_root / "rules")
@@ -182,39 +587,73 @@ class AgentskillsAdaptor:
         for filename, content in root_fragments:
             memory_blocks.append(f"# Plugin: {self.plugin_name} / fragment: {filename}\n\n{content}")
 
+        marker = _memory_marker(self.plugin_name)
+        previous_memory = previous.get("memory")
+        if isinstance(previous_memory, dict):
+            previous_path = _memory_path_from_state(ctx, previous_memory)
+            if previous_path is not None:
+                removed = _remove_memory_block(
+                    previous_path,
+                    previous_memory["marker"],
+                    previous_memory["sha256"],
+                )
+                if not removed and previous_path.exists():
+                    result.warnings.append(
+                        f"preserved modified memory block in {previous_memory['filename']}"
+                    )
+
+        memory_state: dict[str, str] | None = None
         if memory_blocks:
-            joined = "\n\n".join(memory_blocks)
-            ctx.append_to_memory(ctx.memory_filename, joined)
+            start = f"<!-- molecule-plugin:{marker}:start -->"
+            end = f"<!-- molecule-plugin:{marker}:end -->"
+            memory_body = "\n\n".join(memory_blocks)
+            memory_block = f"{start}\n\n{memory_body}\n\n{end}"
+            memory_path = _runtime_memory_path(ctx, ctx.memory_filename)
+            if memory_path is None:
+                raise ValueError("runtime memory path escapes its allowed root")
+            existed_before = (
+                memory_path.is_file() and memory_block in memory_path.read_text()
+            )
+            ctx.append_to_memory(ctx.memory_filename, memory_block)
+            if (
+                not existed_before
+                and memory_path is not None
+                and memory_path.is_file()
+                and memory_block in memory_path.read_text()
+            ):
+                memory_state = {
+                    "filename": ctx.memory_filename,
+                    "path": str(memory_path),
+                    "marker": marker,
+                    "sha256": _text_sha256(memory_block),
+                }
             ctx.logger.info(
                 "%s: injected %d rule+fragment block(s) into %s",
-                self.plugin_name, len(memory_blocks), ctx.memory_filename,
+                self.plugin_name,
+                len(memory_blocks),
+                ctx.memory_filename,
             )
 
         # 3. Skills — copy each skill dir to /configs/skills/.
         src_skills_dir = ctx.plugin_root / "skills"
+        current_skill_names: set[str] = set()
         if src_skills_dir.is_dir():
             dst_skills_root = ctx.configs_dir / SKILLS_SUBDIR
-            dst_skills_root.mkdir(parents=True, exist_ok=True)
-            copied = 0
             for entry in sorted(src_skills_dir.iterdir()):
-                if not entry.is_dir():
+                if not entry.is_dir() or entry.is_symlink():
                     continue
+                current_skill_names.add(entry.name)
                 dst = dst_skills_root / entry.name
-                if dst.exists():
-                    ctx.logger.debug("%s: skill %s already present, skipping", self.plugin_name, entry.name)
-                    continue
-                # symlinks=True: copy links AS links, never dereference. A skill
-                # tree carrying e.g. `x -> /etc/molecule.env` or `-> /proc/self/
-                # environ` must NOT have its target's contents copied into the
-                # agent-readable /configs/skills/ (arbitrary-file-read). RFC#2843
-                # #32 hardening — load-bearing once #31 admits third-party skills.
-                shutil.copytree(entry, dst, symlinks=True)
-                copied += 1
-                for p in dst.rglob("*"):
-                    if p.is_file() and not p.is_symlink():
-                        result.files_written.append(str(p.relative_to(ctx.configs_dir)))
-            if copied:
-                ctx.logger.info("%s: copied %d skill dir(s) to %s", self.plugin_name, copied, dst_skills_root)
+                _sync_owned_files(
+                    ctx,
+                    entry,
+                    dst,
+                    result,
+                    previous_owned_files,
+                    owned_files,
+                    recursive=True,
+                    require_existing_ownership=True,
+                )
         elif (ctx.plugin_root / "SKILL.md").is_file():
             # SKILL.md-at-root shape (RFC#2843 #32): the plugin root IS a single
             # agentskills unit (no skills/<name>/ subdir) — e.g. the seo-all skill
@@ -222,23 +661,34 @@ class AgentskillsAdaptor:
             # /configs/skills/<plugin_name>/ so Claude Code's native skill
             # discovery picks it up. Excludes packaging-only dirs that aren't part
             # of the skill payload.
-            dst_skills_root = ctx.configs_dir / SKILLS_SUBDIR
-            dst_skills_root.mkdir(parents=True, exist_ok=True)
-            dst = dst_skills_root / self.plugin_name
-            if dst.exists():
-                ctx.logger.debug("%s: skill %s already present, skipping", self.plugin_name, self.plugin_name)
-            else:
-                # symlinks=True: never dereference a symlink in the skill tree
-                # into the agent-readable /configs/skills/ (arbitrary-file-read).
-                shutil.copytree(
-                    ctx.plugin_root, dst,
-                    ignore=shutil.ignore_patterns(".git", "__pycache__", "adapters"),
-                    symlinks=True,
-                )
-                for p in dst.rglob("*"):
-                    if p.is_file() and not p.is_symlink():
-                        result.files_written.append(str(p.relative_to(ctx.configs_dir)))
-                ctx.logger.info("%s: copied root SKILL.md skill to %s", self.plugin_name, dst)
+            current_skill_names.add(self.plugin_name)
+            _sync_owned_files(
+                ctx,
+                ctx.plugin_root,
+                ctx.configs_dir / SKILLS_SUBDIR / self.plugin_name,
+                result,
+                previous_owned_files,
+                owned_files,
+                recursive=True,
+                require_existing_ownership=True,
+                ignored_roots={".git", "__pycache__", "adapters"},
+            )
+
+        previous_skill_names = {
+            relative.split("/", 2)[1]
+            for relative in previous_owned_files
+            if relative.startswith(f"{SKILLS_SUBDIR}/") and relative.count("/") >= 2
+        }
+        for removed_skill in sorted(previous_skill_names - current_skill_names):
+            _sync_owned_files(
+                ctx,
+                src_skills_dir / removed_skill,
+                ctx.configs_dir / SKILLS_SUBDIR / removed_skill,
+                result,
+                previous_owned_files,
+                owned_files,
+                recursive=True,
+            )
 
         # 4. Setup script — run setup.sh if present (for npm/pip dependencies).
         # Mirrors sdk/python/molecule_plugin/builtins.py — must stay in sync
@@ -261,6 +711,13 @@ class AgentskillsAdaptor:
                     result.errors.append(err)
                     ctx.logger.error("%s: setup.sh failed: %s", self.plugin_name, proc.stderr[:200])
                     if self.plugin_name == _PRIVILEGED_MCP_PLUGIN:
+                        _persist_ownership(
+                            ctx,
+                            self.plugin_name,
+                            owned_files,
+                            memory_state,
+                            None,
+                        )
                         raise PrivilegedPluginInstallError(err)
             except subprocess.TimeoutExpired:
                 err = "setup.sh timed out (120s)"
@@ -268,6 +725,13 @@ class AgentskillsAdaptor:
                 result.errors.append(err)
                 ctx.logger.error("%s: setup.sh timed out", self.plugin_name)
                 if self.plugin_name == _PRIVILEGED_MCP_PLUGIN:
+                    _persist_ownership(
+                        ctx,
+                        self.plugin_name,
+                        owned_files,
+                        memory_state,
+                        None,
+                    )
                     raise PrivilegedPluginInstallError(err)
 
         # 5. Hooks — copy hooks/* into <configs>/.claude/hooks/ (Claude Code-
@@ -276,7 +740,24 @@ class AgentskillsAdaptor:
         # 7. settings-fragment.json — merge into <configs>/.claude/settings.json,
         #    rewriting ${CLAUDE_DIR} to the absolute install path. Existing
         #    user hooks are preserved (deep-merge by event).
-        _install_claude_layer(ctx, result, self.plugin_name)
+        settings_state = _install_claude_layer(
+            ctx,
+            result,
+            self.plugin_name,
+            previous_owned_files,
+            owned_files,
+            previous.get("settings")
+            if isinstance(previous.get("settings"), dict)
+            else None,
+        )
+
+        _persist_ownership(
+            ctx,
+            self.plugin_name,
+            owned_files,
+            memory_state,
+            settings_state,
+        )
 
         return result
 
@@ -285,36 +766,44 @@ class AgentskillsAdaptor:
     # ------------------------------------------------------------------
 
     async def uninstall(self, ctx: InstallContext) -> None:
-        # Remove copied skill dirs.
-        src_skills_dir = ctx.plugin_root / "skills"
-        if src_skills_dir.is_dir():
-            for entry in src_skills_dir.iterdir():
-                dst = ctx.configs_dir / SKILLS_SUBDIR / entry.name
-                if dst.exists() and dst.is_dir():
-                    shutil.rmtree(dst)
-                    ctx.logger.info("%s: removed %s", self.plugin_name, dst)
-        elif (ctx.plugin_root / "SKILL.md").is_file():
-            # Mirror the SKILL.md-at-root install (RFC#2843 #32).
-            dst = ctx.configs_dir / SKILLS_SUBDIR / self.plugin_name
-            if dst.exists() and dst.is_dir():
-                shutil.rmtree(dst)
-                ctx.logger.info("%s: removed %s", self.plugin_name, dst)
+        with _plugin_lifecycle_lock(ctx):
+            self._uninstall(ctx)
 
-        # Best-effort strip of our markers from CLAUDE.md. Users can always
-        # edit manually; we only guarantee the injected block's first line
-        # is removed so re-install re-adds cleanly.
-        memory_path = ctx.configs_dir / ctx.memory_filename
-        if not memory_path.exists():
+    def _uninstall(self, ctx: InstallContext) -> None:
+        state = _load_ownership(ctx, self.plugin_name)
+        if state is None:
             return
-        text = memory_path.read_text()
-        prefix = f"# Plugin: {self.plugin_name} / "
-        lines = text.splitlines(keepends=True)
-        kept = [line for line in lines if not line.startswith(prefix)]
-        if len(kept) != len(lines):
-            memory_path.write_text("".join(kept))
-            ctx.logger.info("%s: stripped markers from %s", self.plugin_name, ctx.memory_filename)
 
+        memory = state.get("memory")
+        if isinstance(memory, dict):
+            memory_path = _memory_path_from_state(ctx, memory)
+            if memory_path is not None:
+                _remove_memory_block(memory_path, memory["marker"], memory["sha256"])
 
+        settings = state.get("settings")
+        if isinstance(settings, dict):
+            _uninstall_settings_fragment(ctx, settings)
+
+        owned_files = state.get("owned_files")
+        if isinstance(owned_files, dict):
+            for relative, digest in sorted(owned_files.items(), reverse=True):
+                path = _owned_path(ctx, relative)
+                if (
+                    path is None
+                    or not path.is_file()
+                    or not isinstance(digest, str)
+                    or _file_sha256(path) != digest
+                ):
+                    continue
+                path.unlink()
+                _remove_empty_parents(path.parent, ctx.configs_dir.resolve())
+
+        try:
+            ownership_path = _ownership_path(ctx, self.plugin_name)
+        except ValueError:
+            return
+        ownership_path.unlink(missing_ok=True)
+        _remove_empty_parents(ownership_path.parent, ctx.configs_dir.resolve())
 
 
 # ----------------------------------------------------------------------
@@ -323,47 +812,118 @@ class AgentskillsAdaptor:
 # these by dropping the right files; no custom adapter needed.
 # ----------------------------------------------------------------------
 
-def _install_claude_layer(ctx: InstallContext, result: InstallResult, plugin_name: str) -> None:
+def _install_claude_layer(
+    ctx: InstallContext,
+    result: InstallResult,
+    plugin_name: str,
+    previous_owned_files: dict[str, str],
+    owned_files: dict[str, str],
+    previous_settings: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     claude_dir = ctx.configs_dir / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-
-    _copy_dir_files(
+    _sync_owned_files(
+        ctx,
         ctx.plugin_root / "hooks",
         claude_dir / "hooks",
         result,
+        previous_owned_files,
+        owned_files,
         executable_suffix=".sh",
     )
-    _copy_dir_files(
+    _sync_owned_files(
+        ctx,
         ctx.plugin_root / "commands",
         claude_dir / "commands",
         result,
+        previous_owned_files,
+        owned_files,
         only_suffix=".md",
     )
-    _merge_settings_fragment(ctx, claude_dir, result, plugin_name)
+    return _merge_settings_fragment(
+        ctx,
+        claude_dir,
+        result,
+        plugin_name,
+        previous_settings,
+    )
 
 
-def _copy_dir_files(
+def _sync_owned_files(
+    ctx: InstallContext,
     src: Path,
     dst: Path,
     result: InstallResult,
+    previous_owned_files: dict[str, str],
+    owned_files: dict[str, str],
     executable_suffix: str | None = None,
     only_suffix: str | None = None,
+    recursive: bool = False,
+    require_existing_ownership: bool = False,
+    ignored_roots: set[str] | None = None,
 ) -> None:
-    if not src.is_dir():
+    dst_relative = dst.relative_to(ctx.configs_dir).as_posix()
+    prefix = f"{dst_relative}/"
+    previous_scope = {
+        relative: digest
+        for relative, digest in previous_owned_files.items()
+        if relative.startswith(prefix)
+    }
+    if require_existing_ownership and dst.exists() and not previous_scope:
+        result.warnings.append(f"preserved unowned existing directory: {dst_relative}")
         return
-    dst.mkdir(parents=True, exist_ok=True)
-    for f in src.iterdir():
-        if not f.is_file():
+
+    candidates: list[tuple[Path, Path]] = []
+    source_files = (
+        src.rglob("*")
+        if recursive and src.is_dir()
+        else src.iterdir()
+        if src.is_dir()
+        else []
+    )
+    for source in source_files:
+        if not source.is_file() or source.is_symlink():
             continue
-        if only_suffix and f.suffix != only_suffix:
+        relative_source = source.relative_to(src) if recursive else Path(source.name)
+        if ignored_roots and relative_source.parts[0] in ignored_roots:
+            continue
+        if only_suffix and source.suffix != only_suffix:
             # When copying hooks, allow .py companion files alongside .sh
-            if not (executable_suffix and f.suffix == ".py"):
+            if not (executable_suffix and source.suffix == ".py"):
                 continue
-        target = dst / f.name
-        shutil.copy2(f, target)
-        if executable_suffix and f.suffix == executable_suffix:
+        candidates.append((source, dst / relative_source))
+
+    candidate_relatives: set[str] = set()
+    for source, target in candidates:
+        relative = target.relative_to(ctx.configs_dir).as_posix()
+        candidate_relatives.add(relative)
+        if target.exists():
+            previous_digest = previous_scope.get(relative)
+            if (
+                not target.is_file()
+                or previous_digest is None
+                or _file_sha256(target) != previous_digest
+            ):
+                result.warnings.append(f"preserved unowned existing file: {relative}")
+                continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        if executable_suffix and source.suffix == executable_suffix:
             target.chmod(0o755)
-        result.files_written.append(str(target.relative_to(target.parents[2])))
+        result.files_written.append(relative)
+        owned_files[relative] = _file_sha256(target)
+
+    for relative, previous_digest in previous_scope.items():
+        if relative in candidate_relatives or relative in owned_files:
+            continue
+        path = _owned_path(ctx, relative)
+        if (
+            path is None
+            or not path.is_file()
+            or _file_sha256(path) != previous_digest
+        ):
+            continue
+        path.unlink()
+        _remove_empty_parents(path.parent, ctx.configs_dir.resolve())
 
 
 def _merge_settings_fragment(
@@ -371,44 +931,111 @@ def _merge_settings_fragment(
     claude_dir: Path,
     result: InstallResult,
     plugin_name: str,
-) -> None:
+    previous_settings: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     fragment_path = ctx.plugin_root / "settings-fragment.json"
-    if not fragment_path.is_file():
+    if not fragment_path.is_file() and previous_settings is None:
         return
-    try:
-        fragment = json.loads(fragment_path.read_text())
-    except Exception as e:
-        result.warnings.append(f"settings-fragment.json invalid: {e}")
-        return
+    fragment: dict[str, Any] | None = None
+    if fragment_path.is_file():
+        try:
+            loaded = json.loads(fragment_path.read_text())
+            if not _valid_settings_fragment(loaded):
+                raise ValueError("root/hooks/handler shape is invalid")
+            fragment = loaded
+        except Exception as exc:
+            result.warnings.append(f"settings-fragment.json invalid: {exc}")
+            return previous_settings
 
     settings_path = claude_dir / "settings.json"
+    existed_before = (
+        bool(previous_settings.get("existed_before"))
+        if previous_settings is not None
+        else settings_path.is_file()
+    )
     if settings_path.is_file():
         try:
             existing = json.loads(settings_path.read_text())
-        except Exception:
-            existing = {}
+        except Exception as exc:
+            result.warnings.append(
+                f"existing settings.json is invalid; preserved: {exc}"
+            )
+            return previous_settings
     else:
         existing = {}
+    if not _valid_settings_fragment(existing):
+        result.warnings.append(
+            "existing settings.json is invalid; preserved: "
+            "root/hooks/handler shape is invalid"
+        )
+        return previous_settings
+    if previous_settings is not None and isinstance(
+        previous_settings.get("fragment"), dict
+    ):
+        existing = _subtract_settings_fragment(
+            existing,
+            previous_settings["fragment"],
+        )
 
-    # mcpServers are NOT merged here. They are wired through the MCP-wiring PORT
-    # (ctx.register_mcp_server → BaseAdapter.register_mcp_server_hook) so that a
-    # non-Claude runtime gets the MCP rendered into the file IT reads (codex
-    # config.toml, …) instead of being silently written to .claude/settings.json
-    # that its runtime never loads (#3159). MCPServerAdaptor parses the
-    # mcpServers block and calls the port; this claude-layer path only handles
-    # hooks (and any other non-mcpServers settings keys). Dropping mcpServers
-    # here also avoids double-writing the same entry on Claude.
-    fragment_no_mcp = {k: v for k, v in fragment.items() if k != "mcpServers"}
+    fragment_no_mcp = (
+        {key: value for key, value in fragment.items() if key != "mcpServers"}
+        if fragment is not None
+        else None
+    )
     if not fragment_no_mcp:
-        # The fragment only declared mcpServers — nothing for the claude hook
-        # layer to merge. The port owns it; leave settings.json untouched here.
-        return
+        if previous_settings is None:
+            return None
+        if existing or existed_before:
+            _atomic_write_text(settings_path, json.dumps(existing, indent=2) + "\n")
+        else:
+            settings_path.unlink(missing_ok=True)
+        return None
 
     rewritten = _rewrite_hook_paths(fragment_no_mcp, claude_dir)
-    merged = _deep_merge_hooks(existing, rewritten)
-    settings_path.write_text(json.dumps(merged, indent=2) + "\n")
+    merged, applied = _deep_merge_hooks(existing, rewritten)
+    if not applied:
+        if previous_settings is None:
+            return None
+        if existing or existed_before:
+            _atomic_write_text(settings_path, json.dumps(existing, indent=2) + "\n")
+        else:
+            settings_path.unlink(missing_ok=True)
+        return None
+
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(settings_path, json.dumps(merged, indent=2) + "\n")
     result.files_written.append(str(settings_path.relative_to(ctx.configs_dir)))
     ctx.logger.info("%s: merged hook config into %s", plugin_name, settings_path)
+    return {
+        "path": str(settings_path.relative_to(ctx.configs_dir)),
+        "fragment": applied,
+        "existed_before": existed_before,
+    }
+
+
+def _uninstall_settings_fragment(
+    ctx: InstallContext,
+    settings: dict[str, Any],
+) -> None:
+    relative = settings.get("path")
+    fragment = settings.get("fragment")
+    if not isinstance(relative, str) or not isinstance(fragment, dict):
+        return
+    settings_path = _owned_path(ctx, relative)
+    if settings_path is None or not settings_path.is_file():
+        return
+    try:
+        existing = json.loads(settings_path.read_text())
+    except (OSError, ValueError) as exc:
+        ctx.logger.warning("settings file changed or invalid; preserving it: %s", exc)
+        return
+    if not isinstance(existing, dict):
+        return
+    cleaned = _subtract_settings_fragment(existing, fragment)
+    if cleaned or settings.get("existed_before"):
+        _atomic_write_text(settings_path, json.dumps(cleaned, indent=2) + "\n")
+    else:
+        settings_path.unlink()
 
 
 def _rewrite_hook_paths(fragment: dict, claude_dir: Path) -> dict:
@@ -421,10 +1048,13 @@ def _rewrite_hook_paths(fragment: dict, claude_dir: Path) -> dict:
     return out
 
 
-def _deep_merge_hooks(existing: dict, fragment: dict) -> dict:
+def _deep_merge_hooks(existing: dict, fragment: dict) -> tuple[dict, dict]:
     out = dict(existing)
-    out.setdefault("hooks", {})
-    for event, handlers in fragment.get("hooks", {}).items():
+    applied: dict[str, Any] = {}
+    fragment_hooks = fragment.get("hooks", {})
+    if fragment_hooks:
+        out.setdefault("hooks", {})
+    for event, handlers in fragment_hooks.items():
         out["hooks"].setdefault(event, [])
         # Build a set of already-present handler fingerprints so that
         # re-installing the same plugin fragment does not append duplicates.
@@ -443,18 +1073,23 @@ def _deep_merge_hooks(existing: dict, fragment: dict) -> dict:
             if hkey not in seen:
                 seen.add(hkey)
                 out["hooks"][event].append(handler)
+                applied.setdefault("hooks", {}).setdefault(event, []).append(handler)
     for top_key, val in fragment.items():
         if top_key == "hooks":
             continue
-        # mcpServers must be deep-merged: plugin A ships "firecrawl" and
-        # plugin B ships "github" → both entries land in settings.json.
-        # Using setdefault would skip the fragment's value when the key
-        # already exists, so we explicitly handle the dict case.
         if top_key in out and isinstance(out[top_key], dict) and isinstance(val, dict):
-            out[top_key] = {**out[top_key], **val}
-        else:
-            out.setdefault(top_key, val)
-    return out
+            added = {
+                key: value
+                for key, value in val.items()
+                if key not in out[top_key]
+            }
+            if added:
+                out[top_key] = {**out[top_key], **added}
+                applied[top_key] = added
+        elif top_key not in out:
+            out[top_key] = val
+            applied[top_key] = val
+    return out, applied
 
 
 # ----------------------------------------------------------------------
@@ -630,6 +1265,10 @@ class MCPServerAdaptor:
         self.runtime = runtime
 
     async def install(self, ctx: InstallContext) -> InstallResult:
+        with _plugin_lifecycle_lock(ctx):
+            return self._install(ctx)
+
+    def _install(self, ctx: InstallContext) -> InstallResult:
         result = InstallResult(
             plugin_name=self.plugin_name,
             runtime=self.runtime,
@@ -663,7 +1302,7 @@ class MCPServerAdaptor:
                     raise PrivilegedPluginInstallError(err) from exc
         # 2. Hooks/commands + skills + rules + setup.sh — reuse AgentskillsAdaptor
         #    logic (its claude layer now skips mcpServers; the PORT owns those).
-        sub = await AgentskillsAdaptor(self.plugin_name, self.runtime).install(ctx)
+        sub = AgentskillsAdaptor(self.plugin_name, self.runtime)._install(ctx)
         result.files_written.extend(sub.files_written)
         result.warnings.extend(sub.warnings)
         result.errors.extend(sub.errors)
