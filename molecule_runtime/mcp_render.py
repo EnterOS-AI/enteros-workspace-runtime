@@ -6,8 +6,7 @@ reads MCP servers from a different native config file in a different format:
 
   * Claude Code → ``<configs>/.claude/settings.json`` ``mcpServers`` map (JSON).
   * Codex       → ``~/.codex/config.toml`` ``[mcp_servers.<name>]`` tables (TOML).
-  * Hermes      → ``platforms.*`` / entry-point descriptor — TODO, format
-                  unverified.
+  * Hermes      → ``~/.hermes/config.yaml`` ``mcp_servers`` map (YAML).
 
 The descriptor is runtime-agnostic — ``name -> {command, args?, env?}`` — and is
 exactly the ``mcpServers`` entry shape pinned by
@@ -33,6 +32,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+
+import yaml
 
 # SSOT for the operator-default runtime — the ONLY value an unmapped runtime may
 # fall back to (never a hand-set ``claude_code``). See live_runtimes.py.
@@ -175,21 +176,40 @@ def render_codex_config(config_path: Path, name: str, spec: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hermes — platforms.* / entry-point descriptor (TODO: format unverified)
+# Hermes — ~/.hermes/config.yaml  mcp_servers.<name>
 # ---------------------------------------------------------------------------
 
 def render_hermes_config(config_path: Path, name: str, spec: dict) -> None:
-    """TODO(#3159): Hermes' native MCP wiring shape is unverified.
+    """Additively merge ``name -> spec`` into Hermes' native
+    ``~/.hermes/config.yaml`` ``mcp_servers`` map. Idempotent; preserves every
+    other top-level key + server.
 
-    Hermes wires capabilities through a ``platforms.*`` / entry-point
-    descriptor rather than a Claude-style settings.json. The concrete file
-    location and schema are not confirmed in this repo, so this is a marked
-    stub with a skipped render-matrix test. Implement concretely once the
-    hermes adapter's descriptor format is pinned.
+    Pinned against Hermes Agent docs/source: stdio MCP servers are configured
+    under ``mcp_servers`` in ``~/.hermes/config.yaml`` using the same descriptor
+    shape this plugin ships (``{command, args?, env?}``), with HTTP servers also
+    accepted via ``url``/``headers``. We write YAML directly rather than shelling
+    out so the renderer stays a pure filesystem renderer like the other
+    runtimes.
     """
-    raise NotImplementedError(
-        "hermes MCP render not implemented — format unverified (#3159 follow-up)"
-    )
+    settings_path = Path(config_path)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if settings_path.is_file():
+        try:
+            loaded = yaml.safe_load(settings_path.read_text())
+            data = loaded if isinstance(loaded, dict) else {}
+        except (OSError, yaml.YAMLError):
+            data = {}
+    else:
+        data = {}
+
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[name] = dict(spec)
+    data["mcp_servers"] = servers
+
+    settings_path.write_text(yaml.safe_dump(data, sort_keys=False))
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +226,7 @@ def render_gemini_config(config_path: Path, name: str, spec: dict) -> None:
     runtime never reads (the exact #3159 mis-attribution — which is what the old
     silent ``claude_code`` fallback did for these unmapped runtimes), this raises,
     matching the ``builtins.py`` install path that already anticipates a
-    "gemini/hermes" MCP stub. Implement concretely once the native format is
+    "gemini/google-adk" MCP stub. Implement concretely once the native format is
     verified against a live gemini / google-adk CLI."""
     raise NotImplementedError(
         "gemini/google-adk MCP render not implemented — native MCP convention "
@@ -307,6 +327,12 @@ def _openclaw_path(config_path: str | os.PathLike) -> Path:
     return Path(os.path.expanduser("~")) / ".openclaw" / "openclaw.json"
 
 
+def _hermes_path(config_path: str | os.PathLike) -> Path:
+    # Hermes reads ~/.hermes/config.yaml. config_path is unused (Hermes resolves
+    # $HOME), but the signature is uniform across runtimes — mirrors _codex_path.
+    return Path(os.path.expanduser("~")) / ".hermes" / "config.yaml"
+
+
 def _gemini_path(config_path: str | os.PathLike) -> Path:
     # gemini / google-adk native MCP file is UNVERIFIED — this best-guess path
     # (the Gemini CLI ~/.gemini/settings.json convention) exists only so
@@ -359,6 +385,22 @@ def _openclaw_config_has(config_path: Path, name: str) -> bool:
     return isinstance(servers, dict) and name in servers
 
 
+def _hermes_config_has(config_path: Path, name: str) -> bool:
+    """True when ``~/.hermes/config.yaml`` declares ``mcp_servers.<name>``.
+
+    Fail-closed by construction: a missing, unreadable, malformed, or
+    structurally-unexpected config yields False, so a genuinely MCP-less
+    Hermes concierge stays degraded at the platform gate."""
+    try:
+        data = yaml.safe_load(Path(config_path).read_text())
+    except (OSError, yaml.YAMLError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    servers = data.get("mcp_servers")
+    return isinstance(servers, dict) and name in servers
+
+
 # runtime -> (path_resolver, renderer, present_reader). Unverified runtimes get
 # the fail-loud renderer; their present_reader returns False (never silently
 # "present"). claude_code is also the default for any unknown runtime so the
@@ -366,14 +408,16 @@ def _openclaw_config_has(config_path: Path, name: str) -> bool:
 _RUNTIME_SPECS: dict[str, tuple] = {
     "claude_code": (_claude_path, render_claude_settings, _json_settings_has),
     "codex": (_codex_path, render_codex_config, _codex_config_has),
-    # hermes: native path unverified; fail-loud render, never falsely present.
-    "hermes": (_claude_path, render_hermes_config, lambda p, n: False),
+    # hermes: CONCRETE renderer + present-reader pinned against official Hermes
+    # Agent docs/source. Renders the stdio descriptor into
+    # ~/.hermes/config.yaml mcp_servers.<name>.
+    "hermes": (_hermes_path, render_hermes_config, _hermes_config_has),
     # gemini / google-adk: native MCP convention UNVERIFIED — fail-loud stub,
     # never falsely present. Registered EXPLICITLY (not left to the default
     # fallback) so an MCP install on these runtimes fails loud instead of
     # silently rendering into a file they never read (the old claude_code creep
     # for these unmapped runtimes — the #3159 class of bug). Matches the
-    # builtins.py install path that already anticipates a "gemini/hermes" stub.
+    # builtins.py install path that already anticipates a "gemini/google-adk" stub.
     "gemini": (_gemini_path, render_gemini_config, lambda p, n: False),
     "google_adk": (_gemini_path, render_gemini_config, lambda p, n: False),
     # openclaw (phase P4): CONCRETE renderer + present-reader pinned against a
@@ -394,10 +438,10 @@ _DEFAULT_RUNTIME = _SSOT_DEFAULT_RUNTIME
 
 
 # Runtimes whose renderer is a deliberate fail-loud stub (format unverified).
-# openclaw graduated out (phase P4): it now has a concrete renderer +
-# present-reader verified against a live openclaw runtime. gemini/google-adk are
-# fail-loud until their native MCP convention is pinned against a live CLI.
-_UNVERIFIED_RUNTIMES = frozenset({"hermes", "gemini", "google_adk"})
+# openclaw and hermes graduated out: they now have concrete renderers +
+# present-readers pinned against their native runtime contracts. gemini/google-adk
+# are fail-loud until their native MCP convention is pinned against a live CLI.
+_UNVERIFIED_RUNTIMES = frozenset({"gemini", "google_adk"})
 
 
 def _spec_for(runtime: str) -> tuple:
@@ -420,8 +464,8 @@ def is_runtime_supported(runtime: str) -> bool:
     """True when this runtime has a CONCRETE (non-stub) renderer mapped.
 
     Unmapped runtimes fall back to the claude renderer (supported); the
-    hermes stub is mapped but its renderer raises, so it is reported
-    unsupported."""
+    gemini/google-adk stubs are mapped but their renderers raise, so they are
+    reported unsupported."""
     return normalize_runtime(runtime) not in _UNVERIFIED_RUNTIMES
 
 
@@ -434,8 +478,8 @@ def render_for_runtime(runtime: str, config_path: str | os.PathLike, name: str, 
     """Render ``name -> spec`` into the given runtime's native MCP config.
 
     Returns the path written. Raises NotImplementedError for an unverified
-    runtime (hermes) — the caller decides whether that's fatal (it is for
-    the privileged management MCP)."""
+    runtime (gemini/google-adk) — the caller decides whether that's fatal (it is
+    for the privileged management MCP)."""
     path_fn, render_fn, _ = _spec_for(runtime)
     target = path_fn(config_path)
     render_fn(target, name, spec)
@@ -500,15 +544,23 @@ def _read_openclaw_mcp_servers(config_path: Path) -> dict:
     return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
 
 
+def _read_hermes_mcp_servers(config_path: Path) -> dict:
+    """Read the ``mcp_servers`` map from ``~/.hermes/config.yaml``."""
+    try:
+        data = yaml.safe_load(Path(config_path).read_text())
+    except (OSError, yaml.YAMLError):
+        return {}
+    servers = data.get("mcp_servers") if isinstance(data, dict) else None
+    return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
+
+
 # runtime -> native-config reader. Mirrors _RUNTIME_SPECS (same path resolver +
 # native format), but returns the FULL {name: spec} map rather than a single
-# present-bool. The unverified runtime (hermes) gets a reader that returns {}
-# — its format is not pinned, so the producer reports nothing for it rather
-# than guessing (the same fail-loud-vs-fail-silent stance as its renderer).
+# present-bool.
 _RUNTIME_READERS: dict[str, callable] = {
     "claude_code": _read_json_mcp_servers,
     "codex": _read_codex_mcp_servers,
-    "hermes": lambda _p: {},
+    "hermes": _read_hermes_mcp_servers,
     # gemini/google-adk native MCP format unverified — report nothing rather
     # than guessing (same fail-loud-vs-fail-silent stance as their renderer).
     "gemini": lambda _p: {},
