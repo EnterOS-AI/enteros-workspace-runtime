@@ -25,11 +25,10 @@ from molecule_runtime import mcp_render
 
 # The kind=platform runtime allowlist (task #80): the runtimes a concierge is
 # allowed to run on AND that have been pinned against a live CLI. claude-code is
-# the base; codex (#142) and openclaw (#179 / phase P4) graduated to concrete
-# renderers in the de-bake. hermes is intentionally EXCLUDED — it remains a
-# fail-loud stub (format unverified) and a concierge must not be provisioned on
-# it until its renderer is pinned.
-PLATFORM_RUNTIME_ALLOWLIST = ("claude-code", "codex", "openclaw")
+# the base; codex (#142), openclaw (#179 / phase P4), and hermes are concrete
+# renderers in the de-bake. Any runtime listed here may host the platform agent,
+# so it must have native MCP rendering and probing.
+PLATFORM_RUNTIME_ALLOWLIST = ("claude-code", "codex", "openclaw", "hermes")
 
 
 @pytest.mark.parametrize("runtime", PLATFORM_RUNTIME_ALLOWLIST)
@@ -59,9 +58,9 @@ def test_platform_runtime_has_concrete_render_spec(runtime):
 def test_platform_runtime_renderer_is_not_a_failloud_stub(runtime):
     """A concrete entry must have a REAL renderer, not a fail-loud stub.
 
-    ``is_runtime_supported`` is False for the deliberate hermes stub
-    (whose renderer raises NotImplementedError). Every allowlisted platform
-    runtime must be supported."""
+    ``is_runtime_supported`` is False for deliberate stubs whose renderers
+    raise NotImplementedError. Every allowlisted platform runtime must be
+    supported."""
     assert mcp_render.is_runtime_supported(runtime) is True, (
         f"{runtime!r} is an unverified/stub runtime — a concierge cannot be "
         f"provisioned on it until its renderer is pinned against a live CLI."
@@ -83,6 +82,9 @@ def test_platform_runtime_native_path_is_runtime_specific(runtime, tmp_path):
         assert ".claude/settings.json" not in path
     elif key == "openclaw":
         assert path.endswith("/.openclaw/openclaw.json")
+        assert ".claude/settings.json" not in path
+    elif key == "hermes":
+        assert path.endswith("/.hermes/config.yaml")
         assert ".claude/settings.json" not in path
     else:  # pragma: no cover — allowlist is the parametrize source
         pytest.fail(f"unexpected allowlist runtime {runtime!r}")

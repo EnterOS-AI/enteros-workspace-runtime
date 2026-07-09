@@ -457,12 +457,13 @@ class BaseAdapter(ABC):
         :func:`molecule_runtime.mcp_render.render_for_runtime`, so the SAME
         production path (``install_plugins_via_registry`` → this hook) renders
         the descriptor into the file the running runtime actually reads — codex →
-        ``~/.codex/config.toml``, claude → ``.claude/settings.json`` — WITHOUT a
-        per-template adapter override. This is the fix for the #3159 flaw where a
-        codex concierge got the management MCP written to ``.claude/settings.json``
-        (a file its runtime never reads) and so booted without ``create_workspace``.
+        ``~/.codex/config.toml``, claude → ``.claude/settings.json``, hermes →
+        ``~/.hermes/config.yaml`` — WITHOUT a per-template adapter override.
+        This is the fix for the #3159 flaw where a concierge got the management
+        MCP written to a config file its runtime never reads and so booted
+        without ``create_workspace``.
 
-        An unverified runtime (hermes) renders via a deliberate
+        An unverified runtime (gemini/google-adk) renders via a deliberate
         NotImplementedError stub — caught by ``MCPServerAdaptor.install``, which
         fails the privileged management-MCP install LOUDLY rather than booting a
         silently capability-less concierge. An adapter for such a runtime may

@@ -86,7 +86,7 @@ async def test_install_routes_each_server_through_port(tmp_path):
 @pytest.mark.asyncio
 async def test_privileged_plugin_raises_when_runtime_unsupported(tmp_path):
     """If the active runtime's register_mcp_server raises NotImplementedError
-    (gemini/hermes stub), the privileged management MCP install fails LOUDLY —
+    (gemini/google-adk stub), the privileged management MCP install fails LOUDLY —
     a concierge on that runtime must not boot without create_workspace."""
     root = _make_plugin(
         tmp_path, {"mcpServers": {"molecule-platform": {"command": "npx"}}}
@@ -100,7 +100,7 @@ async def test_privileged_plugin_raises_when_runtime_unsupported(tmp_path):
     ctx = _ctx(root, configs, _unsupported)
 
     with pytest.raises(PrivilegedPluginInstallError):
-        await MCPServerAdaptor(_PRIVILEGED_MCP_PLUGIN, "hermes").install(ctx)
+        await MCPServerAdaptor(_PRIVILEGED_MCP_PLUGIN, "gemini").install(ctx)
 
 
 @pytest.mark.asyncio
@@ -115,6 +115,6 @@ async def test_nonprivileged_plugin_records_error_when_runtime_unsupported(tmp_p
         raise NotImplementedError("runtime renderer not implemented")
 
     ctx = _ctx(root, configs, _unsupported)
-    result = await MCPServerAdaptor("some-mcp-plugin", "hermes").install(ctx)
+    result = await MCPServerAdaptor("some-mcp-plugin", "gemini").install(ctx)
     assert result.errors
     assert any("unsupported on runtime" in e for e in result.errors)
