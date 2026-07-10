@@ -24,6 +24,19 @@ unrelated ``.npmrc`` lines). Generic by construction — any ``npm``/``npx`` in
 the container that fetches a private ``@molecule-ai`` package now authenticates,
 not just the concierge MCP.
 
+Registry resolution (single deriver, SSOT with git — audit finding C1)
+======================================================================
+The npm registry URL resolves via :func:`resolve_npm_registry`: an explicit
+``MOLECULE_GITEA_NPM_REGISTRY`` full URL wins; else it is DERIVED from the
+forge base host (:func:`resolve_gitea_base` — ``MOLECULE_PLUGIN_REGISTRY`` →
+``MOLECULE_GITEA_BASE_URL`` → the documented default) plus the canonical npm
+path suffix. Before C1 this module hardcoded the registry host and never read
+the base-URL env, so entrypoints that SET ``MOLECULE_GITEA_BASE_URL`` were
+silently ignored here while git (``plugin_sources``) honored it — a
+registry-host migration would have left npm on the stale host. The base
+resolver now lives here (the lower module) and ``plugin_sources`` imports it,
+so the forge host is spelled in exactly one place for both git and npm.
+
 Token source (precedence): canonical ``MOLECULE_TEMPLATE_REPO_TOKEN`` →
 ``GITEA_TOKEN`` → the gitea HTTPS-auth pair. The HTTPS-auth pair has two shapes:
 the normal basic-auth case carries the token in ``GIT_HTTP_PASSWORD``; the
@@ -46,12 +59,91 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# The gitea npm registry for the ``@molecule-ai`` scope. Overridable via env so
-# the host is not hardcoded in two places (the molecule-platform plugin's
-# settings-fragment also references this registry); the default is the canonical
-# prod registry. SSOT-friendly: set MOLECULE_GITEA_NPM_REGISTRY to override.
-_DEFAULT_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
 _SCOPE = "@molecule-ai"
+
+# ---------------------------------------------------------------------------
+# Gitea forge base-host resolution (SSOT for BOTH git and npm).
+#
+# The box configures ONE forge host. git fetches (plugin_sources) and npm
+# fetches (this module) must resolve it identically — a divergence is the exact
+# drift audit finding C1 flagged: entrypoints SET MOLECULE_GITEA_BASE_URL but
+# npm_auth NEVER read it, so on a registry-host migration the npm helper kept
+# using a stale hardcoded host while git honored the override.
+#
+# This module owns the resolver because it is the lower layer (plugin_sources
+# already imports gitea_read_token from here); plugin_sources imports these back
+# so the constants live in exactly one place, not two.
+# ---------------------------------------------------------------------------
+# Env vars that carry the forge base host, in precedence order.
+# MOLECULE_PLUGIN_REGISTRY is the provider-agnostic canonical name core SETS on
+# the box (conciergePlatformMCPEnv) — the knob a self-host/mirror/airgap uses to
+# point sourcing at a different forge. MOLECULE_GITEA_BASE_URL is the shell
+# mirror's back-compat alias for the same host.
+_REGISTRY_ENV = "MOLECULE_PLUGIN_REGISTRY"
+_BASE_URL_ENV = "MOLECULE_GITEA_BASE_URL"
+_BASE_ENV_PRECEDENCE = (_REGISTRY_ENV, _BASE_URL_ENV)
+
+# Documented back-compat default forge base host, used only when neither base
+# env var is set (emitted NON-SILENTLY by resolve_gitea_base so the reliance is
+# observable, matching the shell's ``${MOLECULE_GITEA_BASE_URL:-<this>}``). This
+# is the ONE literal for the canonical prod host in the runtime.
+_BACKCOMPAT_GITEA_BASE = "https://git.moleculesai.app"
+
+# The npm-registry path suffix appended to the forge base host to form the
+# ``@molecule-ai`` npm registry URL (``<base>/api/packages/molecule-ai/npm/``).
+# Centralized here so the org/path segment is spelled exactly once.
+_NPM_REGISTRY_PATH = "/api/packages/molecule-ai/npm/"
+
+# Explicit full-URL npm-registry override. When set it wins outright (no base
+# composition) — an operator pointing npm at an arbitrary registry URL. Nothing
+# in the fleet sets it today; kept as the explicit escape hatch.
+_NPM_REGISTRY_ENV = "MOLECULE_GITEA_NPM_REGISTRY"
+
+
+def resolve_gitea_base(env: Mapping[str, str] | None = None) -> str:
+    """Return the configured gitea forge base host (no trailing slash guarantee).
+
+    Resolution order: ``MOLECULE_PLUGIN_REGISTRY`` → ``MOLECULE_GITEA_BASE_URL``
+    → the documented back-compat default (LOGged non-silently when used). This
+    is the SSOT both git (plugin_sources) and npm (this module) resolve from, so
+    a forge-host migration flips one env var and both follow.
+    """
+    if env is None:
+        env = os.environ
+    for name in _BASE_ENV_PRECEDENCE:
+        configured = (env.get(name) or "").strip()
+        if configured:
+            return configured
+    log.info(
+        "npm_auth: neither %s nor %s set — using documented back-compat gitea "
+        "base %s (set %s to silence)",
+        _REGISTRY_ENV, _BASE_URL_ENV, _BACKCOMPAT_GITEA_BASE, _REGISTRY_ENV,
+    )
+    return _BACKCOMPAT_GITEA_BASE
+
+
+def resolve_npm_registry(env: Mapping[str, str] | None = None) -> str:
+    """Return the ``@molecule-ai`` npm-registry URL (always trailing-slashed).
+
+    Precedence:
+      1. explicit ``MOLECULE_GITEA_NPM_REGISTRY`` full URL — wins if set;
+      2. else derive from the resolved forge base host (``resolve_gitea_base``:
+         ``MOLECULE_PLUGIN_REGISTRY`` → ``MOLECULE_GITEA_BASE_URL`` → default)
+         plus the canonical npm path suffix — THIS is what makes a set-but-unread
+         base-URL override actually take effect (audit finding C1, runtime-side);
+      3. the back-compat default host is the last-resort fallback, sourced from
+         the one ``resolve_gitea_base`` literal — not re-spelled here.
+
+    Trailing slashes are normalized when composing so ``<base>`` with or without
+    a trailing ``/`` yields exactly one separating slash.
+    """
+    if env is None:
+        env = os.environ
+    explicit = (env.get(_NPM_REGISTRY_ENV) or "").strip()
+    if explicit:
+        return explicit if explicit.endswith("/") else explicit + "/"
+    base = resolve_gitea_base(env).rstrip("/")
+    return base + _NPM_REGISTRY_PATH
 
 # Canonical gitea token env vars, in precedence order.
 # MOLECULE_TEMPLATE_REPO_TOKEN is the read token the box holds for fetching
@@ -143,14 +235,14 @@ def install_npm_gitea_auth() -> None:
         )
         return
 
-    registry = (os.environ.get("MOLECULE_GITEA_NPM_REGISTRY") or _DEFAULT_REGISTRY).strip()
+    # Single deriver (explicit full-URL override → base-host derivation → default).
+    # resolve_npm_registry already normalizes the trailing slash.
+    registry = resolve_npm_registry()
     key = _auth_key(registry)
     if key is None:
-        log.warning("npm_auth: MOLECULE_GITEA_NPM_REGISTRY=%r has no scheme — skipping", registry)
+        log.warning("npm_auth: %s=%r has no scheme — skipping", _NPM_REGISTRY_ENV, registry)
         return
 
-    if not registry.endswith("/"):
-        registry += "/"
     registry_line = f"{_SCOPE}:registry={registry}"
     auth_line = f"{key}:_authToken={token}"
 

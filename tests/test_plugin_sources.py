@@ -447,7 +447,9 @@ def test_gitea_backcompat_default_host_is_logged(monkeypatch, tmp_path, caplog):
     # NON-SILENTLY: a log line records the reliance.
     import logging
     _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"x"}))
-    with caplog.at_level(logging.INFO, logger="molecule_runtime.plugin_sources"):
+    # The back-compat-default log now emits from npm_auth's logger: base-host
+    # resolution is the SSOT owned by npm_auth (shared git+npm) — capture there.
+    with caplog.at_level(logging.INFO, logger="molecule_runtime.npm_auth"):
         ps.install_declared_plugins(
             plugins_dir=tmp_path / "plugins",
             env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo"},
