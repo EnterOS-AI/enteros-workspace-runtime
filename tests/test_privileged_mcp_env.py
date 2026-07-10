@@ -23,7 +23,7 @@ def test_injects_all_canonical_keys_for_management_mcp():
     env = {
         "MOLECULE_API_URL": "http://cp",
         "MOLECULE_API_KEY": "key",
-        "ORG_API_KEY": "orgkey",
+        "MOLECULE_ORG_API_KEY": "orgkey",
         "ORG_SLUG": "acme",
         "AUDIT_ACTOR": "actor@x",
     }
@@ -32,6 +32,19 @@ def test_injects_all_canonical_keys_for_management_mcp():
         assert out["env"][key] == env[key]
     # original spec not mutated
     assert "env" not in {"command": "npx"}
+
+
+def test_org_api_key_forwarded_under_canonical_name():
+    """Regression for the concierge AUTH_ERROR: core sets MOLECULE_ORG_API_KEY and
+    mcp-server reads MOLECULE_ORG_API_KEY (strict, no alias), so the child MUST
+    receive it under that exact name. The old allowlist forwarded the unprefixed
+    ORG_API_KEY and stripped MOLECULE_ORG_API_KEY. Pins molecule-ai-sdk
+    contracts/credentials management_mcp_env.required."""
+    env = {"MOLECULE_ORG_API_KEY": "org-token-xyz"}
+    out = inject_privileged_env(MANAGEMENT_MCP_NAME, {"command": "npx"}, env)
+    assert out["env"]["MOLECULE_ORG_API_KEY"] == "org-token-xyz"
+    # legacy ORG_API_KEY is bridged from the canonical value (back-compat)
+    assert out["env"]["ORG_API_KEY"] == "org-token-xyz"
 
 
 def test_noop_for_non_management_name():
