@@ -306,49 +306,35 @@ def test_install_unauth_when_no_token(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# presign:// scheme — relay-delivered plugin trees (config+plugins ONE channel).
-# The config-relay boot prelude unpacks the CP-staged tree to
-# <config_path>/.relay-plugins/<name>/ BEFORE install; the presign provider
-# resolves it (no network, no plugin cred) and it flows through the SAME
-# atomic build-then-swap as a gitea:// plugin.
+# presign:// scheme — RETIRED. The box-side presign plugin provider resolved
+# plugin trees the CP staged in the config-relay drop; that CP channel was
+# retired (CP#1195, no customer), so the provider was removed. A presign://
+# token is now just an unknown scheme — skipped + logged like any other
+# unregistered provider, never special-cased.
 # ---------------------------------------------------------------------------
-def test_parse_presign_scheme():
-    (s,) = ps.parse_declared_plugins("presign://my-plugin")
-    assert (s.scheme, s.owner, s.repo, s.subpath, s.ref, s.name) == (
-        "presign", "", "", "", "", "my-plugin",
-    )
-
-
-def test_parse_presign_rejects_slash_and_empty():
-    # A slash in a presign spec is ambiguous/hostile — rejected, never traversed.
+def test_parse_presign_is_now_unknown_scheme():
+    # Every presign:// spelling is dropped by parse (unknown scheme), including
+    # the shape that used to parse into a valid source — no special-casing.
+    assert ps.parse_declared_plugins("presign://my-plugin") == []
     assert ps.parse_declared_plugins("presign://a/b") == []
     assert ps.parse_declared_plugins("presign://") == []
-    assert ps.parse_declared_plugins("presign://..") == []
 
 
-def _seed_relay_drop(config_path, name: str, files: dict[str, bytes]) -> None:
-    """Simulate the config-relay prelude having unpacked a plugin tree."""
-    drop = config_path / ps.RELAY_PLUGIN_DROP_SUBDIR / name
-    drop.mkdir(parents=True, exist_ok=True)
-    for rel, content in files.items():
-        p = drop / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(content)
-
-
-def test_install_presign_resolves_relay_drop_no_network(monkeypatch, tmp_path):
-    # httpx MUST NOT be touched for a presign source — it's a local resolve.
+def test_install_presign_scheme_no_longer_resolves(monkeypatch, tmp_path):
+    # Retired: even if a leftover .relay-plugins drop is present on disk, a
+    # presign:// source is an unknown scheme now — never resolved, never
+    # installed, and no network fetch is attempted for it.
     def _boom(*a, **k):  # pragma: no cover - asserts non-invocation
-        raise AssertionError("presign install must not perform a network fetch")
+        raise AssertionError("presign is retired — must not perform a network fetch")
 
     monkeypatch.setattr(ps.httpx, "stream", _boom)
 
     config_path = tmp_path / "configs"
-    _seed_relay_drop(
-        config_path,
-        "seo-mcp",
-        {"mcp-servers.json": b'{"mcpServers":{"seo":{"command":"seo-bin"}}}', "SKILL.md": b"# seo"},
-    )
+    # A stale relay drop must NOT be picked up now that the provider is gone.
+    stale_drop = config_path / ".relay-plugins" / "seo-mcp"
+    stale_drop.mkdir(parents=True)
+    (stale_drop / "SKILL.md").write_bytes(b"# seo")
+
     report = ps.install_declared_plugins(
         plugins_dir=config_path / "plugins",
         env={
@@ -356,38 +342,18 @@ def test_install_presign_resolves_relay_drop_no_network(monkeypatch, tmp_path):
             "WORKSPACE_CONFIG_PATH": str(config_path),
         },
     )
-    assert report.declared is True
-    assert report.installed == ["presign://seo-mcp"]
-    assert report.swapped is True
-    # Installed into the canonical <plugins_dir>/<name> via the uniform swap.
-    assert (config_path / "plugins" / "seo-mcp" / "mcp-servers.json").exists()
-    assert (config_path / "plugins" / "seo-mcp" / "SKILL.md").read_text() == "# seo"
+    # Unknown scheme -> parse drops it -> nothing installed from the drop.
+    assert report.installed == []
+    assert not (config_path / "plugins" / "seo-mcp").exists()
 
 
-def test_install_presign_missing_drop_fails_soft_and_no_swap(monkeypatch, tmp_path):
-    monkeypatch.setattr(ps.httpx, "stream", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no net")))
-    config_path = tmp_path / "configs"
-    # Pre-existing live tree must survive when the CP did not deliver the drop.
-    (config_path / "plugins" / "preexisting").mkdir(parents=True)
-    report = ps.install_declared_plugins(
-        plugins_dir=config_path / "plugins",
-        env={
-            "MOLECULE_DECLARED_PLUGINS": "presign://not-delivered",
-            "WORKSPACE_CONFIG_PATH": str(config_path),
-        },
-    )
-    assert report.failed == ["presign://not-delivered"]
-    assert report.swapped is False
-    assert (config_path / "plugins" / "preexisting").exists()
-
-
-def test_install_mixed_presign_and_gitea_one_channel(monkeypatch, tmp_path):
-    # A gitea:// plugin AND a presign:// (relay-delivered) plugin install together
-    # through the SAME path — the uniform-channel win.
+def test_install_mixed_gitea_and_retired_presign(monkeypatch, tmp_path):
+    # A gitea:// plugin still installs; a co-declared presign:// token is now an
+    # unknown scheme (retired) and is silently dropped — the gitea install is
+    # unaffected.
     archive = _make_targz({"SKILL.md": b"# git"})
     _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
     config_path = tmp_path / "configs"
-    _seed_relay_drop(config_path, "relayed", {"mcp-servers.json": b'{"mcpServers":{"x":{"command":"x"}}}'})
     report = ps.install_declared_plugins(
         plugins_dir=config_path / "plugins",
         env={
@@ -395,7 +361,8 @@ def test_install_mixed_presign_and_gitea_one_channel(monkeypatch, tmp_path):
             "WORKSPACE_CONFIG_PATH": str(config_path),
         },
     )
-    assert set(report.installed) == {"gitea://owner/repo", "presign://relayed"}
+    assert report.installed == ["gitea://owner/repo"]
+    assert "presign://relayed" not in report.installed
     assert report.swapped is True
     assert (config_path / "plugins" / "repo" / "SKILL.md").read_text() == "# git"
-    assert (config_path / "plugins" / "relayed" / "mcp-servers.json").exists()
+    assert not (config_path / "plugins" / "relayed").exists()

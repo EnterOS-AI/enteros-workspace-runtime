@@ -87,19 +87,6 @@ _TOKEN_ENV = "MOLECULE_TEMPLATE_REPO_TOKEN"
 _DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 _FETCH_TIMEOUT_ENV = "MOLECULE_PLUGIN_FETCH_TIMEOUT"
 
-# Relay-delivered plugin drop (cf-r2-relay-config-secret-delivery). When the CP
-# resolves a workspace's declared plugins SERVER-SIDE and stages their trees in
-# the SAME transient R2 relay object as the config bundle, the config-relay boot
-# prelude (``config_relay.py``, runs BEFORE this module in ``main``) unpacks each
-# tree to ``<config_path>/<RELAY_PLUGIN_DROP_SUBDIR>/<name>/``. A declared source
-# of scheme ``presign://<name>`` then resolves to that already-delivered tree
-# instead of a network fetch — so the box holds NO credential for the plugin repo
-# (private third-party plugins included), and config + plugins ride ONE channel.
-# The drop dir is a SIBLING of ``<plugins_dir>`` (never the swap target itself),
-# so the atomic build-then-swap that produces ``<plugins_dir>`` is unaffected.
-RELAY_PLUGIN_DROP_SUBDIR = ".relay-plugins"
-_PRESIGN_SCHEME = "presign"
-
 
 @dataclass(frozen=True)
 class PluginSource:
@@ -182,21 +169,6 @@ def _parse_one(token: str) -> PluginSource | None:
     if "#" in spec:
         ref = spec.rsplit("#", 1)[1] or "main"
         spec = spec.split("#", 1)[0]
-
-    # presign://<name> — the plugin was resolved SERVER-SIDE by the CP and its
-    # tree already delivered via the config relay to
-    # ``<config_path>/.relay-plugins/<name>/``. The spec is simply the on-disk
-    # plugin name: no owner/repo/host (the box holds no creds for it) and no
-    # ``#ref`` (the CP pinned the ref when it resolved). One name segment only —
-    # a slash would be an ambiguous/hostile spec (reject, don't traverse).
-    if scheme == _PRESIGN_SCHEME:
-        name = spec.strip("/")
-        if not name or "/" in name or name in (".", ".."):
-            log.info("[plugins] bad source: %s", token)
-            return None
-        return PluginSource(
-            scheme=scheme, owner="", repo="", subpath="", ref="", name=name, raw=token,
-        )
 
     owner, _slash, rest = spec.partition("/")
     repo, _slash2, subpath = rest.partition("/")
@@ -333,7 +305,6 @@ def _fetch_gitea(
     token: str,
     workdir: Path,
     timeout: float,
-    relay_drop_dir: Path | None = None,  # unused (uniform provider seam) — noqa
 ) -> Path | None:
     """Fetch + extract a gitea archive into ``workdir``; return the content dir
     whose contents become ``<plugins_dir>/<name>/`` (``<top>`` or
@@ -381,62 +352,12 @@ def _fetch_gitea(
     return content_dir
 
 
-def _fetch_presign(
-    source: PluginSource,
-    *,
-    relay_drop_dir: Path | None = None,
-    workdir: Path | None = None,  # unused (uniform provider seam) — noqa
-    base_url: str = "",           # unused
-    token: str = "",              # unused
-    timeout: float = 0.0,         # unused
-) -> Path | None:
-    """Resolve a relay-delivered plugin tree (``presign://<name>`` scheme).
-
-    NO network + NO box-held plugin credential: the control plane resolved this
-    plugin SERVER-SIDE (public via HTTPS, private via a CP-held per-plugin cred)
-    and staged its tree in the SAME transient R2 relay object as the config
-    bundle. The config-relay boot prelude (``config_relay.py``) already fetched +
-    sha256-verified + unpacked that object BEFORE this runs, dropping the tree at
-    ``<relay_drop_dir>/<name>/``. This provider just resolves that directory so
-    the plugin flows through the SAME atomic build-then-swap + manifest-SSOT gate
-    as a ``gitea://`` plugin — one uniform install path, one delivery channel.
-
-    ``relay_drop_dir`` is ``<config_path>/.relay-plugins`` (a SIBLING of the
-    ``<plugins_dir>`` swap target — never the target itself). Defaults from
-    ``WORKSPACE_CONFIG_PATH`` when the caller doesn't pass it (mirrors
-    ``_resolve_plugins_dir``).
-
-    Returns the drop dir (its CONTENTS become ``<plugins_dir>/<name>/``), or None
-    (fail-soft, like a failed gitea fetch) when the CP did not deliver the tree —
-    e.g. the relay was disabled, or the server-side resolve failed. The box then
-    has no other source for this ``presign://`` plugin and skips it; a swap is
-    still blocked so a prior live tree is preserved.
-    """
-    if relay_drop_dir is None:
-        config_path = os.environ.get("WORKSPACE_CONFIG_PATH") or "/configs"
-        relay_drop_dir = Path(config_path) / RELAY_PLUGIN_DROP_SUBDIR
-    drop = Path(relay_drop_dir) / source.name
-    if not drop.is_dir():
-        log.warning(
-            "[plugins] presign source not delivered by relay: %s "
-            "(no drop at %s) — skipping", source.raw, drop,
-        )
-        return None
-    log.info("[plugins] presign resolve %s <- relay drop %s", source.name, drop)
-    return drop
-
-
 # Scheme -> fetch handler. A future github/gitlab/local provider registers here;
 # ``parse_declared_plugins`` then accepts that scheme automatically (the
 # source-provider-ecosystem seam — subsumes the providers-SSOT proposal).
 #   * ``gitea``   — box pulls a gitea archive itself (needs a read PAT).
-#   * ``presign`` — CP resolved the plugin server-side + staged its tree in the
-#                   transient R2 relay object; the box resolves the unpacked drop
-#                   (no network, no plugin cred). config + plugins ride ONE
-#                   channel (cf-r2-relay-config-secret-delivery).
 _PROVIDERS: dict[str, Callable[..., "Path | None"]] = {
     "gitea": _fetch_gitea,
-    _PRESIGN_SCHEME: _fetch_presign,
 }
 
 
@@ -497,11 +418,6 @@ def install_declared_plugins(
     except (TypeError, ValueError):
         timeout = _DEFAULT_FETCH_TIMEOUT_SECONDS
 
-    # Relay-delivered plugin drop — a SIBLING of the plugins target (never the
-    # target itself), so ``presign://`` sources resolve from the config-relay
-    # unpack without any circular reference to the dir being swapped below.
-    relay_drop_dir = target_dir.parent / RELAY_PLUGIN_DROP_SUBDIR
-
     # Stage the new tree as a SIBLING of target_dir so the swap rename stays on
     # one filesystem (atomic, no EXDEV copy). The live tree is NOT touched until
     # the staging build fully succeeds.
@@ -542,7 +458,6 @@ def install_declared_plugins(
                     token=token,
                     workdir=Path(td),
                     timeout=timeout,
-                    relay_drop_dir=relay_drop_dir,
                 )
                 if content_dir is None:
                     report.failed.append(source.raw)
