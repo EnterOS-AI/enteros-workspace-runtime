@@ -54,7 +54,14 @@ log = logging.getLogger(__name__)
 PRIVILEGED_ENV_KEYS: tuple[str, ...] = (
     "MOLECULE_API_URL",
     "MOLECULE_API_KEY",
-    "ORG_API_KEY",
+    # Canonical org-api-key per molecule-ai-sdk contracts/credentials
+    # (management_mcp_env.required). The management tools authenticate with
+    # MOLECULE_ORG_API_KEY (mcp-server src/tools/management/client.ts, strict, no
+    # alias) and core sets it under that name — so the child MUST receive it under
+    # MOLECULE_ORG_API_KEY. The unprefixed ORG_API_KEY was the old allowlist name,
+    # set/read by nobody; it stripped MOLECULE_ORG_API_KEY and AUTH_ERROR'd the
+    # concierge. Demoted to the legacy alias below.
+    "MOLECULE_ORG_API_KEY",
     "ORG_SLUG",
     "AUDIT_ACTOR",
 )
@@ -66,6 +73,7 @@ PRIVILEGED_ENV_KEYS: tuple[str, ...] = (
 _ALIAS_PAIRS: dict[str, str] = {
     "MOLECULE_API_URL": "MOLECULE_CP_URL",
     "MOLECULE_API_KEY": "MOLECULE_ADMIN_TOKEN",
+    "MOLECULE_ORG_API_KEY": "ORG_API_KEY",
     "ORG_SLUG": "MOLECULE_ORG_ID",
 }
 
