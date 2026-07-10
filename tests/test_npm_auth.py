@@ -16,10 +16,15 @@ from pathlib import Path
 
 import pytest
 
-from molecule_runtime.npm_auth import _auth_key, install_npm_gitea_auth
+from molecule_runtime.npm_auth import (
+    _auth_key,
+    install_npm_gitea_auth,
+    resolve_npm_registry,
+)
 
 _ALL_TOKEN_VARS = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN", "GIT_HTTP_USERNAME",
-                   "GIT_HTTP_PASSWORD", "MOLECULE_GITEA_NPM_REGISTRY")
+                   "GIT_HTTP_PASSWORD", "MOLECULE_GITEA_NPM_REGISTRY",
+                   "MOLECULE_GITEA_BASE_URL", "MOLECULE_PLUGIN_REGISTRY")
 
 
 @pytest.fixture(autouse=True)
@@ -153,3 +158,69 @@ def test_token_value_never_logged(monkeypatch, tmp_path, caplog):
     assert "supersecret-TOKEN-zzz" not in caplog.text
     # the file has it, the logs do not
     assert "supersecret-TOKEN-zzz" in _npmrc(tmp_path).read_text()
+
+
+# ---------------------------------------------------------------------------
+# Registry deriver precedence (audit finding C1, runtime-side).
+#
+# Before C1 the registry host was hardcoded and MOLECULE_GITEA_BASE_URL — SET by
+# entrypoints — was never read here, so a forge-host migration left npm on the
+# stale host while git honored the override. resolve_npm_registry now derives the
+# registry from the shared base-host resolver. These lock the precedence:
+#   1. explicit MOLECULE_GITEA_NPM_REGISTRY full URL wins;
+#   2. else derive from base host (MOLECULE_PLUGIN_REGISTRY > MOLECULE_GITEA_BASE_URL);
+#   3. else the documented default literal.
+# ---------------------------------------------------------------------------
+_DEFAULT_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
+
+
+def test_registry_defaults_when_nothing_set():
+    # Neither the explicit override nor any base var set → documented default.
+    # Unset envs must behave exactly as before the C1 change (backward-compat).
+    assert resolve_npm_registry() == _DEFAULT_REGISTRY
+
+
+def test_registry_derives_from_base_url(monkeypatch):
+    # THE C1 FIX: MOLECULE_GITEA_BASE_URL is now honored — the registry is derived
+    # from it + the canonical npm path suffix instead of the hardcoded host.
+    monkeypatch.setenv("MOLECULE_GITEA_BASE_URL", "https://gitea.mirror.corp")
+    assert resolve_npm_registry() == \
+        "https://gitea.mirror.corp/api/packages/molecule-ai/npm/"
+
+
+def test_registry_base_url_trailing_slash_normalized(monkeypatch):
+    # A base host WITH a trailing slash must compose to exactly one separator —
+    # no doubled slash before /api.
+    monkeypatch.setenv("MOLECULE_GITEA_BASE_URL", "https://gitea.mirror.corp/")
+    assert resolve_npm_registry() == \
+        "https://gitea.mirror.corp/api/packages/molecule-ai/npm/"
+
+
+def test_registry_plugin_registry_beats_base_url(monkeypatch):
+    # MOLECULE_PLUGIN_REGISTRY (the provider-agnostic name core SETS) takes
+    # precedence over the MOLECULE_GITEA_BASE_URL back-compat alias — same order
+    # git resolution uses, so both follow one migration knob.
+    monkeypatch.setenv("MOLECULE_PLUGIN_REGISTRY", "https://gitea.internal.corp")
+    monkeypatch.setenv("MOLECULE_GITEA_BASE_URL", "https://git.moleculesai.app")
+    assert resolve_npm_registry() == \
+        "https://gitea.internal.corp/api/packages/molecule-ai/npm/"
+
+
+def test_registry_explicit_override_wins(monkeypatch):
+    # The explicit full-URL override beats derivation from the base host, even
+    # when a base var is also set. Trailing slash is normalized on.
+    monkeypatch.setenv("MOLECULE_GITEA_BASE_URL", "https://gitea.mirror.corp")
+    monkeypatch.setenv("MOLECULE_GITEA_NPM_REGISTRY", "https://npm.custom.io/api/packages/acme/npm")
+    assert resolve_npm_registry() == "https://npm.custom.io/api/packages/acme/npm/"
+
+
+def test_install_honors_base_url_override(monkeypatch, tmp_path):
+    # End-to-end through install_npm_gitea_auth: the derived registry (and its
+    # matching _authToken key) reflect MOLECULE_GITEA_BASE_URL — the set-but-unread
+    # bug is fixed at the .npmrc-write layer, not just the deriver.
+    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-BASE")
+    monkeypatch.setenv("MOLECULE_GITEA_BASE_URL", "https://gitea.mirror.corp")
+    install_npm_gitea_auth()
+    content = _npmrc(tmp_path).read_text()
+    assert "@molecule-ai:registry=https://gitea.mirror.corp/api/packages/molecule-ai/npm/" in content
+    assert "//gitea.mirror.corp/api/packages/molecule-ai/npm/:_authToken=tok-BASE" in content

@@ -109,26 +109,17 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from molecule_runtime import manifest_ssot
-from molecule_runtime.npm_auth import gitea_read_token
+from molecule_runtime.npm_auth import gitea_read_token, resolve_gitea_base
 
 log = logging.getLogger(__name__)
 
-# Configured gitea base host for the ``gitea://`` back-compat form. The box's
-# provisioning does NOT always set MOLECULE_GITEA_BASE_URL (the shell mirror uses
-# ``${MOLECULE_GITEA_BASE_URL:-https://git.moleculesai.app}`` and npm_auth
-# defaults the same way), so removing this fallback entirely would break
-# provisioning of every workspace that relies on the default. We therefore KEEP a
-# documented back-compat default but emit it NON-SILENTLY (a one-line log) when
-# it is used, so the reliance is observable rather than a hidden constant.
-_BACKCOMPAT_GITEA_BASE = "https://git.moleculesai.app"
-# Registry base host. MOLECULE_PLUGIN_REGISTRY is the provider-agnostic canonical
-# name core SETS on the box (conciergePlatformMCPEnv) — it is the knob that lets a
-# self-host/mirror/airgap point plugin sourcing at a different forge. Reading it
-# here is what makes that knob real: core SET + box READ must agree on the NAME
-# (the exact SET-one-READ-another drift that caused the concierge AUTH_ERROR).
-# MOLECULE_GITEA_BASE_URL is kept as a back-compat alias (the shell mirror's var).
-_REGISTRY_ENV = "MOLECULE_PLUGIN_REGISTRY"
-_BASE_URL_ENV = "MOLECULE_GITEA_BASE_URL"
+# Configured gitea forge base host (for the ``gitea://`` back-compat form) is
+# resolved by npm_auth.resolve_gitea_base — the SSOT shared with npm registry
+# resolution: MOLECULE_PLUGIN_REGISTRY (provider-agnostic name core SETS on the
+# box) → MOLECULE_GITEA_BASE_URL (shell-mirror back-compat alias) → documented
+# default. The resolver + its constants live in npm_auth so the forge host is
+# spelled once for BOTH git and npm (audit finding C1 — no re-spelled host
+# literal). The back-compat-default log now emits from npm_auth's logger.
 
 # git binary. PATH ``git`` (consistent with credential_helper.py). Overridable so
 # an operator can pin an absolute path; our clone never puts a token on the URL,
@@ -566,24 +557,9 @@ def _resolve_plugins_dir(env: Mapping[str, str], plugins_dir: str | Path | None)
     return Path(config_path) / "plugins"
 
 
-def _resolve_gitea_base(env: Mapping[str, str]) -> str:
-    """Return the gitea base URL for the ``gitea://`` form.
-
-    Resolution order: ``MOLECULE_PLUGIN_REGISTRY`` (the provider-agnostic name
-    core SETS on the box — this is what makes the registry configurable for a
-    mirror/airgap) → ``MOLECULE_GITEA_BASE_URL`` (back-compat alias of the shell's
-    same var) → the documented default host (LOGged non-silently when used).
-    """
-    for name in (_REGISTRY_ENV, _BASE_URL_ENV):
-        configured = (env.get(name) or "").strip()
-        if configured:
-            return configured
-    log.info(
-        "[plugins] neither %s nor %s set — using documented back-compat gitea "
-        "base %s (set %s to silence)",
-        _REGISTRY_ENV, _BASE_URL_ENV, _BACKCOMPAT_GITEA_BASE, _REGISTRY_ENV,
-    )
-    return _BACKCOMPAT_GITEA_BASE
+# Gitea base-host resolution is the SSOT owned by npm_auth (shared git+npm);
+# _resolve_gitea_base is a back-compat private alias for the imported resolver.
+_resolve_gitea_base = resolve_gitea_base
 
 
 def _host_token_map(env: Mapping[str, str], base_url: str) -> dict[str, str]:
