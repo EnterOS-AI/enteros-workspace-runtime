@@ -118,16 +118,22 @@ def test_seo_agent_is_exempt_not_enumerated() -> None:
     assert "molecule-ai-workspace-template-seo-agent" not in guard.DEFAULT_CONSUMERS
 
 
-def test_default_consumers_cover_all_shipping_templates() -> None:
-    """The shipping wheel-consumer templates that were the silent blind spot are
-    now enumerated, so their .runtime-version pin drift is actually checked."""
+def test_retired_templates_are_exempt_not_enumerated() -> None:
+    """google-adk + crewai were RETIRED 2026-07-09 (runtime#264/#265, sdk#80,
+    core#3730) — their template repos are archived and no longer wheel-bumped, so
+    their frozen .runtime-version pin is EXPECTED, not drift. They must be EXEMPT
+    (explicitly accounted-for), never in DEFAULT_CONSUMERS — which would red every
+    runtime PR on their stale pins. (Was the reverse assertion pre-retirement.)"""
     import check_consumer_runtime_drift as guard
 
     for repo in (
         "molecule-ai-workspace-template-google-adk",
         "molecule-ai-workspace-template-crewai",
     ):
-        assert repo in guard.DEFAULT_CONSUMERS, f"{repo} missing from DEFAULT_CONSUMERS"
+        assert repo in guard.EXEMPT_CONSUMERS, f"retired {repo} should be EXEMPT"
+        assert repo not in guard.DEFAULT_CONSUMERS, (
+            f"retired {repo} must not be in DEFAULT_CONSUMERS (would false-red drift)"
+        )
 
 
 def test_reconcile_flags_unenumerated_pinned_template(monkeypatch: pytest.MonkeyPatch) -> None:

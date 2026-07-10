@@ -387,7 +387,7 @@ class TestEnsureManagementMCPInSettings:
         fetch failed), then run the boot self-heal. The management MCP must be
         present afterward AND the user plugin must persist.
         """
-        from molecule_runtime.mcp_render import render_claude_settings
+        from molecule_runtime.mcp_render import render_json_mcp_servers
         from pathlib import Path
 
         monkeypatch.setenv(PLATFORM_AGENT_IMAGE_ENV, "1")
@@ -395,11 +395,11 @@ class TestEnsureManagementMCPInSettings:
 
         # Simulate the runtime's per-plugin MCP wiring for the user plugin only
         # (the private molecule-platform-mcp plugin fetch failed at boot). The
-        # user plugin's mcpServers now lands in settings.json via the MCP-wiring
-        # PORT's claude renderer (render_claude_settings) — the same path the
-        # default BaseAdapter.register_mcp_server_hook uses — rather than the old
-        # _merge_settings_fragment mcpServers branch (which now skips mcpServers).
-        render_claude_settings(Path(settings), "image-gen", {"command": "npx", "args": ["y"]})
+        # user plugin's mcpServers lands in settings.json via the generic JSON
+        # ``mcpServers`` renderer (ADR-004: mcp_render.render_json_mcp_servers, the
+        # name-free helper the default BaseAdapter.register_mcp_server_hook uses —
+        # byte-identical to the deleted claude-specific renderer).
+        render_json_mcp_servers(Path(settings), "image-gen", {"command": "npx", "args": ["y"]})
 
         # Pre-self-heal: only the user plugin is present (the bug state).
         pre = json.loads(settings.read_text())

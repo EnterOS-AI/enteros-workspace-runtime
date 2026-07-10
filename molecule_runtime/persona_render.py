@@ -1,59 +1,35 @@
-"""Per-runtime materializers for the workspace's CANONICAL PERSONA.
+"""Generic, runtime-name-free helpers for the CANONICAL PERSONA.
 
-This module is the *persona-materialization PORT* — the sibling of
-:mod:`molecule_runtime.mcp_render` (which renders an MCP-server descriptor into
-each runtime's native MCP-config file). Where ``mcp_render`` gives a runtime its
-*tools*, this module gives a runtime its *identity*: it renders the
-runtime-agnostic **canonical persona** — the workspace's intended identity,
-delivered as the ``prompt_files`` content (e.g. a concierge's
-``prompts/concierge.md``) — into each runtime's OWN native identity file, so the
-model ACTUALLY BOOTS with that identity regardless of whether the runtime
-consumes the base-assembled ``config.system_prompt``.
+ADR-004 (`docs/adr/ADR-004-sdk-owns-adapter-contract-and-registry.md`) moved the
+**per-runtime shape** of the persona seam — the native identity-file materializers
+and their path resolvers — OUT of this shared engine and INTO each adapter (the
+sibling of the same move for the MCP seam in :mod:`molecule_runtime.mcp_render`).
+Official adapters ship their own native identity-file writer in their template
+repos (claude-code → ``system-prompt.md``, openclaw → ``SOUL.md`` + cleared
+placeholders, codex → ``AGENTS.md``, hermes → ``~/.hermes/SOUL.md``); third-party
+adapters ship theirs wherever their author wants. **This module holds ZERO
+per-runtime dispatch** — no ``_RUNTIME_PERSONA``, no ``materialize_persona_for``,
+no runtime-name literals. It never spells a runtime name.
 
-Why a materializer is needed
-----------------------------
-Claude Code's executor consumes the base-assembled ``config.system_prompt``
-directly, so its persona already reaches the model. But other runtimes read
-identity from a NATIVE on-disk file their own gateway/CLI loads and IGNORE
-``config.system_prompt`` entirely. Each runtime has a different native identity
-convention:
+What remains here is the small set of GENERIC, name-free helpers ADR-004 §6 says
+the engine keeps — reusable by any adapter (official or third-party):
 
-  * Claude Code → ``<configs>/system-prompt.md`` — the file its adapter reads
-                  as the system-prompt fallback.
-  * OpenClaw    → ``<configs>/SOUL.md`` — copied into the gateway workspace at
-                  setup; the ``BOOTSTRAP.md`` / ``AGENTS.md`` placeholders are
-                  cleared so the baked generic-identity boilerplate can't compete
-                  with the materialized identity.
-  * Codex       → ``<configs>/AGENTS.md`` — the AAIF / AGENTS.md convention codex
-                  reads from its project directory.
-  * Hermes      → native convention unverified — deliberate fail-loud stub.
+  * :func:`read_canonical_persona` — the runtime-agnostic INPUT every materializer
+    consumes: the workspace's intended identity, read from the delivered
+    ``prompt_files`` (falling back to ``system-prompt.md``), joined. Mirrors how
+    ``prompt.build_system_prompt`` sources the role, so materializing is stable
+    across boots (idempotent, never accumulates the base frame).
+  * :func:`write_persona` — the byte-shape writer (parents created, trailing
+    newline appended only when absent) every native writer uses, so a materialized
+    identity file is byte-identical regardless of which adapter wrote it.
+  * :func:`default_persona_path` — the default identity file the BaseAdapter
+    fallback (``adapter_base``) writes when an adapter does not override the
+    persona seam. Not a per-runtime resolver — just the base/reference default.
 
-The bug this closes
--------------------
-core #3418 (the *provision* half) made the concierge's ``/configs`` runtime-native
-and delivered the persona to ``/configs/prompts/concierge.md`` for every
-non-claude-code runtime. But that never reached an OpenClaw concierge's model:
-OpenClaw's setup copies only TOP-LEVEL ``/configs/*.md`` into its gateway
-workspace (so a persona under ``prompts/`` is skipped) AND its executor never
-reads ``config.system_prompt`` — so a concierge on the DEFAULT openclaw runtime
-booted with the baked placeholder SOUL.md and no concierge identity. This module
-is the *runtime* half #3418 was missing: at boot the active adapter reads the
-canonical persona and materializes it into ITS native identity file (SOUL.md for
-openclaw, cleared placeholders included), so ``prompts/concierge.md`` becomes the
-model's actual on-disk identity.
-
-Design
-------
-NO runtime is the reference / special-case: every runtime declares its own
-``(path_resolver, materializer)`` pair in ``_RUNTIME_PERSONA`` and the boot path
-dispatches on ``adapter.name()`` — exactly like ``mcp_render._RUNTIME_SPECS``.
-The materializers are PURE filesystem renderers (take a configs dir + persona
-string, write the native file), idempotent (last-write-wins with identical
-content), and testable without any runtime binary. Adding a new runtime is one
-dict entry + one small writer. An unverified runtime's materializer raises
-``NotImplementedError`` (fail-loud), which the boot-path caller downgrades to a
-non-fatal warning — a persona is not a privileged capability like the management
-MCP, so a missing native convention must not brick the boot.
+DO NOT re-add a per-runtime dispatch table here. A red-on-regression ratchet
+(``tests/test_engine_no_runtime_dispatch_ratchet.py``) fails any change that
+re-introduces a ``_RUNTIME_*`` table or a runtime-name literal into this module —
+per ADR-004 the drift can only shrink (→ 0).
 """
 
 from __future__ import annotations
@@ -62,37 +38,19 @@ import logging
 import os
 from pathlib import Path
 
-# SSOT for the underscore dispatch-key canonicalization — shared with mcp_render
-# so ``claude-code`` -> ``claude_code`` normalizes identically in both ports.
-from molecule_runtime.mcp_render import normalize_runtime
-
-# SSOT for the operator-default runtime — the unmapped-runtime fallback, shared
-# with mcp_render so neither port silently creeps back to ``claude_code``.
-from molecule_runtime.live_runtimes import DEFAULT_RUNTIME as _SSOT_DEFAULT_RUNTIME
-
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Native identity-file names, per runtime convention.
-# ---------------------------------------------------------------------------
-# Claude Code's system-prompt fallback file (the file its adapter's
-# create_executor reads when config.system_prompt is unset). Tied to the
-# claude-code adapter: ``os.path.join(config.config_path, "system-prompt.md")``.
-CLAUDE_PERSONA_FILE = "system-prompt.md"
+# The default identity-file basename the BaseAdapter fallback writes, and the
+# fallback persona SOURCE when a workspace declares no ``prompt_files`` — the same
+# file ``build_system_prompt`` falls back to. A descriptor/format constant (the
+# base/reference default), NOT a per-runtime name: an adapter whose runtime reads
+# a different native identity file (openclaw SOUL.md, codex AGENTS.md, …) owns its
+# own writer in its template repo.
+DEFAULT_PERSONA_FILE = "system-prompt.md"
 
-# OpenClaw reads identity from SOUL.md in its gateway workspace (populated by
-# copying top-level ``/configs/*.md`` at setup). BOOTSTRAP.md / AGENTS.md are the
-# baked generic placeholders that dilute a strong SOUL identity — cleared below.
-OPENCLAW_PERSONA_FILE = "SOUL.md"
-OPENCLAW_CLEARED_FILES = ("BOOTSTRAP.md", "AGENTS.md")
-
-# Codex reads the AAIF-standard AGENTS.md from its project directory.
-CODEX_PERSONA_FILE = "AGENTS.md"
-
-# Fallback persona source when a workspace declares no ``prompt_files`` — the same
-# file build_system_prompt() falls back to. Keeps read_canonical_persona a
-# no-op-preserving mirror of the prompt builder's own fallback.
-_DEFAULT_PERSONA_SOURCE = "system-prompt.md"
+# Kept name for backward-compat with the fallback source used by
+# read_canonical_persona (same value as DEFAULT_PERSONA_FILE).
+_DEFAULT_PERSONA_SOURCE = DEFAULT_PERSONA_FILE
 
 
 # ---------------------------------------------------------------------------
@@ -135,165 +93,29 @@ def read_canonical_persona(config_path: str | os.PathLike, prompt_files) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Per-runtime materializers — PURE filesystem renderers.
+# Generic native-identity writer + default path — the BaseAdapter fallback.
 # ---------------------------------------------------------------------------
 
-def _write_persona_file(target: Path, persona: str) -> None:
-    """Write ``persona`` to ``target`` (parents created), trailing newline."""
+def write_persona(target: Path, persona: str) -> None:
+    """Write ``persona`` to ``target`` (parents created), trailing newline.
+
+    The byte-shape every native identity writer uses (base default and each
+    adapter's own writer) so a materialized identity file is byte-identical
+    regardless of who wrote it: the trailing newline is appended only when
+    absent."""
+    target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     body = persona if persona.endswith("\n") else persona + "\n"
     target.write_text(body, encoding="utf-8")
 
 
-def materialize_claude_persona(config_path: Path, persona: str) -> Path:
-    """Claude Code — write the persona to ``<configs>/system-prompt.md``.
+def default_persona_path(config_path: str | os.PathLike) -> Path:
+    """The default identity file the BaseAdapter fallback writes
+    (``<config_path>/system-prompt.md``).
 
-    This is the file the claude-code adapter reads as its system-prompt fallback.
-    The claude-code executor prefers the base-assembled ``config.system_prompt``,
-    so this write is a no-regression native mirror: it guarantees the persona is
-    present in claude-code's own convention even if the assembled prompt is ever
-    empty, and keeps claude-code non-special (it declares a native file like
-    every other runtime)."""
-    target = Path(config_path) / CLAUDE_PERSONA_FILE
-    _write_persona_file(target, persona)
-    return target
-
-
-def materialize_openclaw_persona(config_path: Path, persona: str) -> Path:
-    """OpenClaw — write the persona to ``<configs>/SOUL.md`` and CLEAR the
-    ``BOOTSTRAP.md`` / ``AGENTS.md`` placeholders.
-
-    OpenClaw's gateway reads identity from SOUL.md in its workspace, populated by
-    copying top-level ``/configs/*.md`` at setup — so writing ``/configs/SOUL.md``
-    (top-level) makes the canonical persona the model's actual identity, overlaying
-    the baked placeholder SOUL.md. The baked BOOTSTRAP.md ("read SOUL.md for your
-    identity …") and generic AGENTS.md are cleared (overwritten with a one-line
-    pointer) so their placeholder boilerplate can't compete with the strong
-    materialized identity. This is the mechanism validated live (concierge
-    self-identified as the Org Concierge and kept orchestrating)."""
-    target = Path(config_path) / OPENCLAW_PERSONA_FILE
-    _write_persona_file(target, persona)
-    for cleared in OPENCLAW_CLEARED_FILES:
-        stub = Path(config_path) / cleared
-        # Overwrite the baked generic placeholder with a neutral one-liner so the
-        # gateway loads no competing identity/boilerplate (identity is SOUL.md).
-        _write_persona_file(
-            stub,
-            f"# {cleared[:-3]}\n\n"
-            "(Cleared by persona materialization — this workspace's identity and "
-            "role are defined in SOUL.md; discover and delegate to peers via the "
-            "`molecule` MCP tools.)",
-        )
-    return target
-
-
-def materialize_codex_persona(config_path: Path, persona: str) -> Path:
-    """Codex — write the persona to ``<configs>/AGENTS.md`` (the AAIF convention
-    codex reads from its project directory)."""
-    target = Path(config_path) / CODEX_PERSONA_FILE
-    _write_persona_file(target, persona)
-    return target
-
-
-def materialize_hermes_persona(config_path: Path, persona: str) -> Path:
-    """TODO: Hermes' native identity-file convention is unverified.
-
-    Hermes wires identity through its own agent descriptor rather than a plain
-    markdown identity file, and the concrete location/format is not confirmed in
-    this repo. Rather than guess and write a file a hermes agent silently never
-    reads (the persona analogue of the #3159 MCP mis-attribution), this is a
-    marked fail-loud stub. The boot-path caller downgrades the NotImplementedError
-    to a non-fatal warning (a persona is not a privileged capability). Implement
-    concretely once the hermes adapter's identity convention is pinned against a
-    live runtime — one dict entry + one writer, no other change."""
-    raise NotImplementedError(
-        "hermes persona materialization not implemented — native identity "
-        "convention unverified"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Native identity-file path resolvers (uniform (config_path) -> Path signature).
-# ---------------------------------------------------------------------------
-
-def _claude_persona_path(config_path: str | os.PathLike) -> Path:
-    return Path(config_path) / CLAUDE_PERSONA_FILE
-
-
-def _openclaw_persona_path(config_path: str | os.PathLike) -> Path:
-    return Path(config_path) / OPENCLAW_PERSONA_FILE
-
-
-def _codex_persona_path(config_path: str | os.PathLike) -> Path:
-    return Path(config_path) / CODEX_PERSONA_FILE
-
-
-# ===========================================================================
-# Per-runtime dispatch — the production wiring.
-# ===========================================================================
-# runtime -> (path_resolver, materializer). Mirrors mcp_render._RUNTIME_SPECS.
-# claude_code is ALSO the default for any unmapped runtime, so a new runtime that
-# hasn't been mapped yet still materializes into the base convention rather than
-# crashing — except the deliberate fail-loud stubs (hermes), whose materializer
-# raises and whose caller warns rather than bricking boot.
-_RUNTIME_PERSONA: dict[str, tuple] = {
-    "claude_code": (_claude_persona_path, materialize_claude_persona),
-    "openclaw": (_openclaw_persona_path, materialize_openclaw_persona),
-    "codex": (_codex_persona_path, materialize_codex_persona),
-    # hermes: native identity convention unverified — fail-loud stub.
-    "hermes": (_claude_persona_path, materialize_hermes_persona),
-}
-
-# The runtime an UNMAPPED runtime falls back to. Derived from the LIVE_RUNTIMES
-# SSOT (``openclaw`` — the operator default), NEVER hand-set to ``claude_code``:
-# an unmapped runtime materializes into the OPERATOR default's identity file
-# (SOUL.md) rather than silently creeping to claude-code's system-prompt.md.
-# Every LIVE runtime still needs its OWN concrete entry or a documented fail-loud
-# exemption (enforced by the Guard A meta-gate).
-_DEFAULT_RUNTIME = _SSOT_DEFAULT_RUNTIME
-
-# Runtimes whose materializer is a deliberate fail-loud stub (convention unverified).
-_UNVERIFIED_RUNTIMES = frozenset({"hermes"})
-
-
-def _spec_for(runtime: str) -> tuple:
-    """Resolve a runtime to its ``(path, materializer)`` spec.
-
-    A mapped runtime returns its OWN concrete entry; an unmapped runtime falls
-    back to the operator-default runtime (``openclaw``) — never to claude-code.
-    Total by construction (degrades to the base ``claude_code`` entry only if the
-    default key is monkeypatched away, so callers never hit a KeyError)."""
-    key = normalize_runtime(runtime)
-    spec = _RUNTIME_PERSONA.get(key)
-    if spec is not None:
-        return spec
-    return _RUNTIME_PERSONA.get(_DEFAULT_RUNTIME) or _RUNTIME_PERSONA["claude_code"]
-
-
-def is_persona_supported(runtime: str) -> bool:
-    """True when this runtime has a CONCRETE (non-stub) persona materializer.
-
-    Unmapped runtimes fall back to the claude materializer (supported); the hermes
-    stub is mapped but its materializer raises, so it is reported unsupported."""
-    return normalize_runtime(runtime) not in _UNVERIFIED_RUNTIMES
-
-
-def persona_path_for(runtime: str, config_path: str | os.PathLike) -> Path:
-    """Absolute native identity file the given runtime reads its persona from."""
-    return _spec_for(runtime)[0](config_path)
-
-
-def materialize_persona_for(
-    runtime: str, config_path: str | os.PathLike, persona: str
-) -> Path | None:
-    """Materialize ``persona`` into ``runtime``'s native identity file.
-
-    Returns the path written, or ``None`` when ``persona`` is empty/whitespace
-    (no-op — never clobber a runtime's baked default with an empty identity).
-    Raises ``NotImplementedError`` for an unverified runtime (hermes); the caller
-    decides whether that is fatal (it is NOT for a persona)."""
-    if not (persona or "").strip():
-        return None
-    _, materialize_fn = _spec_for(runtime)
-    target = materialize_fn(Path(config_path), persona)
-    return target
+    The base/reference default identity-file location (the file the base
+    executor reads as its system-prompt fallback). NOT a per-runtime resolver — an
+    adapter whose runtime reads a different native identity file resolves its OWN
+    path in its template repo. Kept only so the base default has a concrete file
+    to write when an adapter does not override the seam."""
+    return Path(config_path) / DEFAULT_PERSONA_FILE

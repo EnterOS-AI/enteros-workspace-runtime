@@ -20,11 +20,48 @@ import pytest
 import yaml
 
 from molecule_runtime import loaded_mcp_tools_probe as probe
+from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter
 from molecule_runtime.platform_agent_identity import (
     identity_gate_payload,
     loaded_mcp_tools,
     set_loaded_mcp_tools,
 )
+
+
+class _ProbeAdapter(BaseAdapter):
+    """Minimal concrete adapter for the capture tests. name()=="claude-code" and
+    the inherited BaseAdapter default for ``enumerate_loaded_mcp_tools`` reads the
+    generic JSON ``mcpServers`` native config (``<config_path>/.claude/settings.json``,
+    the base fallback default) and feeds the resolved specs to the surviving generic
+    engine ``enumerate_from_specs_async`` — so passing ``_ProbeAdapter()`` exercises
+    the exact read→probe engine the deleted by-name ``("claude-code", config_path)``
+    signature did, now through the ADR-004 runtime-owns-discovery contract (the
+    engine no longer resolves servers by runtime name)."""
+
+    def __init__(self, name="claude-code"):
+        self._name = name
+
+    def name(self):
+        return self._name
+
+    @classmethod
+    def display_name(cls):
+        return "Probe"
+
+    @classmethod
+    def description(cls):
+        return "probe-test"
+
+    def setup(self, config):  # pragma: no cover - stub
+        return None
+
+    def create_executor(self, config):  # pragma: no cover - stub
+        return None
+
+
+def _cfg(config_root):
+    """AdapterConfig carrying just the configs dir the probe reads."""
+    return AdapterConfig(model="test", config_path=str(config_root))
 
 
 @pytest.fixture(autouse=True)
@@ -128,13 +165,34 @@ def _write_fake_server(
 
 
 def _claude_settings_with(tmp_path, servers: dict):
-    """Write a claude settings.json declaring the given {name: spec} servers and
-    return the config_path root (tmp_path) the claude reader resolves from
-    (<config_path>/.claude/settings.json)."""
+    """Write a JSON settings.json declaring the given {name: spec} servers and
+    return the config_path root (tmp_path) the BaseAdapter default reader resolves
+    from (<config_path>/.claude/settings.json — the generic JSON native config)."""
     settings = tmp_path / ".claude" / "settings.json"
     settings.parent.mkdir(parents=True, exist_ok=True)
     settings.write_text(json.dumps({"mcpServers": servers}))
     return str(tmp_path)
+
+
+# ADR-004 migration: the deleted by-name engine entrypoints
+# ``probe.enumerate_loaded_mcp_tools[_async](runtime, config_path)`` are replaced by
+# routing through the ADAPTER (adapter reads its own native config, feeds the
+# generic ``enumerate_from_specs_async`` engine). ``_ProbeAdapter`` uses the
+# BaseAdapter default, which reads the generic JSON ``mcpServers`` config seeded by
+# ``_claude_settings_with`` — so these helpers exercise the identical read→probe
+# engine + boot-safety machinery the old by-name signature did.
+
+async def _enumerate_root_async(config_root):
+    """Adapter-routed async enumeration for a seeded ``.claude/settings.json`` root
+    (the ADR-004 replacement for ``probe.enumerate_loaded_mcp_tools_async``)."""
+    return await _ProbeAdapter().enumerate_loaded_mcp_tools(_cfg(config_root))
+
+
+def _enumerate_root_sync(config_root):
+    """Sync adapter-routed enumeration (the ADR-004 replacement for the sync
+    ``probe.enumerate_loaded_mcp_tools``); drives the async path under
+    ``asyncio.run`` exactly as the deleted sync wrapper did."""
+    return asyncio.run(_enumerate_root_async(config_root))
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +210,7 @@ class TestInitEnumerationHappyPath:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
 
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
 
         assert ids == [
             "mcp__molecule-platform__create_workspace",
@@ -173,7 +231,7 @@ class TestInitEnumerationHappyPath:
         # force=True bypasses the kind=platform gate (gate is exercised separately
         # in TestKindPlatformGate); this asserts the publish path end-to-end.
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", config_root, force=True
+            _ProbeAdapter(), _cfg(config_root), force=True
         )
 
         assert observed == ["mcp__molecule-platform__create_workspace"]
@@ -191,7 +249,7 @@ class TestInitEnumerationHappyPath:
             tmp_path,
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
         assert ids == ["mcp__molecule-platform__create_workspace"]
 
     def test_union_across_multiple_servers_sorted_deduped(self, tmp_path):
@@ -204,7 +262,7 @@ class TestInitEnumerationHappyPath:
                 "a2a": {"command": sys.executable, "args": [str(b)]},
             },
         )
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
         assert ids == [
             "mcp__a2a__send_message",
             "mcp__molecule-platform__create_workspace",
@@ -222,7 +280,7 @@ class TestConnectedButToolless:
             tmp_path,
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
         # Genuine "connected, no tools" -> [], a meaningful non-None signal.
         assert ids == []
 
@@ -234,7 +292,7 @@ class TestConnectedButToolless:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", config_root, force=True
+            _ProbeAdapter(), _cfg(config_root), force=True
         )
         assert observed == []
         assert loaded_mcp_tools() == []
@@ -252,7 +310,7 @@ class TestDegradeSafe:
             tmp_path,
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
         # Only declared server is broken -> NOTHING enumerated -> None (not []),
         # so the heartbeat omits the field and core's grace window applies.
         assert ids is None
@@ -262,7 +320,7 @@ class TestDegradeSafe:
             tmp_path,
             {"molecule-platform": {"command": "/nonexistent/definitely-not-a-binary"}},
         )
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
         assert ids is None
 
     def test_no_command_in_spec_is_skipped(self, tmp_path):
@@ -270,7 +328,7 @@ class TestDegradeSafe:
         config_root = _claude_settings_with(
             tmp_path, {"remote": {"url": "https://example/mcp"}}
         )
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
         assert ids is None
 
     def test_one_broken_one_good_reports_only_the_good(self, tmp_path):
@@ -283,18 +341,18 @@ class TestDegradeSafe:
                 "broken": {"command": sys.executable, "args": [str(bad)]},
             },
         )
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
         # The good server still reports; the broken one is silently dropped.
         assert ids == ["mcp__molecule-platform__create_workspace"]
 
     def test_no_servers_declared_yields_none(self, tmp_path):
         config_root = _claude_settings_with(tmp_path, {})
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", config_root)
+        ids = _enumerate_root_sync(config_root)
         assert ids is None
 
     def test_unreadable_config_yields_none(self, tmp_path):
         # No .claude/settings.json at all -> reader returns {} -> None.
-        ids = probe.enumerate_loaded_mcp_tools("claude-code", str(tmp_path))
+        ids = _enumerate_root_sync(str(tmp_path))
         assert ids is None
 
     @pytest.mark.asyncio
@@ -302,7 +360,7 @@ class TestDegradeSafe:
         """(b) None observation -> producer stays None -> gate payload OMITS key."""
         config_root = _claude_settings_with(tmp_path, {})
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", config_root, force=True
+            _ProbeAdapter(), _cfg(config_root), force=True
         )
         assert observed is None
         assert loaded_mcp_tools() is None
@@ -311,12 +369,16 @@ class TestDegradeSafe:
     @pytest.mark.asyncio
     async def test_capture_never_raises_even_if_reader_explodes(self, tmp_path, monkeypatch):
         # Defense-in-depth: an unexpected error inside enumeration is swallowed.
+        # ADR-004: the BaseAdapter default reads via mcp_render.read_json_mcp_servers
+        # (the deleted probe.read_mcp_servers by-name indirection is gone). Blow up
+        # THAT reader and assert capture still maps to None (never raises into boot).
         def _boom(*_a, **_k):
             raise RuntimeError("simulated reader failure")
 
-        monkeypatch.setattr(probe, "read_mcp_servers", _boom)
+        import molecule_runtime.mcp_render as _mcp_render
+        monkeypatch.setattr(_mcp_render, "read_json_mcp_servers", _boom)
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", str(tmp_path), force=True
+            _ProbeAdapter(), _cfg(tmp_path), force=True
         )
         assert observed is None
         assert loaded_mcp_tools() is None
@@ -353,7 +415,7 @@ class TestBootSafetyStall:
         )
 
         started = time.monotonic()
-        ids = await probe.enumerate_loaded_mcp_tools_async("claude-code", config_root)
+        ids = await _enumerate_root_async(config_root)
         elapsed = time.monotonic() - started
 
         # Stalled server -> not-loaded -> None (so the grace window applies).
@@ -380,7 +442,7 @@ class TestBootSafetyStall:
         # enumerate_loaded_mcp_tools is sync (asyncio.run under the hood); run it
         # off-thread so it can't fight this test's running event loop.
         ids = await asyncio.to_thread(
-            probe.enumerate_loaded_mcp_tools, "claude-code", config_root
+            _enumerate_root_sync, config_root
         )
         elapsed = time.monotonic() - started
         assert ids is None
@@ -404,7 +466,7 @@ class TestBootSafetyStall:
         config_root = _claude_settings_with(tmp_path, servers)
 
         started = time.monotonic()
-        ids = await probe.enumerate_loaded_mcp_tools_async("claude-code", config_root)
+        ids = await _enumerate_root_async(config_root)
         elapsed = time.monotonic() - started
         assert ids is None
         # 5 servers x 2s per-server would be 10s sequentially; the 3s OVERALL
@@ -440,16 +502,21 @@ class TestKindPlatformGate:
             {"image-gen": {"command": sys.executable, "args": [str(server)]}},
         )
 
+        # ADR-004: the kind=platform gate short-circuits BEFORE the adapter's
+        # enumerate runs, so the surviving generic engine core (_probe_specs_async,
+        # which _ProbeAdapter's base default reaches via enumerate_from_specs_async)
+        # must never be entered on a non-platform workspace. Spy on it to prove the
+        # skip (the deleted by-name enumerate_loaded_mcp_tools_async is gone).
         called = {"enum": False}
-        real_enum = probe.enumerate_loaded_mcp_tools_async
+        real_engine = probe._probe_specs_async
 
-        async def _spy(*a, **k):
+        async def _spy(servers):
             called["enum"] = True
-            return await real_enum(*a, **k)
+            return await real_engine(servers)
 
-        monkeypatch.setattr(probe, "enumerate_loaded_mcp_tools_async", _spy)
+        monkeypatch.setattr(probe, "_probe_specs_async", _spy)
 
-        observed = await probe.capture_loaded_mcp_tools_at_init("claude-code", config_root)
+        observed = await probe.capture_loaded_mcp_tools_at_init(_ProbeAdapter(), _cfg(config_root))
 
         assert observed is None
         assert called["enum"] is False, "enumeration ran on a non-platform workspace"
@@ -475,7 +542,7 @@ class TestKindPlatformGate:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
 
-        observed = await probe.capture_loaded_mcp_tools_at_init("claude-code", config_root)
+        observed = await probe.capture_loaded_mcp_tools_at_init(_ProbeAdapter(), _cfg(config_root))
 
         assert observed == ["mcp__molecule-platform__create_workspace"]
         assert loaded_mcp_tools() == ["mcp__molecule-platform__create_workspace"]
@@ -499,7 +566,7 @@ class TestKindPlatformGate:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
 
-        observed = await probe.capture_loaded_mcp_tools_at_init("claude-code", config_root)
+        observed = await probe.capture_loaded_mcp_tools_at_init(_ProbeAdapter(), _cfg(config_root))
 
         assert observed == ["mcp__molecule-platform__create_workspace"]
         assert identity_gate_payload()["loaded_mcp_tools"] == [
@@ -521,7 +588,7 @@ class TestKindPlatformGate:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", config_root, force=True
+            _ProbeAdapter(), _cfg(config_root), force=True
         )
         assert observed == ["mcp__molecule-platform__create_workspace"]
 
@@ -553,70 +620,17 @@ class TestNormalize:
         ) == ["npx", "-y", "@molecule-ai/mcp-server"]
 
 
-# ---------------------------------------------------------------------------
-# read_mcp_servers_for — the native-config readers (inverse of renderers)
-# ---------------------------------------------------------------------------
-
-class TestReadMcpServersFor:
-    def test_claude_reads_settings_json(self, tmp_path):
-        from molecule_runtime.mcp_render import read_mcp_servers_for
-
-        settings = tmp_path / ".claude" / "settings.json"
-        settings.parent.mkdir(parents=True, exist_ok=True)
-        settings.write_text(
-            json.dumps(
-                {"mcpServers": {"molecule-platform": {"command": "npx", "args": ["x"]}}}
-            )
-        )
-        got = read_mcp_servers_for("claude-code", str(tmp_path))
-        assert got == {"molecule-platform": {"command": "npx", "args": ["x"]}}
-
-    def test_codex_reads_config_toml(self, tmp_path, monkeypatch):
-        from molecule_runtime.mcp_render import read_mcp_servers_for, render_codex_config
-
-        # Point ~/.codex at a temp HOME and render a server, then read it back.
-        monkeypatch.setenv("HOME", str(tmp_path))
-        cfg = tmp_path / ".codex" / "config.toml"
-        render_codex_config(
-            cfg, "molecule-platform",
-            {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"],
-             "env": {"MOLECULE_MCP_MODE": "management"}},
-        )
-        got = read_mcp_servers_for("codex", str(tmp_path))
-        assert "molecule-platform" in got
-        assert got["molecule-platform"]["command"] == "npx"
-        assert got["molecule-platform"]["args"] == ["-y", "@molecule-ai/mcp-server"]
-        assert got["molecule-platform"]["env"] == {"MOLECULE_MCP_MODE": "management"}
-
-    def test_hermes_reads_config_yaml(self, tmp_path, monkeypatch):
-        from molecule_runtime.mcp_render import read_mcp_servers_for, render_hermes_config
-
-        monkeypatch.setenv("HOME", str(tmp_path))
-        cfg = tmp_path / ".hermes" / "config.yaml"
-        render_hermes_config(
-            cfg, "molecule-platform",
-            {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"],
-             "env": {"MOLECULE_MCP_MODE": "management"}},
-        )
-        got = read_mcp_servers_for("hermes", str(tmp_path))
-        assert "molecule-platform" in got
-        assert got["molecule-platform"]["command"] == "npx"
-        assert got["molecule-platform"]["args"] == ["-y", "@molecule-ai/mcp-server"]
-        assert got["molecule-platform"]["env"] == {"MOLECULE_MCP_MODE": "management"}
-
-        parsed = yaml.safe_load(cfg.read_text())
-        assert parsed["mcp_servers"] == got
-
-    def test_unmapped_runtime_reads_empty(self, tmp_path):
-        from molecule_runtime.mcp_render import read_mcp_servers_for
-
-        # An unmapped/unknown runtime fails closed to {}.
-        assert read_mcp_servers_for("some-unmapped-runtime", str(tmp_path)) == {}
-
-    def test_missing_config_reads_empty(self, tmp_path):
-        from molecule_runtime.mcp_render import read_mcp_servers_for
-
-        assert read_mcp_servers_for("claude-code", str(tmp_path)) == {}
+# NOTE (ADR-004): the ``TestReadMcpServersFor`` class that tested the deleted
+# by-name reader switch ``mcp_render.read_mcp_servers_for(runtime, config_path)``
+# (via the deleted ``render_codex_config`` / ``render_hermes_config`` engine
+# renderers) is GONE. Per-runtime native-config read/render is now OWNED by each
+# adapter (in its template repo) and proven by the SDK conformance suite's
+# render→read→present round-trip (``molecule_plugin.adapter_conformance`` — each
+# template's ``tests/test_conformance.py`` runs 16 checks against its own Adapter).
+# The engine keeps only the GENERIC JSON reader ``mcp_render.read_json_mcp_servers``
+# (fail-closed coverage in ``tests/test_mcp_render_generic_helpers.py``), which the
+# BaseAdapter default uses and which the boot-safety tests above exercise via
+# ``_ProbeAdapter``.
 
 
 class TestRetryUntilReady:
@@ -630,13 +644,13 @@ class TestRetryUntilReady:
         calls = {"n": 0}
         result = ["mcp__molecule-platform__create_workspace"]
 
-        async def _fake_capture(runtime, config_path, *, force=False):
+        async def _fake_capture(adapter, config, *, force=False, **_kw):
             calls["n"] += 1
             return None if calls["n"] < 3 else result
 
         monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _fake_capture)
         out = await probe.capture_loaded_mcp_tools_with_retry(
-            "claude-code", "/cfg", max_attempts=5, interval_seconds=0.01
+            _ProbeAdapter(), _cfg("/cfg"), max_attempts=5, interval_seconds=0.01
         )
         assert out == result
         assert calls["n"] == 3, "should stop on first success, not keep retrying"
@@ -647,13 +661,13 @@ class TestRetryUntilReady:
         # returning None (the per-turn capture is then the fallback). Must not hang.
         calls = {"n": 0}
 
-        async def _never(runtime, config_path, *, force=False):
+        async def _never(adapter, config, *, force=False, **_kw):
             calls["n"] += 1
             return None
 
         monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _never)
         out = await probe.capture_loaded_mcp_tools_with_retry(
-            "claude-code", "/cfg", max_attempts=4, interval_seconds=0.01
+            _ProbeAdapter(), _cfg("/cfg"), max_attempts=4, interval_seconds=0.01
         )
         assert out is None
         assert calls["n"] == 4, "should attempt exactly max_attempts times"
@@ -665,7 +679,7 @@ class TestRetryUntilReady:
         calls = {"n": 0}
         result = ["mcp__molecule-platform__create_workspace"]
 
-        async def _flaky(runtime, config_path, *, force=False):
+        async def _flaky(adapter, config, *, force=False, **_kw):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("config not ready")
@@ -675,7 +689,94 @@ class TestRetryUntilReady:
 
         monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _flaky)
         out = await probe.capture_loaded_mcp_tools_with_retry(
-            "claude-code", "/cfg", max_attempts=5, interval_seconds=0.01
+            _ProbeAdapter(), _cfg("/cfg"), max_attempts=5, interval_seconds=0.01
         )
         assert out == result
         assert calls["n"] == 3
+
+
+# ---------- runtime#181: the adapter-owns-discovery contract ----------
+
+class TestAdapterEnumerationContract:
+    """runtime#181: capture ALWAYS routes MCP-tool enumeration through the ADAPTER
+    contract (adapter.enumerate_loaded_mcp_tools) — each runtime owns discovery,
+    replacing the hardcoded core switch. capture takes only (adapter, config); the
+    runtime name and configs dir are read off them (adapter.name() /
+    config.config_path), never threaded through separately."""
+
+    def teardown_method(self):
+        from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+        set_loaded_mcp_tools(None)
+
+    @pytest.mark.asyncio
+    async def test_capture_routes_through_adapter_enumerate(self, monkeypatch):
+        from molecule_runtime import platform_agent_identity as pai
+
+        class _FakeAdapter:
+            def name(self):
+                return "hermes"
+
+            async def enumerate_loaded_mcp_tools(self, config):
+                return ["mcp__molecule-platform__provision_workspace"]
+
+        # ADR-004: the deleted by-name engine switch
+        # (probe.enumerate_loaded_mcp_tools_async / _probe_specs_async) must NOT be
+        # consulted — the adapter owns discovery and returns canned ids WITHOUT
+        # touching the engine. Booby-trap the surviving generic engine entry point
+        # to prove capture went straight through the adapter, never the engine.
+        async def _boom(servers):
+            raise AssertionError("engine must not run — adapter owns discovery")
+        monkeypatch.setattr(probe, "_probe_specs_async", _boom)
+
+        observed = await probe.capture_loaded_mcp_tools_at_init(
+            _FakeAdapter(), _cfg("/configs"), force=True
+        )
+        assert observed == ["mcp__molecule-platform__provision_workspace"]
+        # published to the producer so the first heartbeat carries it
+        assert pai.loaded_mcp_tools() == ["mcp__molecule-platform__provision_workspace"]
+
+    @pytest.mark.asyncio
+    async def test_capture_never_publishes_on_none_observation(self, monkeypatch):
+        from molecule_runtime import platform_agent_identity as pai
+
+        class _NoneAdapter:
+            def name(self):
+                return "hermes"
+
+            async def enumerate_loaded_mcp_tools(self, config):
+                return None  # nothing observed yet — grace window
+
+        observed = await probe.capture_loaded_mcp_tools_at_init(
+            _NoneAdapter(), _cfg("/configs"), force=True
+        )
+        assert observed is None
+        assert pai.loaded_mcp_tools() is None
+
+    @pytest.mark.asyncio
+    async def test_base_adapter_default_reads_generic_config_and_feeds_engine(
+        self, tmp_path, monkeypatch
+    ):
+        """ADR-004: the BaseAdapter default reads the adapter's OWN native config
+        (the generic JSON ``mcpServers`` at ``<config_path>/.claude/settings.json``)
+        and hands the resolved specs to the surviving generic engine
+        ``enumerate_from_specs_async`` — it NO LONGER calls a by-name
+        ``enumerate_loaded_mcp_tools_async(runtime, config_path)`` switch (deleted).
+        """
+        captured = {}
+
+        async def _engine(servers):
+            captured["servers"] = servers
+            return []
+        monkeypatch.setattr(probe, "enumerate_from_specs_async", _engine)
+
+        config_root = _claude_settings_with(
+            tmp_path, {"molecule-platform": {"command": "npx", "args": ["x"]}}
+        )
+        out = await _ProbeAdapter("claude-code").enumerate_loaded_mcp_tools(
+            _cfg(config_root)
+        )
+        # base default fed the engine the specs it read from the generic JSON config
+        assert out == []
+        assert captured["servers"] == {
+            "molecule-platform": {"command": "npx", "args": ["x"]}
+        }

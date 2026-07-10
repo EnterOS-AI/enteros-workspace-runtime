@@ -18,9 +18,11 @@ heartbeat omits the field → gate fail-closes). That is task #85's open gap.
 WHAT this does (mirrors the adk#34 / codex#142 prior art)
 ---------------------------------------------------------
 Like codex#142, this enumerates the LOADED tool inventory AT INIT — independent
-of any user turn — by reading the active runtime's declared MCP servers from its
-native config (``mcp_render.read_mcp_servers_for``) and, for each, spawning it as
-a stdio subprocess and performing the minimal MCP JSON-RPC handshake:
+of any user turn — from the active adapter's declared MCP servers (the adapter
+reads its OWN native config — ADR-004 relocated per-runtime config-reading into
+the adapter; the engine no longer resolves servers by runtime name) and, for each,
+spawning it as a stdio subprocess and performing the minimal MCP JSON-RPC
+handshake:
 
     initialize  ->  notifications/initialized  ->  tools/list
 
@@ -81,6 +83,10 @@ import asyncio
 import json
 import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoid an import cycle at runtime (adapter_base imports this module)
+    from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter
 
 logger = logging.getLogger("platform-agent.identity")
 
@@ -463,27 +469,21 @@ async def _list_tools_from_mcp_server(server: str, spec: dict) -> list[str] | No
         await _kill_proc(proc)
 
 
-async def _enumerate_async(runtime: str, config_path: str | os.PathLike) -> list[str] | None:
-    """The async core of enumeration (no overall-deadline wrapper).
+async def _probe_specs_async(servers: dict) -> list[str] | None:
+    """Probe an already-resolved ``{name: spec}`` map, folding the tri-state.
 
-    Reads the declared servers, probes each, and folds the tri-state result.
-    Wrapped by :func:`enumerate_loaded_mcp_tools_async` with the HARD overall
-    enumeration deadline. Never raises (config read is guarded; each per-server
-    probe already maps every failure to None).
+    The generic, runtime-name-free stdio enumeration ENGINE, fed a resolved
+    ``{name: spec}`` map by an adapter that read its OWN native MCP config (the
+    runtime-owns-discovery contract, :meth:`BaseAdapter.enumerate_loaded_mcp_tools`).
+    Given the ``{name: spec}`` map, spawn each STDIO server, handshake, and fold
+    the tri-state. Never raises; each per-server probe already maps failure to
+    None. HTTP/url specs (``_build_server_command`` returns None) are skipped — an
+    adapter that owns an HTTP server reports its tools another way.
     """
-    try:
-        servers = read_mcp_servers(runtime, config_path)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "loaded_mcp_tools: could not read declared MCP servers for runtime=%r "
-            "— leaving producer unset (grace window applies)", runtime, exc_info=True,
-        )
-        return None
-
     if not servers:
         logger.info(
-            "loaded_mcp_tools: no MCP servers declared in runtime=%r native config "
-            "— leaving producer unset (grace window applies)", runtime,
+            "loaded_mcp_tools: no MCP servers to probe — leaving producer unset "
+            "(grace window applies)",
         )
         return None
 
@@ -512,75 +512,46 @@ async def _enumerate_async(runtime: str, config_path: str | os.PathLike) -> list
     return result
 
 
-async def enumerate_loaded_mcp_tools_async(
-    runtime: str, config_path: str | os.PathLike
-) -> list[str] | None:
-    """Async enumeration of the connected MCP servers' tool inventory.
+async def enumerate_from_specs_async(servers: dict) -> list[str] | None:
+    """Boot-safe, bounded, never-raise enumeration of an adapter-supplied specs map.
 
-    Same tri-state contract as :func:`enumerate_loaded_mcp_tools`. BOOT-SAFE: the
-    whole enumeration is bounded by ``asyncio.wait_for(...,
-    _MCP_ENUMERATION_TIMEOUT_SECONDS)`` so even a pathological set of stalling
-    servers cannot stall boot past that bound — on the overall timeout we return
-    None (grace window applies). Never raises.
+    The public entry point an adapter override calls when IT read its runtime's
+    native MCP config (e.g. the hermes adapter parsing its own config.yaml
+    ``mcp_servers`` block). Same overall-deadline + tri-state + never-raise
+    guarantees as :func:`enumerate_loaded_mcp_tools_async`; the only difference is
+    the servers are supplied by the caller rather than read via the (legacy)
+    per-runtime switch.
     """
     try:
         return await asyncio.wait_for(
-            _enumerate_async(runtime, config_path),
+            _probe_specs_async(servers),
             timeout=_MCP_ENUMERATION_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         logger.warning(
-            "loaded_mcp_tools: overall enumeration exceeded %.0fs — leaving "
-            "producer unset (grace window applies)",
-            _MCP_ENUMERATION_TIMEOUT_SECONDS,
+            "loaded_mcp_tools: overall specs enumeration exceeded %.0fs — leaving "
+            "producer unset (grace window applies)", _MCP_ENUMERATION_TIMEOUT_SECONDS,
         )
         return None
     except Exception:  # noqa: BLE001 — enumeration must never crash boot
         logger.warning(
-            "loaded_mcp_tools: enumeration errored — leaving producer unset",
+            "loaded_mcp_tools: specs enumeration errored — leaving producer unset",
             exc_info=True,
         )
         return None
 
 
-def enumerate_loaded_mcp_tools(runtime: str, config_path: str | os.PathLike) -> list[str] | None:
-    """Synchronous enumeration of the connected MCP servers' tool inventory.
-
-    Thin sync wrapper that drives :func:`enumerate_loaded_mcp_tools_async` under
-    ``asyncio.run`` — itself bounded by the async overall deadline, so a caller on
-    a non-async path is equally protected from a stalling server. Prefer the async
-    entry point from an already-running event loop (e.g. ``main.py``); calling
-    this from inside a running loop will raise (asyncio.run), which the boot-path
-    capture wrapper catches.
-
-    Return contract (the load-bearing tri-state, REQUIREMENT 3):
-        * ``None``  — NO server could be enumerated (none declared, or every one
-          failed/timed out/stalled, or the config was unreadable). The caller
-          leaves the producer ``None`` so the heartbeat omits ``loaded_mcp_tools``
-          and core's grace window applies (fail-closed/degrade). Never a guessed
-          list.
-        * ``[]``    — at least one server connected but advertised zero MCP tools
-          (a genuine, observed "connected-but-toolless" signal).
-        * ``[ids]`` — the deduped/sorted union of tool ids that connected servers
-          advertised.
-
-    Never raises: any unexpected error is logged and mapped to ``None``.
-    """
-    try:
-        return asyncio.run(enumerate_loaded_mcp_tools_async(runtime, config_path))
-    except Exception:  # noqa: BLE001 — must never block/crash boot
-        logger.warning(
-            "loaded_mcp_tools: sync enumeration wrapper errored — "
-            "leaving producer unset", exc_info=True,
-        )
-        return None
-
-
-def read_mcp_servers(runtime: str, config_path: str | os.PathLike) -> dict:
-    """Thin indirection over ``mcp_render.read_mcp_servers_for`` (test seam)."""
-    from molecule_runtime.mcp_render import read_mcp_servers_for
-
-    return read_mcp_servers_for(runtime, config_path)
+# NOTE (ADR-004): the by-name enumeration entry points
+# ``enumerate_loaded_mcp_tools_async(runtime, config_path)`` /
+# ``enumerate_loaded_mcp_tools(runtime, config_path)`` and the ``read_mcp_servers``
+# indirection over the deleted ``mcp_render.read_mcp_servers_for`` switch are GONE.
+# The engine no longer resolves a runtime's declared servers by NAME — the per-
+# runtime shape (which native config, which format) moved INTO the adapter. Each
+# adapter reads its OWN native config and feeds the resolved ``{name: spec}`` map to
+# :func:`enumerate_from_specs_async`, the surviving generic, runtime-name-free,
+# boot-safe stdio probe engine (tri-state, bounded, never-raises). The BaseAdapter
+# default (``adapter_base.enumerate_loaded_mcp_tools``) does exactly that for a
+# not-yet-migrated / third-party adapter using the generic JSON reader.
 
 
 def _is_platform_agent() -> bool:
@@ -620,17 +591,29 @@ def _is_platform_agent() -> bool:
 
 
 async def capture_loaded_mcp_tools_at_init(
-    runtime: str, config_path: str | os.PathLike, *, force: bool = False
+    adapter: "BaseAdapter",
+    config: "AdapterConfig",
+    *,
+    force: bool = False,
 ) -> list[str] | None:
     """Enumerate the loaded MCP tool inventory and PUBLISH it to the producer.
 
     This is the one-call entry point ``main.py`` invokes (awaits) right after the
     executor is created (after MCP wiring, before serving). It is a coroutine
-    because the call site is already async; it enumerates via
-    :func:`enumerate_loaded_mcp_tools_async` and, ONLY when a real observation was
-    made (non-``None``), calls ``set_loaded_mcp_tools`` so the first heartbeat
-    carries the field. When enumeration yields ``None`` it leaves the producer
-    untouched (``None``), preserving the fail-closed grace-window semantics.
+    because the call site is already async; it enumerates and, ONLY when a real
+    observation was made (non-``None``), calls ``set_loaded_mcp_tools`` so the
+    first heartbeat carries the field. When enumeration yields ``None`` it leaves
+    the producer untouched (``None``), preserving the fail-closed grace-window
+    semantics.
+
+    RUNTIME-OWNS-DISCOVERY CONTRACT: enumeration is ALWAYS delegated to
+    ``adapter.enumerate_loaded_mcp_tools(config)`` — each runtime owns HOW it
+    discovers its loaded MCP tools. The ``adapter`` and ``config`` are the only
+    inputs needed: ``adapter.name()`` is the runtime and ``config.config_path`` is
+    the configs dir, so there is no separate ``runtime``/``config_path`` to thread
+    through. The base default reads the standard ``.claude``-style layout via the
+    shared core probe (claude/codex/openclaw are byte-identical); hermes overrides
+    it to read its own ``config.yaml``.
 
     kind=platform GATE (REQUIREMENT 3): unless ``force=True`` (tests), the
     enumeration only runs for the concierge (``_is_platform_agent()``). A
@@ -639,7 +622,7 @@ async def capture_loaded_mcp_tools_at_init(
     the cost and don't amplify the (now-bounded) hang blast-radius.
 
     Returns the value it observed (the same tri-state as
-    :func:`enumerate_loaded_mcp_tools_async`) for logging/testing. Never raises.
+    :func:`enumerate_from_specs_async`) for logging/testing. Never raises.
     """
     from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
 
@@ -651,7 +634,7 @@ async def capture_loaded_mcp_tools_at_init(
         return None
 
     try:
-        observed = await enumerate_loaded_mcp_tools_async(runtime, config_path)
+        observed = await adapter.enumerate_loaded_mcp_tools(config)
     except Exception:  # noqa: BLE001 — must never block boot
         logger.warning(
             "loaded_mcp_tools: init capture errored — leaving producer unset",
@@ -665,8 +648,8 @@ async def capture_loaded_mcp_tools_at_init(
 
 
 async def capture_loaded_mcp_tools_with_retry(
-    runtime: str,
-    config_path: str | os.PathLike,
+    adapter: "BaseAdapter",
+    config: "AdapterConfig",
     *,
     max_attempts: int = 40,
     interval_seconds: float = 2.0,
@@ -715,7 +698,7 @@ async def capture_loaded_mcp_tools_with_retry(
     for attempt in range(1, max_attempts + 1):
         try:
             observed = await capture_loaded_mcp_tools_at_init(
-                runtime, config_path, force=force
+                adapter, config, force=force
             )
         except Exception:  # noqa: BLE001 — a background task must never crash the loop
             logger.warning(

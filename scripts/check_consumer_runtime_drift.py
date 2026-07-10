@@ -38,8 +38,6 @@ DEFAULT_CONSUMERS = (
     "molecule-ai-workspace-template-hermes",
     "molecule-ai-workspace-template-openclaw",
     "molecule-ai-workspace-template-codex",
-    "molecule-ai-workspace-template-google-adk",
-    "molecule-ai-workspace-template-crewai",
     "molecule-core",
 )
 
@@ -60,6 +58,18 @@ EXEMPT_CONSUMERS = {
     "molecule-ai-workspace-template-seo-agent": (
         "config/prompts-only Claude-Code template; no Dockerfile / runtime wheel "
         "install / .runtime-version pin"
+    ),
+    "molecule-ai-workspace-template-google-adk": (
+        "RETIRED 2026-07-09 (runtime#264/#265, sdk#80, core#3730) — google-adk "
+        "dropped from the maintained runtime set; the template repo is archived and "
+        "no longer wheel-bumped, so its frozen .runtime-version pin is expected, not "
+        "drift. Kept here (not silently omitted) so reconcile_org_consumers still "
+        "accounts for every template repo."
+    ),
+    "molecule-ai-workspace-template-crewai": (
+        "RETIRED 2026-07-09 (runtime#264/#265, sdk#80, core#3730) — crewai dropped "
+        "from the maintained runtime set; the template repo is archived and no longer "
+        "wheel-bumped, so its frozen .runtime-version pin is expected, not drift."
     ),
 }
 

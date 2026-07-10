@@ -31,10 +31,12 @@ Enforcement is layered, and honestly scoped:
     pins every literal used here to this repo's vendored copy of the contract,
     so an in-repo edit that changes a literal without the contract (or vice
     versa) fails ``unit-tests`` before any image ships.
-  * CROSS-REPO (byte-identical core/template/runtime copies): enforced by
-    ``mcp-plugin-delivery-contract-drift`` in molecule-core. Adding this repo's
-    copy to that byte-compare set is a tracked follow-up — until it lands, the
-    cross-repo guarantee covers core<->template only, not yet the runtime copy.
+  * SDK-SSOT DRIFT (byte-identical to the canonical contract): this repo's
+    vendored ``contracts/mcp-plugin-delivery.contract.json`` is byte-gated against
+    the SDK SSOT (``molecule-ai-sdk:contracts/mcp/mcp-plugin-delivery.contract.json``)
+    by this repo's ``schema-sync`` workflow (``scripts/check-schemas-in-sync.sh``).
+    The core/template copies are additionally guarded by
+    ``mcp-plugin-delivery-contract-drift`` in molecule-core.
 
 Literal drift between producer and consumers is the exact bug this file was
 changed to fix; the contract + the runtime-local gate keep it from recurring
