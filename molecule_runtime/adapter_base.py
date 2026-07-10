@@ -118,6 +118,38 @@ class AdapterConfig:
 
 
 @dataclass(frozen=True)
+class SessionRef:
+    """A single agent session in a runtime's NATIVE session store.
+
+    The read-side value type for the session-lifecycle capability
+    (``session_list`` / ``session_current`` / ``session_start`` /
+    ``session_resume``). ``id`` is the runtime's OWN opaque session handle
+    (a Claude Code session uuid, a hermes/openclaw ``sessionFile`` stem, a
+    codex session id) — NEVER minted by the platform. Every descriptive field
+    is optional so an adapter reports only what its store actually knows; the
+    honest base default carries just ``id`` + ``is_active``.
+    """
+
+    id: str
+    label: str | None = None
+    created_at: float | None = None
+    last_active_at: float | None = None
+    message_count: int | None = None
+    is_active: bool = False
+
+    def to_dict(self) -> dict:
+        """Plain JSON shape for the A2A op / MCP tool result (Go-safe)."""
+        return {
+            "id": self.id,
+            "label": self.label,
+            "created_at": self.created_at,
+            "last_active_at": self.last_active_at,
+            "message_count": self.message_count,
+            "is_active": self.is_active,
+        }
+
+
+@dataclass(frozen=True)
 class RuntimeCapabilities:
     """Adapter-declared ownership of cross-cutting platform capabilities.
 
@@ -160,6 +192,14 @@ class RuntimeCapabilities:
     # requests; the adapter handles QUEUED-state on its own.
     provides_native_session: bool = False
 
+    # Session LIFECYCLE — adapter can ENUMERATE and SWITCH among MULTIPLE
+    # native sessions (session_list / session_start / session_resume), which is
+    # DISTINCT from provides_native_session (durability of the ONE in-flight
+    # session). False ⇒ single-session: session_list reports the one current
+    # session with ``supported: False`` and the canvas hides the switcher.
+    # Additive: default False keeps every existing adapter single-session.
+    provides_native_session_lifecycle: bool = False
+
     # Status lifecycle — adapter reports its own ready/degraded/failed
     # state (e.g. via heartbeat metadata). Platform respects the adapter
     # report instead of inferring status from heartbeat error rate.
@@ -187,6 +227,7 @@ class RuntimeCapabilities:
             "heartbeat": self.provides_native_heartbeat,
             "scheduler": self.provides_native_scheduler,
             "session": self.provides_native_session,
+            "session_lifecycle": self.provides_native_session_lifecycle,
             "status_mgmt": self.provides_native_status_mgmt,
             "retry": self.provides_native_retry,
             "activity_decoration": self.provides_activity_decoration,
@@ -428,6 +469,114 @@ class BaseAdapter(ABC):
         """
         self._snapshot_session_id: str | None = snapshot.get("session_id")
         self._snapshot_transcript: list | None = snapshot.get("transcript_lines")
+
+    # ---- Session lifecycle (ADR-004 capability seam) --------------------
+    # The SDK-owned session surface: enumerate + switch among a runtime's
+    # NATIVE sessions. These base defaults are the honest single-session
+    # fallback — like transcript_lines(), an adapter with no multi-session
+    # store reports ``supported: False`` rather than faking a list. The
+    # official adapters (claude-code / hermes / openclaw / codex) OVERRIDE
+    # the READ side (session_list / session_current) to read their native
+    # store (e.g. ~/.claude/projects/<cwd>/<session>.jsonl). The WRITE side
+    # (session_start / session_resume routing) is a follow-up phase; the base
+    # keeps it a no-op so this whole seam is purely ADDITIVE — it changes no
+    # existing routing and cannot regress the stable-session contract in
+    # subprocess_executor.py.
+
+    def _current_session_ref(self) -> "SessionRef | None":
+        """The active session as a SessionRef, from the executor's stable id.
+
+        Reads ``self._executor._session_id`` (the workspace-keyed stable id
+        the SessionManager resumes each turn). Returns None before an
+        executor/session exists. Adapters with a richer native store override
+        session_current() to add label/timestamps.
+        """
+        executor = getattr(self, "_executor", None)
+        session_id = getattr(executor, "_session_id", None) if executor else None
+        if not session_id:
+            return None
+        return SessionRef(id=str(session_id), is_active=True)
+
+    async def session_current(self) -> dict:
+        """Return the ACTIVE session — the one turns route to right now.
+
+        Default reads the stable workspace-keyed id via _current_session_ref().
+        Returns ``{runtime, supported, session}`` where ``session`` is a
+        SessionRef dict or None. ``supported`` mirrors the lifecycle
+        capability flag; the current session is reported honestly regardless.
+        """
+        ref = self._current_session_ref()
+        return {
+            "runtime": self.name(),
+            "supported": self.capabilities().provides_native_session_lifecycle,
+            "session": ref.to_dict() if ref else None,
+        }
+
+    async def session_list(self) -> dict:
+        """List the workspace's native sessions (read side).
+
+        Honest single-session default: reports the ONE current session with
+        ``supported: False``. Adapters that keep a native session store
+        (claude-code JSONL projects dir, hermes/openclaw sessionFile, codex
+        sessions) OVERRIDE this to enumerate the store — id, label (first
+        user line), created/last-active, message_count — and set
+        ``supported: True``.
+
+        Returns:
+            ``{runtime, supported, sessions, active_id}`` where ``sessions``
+            is a list of SessionRef dicts and ``active_id`` is the id turns
+            currently route to (or None).
+        """
+        ref = self._current_session_ref()
+        return {
+            "runtime": self.name(),
+            "supported": False,
+            "sessions": [ref.to_dict()] if ref else [],
+            "active_id": ref.id if ref else None,
+        }
+
+    async def session_start(self, label: str | None = None) -> dict:
+        """Begin a NEW native session (write side) — an explicit clean slate.
+
+        Base default is a no-op that reports ``supported: False`` (a
+        single-session runtime cannot open a second session). The active-
+        session pointer + the ``subprocess_executor`` indirection that make
+        this route to a fresh native session are a follow-up phase, so this
+        method changes no routing today.
+
+        Args:
+            label: optional human title for the new session (adapters that
+                keep titles use it; the default ignores it).
+
+        Returns:
+            ``{runtime, supported, session, started}``.
+        """
+        return {
+            "runtime": self.name(),
+            "supported": False,
+            "session": None,
+            "started": False,
+        }
+
+    async def session_resume(self, session_id: str) -> dict:
+        """Switch the active session to an existing one (write side).
+
+        Base default is a no-op reporting ``supported: False``. Adapters with
+        a native store + the active-pointer follow-up validate ``session_id``
+        exists and route subsequent turns to it.
+
+        Args:
+            session_id: the native session id to resume (from session_list).
+
+        Returns:
+            ``{runtime, supported, session, resumed}``.
+        """
+        return {
+            "runtime": self.name(),
+            "supported": False,
+            "session": None,
+            "resumed": False,
+        }
 
     def register_subagent_hook(self, name: str, spec: dict) -> None:
         """Default no-op. Sub-agent-capable runtimes override to register a sub-agent."""
