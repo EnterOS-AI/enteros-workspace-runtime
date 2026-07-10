@@ -5,6 +5,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor
@@ -432,44 +433,46 @@ class BaseAdapter(ABC):
         """Default no-op. Sub-agent-capable runtimes override to register a sub-agent."""
         return None
 
-    # MCP-server config path where THIS runtime reads its mcpServers from.
-    # The default DISPATCHES on self.name() through molecule_runtime.mcp_render,
-    # so a codex run resolves ~/.codex/config.toml and a claude run resolves
-    # .claude/settings.json — no per-template override needed. An adapter MAY
-    # still override mcp_settings_path()/register_mcp_server_hook() for a runtime
-    # mcp_render doesn't map.
+    # MCP-config seam (ADR-004 §3). These base defaults are name-AGNOSTIC: per
+    # ADR-004 the per-runtime shape (renderers/readers/present-probes) moved OUT
+    # of the shared engine and INTO each adapter, so the base NO LONGER dispatches
+    # on self.name(). The four official adapters (claude-code / codex / hermes /
+    # openclaw) OVERRIDE every method below to their OWN native format in their
+    # template repos, so these defaults are only the fallback for a not-yet-migrated
+    # / third-party adapter that hasn't implemented the seam. The default is a
+    # single generic JSON ``mcpServers`` native config (mcp_render's name-free
+    # helpers) at the reference path ``<config_path>/.claude/settings.json`` — it
+    # spells no runtime name. An adapter whose runtime reads a different file/format
+    # MUST override these (that is what the official four do).
     def mcp_settings_path(self, config: "AdapterConfig") -> str:
-        """Native MCP-config file for THIS runtime (``self.name()``), absolute.
+        """Default native MCP-config file, absolute — the generic JSON
+        ``mcpServers`` config at ``<config_path>/.claude/settings.json``.
 
-        Dispatches on the active runtime via
-        :func:`molecule_runtime.mcp_render.mcp_settings_path_for` —
-        ``.claude/settings.json`` for Claude Code, ``~/.codex/config.toml`` for
-        codex, etc. An unmapped runtime falls back to the Claude path (the base
-        runtime). Tied to the
-        cross-repo delivery contract's per-runtime ``settings_path`` map."""
-        from molecule_runtime.mcp_render import mcp_settings_path_for
-        return str(mcp_settings_path_for(self.name(), config.config_path))
+        Name-agnostic base fallback (ADR-004: no self.name() dispatch). An adapter
+        whose runtime reads a different native file (codex ``~/.codex/config.toml``,
+        openclaw ``~/.openclaw/openclaw.json``, hermes ``~/.hermes/config.yaml``)
+        OVERRIDES this — the official four all do."""
+        from molecule_runtime.mcp_render import default_json_settings_path
+        return str(default_json_settings_path(config.config_path))
 
     def register_mcp_server_hook(self, config: "AdapterConfig", name: str, spec: dict) -> None:
-        """Wire an MCP server into THIS runtime's native config (the MCP-wiring PORT).
+        """Wire an MCP server into the default native config (the MCP-wiring PORT).
 
-        DISPATCHES on the active runtime (``self.name()``) through
-        :func:`molecule_runtime.mcp_render.render_for_runtime`, so the SAME
-        production path (``install_plugins_via_registry`` → this hook) renders
-        the descriptor into the file the running runtime actually reads — codex →
-        ``~/.codex/config.toml``, claude → ``.claude/settings.json``, hermes →
-        ``~/.hermes/config.yaml`` — WITHOUT a per-template adapter override.
-        This is the fix for the #3159 flaw where a concierge got the management
-        MCP written to a config file its runtime never reads and so booted
-        without ``create_workspace``.
+        Name-agnostic base fallback (ADR-004 §3): additively merges the
+        ``{command, args?, env?}`` descriptor into the generic JSON ``mcpServers``
+        map at the default path (``mcp_render.render_json_mcp_servers`` on
+        ``mcp_settings_path``). Additive + idempotent; writes only that one file.
+        An adapter whose runtime reads a different native format OVERRIDES this to
+        render its OWN file — the official four (claude-code JSON, codex TOML,
+        hermes/openclaw YAML/JSON) all do, so this fallback is only for a
+        not-yet-migrated / third-party adapter.
 
-        An unverified runtime (gemini/google-adk) renders via a deliberate
-        NotImplementedError stub — caught by ``MCPServerAdaptor.install``, which
-        fails the privileged management-MCP install LOUDLY rather than booting a
-        silently capability-less concierge. An adapter for such a runtime may
-        override this method once its native format is verified.
+        Enriches the privileged management-MCP spec via ``inject_privileged_env``
+        first (no-op for non-management names; idempotent; descriptor-wins) — the
+        same enrichment the install funnel applies — so a direct caller (e.g. the
+        ensure_management_mcp_in_settings self-heal) gets the enriched spec too.
         """
-        from molecule_runtime.mcp_render import render_for_runtime
+        from molecule_runtime.mcp_render import render_json_mcp_servers
         from molecule_runtime.privileged_mcp_env import inject_privileged_env
 
         # F2 belt-and-suspenders: enrich the privileged MCP spec for any caller
@@ -478,44 +481,46 @@ class BaseAdapter(ABC):
         # non-management names; idempotent + descriptor-wins, so re-running over an
         # already-enriched spec changes nothing.
         spec = inject_privileged_env(name, spec)
-        target = render_for_runtime(self.name(), config.config_path, name, spec)
+        target = Path(self.mcp_settings_path(config))
+        render_json_mcp_servers(target, name, spec)
         logger.info("register_mcp_server_hook: wired MCP %r into %s (runtime=%s)",
                     name, target, self.name())
 
     def management_mcp_present(self, config: "AdapterConfig") -> bool:
         """True when the privileged management MCP (``molecule-platform``) is
-        wired into THIS runtime's native MCP config.
+        wired into the default native MCP config.
 
-        Runtime-agnostic answer to the RCA#2970 online gate's "is the management
-        MCP wired?" question — DISPATCHES on ``self.name()`` via
-        :func:`molecule_runtime.mcp_render.management_mcp_present_for`, so a codex
-        concierge is judged against ``~/.codex/config.toml`` (parsed as TOML) and
-        a claude concierge against ``.claude/settings.json``, rather than every
-        runtime being judged against a Claude file it may never read (#3159).
+        Name-agnostic base fallback (ADR-004: no self.name() dispatch) — judges the
+        generic JSON ``mcpServers`` config at ``mcp_settings_path``
+        (``mcp_render.json_mcp_servers_has``). Fail-CLOSED: a missing / unreadable /
+        malformed / structurally-unexpected config yields ``False``, so a genuinely
+        MCP-less concierge stays degraded at the RCA#2970 gate. An adapter whose
+        runtime reads a different native file OVERRIDES this (the official four do).
 
         main.py registers this as the gate probe via
         ``platform_agent_identity.register_mcp_present_probe`` once the adapter
         is resolved.
         """
-        from molecule_runtime.mcp_render import management_mcp_present_for
+        from molecule_runtime.mcp_render import json_mcp_servers_has
         from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
 
-        return management_mcp_present_for(self.name(), config.config_path, MANAGEMENT_MCP_NAME)
+        return json_mcp_servers_has(Path(self.mcp_settings_path(config)), MANAGEMENT_MCP_NAME)
 
     async def enumerate_loaded_mcp_tools(
         self, config: "AdapterConfig"
     ) -> "list[str] | None":
         """Return the LOADED MCP tool ids this runtime actually has, or None.
 
-        RUNTIME CONTRACT (runtime#181) — the seam that replaces core's hardcoded
-        per-runtime enumeration switch (``mcp_render.read_mcp_servers_for``). Each
-        adapter answers for ITS OWN runtime, however it knows best: the default
-        below stdio-spawns + probes the runtime's native config via the shared
-        boot-safe core engine (claude-code / codex / openclaw need no override);
-        a runtime whose MCP config lives in a place / format core can't guess
-        (hermes: its own ``config.yaml`` ``mcp_servers`` block) OVERRIDES this to
-        read its own config and hand the resolved ``{name: spec}`` map to
-        :func:`loaded_mcp_tools_probe.enumerate_from_specs_async`.
+        RUNTIME CONTRACT (runtime#181): each adapter answers for ITS OWN runtime,
+        however it knows best. This name-agnostic base fallback (ADR-004: no
+        self.name() dispatch) reads the DEFAULT native config's declared servers
+        (the generic JSON ``mcpServers`` map at ``mcp_settings_path``, via
+        ``mcp_render.read_json_mcp_servers``) and hands the resolved ``{name: spec}``
+        map to the shared boot-safe stdio probe engine
+        (:func:`loaded_mcp_tools_probe.enumerate_from_specs_async`) — the generic,
+        runtime-name-free engine the platform keeps. An adapter whose native MCP
+        config lives elsewhere / in another format OVERRIDES this to read its own
+        config and feed the same probe engine — the official four all do.
 
         TRI-STATE (identical to the loaded_mcp_tools producer contract):
           * ``None`` — nothing could be observed (no servers declared, or all
@@ -525,37 +530,41 @@ class BaseAdapter(ABC):
           * ``[ids]`` — deduped/sorted union of observed ``mcp__<server>__<tool>``
             ids.
 
-        BOOT-SAFE + NEVER-RAISES: the default (and every override) is internally
-        bounded by the core enumeration deadline and maps every failure to None.
+        BOOT-SAFE + NEVER-RAISES: ``enumerate_from_specs_async`` bounds the whole
+        probe by the enumeration deadline and maps every failure to None.
         """
-        from molecule_runtime.loaded_mcp_tools_probe import (
-            enumerate_loaded_mcp_tools_async,
-        )
+        from molecule_runtime.loaded_mcp_tools_probe import enumerate_from_specs_async
+        from molecule_runtime.mcp_render import read_json_mcp_servers
 
-        return await enumerate_loaded_mcp_tools_async(self.name(), config.config_path)
+        try:
+            servers = read_json_mcp_servers(Path(self.mcp_settings_path(config)))
+        except Exception:  # noqa: BLE001 — enumeration must never crash boot
+            logger.warning(
+                "enumerate_loaded_mcp_tools: could not read declared MCP servers "
+                "for runtime=%s — leaving producer unset (grace window applies)",
+                self.name(), exc_info=True,
+            )
+            return None
+        return await enumerate_from_specs_async(servers)
 
     def materialize_persona(self, config: "AdapterConfig") -> "Any":
-        """Materialize the workspace's CANONICAL PERSONA into THIS runtime's
-        native identity file (the persona-materialization PORT).
+        """Materialize the workspace's CANONICAL PERSONA into the default native
+        identity file (the persona-materialization PORT).
 
-        DISPATCHES on the active runtime (``self.name()``) through
-        :func:`molecule_runtime.persona_render.materialize_persona_for`, so a
-        workspace on ANY runtime boots with its intended identity — even runtimes
-        whose gateway/CLI reads a native identity file and never consumes the
-        base-assembled ``config.system_prompt`` (openclaw → SOUL.md, codex →
-        AGENTS.md, gemini/google-adk → GEMINI.md, claude-code → system-prompt.md).
-
-        The canonical persona is read runtime-agnostically from the delivered
-        ``config.prompt_files`` (a concierge's ``prompts/concierge.md``; a member's
-        role prompt), so this is the runtime half of core #3418's provision half:
-        the delivered persona actually becomes the model's on-disk identity for the
-        ACTUAL runtime, not just claude-code.
+        Name-agnostic base fallback (ADR-004: no self.name() dispatch). Reads the
+        canonical persona runtime-agnostically from the delivered
+        ``config.prompt_files`` (``persona_render.read_canonical_persona`` — the one
+        generic, runtime-name-free helper the engine keeps), then writes it to the
+        DEFAULT identity file ``<config_path>/system-prompt.md``
+        (``persona_render.write_persona`` at ``persona_render.default_persona_path``).
+        An adapter whose runtime reads a different native identity file (openclaw
+        SOUL.md, codex AGENTS.md, hermes ~/.hermes/SOUL.md) OVERRIDES this to write
+        its OWN file — the official four all do, so this fallback is only for a
+        not-yet-migrated / third-party adapter.
 
         Best-effort by design: returns ``None`` (no-op) when no persona is
-        delivered, and downgrades an unverified-runtime ``NotImplementedError``
-        (hermes) to a warning — a persona is not a privileged capability like the
-        management MCP, so a missing native convention must never brick the boot.
-        Returns the path written, or ``None``.
+        delivered — a persona is not a privileged capability like the management
+        MCP, so this never bricks boot. Returns the path written, or ``None``.
         """
         from molecule_runtime import persona_render
 
@@ -569,23 +578,12 @@ class BaseAdapter(ABC):
                 self.name(),
             )
             return None
-        try:
-            target = persona_render.materialize_persona_for(
-                self.name(), config.config_path, persona
-            )
-        except NotImplementedError as exc:
-            logger.warning(
-                "materialize_persona: runtime %s has no verified native persona "
-                "convention — persona NOT materialized (%s). The delivered persona "
-                "still reaches any runtime that consumes config.system_prompt.",
-                self.name(), exc,
-            )
-            return None
-        if target is not None:
-            logger.info(
-                "materialize_persona: wrote %s persona (%d chars) to %s",
-                self.name(), len(persona), target,
-            )
+        target = persona_render.default_persona_path(config.config_path)
+        persona_render.write_persona(target, persona)
+        logger.info(
+            "materialize_persona: wrote %s persona (%d chars) to %s",
+            self.name(), len(persona), target,
+        )
         return target
 
     def append_to_memory_hook(self, config: AdapterConfig, filename: str, content: str) -> None:

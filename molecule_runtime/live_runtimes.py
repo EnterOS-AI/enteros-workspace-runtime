@@ -1,32 +1,30 @@
 """SSOT for the set of LIVE runtimes and the operator-default runtime.
 
-This module is the *single list* every cross-runtime contract derives from, so
-the runtime axis is declared ONCE and never hand-copied into each renderer /
-test. Guard A (the cross-runtime contract meta-gate) parametrizes its matrix over
-``LIVE_RUNTIMES`` × every registered SDK contract, and the per-contract renderers
-import ``DEFAULT_RUNTIME`` from here for their unmapped-runtime fallback — so the
-"reference runtime" can never silently drift back to ``claude_code``.
+This module is the *single list* of the runtimes a workspace can boot on today,
+declared ONCE. It is the **membership SSOT** the SDK official registry references
+(``molecule-ai-sdk:contracts/adapter/official-runtimes.registry.json`` ->
+``live_runtimes_ssot``); the manifest/skill-gating story reads it too.
 
-Why a dedicated SSOT
---------------------
-Before this module the runtime set lived implicitly and INCONSISTENTLY across the
-contract registries (``mcp_render._RUNTIME_SPECS`` lacked ``google_adk`` while
-``persona_render._RUNTIME_PERSONA`` had it) and the unmapped fallback was
-hand-set to ``claude_code`` in two places. That divergence is exactly how a
-"claude-code only" contract slips in: a new runtime or a new contract is added
-without every cell being covered, and the silent ``claude_code`` fallback hides
-the gap at runtime. Deriving the axis + the default from one list makes the gap a
-RED test instead of a latent capability loss.
+ADR-004 note
+------------
+This module NO LONGER feeds a per-runtime *dispatch* fallback. Before ADR-004 the
+shared engine held per-runtime renderers/readers/materializers in ``_RUNTIME_*``
+dispatch tables (``mcp_render._RUNTIME_SPECS`` / ``persona_render._RUNTIME_PERSONA``)
+and imported ``DEFAULT_RUNTIME`` from here as their unmapped-runtime fallback. ADR-004
+moved that per-runtime shape INTO each adapter and deleted the engine dispatch
+tables, so the engine no longer resolves a runtime by name and no longer imports
+``DEFAULT_RUNTIME``. ``LIVE_RUNTIMES`` / ``DEFAULT_RUNTIME`` remain as the plain
+membership + operator-default facts (a tuple + a string — carrying NO dispatch),
+consumed by the SDK registry and any membership/policy check that needs the axis.
 
 Membership policy
 -----------------
-``LIVE_RUNTIMES`` is the set of runtimes a workspace can actually boot on today
-(the design SSOT ``regression-prevention-guards.md`` §Guard A). It is a curated
-subset of the broader manifest ``runtimes`` enum
+``LIVE_RUNTIMES`` is the set of runtimes a workspace can actually boot on today. It
+is a curated subset of the broader manifest ``runtimes`` enum
 (``contracts/plugin-manifest.schema.json`` — which also carries not-yet-live /
-external values like ``crewai`` / ``external``). Adding a runtime here forces the
-Guard A meta-gate to demand a concrete adapter OR a documented fail-loud
-exemption for it in EVERY registered contract.
+external values like ``crewai`` / ``external``). Adding a runtime here declares it
+part of the officially-supported axis; its adapter (in the template repo) is what
+implements the SDK adapter socket for it — the engine holds nothing per-runtime.
 """
 from __future__ import annotations
 

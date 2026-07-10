@@ -899,10 +899,13 @@ async def main():  # pragma: no cover
             )
             global _LOADED_MCP_TOOLS_BG_TASK
             _LOADED_MCP_TOOLS_BG_TASK = asyncio.create_task(
-                # runtime#181: pass the resolved adapter so enumeration goes
-                # through the runtime-owns-discovery contract
-                # (adapter.enumerate_loaded_mcp_tools) — hermes reads its own
-                # config.yaml; claude/codex/openclaw use the base default.
+                # runtime#181 / ADR-004: pass the resolved adapter so enumeration
+                # goes through the runtime-owns-discovery contract
+                # (adapter.enumerate_loaded_mcp_tools). Each adapter reads its OWN
+                # native config and feeds the resolved specs to the generic engine
+                # (enumerate_from_specs_async); the engine never resolves servers by
+                # runtime name. The BaseAdapter default handles a not-yet-migrated /
+                # third-party adapter via the generic JSON reader.
                 capture_loaded_mcp_tools_with_retry(adapter, adapter_config)
             )
             print(

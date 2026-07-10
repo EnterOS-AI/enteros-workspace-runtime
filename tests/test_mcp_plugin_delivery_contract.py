@@ -228,20 +228,32 @@ def test_legacy_binary_alone_satisfies_contract_gate(
 
 
 # ===========================================================================
-# RFC §5b Addition 1 — per-runtime MCP render matrix.
+# ADR-004 — the plugin→runtime MCP shape lives in the ADAPTER, not the engine.
 # ===========================================================================
-# The bug this whole change fixes (#3159): a codex/hermes concierge had the
-# management MCP written to .claude/settings.json — a file its runtime never
-# reads — so it booted WITHOUT create_workspace and the RCA#2970 gate fail-
-# closed it offline. These tests are the regression net: for every runtime,
-# assert the renderer writes the RIGHT native config, and ASSERT NEGATIVELY
-# that codex does NOT write .claude/settings.json. A renderer regression that
-# re-introduces the "always write claude settings.json" behavior fails here
-# before any image ships.
+# The bug this whole line of work fixes (#3159): a codex/hermes concierge had the
+# management MCP written to .claude/settings.json — a file its runtime never reads
+# — so it booted WITHOUT create_workspace and the RCA#2970 gate fail-closed it
+# offline. ADR-004 relocated the per-runtime render/read/present OUT of the shared
+# engine (the deleted mcp_render.render_codex_config / render_hermes_config /
+# render_claude_settings / _RUNTIME_SPECS dispatch) and INTO each adapter's
+# template repo. So the #3159 regression net now lives in TWO places:
+#
+#   * PER-ADAPTER (native format): each template's SDK conformance suite
+#     (``molecule_plugin.adapter_conformance`` — 16 checks) proves that adapter's
+#     OWN register→read→present round-trips on ITS native file (codex → config.toml,
+#     hermes → config.yaml, openclaw → openclaw.json) and NEVER false-greens against
+#     claude's settings.json (the ``test_unmapped_runtime_*`` fail-closed checks +
+#     ``test_native_mcp_path_is_runtime_specific``). Run in each template repo.
+#
+#   * BASE DEFAULT (this file): the BaseAdapter fallback — the ONLY thing that
+#     survives in this engine repo — is now name-AGNOSTIC. A name-only adapter (one
+#     that overrides NOTHING but name()) gets the generic JSON ``mcpServers`` default
+#     at ``<config_path>/.claude/settings.json``. It does NOT dispatch codex→toml /
+#     hermes→yaml by name any more (that per-runtime shape moved into the adapter).
+#     The tests below pin that ADR-004 base-default contract + the delivery-contract
+#     SSOT literals.
 
 import pytest  # noqa: E402
-import tomllib  # noqa: E402
-import yaml  # noqa: E402
 
 from molecule_runtime import mcp_render  # noqa: E402
 
@@ -253,8 +265,11 @@ _PLATFORM_SPEC = {
 
 
 def test_runtime_matrix_contract_present():
-    """The contract enumerates a per-runtime map; platform runtimes must be
-    concretely implemented (not stubs)."""
+    """The delivery contract enumerates a per-runtime map; platform runtimes must
+    be concretely implemented (not stubs). This is the SSOT the SDK official
+    registry mirrors — unchanged by ADR-004 (the CONTRACT still declares the
+    per-runtime native path/format; the IMPLEMENTATION of it moved into the
+    adapters)."""
     runtimes = CONTRACT["runtimes"]
     assert runtimes["claude_code"]["status"] == "implemented"
     assert runtimes["codex"]["status"] == "implemented"
@@ -262,100 +277,30 @@ def test_runtime_matrix_contract_present():
     assert runtimes["hermes"]["status"] == "implemented"
 
 
-def test_claude_render_writes_settings_json(tmp_path):
+def test_base_default_json_render_writes_mcpservers(tmp_path):
+    """The generic JSON ``mcpServers`` renderer the BaseAdapter default uses writes
+    the descriptor byte-stably (ADR-004 kept this as the ONE name-free renderer; the
+    per-runtime renderers moved into the adapters). Byte-shape: json.dumps(indent=2)
+    + trailing newline — the golden-parity invariant, unchanged from the deleted
+    claude renderer."""
     settings = tmp_path / ".claude" / "settings.json"
-    mcp_render.render_claude_settings(settings, "molecule-platform", _PLATFORM_SPEC)
+    mcp_render.render_json_mcp_servers(settings, "molecule-platform", _PLATFORM_SPEC)
     assert settings.is_file()
     data = json.loads(settings.read_text())
     assert data["mcpServers"]["molecule-platform"] == _PLATFORM_SPEC
-
-
-def test_codex_render_writes_config_toml_AND_NOT_claude_settings(tmp_path):
-    """THE test that would have caught #3159: codex → config.toml, and the
-    Claude settings.json is NOT touched."""
-    config_toml = tmp_path / ".codex" / "config.toml"
-    claude_settings = tmp_path / ".claude" / "settings.json"
-
-    mcp_render.render_codex_config(config_toml, "molecule-platform", _PLATFORM_SPEC)
-
-    # Wrote the codex-native file...
-    assert config_toml.is_file(), "codex render must write ~/.codex/config.toml"
-    parsed = tomllib.loads(config_toml.read_text())
-    entry = parsed["mcp_servers"]["molecule-platform"]
-    assert entry["command"] == "npx"
-    assert entry["args"] == ["-y", "@molecule-ai/mcp-server"]
-    assert entry["env"]["MOLECULE_MCP_MODE"] == "management"
-
-    # ...and crucially did NOT write the Claude settings.json. This negative
-    # assertion is the #3159 regression guard.
-    assert not claude_settings.exists(), (
-        "codex render must NOT write .claude/settings.json (the #3159 bug)"
-    )
-
-
-def test_codex_render_idempotent_and_additive(tmp_path):
-    """Re-rendering the same server is idempotent; a second server is additive."""
-    config_toml = tmp_path / "config.toml"
-    mcp_render.render_codex_config(config_toml, "molecule-platform", _PLATFORM_SPEC)
-    first = config_toml.read_text()
-    # Re-install same server → byte-stable (no duplicate table).
-    mcp_render.render_codex_config(config_toml, "molecule-platform", _PLATFORM_SPEC)
-    assert config_toml.read_text() == first
-    parsed = tomllib.loads(config_toml.read_text())
-    assert list(parsed["mcp_servers"].keys()) == ["molecule-platform"]
-
-    # Add a second server → both present, original untouched.
-    mcp_render.render_codex_config(
-        config_toml, "other-mcp", {"command": "uvx", "args": ["other"]}
-    )
-    parsed = tomllib.loads(config_toml.read_text())
-    assert set(parsed["mcp_servers"].keys()) == {"molecule-platform", "other-mcp"}
-    assert parsed["mcp_servers"]["molecule-platform"]["command"] == "npx"
-
-
-def test_codex_render_preserves_handwritten_config(tmp_path):
-    """A hand-written top-of-file setting outside our markers survives a render."""
-    config_toml = tmp_path / "config.toml"
-    config_toml.write_text('model = "gpt-5.5"\n')
-    mcp_render.render_codex_config(config_toml, "molecule-platform", _PLATFORM_SPEC)
-    parsed = tomllib.loads(config_toml.read_text())
-    assert parsed["model"] == "gpt-5.5"
-    assert "molecule-platform" in parsed["mcp_servers"]
-
-
-@pytest.mark.parametrize("renderer_name", ["render_gemini_config"])
-def test_unverified_runtimes_are_explicit_stubs(tmp_path, renderer_name):
-    """Unverified renderers are honest NotImplementedError stubs — NOT silent
-    wrong writes."""
-    renderer = getattr(mcp_render, renderer_name)
-    with pytest.raises(NotImplementedError):
-        renderer(tmp_path / "out", "molecule-platform", _PLATFORM_SPEC)
-
-
-def test_hermes_render_writes_native_config(tmp_path):
-    """Hermes renders to ~/.hermes/config.yaml and NOT .claude/settings.json."""
-    config_yaml = tmp_path / ".hermes" / "config.yaml"
-    claude_settings = tmp_path / ".claude" / "settings.json"
-
-    mcp_render.render_hermes_config(config_yaml, "molecule-platform", _PLATFORM_SPEC)
-
-    assert config_yaml.is_file(), "hermes render must write ~/.hermes/config.yaml"
-    parsed = yaml.safe_load(config_yaml.read_text())
-    entry = parsed["mcp_servers"]["molecule-platform"]
-    assert entry["command"] == "npx"
-    assert entry["args"] == ["-y", "@molecule-ai/mcp-server"]
-    assert entry["env"]["MOLECULE_MCP_MODE"] == "management"
-    assert not claude_settings.exists(), (
-        "hermes render must NOT write .claude/settings.json (the #3159 bug)"
-    )
+    # byte-shape pinned (the migration must not churn native output)
+    assert settings.read_text() == json.dumps(
+        {"mcpServers": {"molecule-platform": _PLATFORM_SPEC}}, indent=2
+    ) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# PORT default-dispatch matrix: the BaseAdapter DEFAULT hook renders per-runtime
-# by dispatching on self.name() — a codex adapter that overrides NOTHING but
-# name() must still get codex rendering. This is the production-path guarantee
-# the reviewers (CR2 #13467 / Researcher #13468) flagged as the gap: without it
-# a real codex concierge writes the MCP to .claude/settings.json (the #3159 bug).
+# PORT default matrix (ADR-004): the BaseAdapter DEFAULT hook is name-AGNOSTIC.
+# A name-only adapter (overrides NOTHING but name()) writes the generic JSON
+# ``mcpServers`` default — it NO LONGER dispatches codex→toml / hermes→yaml by
+# name (that per-runtime shape moved into the adapter's own override, proven by
+# the template's SDK conformance suite). The real codex/hermes/openclaw adapters
+# get their native format because they OVERRIDE the seam, not via base dispatch.
 # ---------------------------------------------------------------------------
 
 from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter  # noqa: E402
@@ -364,7 +309,8 @@ from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter  # noqa: E4
 class _BaseTestAdapter(BaseAdapter):
     """A no-override adapter: only name() differs per subclass. It deliberately
     does NOT override mcp_settings_path / register_mcp_server_hook /
-    management_mcp_present — proving the DEFAULT dispatch closes the loop."""
+    management_mcp_present — so it exercises the ADR-004 name-agnostic BASE
+    DEFAULT (generic JSON ``mcpServers``), NOT any per-runtime native format."""
 
     @staticmethod
     def display_name():
@@ -393,13 +339,17 @@ class _CodexOnlyNameAdapter(_BaseTestAdapter):
         return "codex"
 
 
-class _HermesOnlyNameAdapter(_BaseTestAdapter):
+class _ThirdPartyNameAdapter(_BaseTestAdapter):
     @staticmethod
     def name():
-        return "hermes"
+        return "some-third-party-runtime"
 
 
-def test_default_hook_dispatches_claude_for_claude_runtime(tmp_path):
+def test_base_default_writes_generic_json_and_present_probes_it(tmp_path):
+    """The name-agnostic base default: render → present round-trips on the generic
+    JSON ``mcpServers`` config at ``<config_path>/.claude/settings.json`` for ANY
+    adapter that doesn't override the seam (here a claude-named one). This is the
+    ADR-004 replacement for the deleted engine lockstep."""
     cfg = AdapterConfig(model="anthropic:claude-sonnet-4-6", config_path=str(tmp_path))
     adapter = _ClaudeOnlyNameAdapter()
     assert adapter.management_mcp_present(cfg) is False
@@ -408,99 +358,59 @@ def test_default_hook_dispatches_claude_for_claude_runtime(tmp_path):
     assert adapter.management_mcp_present(cfg) is True
 
 
-def test_default_hook_dispatches_CODEX_for_codex_runtime(tmp_path, monkeypatch):
-    """THE production-path regression guard: a codex adapter that overrides only
-    name() gets codex config.toml from the DEFAULT hook — and NOT
-    .claude/settings.json. Codex resolves ~/.codex/config.toml, so we redirect
-    HOME into tmp."""
+def test_base_default_is_name_agnostic_codex_name_gets_generic_json(tmp_path, monkeypatch):
+    """ADR-004 CONTRACT INVERSION (was: 'default hook dispatches CODEX for codex').
+    A codex-NAMED adapter that overrides ONLY name() now gets the GENERIC JSON
+    default (``<config_path>/.claude/settings.json``), NOT ~/.codex/config.toml —
+    because the base no longer dispatches by runtime name. The REAL codex adapter
+    writes config.toml because it OVERRIDES register_mcp_server_hook (proven by the
+    codex template's SDK conformance suite), not via the base."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
 
-    cfg = AdapterConfig(model="openai:gpt-5.5", config_path=str(tmp_path / "configs"))
+    configs = tmp_path / "configs"
+    cfg = AdapterConfig(model="openai:gpt-5.5", config_path=str(configs))
     adapter = _CodexOnlyNameAdapter()
     assert adapter.management_mcp_present(cfg) is False
 
     adapter.register_mcp_server_hook(cfg, "molecule-platform", _PLATFORM_SPEC)
 
-    codex_cfg = home / ".codex" / "config.toml"
-    assert codex_cfg.is_file(), "default hook must render codex config.toml for runtime=codex"
-    parsed = tomllib.loads(codex_cfg.read_text())
-    assert "molecule-platform" in parsed["mcp_servers"]
-    # Negative: claude settings.json NOT written by a codex run (#3159).
-    assert not (tmp_path / "configs" / ".claude" / "settings.json").exists()
-    # The gate probe also reads codex's config.toml, not claude settings.json.
+    # ADR-004: the base default wrote the GENERIC JSON config, not codex's toml.
+    assert (configs / ".claude" / "settings.json").is_file(), (
+        "the name-agnostic base default writes the generic JSON mcpServers config"
+    )
+    assert not (home / ".codex" / "config.toml").exists(), (
+        "the base default is name-agnostic — it does NOT render codex's config.toml "
+        "by name (that per-runtime shape moved into the codex adapter's override)"
+    )
+    # The base present-probe reads that same generic JSON config (render/present
+    # lockstep on the base default's own file).
     assert adapter.management_mcp_present(cfg) is True
 
 
-def test_default_hook_dispatches_HERMES_for_hermes_runtime(tmp_path, monkeypatch):
-    """A Hermes adapter that overrides only name() gets Hermes config.yaml from
-    the DEFAULT hook — and NOT .claude/settings.json."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-
-    cfg = AdapterConfig(model="nous:hermes", config_path=str(tmp_path / "configs"))
-    adapter = _HermesOnlyNameAdapter()
-    assert adapter.management_mcp_present(cfg) is False
-
+def test_base_default_third_party_runtime_gets_generic_json(tmp_path):
+    """A genuinely third-party runtime name (no override) also gets the generic
+    JSON default — ADR-004's 'bring your own adapter' seam: a third party gets a
+    sane fail-closed default from the base, then overrides the seam to render its
+    own native format."""
+    configs = tmp_path / "configs"
+    cfg = AdapterConfig(model="x:y", config_path=str(configs))
+    adapter = _ThirdPartyNameAdapter()
     adapter.register_mcp_server_hook(cfg, "molecule-platform", _PLATFORM_SPEC)
-
-    hermes_cfg = home / ".hermes" / "config.yaml"
-    assert hermes_cfg.is_file(), "default hook must render Hermes config.yaml"
-    parsed = yaml.safe_load(hermes_cfg.read_text())
-    assert "molecule-platform" in parsed["mcp_servers"]
-    assert not (tmp_path / "configs" / ".claude" / "settings.json").exists()
+    assert (configs / ".claude" / "settings.json").is_file()
     assert adapter.management_mcp_present(cfg) is True
 
 
 @pytest.mark.asyncio
-async def test_install_plugins_via_registry_codex_writes_config_toml_not_claude(tmp_path, monkeypatch):
+async def test_install_plugins_via_registry_base_default_writes_generic_json(tmp_path, monkeypatch):
     """END-TO-END through the REAL production path
-    (BaseAdapter.install_plugins_via_registry): a codex-configured run installing
-    the molecule-platform-mcp plugin lands the management MCP in
-    ~/.codex/config.toml and NOT in .claude/settings.json. This is the exact
-    #3159 scenario, exercised without any synthetic adapter override."""
-    from molecule_runtime.plugins import LoadedPlugins, Plugin
-
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-
-    # A real molecule-platform-mcp plugin dir shipping the mcpServers descriptor.
-    plugin_root = tmp_path / "molecule-platform-mcp"
-    plugin_root.mkdir()
-    (plugin_root / "settings-fragment.json").write_text(json.dumps({
-        "mcpServers": {"molecule-platform": {
-            "command": "npx", "args": ["-y", "@molecule-ai/mcp-server"],
-            "env": {"MOLECULE_MCP_MODE": "management"},
-        }}
-    }))
-
-    configs = tmp_path / "configs"
-    configs.mkdir()
-    cfg = AdapterConfig(model="openai:gpt-5.5", config_path=str(configs))
-    adapter = _CodexOnlyNameAdapter()  # overrides ONLY name()
-
-    plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
-    results = await adapter.install_plugins_via_registry(cfg, plugins)
-    assert results, "install must have run the MCPServerAdaptor"
-
-    codex_cfg = home / ".codex" / "config.toml"
-    assert codex_cfg.is_file(), "production path must write codex config.toml for runtime=codex"
-    parsed = tomllib.loads(codex_cfg.read_text())
-    assert parsed["mcp_servers"]["molecule-platform"]["command"] == "npx"
-    assert not (configs / ".claude" / "settings.json").exists(), \
-        "production codex path must NOT write .claude/settings.json (#3159)"
-    # The runtime-agnostic gate probe sees the management MCP for codex.
-    assert adapter.management_mcp_present(cfg) is True
-
-
-@pytest.mark.asyncio
-async def test_install_plugins_via_registry_hermes_writes_config_yaml_not_claude(tmp_path, monkeypatch):
-    """END-TO-END through the REAL production path: a Hermes-configured run
-    installing molecule-platform-mcp lands the management MCP in
-    ~/.hermes/config.yaml and NOT in .claude/settings.json."""
+    (BaseAdapter.install_plugins_via_registry) for a name-only adapter: the
+    management MCP lands in the generic JSON ``mcpServers`` config (the ADR-004
+    base default). The REAL codex/hermes production paths write their native
+    formats via their OWN adapter overrides — exercised in the template repos'
+    conformance/e2e jobs, not here (the engine repo has no per-runtime renderer to
+    test)."""
     from molecule_runtime.plugins import LoadedPlugins, Plugin
 
     home = tmp_path / "home"
@@ -518,26 +428,31 @@ async def test_install_plugins_via_registry_hermes_writes_config_yaml_not_claude
 
     configs = tmp_path / "configs"
     configs.mkdir()
-    cfg = AdapterConfig(model="nous:hermes", config_path=str(configs))
-    adapter = _HermesOnlyNameAdapter()
+    cfg = AdapterConfig(model="x:y", config_path=str(configs))
+    adapter = _ThirdPartyNameAdapter()  # overrides ONLY name()
 
     plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
     results = await adapter.install_plugins_via_registry(cfg, plugins)
     assert results, "install must have run the MCPServerAdaptor"
 
-    hermes_cfg = home / ".hermes" / "config.yaml"
-    assert hermes_cfg.is_file(), "production path must write Hermes config.yaml"
-    parsed = yaml.safe_load(hermes_cfg.read_text())
-    assert parsed["mcp_servers"]["molecule-platform"]["command"] == "npx"
-    assert not (configs / ".claude" / "settings.json").exists(), \
-        "production Hermes path must NOT write .claude/settings.json (#3159)"
+    # The base default wired the management MCP into the generic JSON config.
+    assert (configs / ".claude" / "settings.json").is_file(), (
+        "production path (base default) must write the generic JSON mcpServers config"
+    )
+    parsed = json.loads((configs / ".claude" / "settings.json").read_text())
+    assert parsed["mcpServers"]["molecule-platform"]["command"] == "npx"
+    # No native codex/hermes file appears — the base default is name-agnostic.
+    assert not (home / ".codex" / "config.toml").exists()
+    assert not (home / ".hermes" / "config.yaml").exists()
+    # The runtime-agnostic gate probe sees the management MCP.
     assert adapter.management_mcp_present(cfg) is True
 
 
 @pytest.mark.asyncio
 async def test_install_plugins_via_registry_claude_writes_claude_settings(tmp_path, monkeypatch):
-    """Symmetric end-to-end for the claude runtime: the same production path
-    writes .claude/settings.json (and the codex config.toml stays absent)."""
+    """The claude runtime end-to-end: the production path writes
+    .claude/settings.json (claude-code's native format IS the generic JSON default,
+    so this holds for both the base default and claude's own adapter)."""
     from molecule_runtime.plugins import LoadedPlugins, Plugin
 
     home = tmp_path / "home"
@@ -561,33 +476,3 @@ async def test_install_plugins_via_registry_claude_writes_claude_settings(tmp_pa
     assert (configs / ".claude" / "settings.json").is_file()
     assert not (home / ".codex" / "config.toml").exists()
     assert adapter.management_mcp_present(cfg) is True
-
-
-@pytest.mark.asyncio
-async def test_install_plugins_via_registry_gemini_fails_loud_for_privileged(tmp_path, monkeypatch):
-    """An UNVERIFIED runtime (gemini) installing the PRIVILEGED management MCP
-    fails LOUDLY through the production path rather than booting a
-    capability-less concierge — the deliberate fail-loud stub behavior."""
-    from molecule_runtime.plugins import LoadedPlugins, Plugin
-    from molecule_runtime.adapter_base import PrivilegedPluginInstallError
-
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-
-    plugin_root = tmp_path / "molecule-platform-mcp"
-    plugin_root.mkdir()
-    (plugin_root / "settings-fragment.json").write_text(json.dumps({
-        "mcpServers": {"molecule-platform": {"command": "npx"}}
-    }))
-
-    cfg = AdapterConfig(model="x:y", config_path=str(tmp_path / "configs"))
-
-    class _GeminiAdapter(_BaseTestAdapter):
-        @staticmethod
-        def name():
-            return "gemini"
-
-    plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
-    with pytest.raises(PrivilegedPluginInstallError):
-        await _GeminiAdapter().install_plugins_via_registry(cfg, plugins)

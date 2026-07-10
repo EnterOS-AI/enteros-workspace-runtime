@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from molecule_runtime import mcp_render, prompt
+from molecule_runtime import prompt
 from molecule_runtime.prompt import build_system_prompt
 
 
@@ -100,58 +100,25 @@ def test_selftest_g2_base_frame_always_present(tmp_path, monkeypatch):
         assert "Molecule AI platform" in regressed
 
 
-# ── G5: openclaw renderer fail-closed (native config, not claude fallback) ─────
-
-def test_selftest_g5_openclaw_not_claude_fallback(tmp_path, monkeypatch):
-    from tests.test_mcp_render_openclaw_failclosed import (
-        MANAGEMENT_MCP_NAME,
-        test_openclaw_present_does_not_probe_claude_settings,
-    )
-
-    # (1) PASSES on pristine code.
-    test_openclaw_present_does_not_probe_claude_settings(tmp_path, monkeypatch)
-
-    # (2) REGRESSION: drop openclaw's concrete entry so it falls through to the
-    # claude_code default (the #3159 mis-attribution). The present-reader would
-    # then read .claude/settings.json — and the guardrail's assertion that
-    # present stays False despite the claude file now FAILS (RED).
-    regressed_specs = dict(mcp_render._RUNTIME_SPECS)
-    regressed_specs.pop("openclaw", None)  # force the claude fallback
-    monkeypatch.setattr(mcp_render, "_RUNTIME_SPECS", regressed_specs)
-
-    import json
-
-    fresh = tmp_path / "g5regress"
-    fresh.mkdir()
-    monkeypatch.setenv("HOME", str(fresh))
-    claude_settings = fresh / ".claude" / "settings.json"
-    claude_settings.parent.mkdir(parents=True, exist_ok=True)
-    claude_settings.write_text(
-        json.dumps({"mcpServers": {MANAGEMENT_MCP_NAME: {"command": "npx"}}})
-    )
-    with pytest.raises(AssertionError):
-        # Regressed openclaw now resolves to claude's present-reader → True
-        # against the claude file → the fail-closed contract is violated.
-        assert (
-            mcp_render.management_mcp_present_for("openclaw", fresh, MANAGEMENT_MCP_NAME)
-            is False
-        )
-
-
-# ── G6: renderer-completeness for the kind=platform allowlist ──────────────────
-
-def test_selftest_g6_renderer_completeness(monkeypatch):
-    from tests.test_mcp_render_completeness_g6 import (
-        test_platform_runtime_has_concrete_render_spec,
-    )
-
-    # (1) PASSES: codex has a concrete entry.
-    test_platform_runtime_has_concrete_render_spec("codex")
-
-    # (2) REGRESSION: remove codex's concrete entry so it would silently fall
-    # through to _DEFAULT_RUNTIME. The completeness guardrail now FAILS (RED).
-    regressed_specs = dict(mcp_render._RUNTIME_SPECS)
-    regressed_specs.pop("codex", None)
-    monkeypatch.setattr(mcp_render, "_RUNTIME_SPECS", regressed_specs)
-    with pytest.raises(AssertionError):
-        test_platform_runtime_has_concrete_render_spec("codex")
+# ── G5 / G6 (ADR-004): SUPERSEDED — the engine-side per-runtime guardrails are
+# gone with the engine dispatch tables they policed.
+# ------------------------------------------------------------------------------
+# The old G5 (openclaw renderer must not fall back to claude) and G6
+# (renderer-completeness for the kind=platform allowlist) self-tests monkeypatched
+# ``mcp_render._RUNTIME_SPECS`` to prove the guardrail went RED when a runtime lost
+# its concrete engine entry. ADR-004 DELETED ``_RUNTIME_SPECS`` and moved the
+# per-runtime render/read/present INTO each adapter, so there is no engine entry to
+# drop and no by-name ``management_mcp_present_for`` fallback to mis-attribute.
+#
+# The invariant those guards protected is now enforced in two places:
+#   * PER-ADAPTER: the SDK conformance suite (``molecule_plugin.adapter_conformance``)
+#     asserts each adapter's own render→read→present round-trips on ITS native
+#     config and FAILS CLOSED when unmapped (an unmapped adapter never false-greens
+#     against claude's settings.json — the #3159 guard, now ``test_unmapped_runtime_*``
+#     in the SDK suite, run by every template's ``tests/test_conformance.py``).
+#   * DRIFT-DOWN RATCHET: ``tests/test_engine_no_runtime_dispatch_ratchet.py`` fails
+#     any change that re-introduces a ``_RUNTIME_*`` table or a runtime-name literal
+#     into ``mcp_render`` / ``persona_render`` (the drift can only shrink → 0).
+#
+# G0/G1/G2 above remain here (they police the prompt SSOT, not the engine's
+# per-runtime dispatch, so they are unaffected by ADR-004).
