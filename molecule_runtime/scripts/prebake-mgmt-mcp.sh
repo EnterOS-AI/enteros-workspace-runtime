@@ -47,8 +47,21 @@ command -v npx >/dev/null 2>&1 || { echo "prebake-mgmt-mcp: npx not reachable (s
 
 echo "prebake-mgmt-mcp: baking ${SPEC} from ${REG}"
 mkdir -p "${HOME}/.npm"
-# Scoped @molecule-ai registry (anonymous read of the public org package). No
-# token — the fetch is anonymous, same posture as the git-native plugin source.
+# Scoped @molecule-ai registry + npm cache, configured GLOBALLY (node prefix
+# etc/npmrc) so they are honored regardless of the $HOME the runtime later spawns
+# the mgmt-MCP under. The launch context's HOME is NOT guaranteed to be the agent
+# $HOME — the runtime's boot enumeration was observed spawning the mgmt-MCP under
+# HOME=/root, so a per-user ${HOME}/.npmrc (which npm reads ONLY when $HOME
+# matches) is MISSED and npx falls through to the public registry -> ETARGET on
+# the private @molecule-ai scope -> #1027 fail-close. A --global config is read by
+# npm/npx under ANY HOME, so the baked package resolves at LAUNCH, not just in this
+# build-time self-check. Anonymous (public org package): no token, same posture as
+# the git-native plugin source. Values are SSOT — from the contract-pinned runtime
+# constants (SCOPE/REG/HOME cache), never hand-typed here.
+npm config set "${SCOPE}:registry" "${REG}" --global
+npm config set cache "${HOME}/.npm" --global
+# Belt-and-suspenders: also write the per-user .npmrc for launch contexts that DO
+# run under the agent $HOME.
 printf '%s:registry=%s\n' "${SCOPE}" "${REG}" > "${HOME}/.npmrc"
 
 # Warm-install into a throwaway dir, then DISCARD it BEFORE the seeding npx runs
@@ -65,10 +78,23 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 # HARD offline self-check: the OFFLINE launch must expose the degrade-gate verb
 # (REQUIRED_TOOL == provision_workspace). Fails the image build if the bake is
 # broken — so a broken bake can never ship.
-printf '%s\n%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"verify","version":"1"}}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  | MOLECULE_MCP_MODE=management timeout 60 npx -y --offline "${SPEC}" 2>/dev/null | grep -q "${TOOL}" \
-  || { echo "prebake-mgmt-mcp: ERROR — ${SPEC} did not resolve OFFLINE or ${TOOL} missing; the concierge warm-up bake is broken" >&2; exit 1; }
+_prebake_self_check() {
+  printf '%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"verify","version":"1"}}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+    | MOLECULE_MCP_MODE=management timeout 60 npx -y --offline "${SPEC}" 2>/dev/null | grep -q "${TOOL}"
+}
+# (1) under the build HOME (the agent home).
+_prebake_self_check \
+  || { echo "prebake-mgmt-mcp: ERROR — ${SPEC} did not resolve OFFLINE or ${TOOL} missing (build HOME); the concierge warm-up bake is broken" >&2; exit 1; }
+# (2) under a FOREIGN HOME — REGRESSION GUARD for the exact fail-close class this
+# fixes: the runtime spawns the mgmt-MCP under a non-agent HOME (observed /root),
+# and a HOME-local ${HOME}/.npmrc would ETARGET there while silently passing check
+# (1). This proves the scoped registry + cache are GLOBAL, so the LAUNCH resolves
+# regardless of HOME.
+_foreign_home="$(mktemp -d)"
+( export HOME="${_foreign_home}"; _prebake_self_check ) \
+  || { rm -rf "${_foreign_home}"; echo "prebake-mgmt-mcp: ERROR — ${SPEC} did not resolve OFFLINE under a non-agent HOME; the scoped registry/cache is not GLOBAL — the runtime would ETARGET (#1027 fail-close) when it spawns the mgmt-MCP under a different HOME" >&2; exit 1; }
+rm -rf "${_foreign_home}"
 
-echo "prebake-mgmt-mcp: OK — ${SPEC} resolves offline with ${TOOL}"
+echo "prebake-mgmt-mcp: OK — ${SPEC} resolves offline with ${TOOL} (HOME-independent)"
