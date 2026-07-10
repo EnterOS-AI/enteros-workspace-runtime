@@ -133,6 +133,29 @@ class TestMCPServerPresent:
             "mcp_settings_entry",
             "mcp_command_resolved",
         }
+        # EV4: mcp_launch_failure is OMITTED in the healthy (no recorded hard
+        # fail) case — its presence must never read as a false alarm.
+        assert "mcp_launch_failure" not in payload
+
+    def test_identity_gate_payload_surfaces_launch_failure(self, monkeypatch):
+        # runtime EV4: once a DETERMINISTIC hard MCP launch-failure is recorded
+        # (npx ETARGET — the pinned version is unresolvable on this image), the
+        # refuse-online reason MUST ride the identity gate payload so core can fail
+        # the concierge CLOSED loudly instead of us silently retrying / degrading.
+        from molecule_runtime import loaded_mcp_tools_probe as lp
+
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.mcp_server_present",
+            lambda: True,
+        )
+        lp.record_launch_failure(None)  # clean baseline
+        try:
+            assert "mcp_launch_failure" not in identity_gate_payload()
+            lp.record_launch_failure("mcp-server: exit=1 ETARGET")
+            payload = identity_gate_payload()
+            assert payload["mcp_launch_failure"] == "mcp-server: exit=1 ETARGET"
+        finally:
+            lp.record_launch_failure(None)
 
 
 @pytest.fixture

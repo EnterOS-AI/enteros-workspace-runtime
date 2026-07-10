@@ -760,6 +760,25 @@ async def capture_loaded_mcp_tools_with_retry(
                 attempt, max_attempts, len(observed),
             )
             return observed
+        # Short-circuit a DETERMINISTIC hard launch-failure. When an attempt sees
+        # the management MCP child EXIT NON-ZERO (npx ETARGET/E404: the pinned
+        # version is unresolvable on this image), _classify_launch_failure has
+        # already recorded launch_failure_reason() and fired the #1027 CRITICAL
+        # alarm. That will NEVER self-heal on this image, so re-spinning all
+        # remaining attempts is pure waste — and worse, it delays the fail-closed
+        # signal. Stop now; the recorded reason is surfaced on the heartbeat's
+        # identity gate payload so core fails the concierge CLOSED loudly instead
+        # of us silently retrying into the grace window (#228).
+        reason = launch_failure_reason()
+        if reason is not None:
+            logger.error(
+                "loaded_mcp_tools: HARD launch-failure observed on attempt %d/%d "
+                "(%s) — a deterministic failure will not self-heal; STOPPING the "
+                "retry loop. The refuse-online reason is on the heartbeat identity "
+                "gate payload for core to fail-closed on.",
+                attempt, max_attempts, reason,
+            )
+            return None
         if attempt < max_attempts:
             # Equal-jitter exponential backoff: sleep [delay/2, delay] so we keep a
             # guaranteed minimum spacing (never hot-spin) while decorrelating
