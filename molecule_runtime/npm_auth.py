@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -65,11 +66,15 @@ _CANONICAL_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN"
 _OAUTH_BASIC_SENTINEL = "x-oauth-basic"
 
 
-def _gitea_read_token() -> str:
+def gitea_read_token(env: Mapping[str, str] | None = None) -> str:
     """Return the gitea read token, or "" if none is present.
 
-    SSOT: the SAME token the box uses for git fetches. Must carry read:package
-    scope for npm fetches to succeed (see module docstring).
+    SSOT: the SAME token the box uses for git fetches (git-native plugin_sources
+    clones consume this exact resolver too — one credential, one resolution).
+    Must carry read:package scope for npm fetches to succeed (see docstring).
+
+    ``env`` defaults to ``os.environ``; callers that resolve from an explicit
+    mapping (e.g. the boot-install's ``env=`` parameter) pass it through.
 
     Resolution order (token-source precedence):
       1. MOLECULE_TEMPLATE_REPO_TOKEN (canonical, highest precedence)
@@ -84,13 +89,15 @@ def _gitea_read_token() -> str:
     The literal x-oauth-basic sentinel is never returned as a token: it merely
     routes us to read the PAT from GIT_HTTP_USERNAME instead.
     """
+    if env is None:
+        env = os.environ
     for var in _CANONICAL_TOKEN_ENV_PRECEDENCE:
-        v = (os.environ.get(var) or "").strip()
+        v = (env.get(var) or "").strip()
         if v:
             return v
 
-    http_password = (os.environ.get("GIT_HTTP_PASSWORD") or "").strip()
-    http_username = (os.environ.get("GIT_HTTP_USERNAME") or "").strip()
+    http_password = (env.get("GIT_HTTP_PASSWORD") or "").strip()
+    http_username = (env.get("GIT_HTTP_USERNAME") or "").strip()
     if http_password and http_password.lower() != _OAUTH_BASIC_SENTINEL:
         # Normal basic-auth shape: the secret/token is the password.
         return http_password
@@ -99,6 +106,10 @@ def _gitea_read_token() -> str:
         # is only the sentinel. Use the username as the token; never the sentinel.
         return http_username
     return ""
+
+
+# Back-compat private alias (pre-existing internal name).
+_gitea_read_token = gitea_read_token
 
 
 def _auth_key(registry: str) -> str | None:
@@ -123,7 +134,7 @@ def install_npm_gitea_auth() -> None:
     auth being perfect, and the loud RCA#2970/#3082 gates surface a still-broken
     MCP downstream.
     """
-    token = _gitea_read_token()
+    token = gitea_read_token()
     if not token:
         log.info(
             "npm_auth: no gitea token present (%s/GIT_HTTP_PASSWORD/GIT_HTTP_USERNAME)"

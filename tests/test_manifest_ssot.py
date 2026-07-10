@@ -34,7 +34,7 @@ import molecule_runtime.manifest_ssot as manifest_ssot
 import molecule_runtime.plugin_sources as ps
 from molecule_runtime.plugins import load_plugin_manifest, load_plugins
 
-from tests.test_plugin_sources import _FakeStream, _make_targz, _patch_stream
+from tests.test_plugin_sources import _make_repo, _patch_git
 
 _ENFORCE_ENV = "MOLECULE_MANIFEST_SSOT_ENFORCE"
 
@@ -371,10 +371,12 @@ def test_jsonschema_unavailable_is_loud_not_silent(monkeypatch, caplog):
 def test_install_enforce_rejects_violating_manifest_no_swap(
     monkeypatch, tmp_path, caplog
 ):
-    archive = _make_targz(
-        {"plugin.yaml": b"name: bad-manifest\n", "SKILL.md": b"# s"}
+    _patch_git(
+        monkeypatch,
+        lambda url, ref, cmd, env: _make_repo(
+            {"plugin.yaml": b"name: bad-manifest\n", "SKILL.md": b"# s"}
+        ),
     )
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
     plugins_dir = tmp_path / "plugins"
     # A previous boot's live tree — it must survive the rejected install.
     prior = plugins_dir / "prior-plugin"
@@ -413,10 +415,12 @@ def test_install_enforce_off_warns_on_invalid_manifest_but_still_swaps(
     # a non-conformant plugin.yaml warns with the "[plugins] " prefix AND the
     # swap still happens — validation doesn't feed the swap decision.
     monkeypatch.setenv(_ENFORCE_ENV, "off")
-    archive = _make_targz(
-        {"plugin.yaml": b"name: bad-manifest\n", "SKILL.md": b"# s"}
+    _patch_git(
+        monkeypatch,
+        lambda url, ref, cmd, env: _make_repo(
+            {"plugin.yaml": b"name: bad-manifest\n", "SKILL.md": b"# s"}
+        ),
     )
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
     plugins_dir = tmp_path / "plugins"
     with caplog.at_level(logging.WARNING, logger="molecule_runtime.plugin_sources"):
         report = ps.install_declared_plugins(
@@ -444,8 +448,7 @@ def test_install_missing_manifest_carveout_still_swaps_under_enforcement(
 ):
     # CARVE-OUT: a staged plugin WITHOUT plugin.yaml (bare-SKILL.md) is
     # advisory-only even with enforcement ON — it still installs and swaps.
-    archive = _make_targz({"SKILL.md": b"# bare"})
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
+    _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"# bare"}))
     plugins_dir = tmp_path / "plugins"
     with caplog.at_level(logging.WARNING, logger="molecule_runtime.plugin_sources"):
         report = ps.install_declared_plugins(
@@ -466,16 +469,18 @@ def test_install_missing_manifest_carveout_still_swaps_under_enforcement(
 
 
 def test_install_conformant_manifest_no_ssot_warning(monkeypatch, tmp_path, caplog):
-    archive = _make_targz(
-        {
-            "plugin.yaml": (
-                b"name: repo\nversion: 1.2.0\ndescription: fine\n"
-                b"runtimes: [claude-code]\n"
-            ),
-            "SKILL.md": b"# s",
-        }
+    _patch_git(
+        monkeypatch,
+        lambda url, ref, cmd, env: _make_repo(
+            {
+                "plugin.yaml": (
+                    b"name: repo\nversion: 1.2.0\ndescription: fine\n"
+                    b"runtimes: [claude-code]\n"
+                ),
+                "SKILL.md": b"# s",
+            }
+        ),
     )
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
     plugins_dir = tmp_path / "plugins"
     with caplog.at_level(logging.WARNING, logger="molecule_runtime.plugin_sources"):
         report = ps.install_declared_plugins(

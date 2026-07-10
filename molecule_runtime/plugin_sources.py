@@ -3,8 +3,8 @@
 Background — agent-skills must survive a SaaS "restart"
 ======================================================
 A workspace's DECLARED plugins (the DB desired-set, passed as
-``MOLECULE_DECLARED_PLUGINS`` — a comma-separated list of ``gitea://`` sources)
-are installed into ``<config_path>/plugins`` BEFORE the runtime reads that
+``MOLECULE_DECLARED_PLUGINS`` — a comma-separated list of plugin sources) are
+installed into ``<config_path>/plugins`` BEFORE the runtime reads that
 directory, so agent-skills survive the full ephemeral re-provision that a SaaS
 "restart" performs (fresh instance + disk). This was proven first as a shell
 block in the template entrypoint (``wt-claude-code/entrypoint.sh`` — runs as
@@ -12,21 +12,50 @@ ROOT pre-gosu) and ported to ``_oc-template`` (openclaw #130).
 
 This module is the **base-runtime** Python equivalent of that shell block, so
 EVERY runtime gets the boot-install uniformly — no per-template fork. It is
-called from ``main.main()`` (step 0.4) right after the npm-registry auth and
+called from ``main.main()`` (step 0.2c) right after the npm-registry auth and
 BEFORE ``load_config`` / ``adapter.setup``, so the plugins land on disk before
 ``adapter_base._common_setup`` reads ``<config_path>/plugins`` and
 ``install_plugins_via_registry`` wires their MCP/skills.
 
-Faithful to the shell block (``entrypoint.sh`` lines 214-284):
-  * split ``MOLECULE_DECLARED_PLUGINS`` on commas, strip all whitespace;
-  * accept only ``gitea://owner/repo[/subpath][#ref]`` (default ref ``main``,
-    name = last path segment of subpath else repo);
-  * fetch ``<base>/api/v1/repos/<owner>/<repo>/archive/<ref>.tar.gz`` with
-    ``Authorization: token <MOLECULE_TEMPLATE_REPO_TOKEN>`` (unauth fallback);
-  * untar, copy ``<subpath|top>/.`` into a STAGING tree, then atomically swap
-    the staging tree into ``<plugins_dir>`` only on a fully-successful build;
-  * fail-soft — a fetch/extract failure logs and never blocks boot; an empty
-    ``MOLECULE_DECLARED_PLUGINS`` is a no-op (existing behaviour preserved).
+Fetch mechanism — git-native, provider-agnostic (this change)
+=============================================================
+The fetch step is a **git clone**, not a forge-specific archive REST call:
+
+    git clone --depth 1 --single-branch --branch <ref> <repoURL> <dir>
+
+then (for a declared subpath) the subdir is copied out of the checked-out tree;
+the common case (the mgmt-MCP has NO subpath) copies the whole tree. This is
+universal across forges — gitea, github, gitlab, self-hosted — and removes the
+box's coupling to gitea's ``/api/v1/repos/.../archive/<ref>.tar.gz`` endpoint.
+
+**Anonymous by default (credential-as-abstraction, private-only).** No token is
+ever placed in the clone URL or on git's argv. Instead, when the box holds a
+token for the repo's host, we wire a **per-host git credential helper** (keyed
+on ``<scheme>://<host>``) that reads the token from the ``MOLECULE_GIT_CRED_TOKEN``
+child-process env var. Git invokes a credential helper ONLY after the server
+answers ``401`` — so a PUBLIC repo (the mgmt-MCP plugin repo is public) clones
+anonymously and NO token is ever transmitted, while a PRIVATE repo's ``401``
+triggers the helper and the token is supplied on the authenticated retry. This
+closes the 401-poison risk of the old unconditional ``Authorization: token``
+header (RCA #2970 class). ``GIT_TERMINAL_PROMPT=0`` is always set so a genuinely
+private repo with no available credential fails fast instead of blocking boot on
+an interactive prompt.
+
+Two accepted source forms (any forge)
+-------------------------------------
+  * ``gitea://owner/repo[/subpath][#ref]`` — host resolved from config
+    (``MOLECULE_GITEA_BASE_URL``); back-compat form, ``#ref`` default ``main``.
+  * a full git URL — ``https://host/owner/repo[.git/subpath][#ref]`` (also
+    ``http://``, ``git+https://``, ``git+http://``) — self-contained host, works
+    for github/gitlab/self-hosted. A ``.git/`` in the path delimits the repo
+    from an in-repo subpath.
+Any other scheme (e.g. ``github://``, ``presign://``) is skipped + logged,
+exactly like the shell.
+
+Token source (SSOT): the SAME resolution npm auth uses — ``npm_auth`` is the one
+resolver (``MOLECULE_TEMPLATE_REPO_TOKEN`` → ``GITEA_TOKEN`` → the gitea
+git-http cred: ``GIT_HTTP_PASSWORD``, or ``GIT_HTTP_USERNAME`` when the password
+is the ``x-oauth-basic`` sentinel). No new credential is introduced.
 
 Atomic build-then-swap (hardening win #2 over the shell)
 ========================================================
@@ -38,77 +67,114 @@ source succeeds; any failure leaves the existing live tree untouched (retried
 next boot). Full-replace semantics (a de-declared plugin doesn't linger) are
 preserved — the swap just never leaves the live dir half-built/empty.
 
-Hardening win #1 over the shell: ``tarfile`` extraction is path-traversal-guarded
-(the shell ``cp -a`` had no such guard), so a malicious archive member whose
-resolved path escapes the extraction dir is rejected.
+Hardening win #1 over the shell: the subpath copied out of the tree is
+containment-guarded (``_is_within``) so a crafted ``../``-escaping subpath is
+rejected. (With ``git clone`` the checked-out tree is written by git within the
+clone dir — there is no archive-member write-escape vector as the shell
+``cp -a`` had; the ``.git`` metadata dir is stripped before copy so the plugins
+tree matches the old archive semantics.)
 
-Provider seam (source-provider-ecosystem): ``_PROVIDERS`` maps a URL scheme to
-a fetch handler. v1 ships ``gitea`` only; a future github/gitlab/local provider
-registers its scheme here and ``parse_declared_plugins`` accepts it
-automatically. An unknown scheme is skipped + logged (matches the shell).
+Provider seam (source-provider-ecosystem): ``_PROVIDERS`` maps a URL scheme to a
+fetch handler; both handlers funnel into one ``_git_fetch_tree`` clone core.
+``parse_declared_plugins`` accepts any registered scheme automatically; an
+unknown scheme is skipped + logged (matches the shell).
 
-Idempotency / cutover: this rebuilds ``<plugins_dir>`` from the same source
-list the shell block uses, so during the template cutover BOTH run (shell first
-as root pre-gosu, this second as the agent uid in ``main``) and the second run
-simply rebuilds the identical tree via staging+swap — harmless. Templates drop
-their shell copies LATER, gated by a runtime-capability floor; this base change
-must never regress the proven flow.
+Idempotency / cutover: this rebuilds ``<plugins_dir>`` from the same source list
+the shell block uses, so during the template cutover BOTH run (shell first as
+root pre-gosu, this second as the agent uid in ``main``) and the second run
+simply rebuilds the identical tree via staging+swap — harmless, and this Python
+run is authoritative (it runs second, in ``main``).
+
+Shell mirror status (NOT yet parity — do not assume it): the boot-install shell
+block lives in the TEMPLATE repos (``entrypoint.sh``), NOT here, and still uses
+the archive REST fetch. It fetches the (public) mgmt-MCP anonymously today only
+because ``MOLECULE_TEMPLATE_REPO_TOKEN`` is on the box FORBIDDEN-ENV denylist
+(``core workspace_provision_forbidden_env.go``), so its unconditional-token
+branch never fires on the box. A matching git-native + per-host-cred-helper
+rewrite of each template's shell block is a REQUIRED FOLLOW-UP (one PR per
+template repo) before the shell can be treated as consistent with this module.
 """
 from __future__ import annotations
 
 import logging
 import os
 import shutil
-import tarfile
+import subprocess
 import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-
-import httpx
+from urllib.parse import urlsplit
 
 from molecule_runtime import manifest_ssot
+from molecule_runtime.npm_auth import gitea_read_token
 
 log = logging.getLogger(__name__)
 
-# Default gitea base — overridable via MOLECULE_GITEA_BASE_URL (mirrors the
-# shell ``${MOLECULE_GITEA_BASE_URL:-https://git.moleculesai.app}``).
-_DEFAULT_GITEA_BASE = "https://git.moleculesai.app"
+# Configured gitea base host for the ``gitea://`` back-compat form. The box's
+# provisioning does NOT always set MOLECULE_GITEA_BASE_URL (the shell mirror uses
+# ``${MOLECULE_GITEA_BASE_URL:-https://git.moleculesai.app}`` and npm_auth
+# defaults the same way), so removing this fallback entirely would break
+# provisioning of every workspace that relies on the default. We therefore KEEP a
+# documented back-compat default but emit it NON-SILENTLY (a one-line log) when
+# it is used, so the reliance is observable rather than a hidden constant.
+_BACKCOMPAT_GITEA_BASE = "https://git.moleculesai.app"
+# Registry base host. MOLECULE_PLUGIN_REGISTRY is the provider-agnostic canonical
+# name core SETS on the box (conciergePlatformMCPEnv) — it is the knob that lets a
+# self-host/mirror/airgap point plugin sourcing at a different forge. Reading it
+# here is what makes that knob real: core SET + box READ must agree on the NAME
+# (the exact SET-one-READ-another drift that caused the concierge AUTH_ERROR).
+# MOLECULE_GITEA_BASE_URL is kept as a back-compat alias (the shell mirror's var).
+_REGISTRY_ENV = "MOLECULE_PLUGIN_REGISTRY"
+_BASE_URL_ENV = "MOLECULE_GITEA_BASE_URL"
 
-# Read token for the gitea archive fetch — the SAME token the box already holds
-# for git/npm fetches (npm_auth.py SSOT). Unauth fallback when absent, exactly
-# like the shell's ``if [ -n "${MOLECULE_TEMPLATE_REPO_TOKEN:-}" ]`` branch.
-_TOKEN_ENV = "MOLECULE_TEMPLATE_REPO_TOKEN"
+# git binary. PATH ``git`` (consistent with credential_helper.py). Overridable so
+# an operator can pin an absolute path; our clone never puts a token on the URL,
+# so a token-stripping git shell-wrapper (if any) is harmless to this path.
+_GIT_BINARY_ENV = "MOLECULE_GIT_BINARY"
+_DEFAULT_GIT_BINARY = "git"
 
-# Fetch timeout — mirrors the shell ``curl --max-time 120``. Overridable so an
-# operator on a slow link can widen it without a code change.
+# Child-env var the per-host inline credential helper reads the token from. Kept
+# OUT of git's argv (no ``ps`` leak) and out of the clone URL — git reads it only
+# when it invokes the helper, which happens only on a 401 challenge.
+_CRED_TOKEN_ENVVAR = "MOLECULE_GIT_CRED_TOKEN"
+
+# Git URL schemes accepted as a full self-contained source (any forge). ``git+``
+# variants are normalized to plain http(s) for the actual clone.
+_GIT_URL_SCHEMES = ("https", "http", "git+https", "git+http")
+
+# Clone timeout — mirrors the shell ``--max-time``/``timeout`` guard. Overridable
+# so an operator on a slow link can widen it without a code change.
 _DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 _FETCH_TIMEOUT_ENV = "MOLECULE_PLUGIN_FETCH_TIMEOUT"
 
 
 @dataclass(frozen=True)
 class PluginSource:
-    """One parsed ``gitea://owner/repo[/subpath][#ref]`` declared-plugin source.
+    """One parsed declared-plugin source.
+
+    Populated differently by the two accepted forms:
+      * ``gitea://owner/repo[/subpath][#ref]`` sets ``owner``/``repo`` and leaves
+        ``host``/``clone_url`` empty — the host is resolved from config at fetch.
+      * a full git URL sets ``host``/``clone_url`` (self-contained) and leaves
+        ``owner``/``repo`` empty.
 
     ``name`` is the on-disk directory created under ``<plugins_dir>`` — the last
-    path segment of ``subpath`` when a subpath is given, else ``repo`` (mirrors
-    ``entrypoint.sh`` lines 248-256). ``raw`` keeps the original token for the
-    skip/installed/failed log lines so they read like the shell's.
+    path segment of ``subpath`` when a subpath is given, else the repo name.
+    ``raw`` keeps the original token for the skip/installed/failed log lines.
     """
 
     scheme: str
-    owner: str
-    repo: str
     subpath: str
     ref: str
     name: str
     raw: str
-
-    def archive_path(self) -> str:
-        """Gitea archive REST path: ``/api/v1/repos/<owner>/<repo>/archive/<ref>.tar.gz``."""
-        return f"/api/v1/repos/{self.owner}/{self.repo}/archive/{self.ref}.tar.gz"
+    owner: str = ""
+    repo: str = ""
+    host: str = ""
+    clone_url: str = ""
 
 
 @dataclass
@@ -137,30 +203,17 @@ class InstallReport:
         )
 
 
-class PluginExtractError(Exception):
-    """Raised when an archive member would extract outside the destination
-    (path-traversal guard) — caught per-source so one bad archive can't abort
-    the others."""
-
-
 # ---------------------------------------------------------------------------
 # Parsing — pure, side-effect-light (logs skips like the shell), unit-testable.
 # ---------------------------------------------------------------------------
-def _parse_one(token: str) -> PluginSource | None:
-    """Parse one comma-token into a :class:`PluginSource`, or None to skip.
+def _parse_gitea(token: str) -> PluginSource | None:
+    """Parse a ``gitea://owner/repo[/subpath][#ref]`` token (host resolved later).
 
-    Mirrors ``entrypoint.sh`` lines 241-256. A token with an unknown scheme
-    (not registered in ``_PROVIDERS``) or a structurally-invalid spec is
-    skipped + logged, exactly like the shell's ``skip unsupported source`` /
-    ``bad source`` branches.
+    Mirrors ``entrypoint.sh`` lines 241-256: ``#ref`` default ``main``, name =
+    last path segment of subpath else repo; a structurally-invalid spec is
+    skipped + logged like the shell's ``bad source`` branch.
     """
-    if "://" not in token:
-        log.info("[plugins] skip unsupported source: %s", token)
-        return None
-    scheme, spec = token.split("://", 1)
-    if scheme not in _PROVIDERS:
-        log.info("[plugins] skip unsupported source: %s", token)
-        return None
+    spec = token.split("://", 1)[1]
 
     # '#ref' suffix -> ref; default 'main'. Faithful to the shell:
     #   ref  = ${spec##*#}  (everything after the LAST '#')
@@ -180,7 +233,7 @@ def _parse_one(token: str) -> PluginSource | None:
         return None
 
     return PluginSource(
-        scheme=scheme,
+        scheme="gitea",
         owner=owner,
         repo=repo,
         subpath=subpath,
@@ -188,6 +241,76 @@ def _parse_one(token: str) -> PluginSource | None:
         name=name,
         raw=token,
     )
+
+
+def _parse_git_url(token: str) -> PluginSource | None:
+    """Parse a full git URL source (``https|http|git+https|git+http://...``).
+
+    Self-contained host; ``#ref`` default ``main``. A ``.git/`` in the path
+    delimits the repo (clone target) from an in-repo subpath; otherwise the whole
+    path is the repo and there is no subpath. ``name`` = last subpath segment
+    else the repo's last segment (trailing ``.git`` stripped). Malformed → skip.
+    """
+    parts = urlsplit(token)
+    scheme = parts.scheme.lower()
+    # Normalize git+https -> https for the actual clone URL.
+    clone_scheme = scheme[len("git+"):] if scheme.startswith("git+") else scheme
+    host = parts.netloc
+    ref = parts.fragment or "main"
+    path = parts.path
+
+    if not host or not path.strip("/"):
+        log.info("[plugins] bad source: %s", token)
+        return None
+
+    # Split repo vs in-repo subpath on a ``.git/`` delimiter (optional).
+    subpath = ""
+    repo_path = path
+    marker = ".git/"
+    idx = path.find(marker)
+    if idx != -1:
+        repo_path = path[: idx + len(".git")]  # include the ``.git`` suffix
+        subpath = path[idx + len(marker):].strip("/")
+
+    clone_url = f"{clone_scheme}://{host}{repo_path}"
+
+    repo_seg = repo_path.rstrip("/").rsplit("/", 1)[-1]
+    if repo_seg.endswith(".git"):
+        repo_seg = repo_seg[: -len(".git")]
+    name = subpath.rsplit("/", 1)[-1] if subpath else repo_seg
+
+    if not name:
+        log.info("[plugins] bad source: %s", token)
+        return None
+
+    return PluginSource(
+        scheme=scheme,
+        subpath=subpath,
+        ref=ref,
+        name=name,
+        raw=token,
+        host=host,
+        clone_url=clone_url,
+    )
+
+
+def _parse_one(token: str) -> PluginSource | None:
+    """Parse one comma-token into a :class:`PluginSource`, or None to skip.
+
+    A token with an unknown scheme (not registered in ``_PROVIDERS``) or a
+    structurally-invalid spec is skipped + logged, exactly like the shell's
+    ``skip unsupported source`` / ``bad source`` branches.
+    """
+    if "://" not in token:
+        log.info("[plugins] skip unsupported source: %s", token)
+        return None
+    scheme = token.split("://", 1)[0].lower()
+    if scheme not in _PROVIDERS:
+        log.info("[plugins] skip unsupported source: %s", token)
+        return None
+    if scheme == "gitea":
+        return _parse_gitea(token)
+    return _parse_git_url(token)
 
 
 def parse_declared_plugins(raw: str | None) -> list[PluginSource]:
@@ -211,47 +334,13 @@ def parse_declared_plugins(raw: str | None) -> list[PluginSource]:
 
 
 # ---------------------------------------------------------------------------
-# Extraction — path-traversal-guarded (the hardening win over the shell cp -a).
+# Containment guard (the hardening win — a crafted subpath must not escape).
 # ---------------------------------------------------------------------------
 def _is_within(base: Path, target: Path) -> bool:
     """True iff ``target`` is ``base`` or nested under it (resolved)."""
     base_r = base.resolve()
     target_r = target.resolve()
     return target_r == base_r or base_r in target_r.parents
-
-
-def _safe_extract_tar(tar: tarfile.TarFile, dest: Path) -> None:
-    """Extract every member, rejecting any whose resolved path — or symlink/
-    hardlink target — escapes ``dest``. The shell ``cp -a`` had no such guard."""
-    dest = dest.resolve()
-    members = tar.getmembers()
-    for member in members:
-        member_path = dest / member.name
-        if not _is_within(dest, member_path):
-            raise PluginExtractError(
-                f"archive member escapes destination: {member.name!r}"
-            )
-        # Link targets must also stay inside dest (symlink/hardlink traversal).
-        if member.issym() or member.islnk():
-            link_target = dest / member.name
-            resolved_link = (link_target.parent / member.linkname)
-            if not _is_within(dest, resolved_link):
-                raise PluginExtractError(
-                    f"archive link target escapes destination: "
-                    f"{member.name!r} -> {member.linkname!r}"
-                )
-    tar.extractall(dest)  # noqa: S202 — members validated above
-
-
-def _find_archive_top(extract_dir: Path) -> Path | None:
-    """Return the single top-level directory of a gitea archive (``<repo>/``).
-
-    Mirrors the shell ``find -mindepth 1 -maxdepth 1 -type d | head -n1``.
-    """
-    for child in sorted(extract_dir.iterdir()):
-        if child.is_dir():
-            return child
-    return None
 
 
 def _atomic_swap_dir(staging_dir: Path, target_dir: Path) -> None:
@@ -296,68 +385,174 @@ def _atomic_swap_dir(staging_dir: Path, target_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Provider seam — scheme -> fetch handler. v1: gitea only.
+# Fetch core — one git-clone path shared by every provider.
+# ---------------------------------------------------------------------------
+def _host_cred_config_args(scheme: str, host: str) -> list[str]:
+    """git ``-c`` args wiring a per-host inline credential helper.
+
+    The helper reads the token from the ``MOLECULE_GIT_CRED_TOKEN`` child-env var
+    (NOT argv, NOT the URL) and emits it on ``get``. Git invokes it ONLY after a
+    ``401`` — so public repos clone anonymously (no token sent) and private repos
+    are authenticated on the retry. We first RESET any inherited helper for this
+    exact host (empty value) so the behaviour is deterministic, then append ours.
+    """
+    key = f"credential.{scheme}://{host}"
+    helper = (
+        "!f() { test \"$1\" = get && "
+        "printf 'username=oauth2\\npassword=%s\\n' "
+        "\"$" + _CRED_TOKEN_ENVVAR + "\"; }; f"
+    )
+    return ["-c", f"{key}.helper=", "-c", f"{key}.helper={helper}"]
+
+
+def _git_fetch_tree(
+    *,
+    clone_url: str,
+    host: str,
+    scheme: str,
+    ref: str,
+    subpath: str,
+    raw: str,
+    token: str,
+    git_binary: str,
+    workdir: Path,
+    timeout: float,
+) -> Path | None:
+    """``git clone`` ``clone_url`` at ``ref`` into ``workdir`` and return the dir
+    whose contents become ``<plugins_dir>/<name>/`` (the clone root, or
+    ``<clone_root>/<subpath>``), or None on a clone/subpath failure.
+
+    Anonymous by default: the token (if any) is supplied ONLY via a per-host
+    credential helper that git consults on a 401, never on the URL/argv. Fail-
+    soft: any error logs ``[plugins] fetch/extract failed`` and returns None so
+    the caller continues with the next source.
+
+    NOTE (ref shape): ``--branch`` accepts a branch or tag name (the common case
+    for declared plugins, incl. the mgmt-MCP's ``main``). A raw commit SHA is NOT
+    a valid ``--branch`` argument — the old archive-by-<sha> path accepted one;
+    pinning a declared plugin to a bare SHA is unsupported by this git-native
+    fetch and would need an ``init``+``fetch``+``checkout`` variant.
+    """
+    clone_dir = workdir / "clone"
+
+    cmd = [git_binary]
+    child_env = dict(os.environ)
+    child_env["GIT_TERMINAL_PROMPT"] = "0"  # never block boot on a cred prompt
+    if token and host:
+        # Wire the 401-only per-host helper and hand git the token via env.
+        cmd += _host_cred_config_args(scheme, host)
+        child_env[_CRED_TOKEN_ENVVAR] = token
+    cmd += [
+        "clone",
+        "--depth", "1",
+        "--single-branch",
+        "--branch", ref,
+        clone_url,
+        str(clone_dir),
+    ]
+
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=child_env,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        # The clone URL is token-free by construction, so it is safe to surface;
+        # git never echoes the credential to stderr. Truncate for log hygiene.
+        stderr = (getattr(exc, "stderr", "") or "").strip()
+        log.warning(
+            "[plugins] fetch/extract failed: %s (%s) %s",
+            raw, exc.__class__.__name__, stderr[:500],
+        )
+        return None
+
+    # Strip VCS metadata so the installed tree matches the old archive semantics
+    # (a tarball of the tree carried no ``.git``) and the plugins dir never holds
+    # a nested repo.
+    shutil.rmtree(clone_dir / ".git", ignore_errors=True)
+
+    content_dir = clone_dir / subpath if subpath else clone_dir
+    if not _is_within(clone_dir, content_dir):
+        log.warning("[plugins] subpath escapes repo: %s (%s)", subpath, raw)
+        return None
+    if not content_dir.is_dir():
+        log.warning(
+            "[plugins] subpath not in repo: %s (%s)", subpath, raw
+        )
+        return None
+    return content_dir
+
+
+# ---------------------------------------------------------------------------
+# Provider seam — scheme -> fetch handler (uniform signature).
 # ---------------------------------------------------------------------------
 def _fetch_gitea(
     source: PluginSource,
     *,
     base_url: str,
     token: str,
+    git_binary: str,
     workdir: Path,
     timeout: float,
 ) -> Path | None:
-    """Fetch + extract a gitea archive into ``workdir``; return the content dir
-    whose contents become ``<plugins_dir>/<name>/`` (``<top>`` or
-    ``<top>/<subpath>``), or None on a fetch/extract/subpath failure.
-
-    Fail-soft: any error logs ``[plugins] fetch/extract failed`` and returns
-    None so the caller continues with the next source.
-    """
-    url = base_url.rstrip("/") + source.archive_path()
-    headers = {"Authorization": f"token {token}"} if token else {}
-    archive_file = workdir / "archive.tar.gz"
-    extract_dir = workdir / "extract"
-    extract_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        with httpx.stream(
-            "GET", url, headers=headers, timeout=timeout, follow_redirects=True
-        ) as resp:
-            resp.raise_for_status()
-            with open(archive_file, "wb") as fh:
-                for chunk in resp.iter_bytes():
-                    fh.write(chunk)
-    except Exception as exc:  # noqa: BLE001 — fail-soft per source
-        log.warning("[plugins] fetch/extract failed: %s (%s)", source.raw, exc)
-        return None
-
-    try:
-        with tarfile.open(archive_file, "r:gz") as tar:
-            _safe_extract_tar(tar, extract_dir)
-    except (tarfile.TarError, PluginExtractError, OSError) as exc:
-        log.warning("[plugins] fetch/extract failed: %s (%s)", source.raw, exc)
-        return None
-
-    top = _find_archive_top(extract_dir)
-    if top is None:
-        log.warning("[plugins] fetch/extract failed: %s (empty archive)", source.raw)
-        return None
-
-    content_dir = top / source.subpath if source.subpath else top
-    if not content_dir.is_dir():
-        log.warning(
-            "[plugins] subpath not in archive: %s (%s)", source.subpath, source.raw
-        )
-        return None
-    return content_dir
+    """Resolve the gitea host from config and git-clone ``owner/repo``."""
+    base = base_url.rstrip("/")
+    host = urlsplit(base).netloc
+    clone_url = f"{base}/{source.owner}/{source.repo}.git"
+    return _git_fetch_tree(
+        clone_url=clone_url,
+        host=host,
+        scheme="https",
+        ref=source.ref,
+        subpath=source.subpath,
+        raw=source.raw,
+        token=token,
+        git_binary=git_binary,
+        workdir=workdir,
+        timeout=timeout,
+    )
 
 
-# Scheme -> fetch handler. A future github/gitlab/local provider registers here;
-# ``parse_declared_plugins`` then accepts that scheme automatically (the
-# source-provider-ecosystem seam — subsumes the providers-SSOT proposal).
-#   * ``gitea``   — box pulls a gitea archive itself (needs a read PAT).
+def _fetch_git_url(
+    source: PluginSource,
+    *,
+    base_url: str,  # noqa: ARG001 — uniform provider signature; host is self-contained
+    token: str,
+    git_binary: str,
+    workdir: Path,
+    timeout: float,
+) -> Path | None:
+    """git-clone a full self-contained git URL source (any forge)."""
+    clone_scheme = urlsplit(source.clone_url).scheme or "https"
+    return _git_fetch_tree(
+        clone_url=source.clone_url,
+        host=source.host,
+        scheme=clone_scheme,
+        ref=source.ref,
+        subpath=source.subpath,
+        raw=source.raw,
+        token=token,
+        git_binary=git_binary,
+        workdir=workdir,
+        timeout=timeout,
+    )
+
+
+# Scheme -> fetch handler. Both funnel into ``_git_fetch_tree`` (one clone core).
+# A future provider registers its scheme here and ``parse_declared_plugins``
+# accepts it automatically (the source-provider-ecosystem seam).
+#   * ``gitea``                              — host from config, box clones itself.
+#   * ``https``/``http``/``git+https``/``git+http`` — full self-contained git URL.
 _PROVIDERS: dict[str, Callable[..., "Path | None"]] = {
     "gitea": _fetch_gitea,
+    "https": _fetch_git_url,
+    "http": _fetch_git_url,
+    "git+https": _fetch_git_url,
+    "git+http": _fetch_git_url,
 }
 
 
@@ -371,6 +566,42 @@ def _resolve_plugins_dir(env: Mapping[str, str], plugins_dir: str | Path | None)
     return Path(config_path) / "plugins"
 
 
+def _resolve_gitea_base(env: Mapping[str, str]) -> str:
+    """Return the gitea base URL for the ``gitea://`` form.
+
+    Resolution order: ``MOLECULE_PLUGIN_REGISTRY`` (the provider-agnostic name
+    core SETS on the box — this is what makes the registry configurable for a
+    mirror/airgap) → ``MOLECULE_GITEA_BASE_URL`` (back-compat alias of the shell's
+    same var) → the documented default host (LOGged non-silently when used).
+    """
+    for name in (_REGISTRY_ENV, _BASE_URL_ENV):
+        configured = (env.get(name) or "").strip()
+        if configured:
+            return configured
+    log.info(
+        "[plugins] neither %s nor %s set — using documented back-compat gitea "
+        "base %s (set %s to silence)",
+        _REGISTRY_ENV, _BASE_URL_ENV, _BACKCOMPAT_GITEA_BASE, _REGISTRY_ENV,
+    )
+    return _BACKCOMPAT_GITEA_BASE
+
+
+def _host_token_map(env: Mapping[str, str], base_url: str) -> dict[str, str]:
+    """Map ``host -> token`` for the hosts the box holds a credential for.
+
+    Currently the one credential the box carries is the gitea read token (SSOT:
+    ``npm_auth.gitea_read_token``), keyed to the configured gitea host. A full
+    git URL that targets that same host reuses it; any other host has no token
+    here and clones anonymously (or relies on a globally-configured helper, e.g.
+    the github.com helper ``credential_helper.py`` installs).
+    """
+    token = gitea_read_token(env)
+    if not token:
+        return {}
+    host = urlsplit(base_url).netloc
+    return {host: token} if host else {}
+
+
 def install_declared_plugins(
     plugins_dir: str | Path | None = None,
     env: Mapping[str, str] | None = None,
@@ -381,19 +612,10 @@ def install_declared_plugins(
     is unset/empty, so existing behaviour is byte-for-byte unchanged when the
     signal is absent.
 
-    Atomic build-then-swap (the fix for F1's wipe-on-transient-failure)
-    -----------------------------------------------------------------
-    The previous implementation ``rm -rf``'d the live ``plugins_dir`` UP FRONT
-    and then re-fetched — so a single transient fetch failure wiped skills a
-    prior boot had already materialized, leaving the workspace skill-less for
-    that boot. Instead we now fetch the WHOLE declared set into a sibling
-    ``staging`` directory first, and only ``os.replace``-swap it into place when
-    EVERY source materialized. On any fetch/copy failure (or a swap-rename
-    failure) the existing live tree is left untouched — the build is discarded
-    and retried next boot. The swap still drops plugins no longer in the declared
-    set (full-replace semantics preserved), it just never leaves the live dir in
-    a half-built/empty state. Fail-soft: never raises into the caller — the
-    runtime starting matters more than any one plugin landing.
+    Fetch is a git clone, anonymous by default (see the module docstring); the
+    atomic build-then-swap and manifest-SSOT gate below are unchanged — only the
+    per-source FETCH mechanism changed. Fail-soft: never raises into the caller —
+    the runtime starting matters more than any one plugin landing.
     """
     if env is None:
         env = os.environ
@@ -411,8 +633,9 @@ def install_declared_plugins(
     target_dir = _resolve_plugins_dir(env, plugins_dir)
     report.plugins_dir = str(target_dir)
 
-    base_url = (env.get("MOLECULE_GITEA_BASE_URL") or _DEFAULT_GITEA_BASE).strip()
-    token = (env.get(_TOKEN_ENV) or "").strip()
+    base_url = _resolve_gitea_base(env)
+    host_tokens = _host_token_map(env, base_url)
+    git_binary = (env.get(_GIT_BINARY_ENV) or "").strip() or _DEFAULT_GIT_BINARY
     try:
         timeout = float(env.get(_FETCH_TIMEOUT_ENV) or _DEFAULT_FETCH_TIMEOUT_SECONDS)
     except (TypeError, ValueError):
@@ -451,11 +674,16 @@ def install_declared_plugins(
                 log.info("[plugins] skip unsupported source: %s", source.raw)
                 report.skipped.append(source.raw)
                 continue
+            # Resolve the per-host token for THIS source's host. gitea:// resolves
+            # its host from base_url; a full URL carries its own host.
+            source_host = source.host or urlsplit(base_url).netloc
+            token = host_tokens.get(source_host, "")
             with tempfile.TemporaryDirectory(prefix="molecule-plugin-") as td:
                 content_dir = fetch(
                     source,
                     base_url=base_url,
                     token=token,
+                    git_binary=git_binary,
                     workdir=Path(td),
                     timeout=timeout,
                 )

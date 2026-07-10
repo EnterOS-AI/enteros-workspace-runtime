@@ -1,20 +1,18 @@
 """Tests for plugin_sources — the declared-plugins boot-install (F1).
 
-Locks in the Python SSOT port of the proven shell block
-(``wt-claude-code/entrypoint.sh:214-284``):
-  * ``parse_declared_plugins`` — gitea:// scheme guard, ``#ref`` suffix,
-    subpath, name extraction; rejects non-gitea + malformed tokens.
-  * ``install_declared_plugins`` — materializes ``<plugins_dir>/<name>`` from a
-    fetched gitea archive (httpx monkeypatched), with the path-traversal guard
-    the shell ``cp -a`` lacked, fail-soft per source, and the empty-signal
-    no-op that preserves existing behaviour.
+Locks in the git-native, provider-agnostic boot-install:
+  * ``parse_declared_plugins`` — accepts ``gitea://owner/repo[/subpath][#ref]``
+    AND a full git URL (``https|http|git+https|git+http://host/...[.git/sub][#ref]``);
+    rejects unknown schemes + malformed tokens.
+  * ``install_declared_plugins`` — materializes ``<plugins_dir>/<name>`` by
+    ``git clone`` (subprocess monkeypatched), ANONYMOUS by default (no token in
+    URL/argv), a per-host credential helper only for 401 (private) repos, the
+    subpath-containment guard, fail-soft per source, atomic build-then-swap, and
+    the empty-signal no-op that preserves existing behaviour.
 """
 from __future__ import annotations
 
-import io
-import tarfile
-
-import pytest
+from pathlib import Path
 
 import molecule_runtime.plugin_sources as ps
 
@@ -27,7 +25,9 @@ def test_parse_basic_owner_repo():
     assert (s.scheme, s.owner, s.repo, s.subpath, s.ref, s.name) == (
         "gitea", "owner", "repo", "", "main", "repo",
     )
-    assert s.archive_path() == "/api/v1/repos/owner/repo/archive/main.tar.gz"
+    # gitea:// leaves host/clone_url empty — the host is resolved from config at
+    # fetch time (see _fetch_gitea), not baked into the parse.
+    assert (s.host, s.clone_url) == ("", "")
 
 
 def test_parse_ref_suffix_and_subpath_and_name():
@@ -36,7 +36,32 @@ def test_parse_ref_suffix_and_subpath_and_name():
     assert s.subpath == "sub/skill"
     # name = LAST path segment of subpath (entrypoint.sh:255)
     assert s.name == "skill"
-    assert s.archive_path() == "/api/v1/repos/o2/r2/archive/dev.tar.gz"
+
+
+def test_parse_full_https_url():
+    # A full git URL is self-contained (any forge): host + clone_url are parsed,
+    # owner/repo stay empty, name = repo segment (trailing .git stripped).
+    (s,) = ps.parse_declared_plugins("https://github.com/acme/mgmt-mcp#v1")
+    assert s.scheme == "https"
+    assert s.host == "github.com"
+    assert s.clone_url == "https://github.com/acme/mgmt-mcp"
+    assert (s.ref, s.name, s.subpath) == ("v1", "mgmt-mcp", "")
+
+
+def test_parse_git_plus_https_normalizes_and_defaults_ref():
+    (s,) = ps.parse_declared_plugins("git+https://gitlab.com/g/proj.git")
+    assert s.scheme == "git+https"
+    # git+ is normalized away for the actual clone URL.
+    assert s.clone_url == "https://gitlab.com/g/proj.git"
+    assert (s.host, s.ref, s.name) == ("gitlab.com", "main", "proj")
+
+
+def test_parse_full_url_subpath_via_dotgit_delimiter():
+    # ``.git/`` delimits the repo (clone target) from an in-repo subpath.
+    (s,) = ps.parse_declared_plugins("https://h.example/o/r.git/sub/skill#dev")
+    assert s.clone_url == "https://h.example/o/r.git"
+    assert s.subpath == "sub/skill"
+    assert (s.ref, s.name) == ("dev", "skill")
 
 
 def test_parse_strips_all_whitespace_and_splits_commas():
@@ -45,10 +70,16 @@ def test_parse_strips_all_whitespace_and_splits_commas():
 
 
 def test_parse_skips_unsupported_scheme():
-    # github:// is not a registered provider in v1 — skipped (matches the shell's
-    # "skip unsupported source"); gitea survives.
+    # github:// is a bespoke scheme, NOT a full git URL (those are https://…) —
+    # skipped (matches the shell's "skip unsupported source"); gitea survives.
     out = ps.parse_declared_plugins("github://x/y,gitea://a/b")
     assert [s.owner for s in out] == ["a"]
+
+
+def test_parse_skips_malformed_full_url():
+    # A full URL with no repo path is malformed → skipped.
+    assert ps.parse_declared_plugins("https://only.host") == []
+    assert ps.parse_declared_plugins("https://only.host/") == []
 
 
 def test_parse_skips_malformed():
@@ -64,66 +95,67 @@ def test_parse_empty_is_noop():
 
 
 # ---------------------------------------------------------------------------
-# install_declared_plugins — archive fetch monkeypatched
+# install_declared_plugins — git clone monkeypatched
 # ---------------------------------------------------------------------------
-def _make_targz(members: dict[str, bytes], top: str = "repo-main") -> bytes:
-    """Build a gitea-style .tar.gz: a single top dir containing ``members``."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # top dir entry — DIRTYPE so it extracts as a directory (a gitea archive
-        # is rooted at a single ``<repo>-<ref>/`` directory).
-        d = tarfile.TarInfo(name=top + "/")
-        d.type = tarfile.DIRTYPE
-        d.mode = 0o755
-        tar.addfile(d)
-        for rel, data in members.items():
-            info = tarfile.TarInfo(name=f"{top}/{rel}")
-            info.size = len(data)
-            info.mode = 0o644
-            tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
+def _make_repo(members: dict[str, bytes]) -> dict[str, bytes]:
+    """A fake checked-out repo tree: rel-path -> bytes (git clone hands us the
+    tree directly — no ``<repo>-<ref>/`` archive wrapper)."""
+    return dict(members)
 
 
-class _FakeStream:
-    """Context-manager stand-in for ``httpx.stream(...)``."""
+def _patch_git(monkeypatch, resolver):
+    """Patch ``plugin_sources.subprocess.run`` so a ``git clone ... <dir>`` writes
+    a fake checked-out tree instead of hitting the network.
 
-    def __init__(self, data: bytes | None, status: int = 200):
-        self._data = data
-        self.status_code = status
+    ``resolver(clone_url, ref, cmd, env) -> dict[str,bytes] | None``
+      returns the repo file-map to materialize at ``<dir>`` (success), or None to
+      simulate a clone FAILURE (non-zero exit, like an unreachable/private repo).
 
-    def __enter__(self):
-        return self
+    Returns a ``calls`` list of ``{"cmd", "env"}`` for argv/env assertions.
+    """
+    calls: list[dict] = []
 
-    def __exit__(self, *a):
-        return False
+    def fake_run(cmd, **kwargs):
+        env = kwargs.get("env") or {}
+        calls.append({"cmd": list(cmd), "env": dict(env)})
+        if "clone" not in cmd:  # e.g. a hypothetical `git config` — succeed no-op
+            return _completed(cmd, 0)
+        clone_url = cmd[-2]
+        dest = Path(cmd[-1])
+        ref = cmd[cmd.index("--branch") + 1] if "--branch" in cmd else "main"
+        files = resolver(clone_url, ref, list(cmd), dict(env))
+        if files is None:
+            raise ps.subprocess.CalledProcessError(
+                128, cmd, output="", stderr=f"fatal: could not clone {clone_url}"
+            )
+        dest.mkdir(parents=True, exist_ok=True)
+        # git leaves a .git metadata dir in the checkout — the code must strip it.
+        (dest / ".git").mkdir(exist_ok=True)
+        (dest / ".git" / "HEAD").write_text("ref: refs/heads/x\n")
+        for rel, data in files.items():
+            p = dest / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        return _completed(cmd, 0)
 
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
-
-    def iter_bytes(self):
-        yield self._data or b""
+    monkeypatch.setattr(ps.subprocess, "run", fake_run)
+    return calls
 
 
-def _patch_stream(monkeypatch, router):
-    """Patch plugin_sources.httpx.stream with a URL->_FakeStream router."""
-
-    def _fake_stream(method, url, **kwargs):
-        return router(url, kwargs)
-
-    monkeypatch.setattr(ps.httpx, "stream", _fake_stream)
+def _completed(cmd, code):
+    return ps.subprocess.CompletedProcess(cmd, code, "", "")
 
 
 def test_install_materializes_plugin(monkeypatch, tmp_path):
-    archive = _make_targz({"SKILL.md": b"# hello", "tool.py": b"print(1)"})
+    repo = _make_repo({"SKILL.md": b"# hello", "tool.py": b"print(1)"})
 
-    def router(url, kwargs):
-        assert "/api/v1/repos/owner/repo/archive/main.tar.gz" in url
-        # token header sent when MOLECULE_TEMPLATE_REPO_TOKEN set
-        assert kwargs["headers"].get("Authorization") == "token tok-XYZ"
-        return _FakeStream(archive)
+    def resolver(clone_url, ref, cmd, env):
+        # gitea:// resolves to a token-free https clone URL of the whole repo.
+        assert clone_url == "https://git.moleculesai.app/owner/repo.git"
+        assert ref == "main"
+        return repo
 
-    _patch_stream(monkeypatch, router)
+    _patch_git(monkeypatch, resolver)
     plugins_dir = tmp_path / "plugins"
     report = ps.install_declared_plugins(
         plugins_dir=plugins_dir,
@@ -133,20 +165,104 @@ def test_install_materializes_plugin(monkeypatch, tmp_path):
     assert report.installed == ["gitea://owner/repo"]
     assert (plugins_dir / "repo" / "SKILL.md").read_text() == "# hello"
     assert (plugins_dir / "repo" / "tool.py").exists()
+    # The .git metadata dir must NOT be copied into the plugins tree.
+    assert not (plugins_dir / "repo" / ".git").exists()
+
+
+def test_public_fetch_sends_no_token_in_url_or_argv(monkeypatch, tmp_path):
+    # A token IS configured, but for a PUBLIC repo git never 401s so the helper is
+    # never invoked and NO token is transmitted. Mechanism guarantees: the token
+    # value never appears in the clone URL or anywhere on git's argv; it is
+    # handed to git ONLY via the child env, read solely by the 401-time helper.
+    calls = _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"x"}))
+    ps.install_declared_plugins(
+        plugins_dir=tmp_path / "plugins",
+        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo", "MOLECULE_TEMPLATE_REPO_TOKEN": "sekret-tok"},
+    )
+    (call,) = [c for c in calls if "clone" in c["cmd"]]
+    argv = call["cmd"]
+    # Token NEVER on argv (no ps leak) and NEVER in the URL.
+    assert not any("sekret-tok" in a for a in argv)
+    clone_url = argv[-2]
+    assert "sekret-tok" not in clone_url and "@" not in clone_url
+    # A per-host credential helper IS wired (for the private/401 case) and reads
+    # the token from the env var, not argv.
+    assert any(a.startswith("credential.https://git.moleculesai.app.helper=!") for a in argv)
+    assert any(ps._CRED_TOKEN_ENVVAR in a for a in argv)  # helper references the env var name
+    # The token is supplied to git ONLY via the child env.
+    assert call["env"].get(ps._CRED_TOKEN_ENVVAR) == "sekret-tok"
+    # Never block boot on an interactive credential prompt.
+    assert call["env"].get("GIT_TERMINAL_PROMPT") == "0"
+
+
+def test_private_fetch_wires_per_host_cred_helper(monkeypatch, tmp_path):
+    # Simulate a PRIVATE repo: the resolver refuses UNLESS git could supply the
+    # token — i.e. the per-host helper is wired and the token is in the child env.
+    # This proves the credential-as-abstraction path is available on a 401.
+    def resolver(clone_url, ref, cmd, env):
+        helper_wired = any(
+            a.startswith("credential.https://git.moleculesai.app.helper=!") for a in cmd
+        )
+        token_in_env = env.get(ps._CRED_TOKEN_ENVVAR) == "priv-tok"
+        if helper_wired and token_in_env:
+            return _make_repo({"SKILL.md": b"# private"})
+        return None  # 401 with no usable credential -> clone fails
+
+    _patch_git(monkeypatch, resolver)
+    plugins_dir = tmp_path / "plugins"
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo", "GITEA_TOKEN": "priv-tok"},
+    )
+    assert report.installed == ["gitea://owner/repo"]
+    assert report.swapped is True
+    assert (plugins_dir / "repo" / "SKILL.md").read_text() == "# private"
+
+
+def test_anonymous_when_no_token_no_cred_helper(monkeypatch, tmp_path):
+    # No token configured: NO credential helper is wired and NO token env is set —
+    # the clone is fully anonymous. GIT_TERMINAL_PROMPT=0 still guards against a
+    # boot-blocking prompt if the repo turns out to be private.
+    calls = _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"x"}))
+    ps.install_declared_plugins(
+        plugins_dir=tmp_path / "plugins",
+        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo"},
+    )
+    (call,) = [c for c in calls if "clone" in c["cmd"]]
+    assert not any("credential." in a for a in call["cmd"])
+    assert ps._CRED_TOKEN_ENVVAR not in call["env"]
+    assert call["env"].get("GIT_TERMINAL_PROMPT") == "0"
 
 
 def test_install_honors_subpath_and_name(monkeypatch, tmp_path):
-    archive = _make_targz({"sub/skill/SKILL.md": b"# sub", "README.md": b"top"})
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
+    repo = _make_repo({"sub/skill/SKILL.md": b"# sub", "README.md": b"top"})
+    _patch_git(monkeypatch, lambda url, ref, cmd, env: repo)
     plugins_dir = tmp_path / "plugins"
     report = ps.install_declared_plugins(
         plugins_dir=plugins_dir,
         env={"MOLECULE_DECLARED_PLUGINS": "gitea://o/r/sub/skill"},
     )
     assert report.installed == ["gitea://o/r/sub/skill"]
-    # named after the last subpath segment, contents come from <top>/sub/skill
+    # named after the last subpath segment, contents come from <clone>/sub/skill
     assert (plugins_dir / "skill" / "SKILL.md").read_text() == "# sub"
     assert not (plugins_dir / "skill" / "README.md").exists()
+
+
+def test_install_full_git_url_source(monkeypatch, tmp_path):
+    # A full git URL (any forge) clones its self-contained URL; name = repo seg.
+    def resolver(clone_url, ref, cmd, env):
+        assert clone_url == "https://github.com/acme/mgmt-mcp"
+        assert ref == "v2"
+        return _make_repo({"SKILL.md": b"# gh"})
+
+    _patch_git(monkeypatch, resolver)
+    plugins_dir = tmp_path / "plugins"
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": "https://github.com/acme/mgmt-mcp#v2"},
+    )
+    assert report.installed == ["https://github.com/acme/mgmt-mcp#v2"]
+    assert (plugins_dir / "mgmt-mcp" / "SKILL.md").read_text() == "# gh"
 
 
 def test_install_empty_signal_is_noop_and_preserves_existing(monkeypatch, tmp_path):
@@ -156,14 +272,14 @@ def test_install_empty_signal_is_noop_and_preserves_existing(monkeypatch, tmp_pa
     (plugins_dir / "preexisting").mkdir(parents=True)
     (plugins_dir / "preexisting" / "keep.txt").write_text("keep")
 
-    called = {"stream": False}
-    monkeypatch.setattr(ps.httpx, "stream", lambda *a, **k: called.__setitem__("stream", True))
+    called = {"run": False}
+    monkeypatch.setattr(ps.subprocess, "run", lambda *a, **k: called.__setitem__("run", True))
 
     report = ps.install_declared_plugins(plugins_dir=plugins_dir, env={})
     assert report.declared is False
     assert "no MOLECULE_DECLARED_PLUGINS" in report.summary()
     assert (plugins_dir / "preexisting" / "keep.txt").read_text() == "keep"
-    assert called["stream"] is False  # never fetched
+    assert called["run"] is False  # never cloned
 
 
 def test_install_partial_failure_does_not_swap_and_keeps_existing(monkeypatch, tmp_path):
@@ -171,14 +287,12 @@ def test_install_partial_failure_does_not_swap_and_keeps_existing(monkeypatch, t
     # staging build is NOT promoted — the existing live tree is left intact. A
     # transient blip on one source must never half-replace the plugins dir. The
     # per-source outcomes are still reported so observability is unchanged.
-    good = _make_targz({"SKILL.md": b"ok"})
+    def resolver(clone_url, ref, cmd, env):
+        if "/bad/" in clone_url:
+            return None  # clone fails
+        return _make_repo({"SKILL.md": b"ok"})
 
-    def router(url, kwargs):
-        if "/bad/" in url:
-            return _FakeStream(None, status=404)  # raise_for_status -> fail
-        return _FakeStream(good)
-
-    _patch_stream(monkeypatch, router)
+    _patch_git(monkeypatch, resolver)
     plugins_dir = tmp_path / "plugins"
     # A prior boot's tree exists and must survive the partial failure.
     (plugins_dir / "prior").mkdir(parents=True)
@@ -205,8 +319,8 @@ def test_install_fetch_failure_preserves_existing_tree(monkeypatch, tmp_path):
     (plugins_dir / "old-skill" / "SKILL.md").write_text("prior-good")
     (plugins_dir / "old-skill" / "tool.py").write_text("print('keep me')")
 
-    # Every fetch 503s (gitea blip) for this boot.
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(None, status=503))
+    # Every clone fails (gitea blip) for this boot.
+    _patch_git(monkeypatch, lambda url, ref, cmd, env: None)
 
     report = ps.install_declared_plugins(
         plugins_dir=plugins_dir,
@@ -231,8 +345,7 @@ def test_install_full_success_swaps_and_drops_removed(monkeypatch, tmp_path):
     (plugins_dir / "stale").mkdir(parents=True)
     (plugins_dir / "stale" / "x.txt").write_text("old")
 
-    archive = _make_targz({"SKILL.md": b"new"})
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
+    _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"new"}))
 
     report = ps.install_declared_plugins(
         plugins_dir=plugins_dir,
@@ -247,36 +360,27 @@ def test_install_full_success_swaps_and_drops_removed(monkeypatch, tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["plugins"]
 
 
-def test_install_rejects_path_traversal_member(monkeypatch, tmp_path):
-    # A malicious archive member that resolves OUTSIDE the extraction dir must be
-    # rejected (the shell cp -a had no such guard). The whole source fails-soft;
-    # nothing is written outside, and the escape file never lands.
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        tar.addfile(tarfile.TarInfo(name="repo-main/"))
-        evil = b"pwned"
-        info = tarfile.TarInfo(name="repo-main/../../escape.txt")
-        info.size = len(evil)
-        tar.addfile(info, io.BytesIO(evil))
-    archive = buf.getvalue()
-
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
+def test_install_rejects_subpath_escape(monkeypatch, tmp_path):
+    # The containment guard: a crafted subpath that resolves OUTSIDE the clone
+    # dir must be rejected (fail-soft), so nothing outside the plugins tree is
+    # read/copied. Replaces the old tar-member traversal guard (git clone writes
+    # the tree within the clone dir — there is no archive write-escape vector).
+    # `..` segments in the subpath try to climb out of the checkout.
+    _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"ok"}))
     plugins_dir = tmp_path / "plugins"
     report = ps.install_declared_plugins(
         plugins_dir=plugins_dir,
-        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo"},
+        # subpath = "../../escape" -> name "escape", content_dir escapes clone dir
+        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo/../../escape"},
     )
-    assert report.failed == ["gitea://owner/repo"]
+    assert report.failed == ["gitea://owner/repo/../../escape"]
     assert report.installed == []
-    # No file escaped above the plugins dir.
-    assert not (tmp_path / "escape.txt").exists()
-    assert not (plugins_dir.parent / "escape.txt").exists()
+    assert not (plugins_dir / "escape").exists()
 
 
 def test_install_default_plugins_dir_from_env(monkeypatch, tmp_path):
     # When plugins_dir is not passed, it derives from WORKSPACE_CONFIG_PATH.
-    archive = _make_targz({"SKILL.md": b"x"})
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
+    _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"x"}))
     config_path = tmp_path / "configs"
     report = ps.install_declared_plugins(
         env={
@@ -288,21 +392,71 @@ def test_install_default_plugins_dir_from_env(monkeypatch, tmp_path):
     assert (config_path / "plugins" / "repo" / "SKILL.md").exists()
 
 
-def test_install_unauth_when_no_token(monkeypatch, tmp_path):
-    archive = _make_targz({"SKILL.md": b"x"})
-    seen = {}
+def test_gitea_clone_url_from_configured_base(monkeypatch, tmp_path):
+    # MOLECULE_GITEA_BASE_URL sets the host + the credential-helper host key.
+    def resolver(clone_url, ref, cmd, env):
+        assert clone_url == "https://gitea.example.com/owner/repo.git"
+        # helper is keyed on the CONFIGURED host, not the hardcoded default.
+        assert any(
+            a.startswith("credential.https://gitea.example.com.helper=!") for a in cmd
+        )
+        return _make_repo({"SKILL.md": b"x"})
 
-    def router(url, kwargs):
-        seen["headers"] = kwargs["headers"]
-        return _FakeStream(archive)
-
-    _patch_stream(monkeypatch, router)
-    ps.install_declared_plugins(
+    _patch_git(monkeypatch, resolver)
+    report = ps.install_declared_plugins(
         plugins_dir=tmp_path / "plugins",
-        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo"},
+        env={
+            "MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo",
+            "MOLECULE_GITEA_BASE_URL": "https://gitea.example.com",
+            "GITEA_TOKEN": "t",
+        },
     )
-    # No token -> no Authorization header (unauth fallback, like the shell).
-    assert "Authorization" not in seen["headers"]
+    assert report.installed == ["gitea://owner/repo"]
+
+
+def test_gitea_clone_url_from_plugin_registry(monkeypatch, tmp_path):
+    # MOLECULE_PLUGIN_REGISTRY is the provider-agnostic name core SETS on the box
+    # (conciergePlatformMCPEnv). The resolver MUST read it — this is the SET/READ
+    # bridge that makes the registry knob real (a self-host/mirror/airgap points
+    # plugin sourcing elsewhere via this var). Regression for the exact SET-one-
+    # name/READ-another drift that broke the concierge before. It also takes
+    # PRECEDENCE over the MOLECULE_GITEA_BASE_URL back-compat alias.
+    def resolver(clone_url, ref, cmd, env):
+        assert clone_url == "https://gitea.internal.corp/owner/repo.git"
+        assert any(
+            a.startswith("credential.https://gitea.internal.corp.helper=!") for a in cmd
+        )
+        return _make_repo({"SKILL.md": b"x"})
+
+    _patch_git(monkeypatch, resolver)
+    report = ps.install_declared_plugins(
+        plugins_dir=tmp_path / "plugins",
+        env={
+            "MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo",
+            "MOLECULE_PLUGIN_REGISTRY": "https://gitea.internal.corp",
+            "MOLECULE_GITEA_BASE_URL": "https://git.moleculesai.app",  # loses to registry
+            "GITEA_TOKEN": "t",  # so the per-host cred-helper wires (keyed on registry host)
+        },
+    )
+    assert report.installed == ["gitea://owner/repo"]
+
+
+def test_gitea_backcompat_default_host_is_logged(monkeypatch, tmp_path, caplog):
+    # Removing the default host would break provisioning where the box relies on
+    # it (the shell mirror defaults the same way), so it is KEPT — but emitted
+    # NON-SILENTLY: a log line records the reliance.
+    import logging
+    _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"x"}))
+    with caplog.at_level(logging.INFO, logger="molecule_runtime.plugin_sources"):
+        ps.install_declared_plugins(
+            plugins_dir=tmp_path / "plugins",
+            env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/repo"},
+        )
+    assert any(
+        "MOLECULE_PLUGIN_REGISTRY" in r.getMessage()
+        and "back-compat" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,11 +477,11 @@ def test_parse_presign_is_now_unknown_scheme():
 def test_install_presign_scheme_no_longer_resolves(monkeypatch, tmp_path):
     # Retired: even if a leftover .relay-plugins drop is present on disk, a
     # presign:// source is an unknown scheme now — never resolved, never
-    # installed, and no network fetch is attempted for it.
+    # installed, and no clone is attempted for it.
     def _boom(*a, **k):  # pragma: no cover - asserts non-invocation
-        raise AssertionError("presign is retired — must not perform a network fetch")
+        raise AssertionError("presign is retired — must not perform a git clone")
 
-    monkeypatch.setattr(ps.httpx, "stream", _boom)
+    monkeypatch.setattr(ps.subprocess, "run", _boom)
 
     config_path = tmp_path / "configs"
     # A stale relay drop must NOT be picked up now that the provider is gone.
@@ -351,8 +505,7 @@ def test_install_mixed_gitea_and_retired_presign(monkeypatch, tmp_path):
     # A gitea:// plugin still installs; a co-declared presign:// token is now an
     # unknown scheme (retired) and is silently dropped — the gitea install is
     # unaffected.
-    archive = _make_targz({"SKILL.md": b"# git"})
-    _patch_stream(monkeypatch, lambda url, kw: _FakeStream(archive))
+    _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"SKILL.md": b"# git"}))
     config_path = tmp_path / "configs"
     report = ps.install_declared_plugins(
         plugins_dir=config_path / "plugins",
