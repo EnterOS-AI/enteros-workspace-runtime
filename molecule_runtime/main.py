@@ -590,10 +590,21 @@ async def main():  # pragma: no cover
     # and the shell block run idempotently (shell first as root pre-gosu, this
     # second as the agent uid here) — the second simply rebuilds the same tree.
     from molecule_runtime.plugin_sources import install_declared_plugins
+    # BOOT_STEP 1/8 (task #51) — "Install plugins". emit_boot_step is
+    # concierge-gated + fire-and-forget + 404-safe, so these are pure additive
+    # telemetry: no control-flow, timing, or behavior change to the boot itself.
+    from molecule_runtime.boot_step_emit import emit_boot_step
+    _BOOT_TOTAL = 8
+    emit_boot_step("PLG", "Install plugins", "running", step=1, total=_BOOT_TOTAL)
     try:
         print(install_declared_plugins().summary(), flush=True)
+        emit_boot_step("PLG", "Install plugins", "ok", step=1, total=_BOOT_TOTAL)
     except Exception as e:  # noqa: BLE001 — boot-install must never block boot
         print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
+        emit_boot_step(
+            "PLG", "Install plugins", "failed", step=1, total=_BOOT_TOTAL,
+            message=f"{type(e).__name__}: {e}",
+        )
 
     # 0.2d Self-reprovision wake detection (design §5.2 — proactive wake).
     # Diff the plugins tree boot-install just (re)built against last boot's
@@ -667,6 +678,9 @@ async def main():  # pragma: no cover
     # the inbox poller below. The proven push concierge never sets this, so the
     # entire poll branch is dead code for it.
     delivery_mode = resolve_delivery_mode(os.environ, config.a2a.delivery_mode)
+    # BOOT_STEP 2/8 (task #51) — "Load identity" (preflight: config + required
+    # env). ok/failed emitted below once preflight.ok is known.
+    emit_boot_step("ID", "Load identity", "running", step=2, total=_BOOT_TOTAL)
     preflight = run_preflight(config, config_path)
     render_preflight_report(preflight)
 
@@ -677,7 +691,14 @@ async def main():  # pragma: no cover
     except Exception as _agents_md_err:  # pragma: no cover
         print(f"Warning: AGENTS.md generation failed (non-fatal): {_agents_md_err}")
     if not preflight.ok:
+        # BOOT_STEP 2/8 failed — preflight rejected config / required env. Emit
+        # the red step before the halt so the canvas shows WHY boot stopped.
+        emit_boot_step(
+            "ID", "Load identity", "failed", step=2, total=_BOOT_TOTAL,
+            message="preflight failed — see boot log for missing config/env",
+        )
         raise SystemExit(1)
+    emit_boot_step("ID", "Load identity", "ok", step=2, total=_BOOT_TOTAL)
     if awareness_config:
         awareness_namespace = resolve_awareness_namespace(
             workspace_id,
@@ -706,9 +727,20 @@ async def main():  # pragma: no cover
 
     # 3. Get adapter for this runtime
     runtime = config.runtime or "claude-code"
-    adapter_cls = get_adapter(runtime)  # Raises KeyError if unknown — no silent fallback
-
-    adapter = adapter_cls()
+    # BOOT_STEP 3/8 (task #51) — "Start runtime": resolve + instantiate the
+    # runtime adapter. get_adapter raises KeyError on an unknown runtime (no
+    # silent fallback), so emit failed before it propagates.
+    emit_boot_step("RT", "Start runtime", "running", step=3, total=_BOOT_TOTAL)
+    try:
+        adapter_cls = get_adapter(runtime)  # Raises KeyError if unknown — no silent fallback
+        adapter = adapter_cls()
+    except Exception as _rt_err:  # noqa: BLE001 — emit then re-raise, no swallow
+        emit_boot_step(
+            "RT", "Start runtime", "failed", step=3, total=_BOOT_TOTAL,
+            message=f"unknown or unloadable runtime {runtime!r}: {_rt_err}",
+        )
+        raise
+    emit_boot_step("RT", "Start runtime", "ok", step=3, total=_BOOT_TOTAL)
     print(f"Runtime: {runtime} ({adapter.display_name()})")
 
     # 3a. Wire pluggable event-log backend from config.observability.event_log.
@@ -745,6 +777,10 @@ async def main():  # pragma: no cover
     # adapter and its config, so it registers the probe here. The baked-binary
     # path and the claude-settings fallback both still apply inside
     # mcp_server_present().
+    # BOOT_STEP 4/8 (task #51) — "Management MCP". THE key UX win: on the
+    # fail-closed abort below the runtime emits a RED, HALTED step with the
+    # box-level diagnostic instead of leaving the canvas on an infinite spinner.
+    emit_boot_step("MCP", "Management MCP", "running", step=4, total=_BOOT_TOTAL)
     try:
         from molecule_runtime.platform_agent_identity import (
             register_mcp_launch_env_provider,
@@ -762,6 +798,7 @@ async def main():  # pragma: no cover
         register_mcp_launch_env_provider(
             lambda _a=adapter, _c=adapter_config: _a.mcp_launch_env(_c)
         )
+        emit_boot_step("MCP", "Management MCP", "ok", step=4, total=_BOOT_TOTAL)
     except Exception as probe_err:  # noqa: BLE001
         # On a PLATFORM agent (concierge), silently falling back to the claude
         # settings.json check would fail-OPEN the RCA#2970 gate for a non-claude
@@ -769,11 +806,31 @@ async def main():  # pragma: no cover
         # LOUD: abort the boot. An ordinary workspace doesn't gate on the
         # management MCP, so its boot proceeds with the harmless fallback.
         if _probe_wiring_failure_is_fatal():
+            # Red, halted keycap + the box-level diagnostic (on_platform_agent_
+            # image / mcp_command_resolved / binary / settings entry) so the
+            # canvas shows WHY, without needing SSH to the locked-down box.
+            try:
+                from molecule_runtime.platform_agent_identity import (
+                    management_mcp_diagnostic,
+                )
+                _diag = management_mcp_diagnostic()
+            except Exception:  # noqa: BLE001 — diagnostic is best-effort
+                _diag = {}
+            emit_boot_step(
+                "MCP", "Management MCP", "failed", step=4, total=_BOOT_TOTAL,
+                message=(
+                    f"management-MCP gate probe failed to wire "
+                    f"({type(probe_err).__name__}: {probe_err}); diag={_diag}"
+                ),
+            )
             raise RuntimeError(
                 "FATAL: failed to register management-MCP gate probe on a "
                 "platform agent — refusing to boot fail-open against the claude "
                 "settings.json fallback (the #3159 cross-runtime mis-attribution)"
             ) from probe_err
+        # Non-fatal (ordinary workspace) — the fallback is harmless. Mark the
+        # step ok so the boot screen (if any) doesn't stall on a running keycap.
+        emit_boot_step("MCP", "Management MCP", "ok", step=4, total=_BOOT_TOTAL)
         print("WARNING: failed to register management-MCP gate probe; "
               "falling back to claude settings.json check")
 
@@ -904,6 +961,16 @@ async def main():  # pragma: no cover
         # a turn — while NEVER delaying register/heartbeat below (fire-and-forget;
         # the coroutine is boot-safe + never raises). Keep a reference so the task
         # is not GC'd. The per-turn capture (template executor) remains a fallback.
+        # BOOT_STEP 5/8 (task #51) — "Enumerate tools". Numbered 5 (before A2A
+        # "Wire transport", step 6) so the keycaps light up in wall-clock order:
+        # this init-enumeration is kicked off during adapter.setup(), which runs
+        # BEFORE the A2A routes are assembled below. The enumeration itself runs
+        # as a non-blocking BACKGROUND task (retry until the management MCP is
+        # connectable), so boot does NOT wait for the tool list. We mark the step
+        # ok once the enumeration is successfully KICKED OFF — the terminal
+        # online verdict (loaded_mcp_tools populated) is the platform's, carried
+        # by the heartbeat, not this presentation step.
+        emit_boot_step("TOOL", "Enumerate tools", "running", step=5, total=_BOOT_TOTAL)
         try:
             from molecule_runtime.loaded_mcp_tools_probe import (
                 capture_loaded_mcp_tools_with_retry,
@@ -924,11 +991,16 @@ async def main():  # pragma: no cover
                 "the management MCP is connectable; non-blocking)",
                 flush=True,
             )
+            emit_boot_step("TOOL", "Enumerate tools", "ok", step=5, total=_BOOT_TOTAL)
         except Exception as mcp_probe_err:  # noqa: BLE001 — never block boot
             print(
                 f"loaded_mcp_tools: failed to spawn init enumeration (non-fatal): "
                 f"{type(mcp_probe_err).__name__}: {mcp_probe_err}",
                 flush=True,
+            )
+            emit_boot_step(
+                "TOOL", "Enumerate tools", "failed", step=5, total=_BOOT_TOTAL,
+                message=f"{type(mcp_probe_err).__name__}: {mcp_probe_err}",
             )
 
         # 6a. Boot-smoke short-circuit (issue #2275): if MOLECULE_SMOKE_MODE
@@ -1009,8 +1081,15 @@ async def main():  # pragma: no cover
     # this extraction a future refactor that re-coupled card + setup()
     # would silently bypass PR #2756. tests/test_boot_routes.py pins
     # the four-branch contract.
+    # BOOT_STEP 6/8 (task #51) — "Wire transport": assemble the A2A/JSON-RPC
+    # Starlette routes (card always mounted; JSON-RPC route swaps on adapter
+    # state). This is the real transport-wiring phase — the A2A app is built
+    # here, then served by uvicorn below. Numbered 6 (after TOOL step 5) so the
+    # keycaps light up in wall-clock order.
+    emit_boot_step("A2A", "Wire transport", "running", step=6, total=_BOOT_TOTAL)
     from molecule_runtime.boot_routes import build_routes
     app = Starlette(routes=build_routes(agent_card, executor, adapter_error))
+    emit_boot_step("A2A", "Wire transport", "ok", step=6, total=_BOOT_TOTAL)
 
     # 8. Register with platform
     # When adapter.setup() failed, advertise via configuration_status so
@@ -1047,8 +1126,12 @@ async def main():  # pragma: no cover
     # momentarily down (Cloudflare 530 / tunnel 1033 during a recreate
     # sweep), making the workspace online-but-undialable. register_with_platform
     # retries until a 2xx and never raises, so boot continues regardless.
+    # BOOT_STEP 7/8 (task #51) — "Register": boot-register with the platform.
+    # register_with_platform never raises (returns True on 2xx, False on
+    # bounded-retry exhaustion); we mirror that into the step's ok/failed.
+    emit_boot_step("NET", "Register", "running", step=7, total=_BOOT_TOTAL)
     async with httpx.AsyncClient(timeout=10.0) as client:
-        await register_with_platform(
+        _registered = await register_with_platform(
             client,
             platform_url=platform_url,
             workspace_id=workspace_id,
@@ -1057,11 +1140,27 @@ async def main():  # pragma: no cover
             headers=auth_headers(),
             delivery_mode=delivery_mode,
         )
+    if _registered:
+        emit_boot_step("NET", "Register", "ok", step=7, total=_BOOT_TOTAL)
+    else:
+        # Registration exhausted its retries — the workspace can still serve
+        # traffic and the heartbeat backfill is the recovery net, but surface
+        # the degraded register so the boot screen isn't falsely green.
+        emit_boot_step(
+            "NET", "Register", "failed", step=7, total=_BOOT_TOTAL,
+            message="registration retries exhausted — heartbeat backfill is the recovery path",
+        )
 
     heartbeat.agent_card = agent_card_dict
 
     # 9. Start heartbeat
+    # BOOT_STEP 8/8 (task #51) — "Go online". `online` is ultimately a CP
+    # verdict (WORKSPACE_ONLINE flips the canvas out of the boot screen), but
+    # from the runtime's side the register-complete + heartbeat-started state is
+    # the terminal boot step we can assert; emit ok as the heartbeat arms.
+    emit_boot_step("ONLINE", "Go online", "running", step=8, total=_BOOT_TOTAL)
     heartbeat.start()
+    emit_boot_step("ONLINE", "Go online", "ok", step=8, total=_BOOT_TOTAL)
 
     # 9a. E1 — poll-mode inbound delivery is started LATER, gated on uvicorn
     # having bound (see the start_poll_delivery_when_bound task created just
