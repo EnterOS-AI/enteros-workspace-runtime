@@ -12,10 +12,13 @@ so an in-repo edit that changes a literal without the contract (or vice versa)
 fails ``unit-tests`` before any image ships. It also exercises the real delivery
 path by materializing a delivered ``settings.json`` and asserting that
 ``_settings_has_management_mcp()``, ``mcp_server_present()``, and
-``identity_gate_payload()`` report correctly. The CROSS-REPO guarantee that the
-core/template/runtime copies stay byte-identical is enforced separately by the
-``mcp-plugin-delivery-contract-drift`` workflow in molecule-core; wiring this
-repo's copy into that byte-compare set is a tracked follow-up.
+``identity_gate_payload()`` report correctly. The BYTE-IDENTICAL guarantee — that
+this repo's vendored copy stays equal to the SDK SSOT
+(``molecule-ai-sdk:contracts/mcp/mcp-plugin-delivery.contract.json``) — is now
+enforced by this repo's own ``schema-sync`` workflow
+(``scripts/check-schemas-in-sync.sh`` fetches SDK main and diffs), alongside the
+core/template copies guarded by ``mcp-plugin-delivery-contract-drift`` in
+molecule-core.
 """
 
 import json
@@ -257,8 +260,9 @@ def test_runtime_matrix_contract_present():
     runtimes = CONTRACT["runtimes"]
     assert runtimes["claude_code"]["status"] == "implemented"
     assert runtimes["codex"]["status"] == "implemented"
-    # hermes is explicitly marked unverified, not silently absent.
-    assert runtimes["hermes"]["status"].startswith("todo")
+    # hermes graduated to a concrete renderer (runtime#181): its native
+    # ~/.hermes/config.yaml `mcp_servers` surface is pinned.
+    assert runtimes["hermes"]["status"] == "implemented"
 
 
 def test_claude_render_writes_settings_json(tmp_path):
@@ -322,20 +326,52 @@ def test_codex_render_preserves_handwritten_config(tmp_path):
     assert "molecule-platform" in parsed["mcp_servers"]
 
 
-@pytest.mark.parametrize("renderer_name", ["render_hermes_config"])
+@pytest.mark.parametrize("renderer_name", ["render_gemini_config"])
 def test_unverified_runtimes_are_explicit_stubs(tmp_path, renderer_name):
-    """The hermes renderer is an honest NotImplementedError stub (format
-    unverified) — NOT a silent wrong write. Implement concretely once the
-    native format is pinned against a live runtime (#3159 follow-up)."""
+    """The remaining unverified renderers (gemini/google-adk) are honest
+    NotImplementedError stubs (native MCP convention unpinned) — NOT a silent
+    wrong write. Implement concretely once the format is pinned against a live
+    CLI. hermes graduated OUT (runtime#181) and is covered by
+    test_hermes_render_writes_native_config below."""
     renderer = getattr(mcp_render, renderer_name)
     with pytest.raises(NotImplementedError):
         renderer(tmp_path / "out", "molecule-platform", _PLATFORM_SPEC)
 
 
-@pytest.mark.skip(reason="hermes native MCP descriptor format unverified (#3159 follow-up)")
-def test_hermes_render_writes_native_config(tmp_path):
-    """TODO(#3159): assert hermes renderer writes its platforms.*/entry-point
-    descriptor (and NOT .claude/settings.json) once the format is confirmed."""
+def test_hermes_render_writes_native_config(tmp_path, monkeypatch):
+    """hermes renderer writes ~/.hermes/config.yaml `mcp_servers.<name>` (and NOT
+    .claude/settings.json) — the #3159 cross-runtime-mis-attribution guard for the
+    hermes surface. Additive: an existing server + the `model` block survive."""
+    import yaml
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+    cfg = home / ".hermes" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        yaml.safe_dump(
+            {"model": "nous:x", "mcp_servers": {"keep": {"url": "http://127.0.0.1:9100/mcp"}}},
+            sort_keys=False,
+        )
+    )
+
+    path = mcp_render.render_for_runtime(
+        "hermes", str(tmp_path / "configs"), "molecule-platform", _PLATFORM_SPEC
+    )
+    assert str(path).endswith("/.hermes/config.yaml")
+
+    parsed = yaml.safe_load(cfg.read_text())
+    assert parsed["model"] == "nous:x"                                   # preserved
+    assert parsed["mcp_servers"]["keep"] == {"url": "http://127.0.0.1:9100/mcp"}
+    entry = parsed["mcp_servers"]["molecule-platform"]
+    assert entry["command"] == "npx"
+    assert entry["env"]["MOLECULE_MCP_MODE"] == "management"
+    # and crucially did NOT write the Claude settings.json (the #3159 bug)
+    assert not (tmp_path / "configs" / ".claude" / "settings.json").exists()
+    # present-reader agrees with what the renderer just wrote
+    assert mcp_render.management_mcp_present_for(
+        "hermes", str(tmp_path / "configs"), "molecule-platform"
+    ) is True
 
 
 # ---------------------------------------------------------------------------
@@ -487,10 +523,11 @@ async def test_install_plugins_via_registry_claude_writes_claude_settings(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_install_plugins_via_registry_hermes_fails_loud_for_privileged(tmp_path, monkeypatch):
-    """An UNVERIFIED runtime (hermes) installing the PRIVILEGED management MCP
-    fails LOUDLY through the production path rather than booting a
-    capability-less concierge — the deliberate fail-loud stub behavior."""
+async def test_install_plugins_via_registry_unverified_fails_loud_for_privileged(tmp_path, monkeypatch):
+    """A still-UNVERIFIED runtime (google-adk) installing the PRIVILEGED
+    management MCP fails LOUDLY through the production path rather than booting a
+    capability-less concierge — the deliberate fail-loud stub behavior. (hermes
+    graduated OUT — runtime#181 — so it renders concretely; see the next test.)"""
     from molecule_runtime.plugins import LoadedPlugins, Plugin
     from molecule_runtime.adapter_base import PrivilegedPluginInstallError
 
@@ -506,11 +543,46 @@ async def test_install_plugins_via_registry_hermes_fails_loud_for_privileged(tmp
 
     cfg = AdapterConfig(model="x:y", config_path=str(tmp_path / "configs"))
 
+    class _GoogleAdkAdapter(_BaseTestAdapter):
+        @staticmethod
+        def name():
+            return "google_adk"
+
+    plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
+    with pytest.raises(PrivilegedPluginInstallError):
+        await _GoogleAdkAdapter().install_plugins_via_registry(cfg, plugins)
+
+
+@pytest.mark.asyncio
+async def test_install_plugins_via_registry_hermes_renders_into_native_config(tmp_path, monkeypatch):
+    """A hermes concierge installing the PRIVILEGED management MCP through the
+    production path renders it into ~/.hermes/config.yaml `mcp_servers` (NOT a
+    fail-loud stub, NOT .claude/settings.json) — the runtime#181 graduation."""
+    import yaml
+    from molecule_runtime.plugins import LoadedPlugins, Plugin
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+
+    plugin_root = tmp_path / "molecule-platform-mcp"
+    plugin_root.mkdir()
+    (plugin_root / "settings-fragment.json").write_text(json.dumps({
+        "mcpServers": {"molecule-platform": {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"]}}
+    }))
+
+    cfg = AdapterConfig(model="x:y", config_path=str(tmp_path / "configs"))
+
     class _HermesAdapter(_BaseTestAdapter):
         @staticmethod
         def name():
             return "hermes"
 
+    adapter = _HermesAdapter()
     plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
-    with pytest.raises(PrivilegedPluginInstallError):
-        await _HermesAdapter().install_plugins_via_registry(cfg, plugins)
+    await adapter.install_plugins_via_registry(cfg, plugins)
+
+    parsed = yaml.safe_load((home / ".hermes" / "config.yaml").read_text())
+    assert parsed["mcp_servers"]["molecule-platform"]["command"] == "npx"
+    assert not (tmp_path / "configs" / ".claude" / "settings.json").exists()
+    assert adapter.management_mcp_present(cfg) is True

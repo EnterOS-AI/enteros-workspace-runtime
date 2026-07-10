@@ -19,11 +19,46 @@ import time
 import pytest
 
 from molecule_runtime import loaded_mcp_tools_probe as probe
+from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter
 from molecule_runtime.platform_agent_identity import (
     identity_gate_payload,
     loaded_mcp_tools,
     set_loaded_mcp_tools,
 )
+
+
+class _ProbeAdapter(BaseAdapter):
+    """Minimal concrete adapter for the capture tests. name()=="claude-code" and
+    the inherited BaseAdapter default for ``enumerate_loaded_mcp_tools`` delegates
+    to the shared core probe (``enumerate_loaded_mcp_tools_async``), so passing
+    ``_ProbeAdapter()`` exercises the exact core-probe path the old
+    ``("claude-code", config_path)`` signature did — now through the
+    runtime-owns-discovery contract."""
+
+    def __init__(self, name="claude-code"):
+        self._name = name
+
+    def name(self):
+        return self._name
+
+    @classmethod
+    def display_name(cls):
+        return "Probe"
+
+    @classmethod
+    def description(cls):
+        return "probe-test"
+
+    def setup(self, config):  # pragma: no cover - stub
+        return None
+
+    def create_executor(self, config):  # pragma: no cover - stub
+        return None
+
+
+def _cfg(config_root):
+    """AdapterConfig carrying just the configs dir the probe reads."""
+    return AdapterConfig(model="test", config_path=str(config_root))
 
 
 @pytest.fixture(autouse=True)
@@ -172,7 +207,7 @@ class TestInitEnumerationHappyPath:
         # force=True bypasses the kind=platform gate (gate is exercised separately
         # in TestKindPlatformGate); this asserts the publish path end-to-end.
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", config_root, force=True
+            _ProbeAdapter(), _cfg(config_root), force=True
         )
 
         assert observed == ["mcp__molecule-platform__create_workspace"]
@@ -233,7 +268,7 @@ class TestConnectedButToolless:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", config_root, force=True
+            _ProbeAdapter(), _cfg(config_root), force=True
         )
         assert observed == []
         assert loaded_mcp_tools() == []
@@ -301,7 +336,7 @@ class TestDegradeSafe:
         """(b) None observation -> producer stays None -> gate payload OMITS key."""
         config_root = _claude_settings_with(tmp_path, {})
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", config_root, force=True
+            _ProbeAdapter(), _cfg(config_root), force=True
         )
         assert observed is None
         assert loaded_mcp_tools() is None
@@ -315,7 +350,7 @@ class TestDegradeSafe:
 
         monkeypatch.setattr(probe, "read_mcp_servers", _boom)
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", str(tmp_path), force=True
+            _ProbeAdapter(), _cfg(tmp_path), force=True
         )
         assert observed is None
         assert loaded_mcp_tools() is None
@@ -448,7 +483,7 @@ class TestKindPlatformGate:
 
         monkeypatch.setattr(probe, "enumerate_loaded_mcp_tools_async", _spy)
 
-        observed = await probe.capture_loaded_mcp_tools_at_init("claude-code", config_root)
+        observed = await probe.capture_loaded_mcp_tools_at_init(_ProbeAdapter(), _cfg(config_root))
 
         assert observed is None
         assert called["enum"] is False, "enumeration ran on a non-platform workspace"
@@ -474,7 +509,7 @@ class TestKindPlatformGate:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
 
-        observed = await probe.capture_loaded_mcp_tools_at_init("claude-code", config_root)
+        observed = await probe.capture_loaded_mcp_tools_at_init(_ProbeAdapter(), _cfg(config_root))
 
         assert observed == ["mcp__molecule-platform__create_workspace"]
         assert loaded_mcp_tools() == ["mcp__molecule-platform__create_workspace"]
@@ -498,7 +533,7 @@ class TestKindPlatformGate:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
 
-        observed = await probe.capture_loaded_mcp_tools_at_init("claude-code", config_root)
+        observed = await probe.capture_loaded_mcp_tools_at_init(_ProbeAdapter(), _cfg(config_root))
 
         assert observed == ["mcp__molecule-platform__create_workspace"]
         assert identity_gate_payload()["loaded_mcp_tools"] == [
@@ -520,7 +555,7 @@ class TestKindPlatformGate:
             {"molecule-platform": {"command": sys.executable, "args": [str(server)]}},
         )
         observed = await probe.capture_loaded_mcp_tools_at_init(
-            "claude-code", config_root, force=True
+            _ProbeAdapter(), _cfg(config_root), force=True
         )
         assert observed == ["mcp__molecule-platform__create_workspace"]
 
@@ -611,13 +646,13 @@ class TestRetryUntilReady:
         calls = {"n": 0}
         result = ["mcp__molecule-platform__create_workspace"]
 
-        async def _fake_capture(runtime, config_path, *, force=False):
+        async def _fake_capture(adapter, config, *, force=False, **_kw):
             calls["n"] += 1
             return None if calls["n"] < 3 else result
 
         monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _fake_capture)
         out = await probe.capture_loaded_mcp_tools_with_retry(
-            "claude-code", "/cfg", max_attempts=5, interval_seconds=0.01
+            _ProbeAdapter(), _cfg("/cfg"), max_attempts=5, interval_seconds=0.01
         )
         assert out == result
         assert calls["n"] == 3, "should stop on first success, not keep retrying"
@@ -628,13 +663,13 @@ class TestRetryUntilReady:
         # returning None (the per-turn capture is then the fallback). Must not hang.
         calls = {"n": 0}
 
-        async def _never(runtime, config_path, *, force=False):
+        async def _never(adapter, config, *, force=False, **_kw):
             calls["n"] += 1
             return None
 
         monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _never)
         out = await probe.capture_loaded_mcp_tools_with_retry(
-            "claude-code", "/cfg", max_attempts=4, interval_seconds=0.01
+            _ProbeAdapter(), _cfg("/cfg"), max_attempts=4, interval_seconds=0.01
         )
         assert out is None
         assert calls["n"] == 4, "should attempt exactly max_attempts times"
@@ -646,7 +681,7 @@ class TestRetryUntilReady:
         calls = {"n": 0}
         result = ["mcp__molecule-platform__create_workspace"]
 
-        async def _flaky(runtime, config_path, *, force=False):
+        async def _flaky(adapter, config, *, force=False, **_kw):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("config not ready")
@@ -656,7 +691,78 @@ class TestRetryUntilReady:
 
         monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _flaky)
         out = await probe.capture_loaded_mcp_tools_with_retry(
-            "claude-code", "/cfg", max_attempts=5, interval_seconds=0.01
+            _ProbeAdapter(), _cfg("/cfg"), max_attempts=5, interval_seconds=0.01
         )
         assert out == result
         assert calls["n"] == 3
+
+
+# ---------- runtime#181: the adapter-owns-discovery contract ----------
+
+class TestAdapterEnumerationContract:
+    """runtime#181: capture ALWAYS routes MCP-tool enumeration through the ADAPTER
+    contract (adapter.enumerate_loaded_mcp_tools) — each runtime owns discovery,
+    replacing the hardcoded core switch. capture takes only (adapter, config); the
+    runtime name and configs dir are read off them (adapter.name() /
+    config.config_path), never threaded through separately."""
+
+    def teardown_method(self):
+        from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+        set_loaded_mcp_tools(None)
+
+    @pytest.mark.asyncio
+    async def test_capture_routes_through_adapter_enumerate(self, monkeypatch):
+        from molecule_runtime import platform_agent_identity as pai
+
+        class _FakeAdapter:
+            def name(self):
+                return "hermes"
+
+            async def enumerate_loaded_mcp_tools(self, config):
+                return ["mcp__molecule-platform__provision_workspace"]
+
+        # the core switch must NOT be consulted — the adapter owns discovery
+        async def _boom(runtime, config_path):
+            raise AssertionError("core switch must not run — adapter owns discovery")
+        monkeypatch.setattr(probe, "enumerate_loaded_mcp_tools_async", _boom)
+
+        observed = await probe.capture_loaded_mcp_tools_at_init(
+            _FakeAdapter(), _cfg("/configs"), force=True
+        )
+        assert observed == ["mcp__molecule-platform__provision_workspace"]
+        # published to the producer so the first heartbeat carries it
+        assert pai.loaded_mcp_tools() == ["mcp__molecule-platform__provision_workspace"]
+
+    @pytest.mark.asyncio
+    async def test_capture_never_publishes_on_none_observation(self, monkeypatch):
+        from molecule_runtime import platform_agent_identity as pai
+
+        class _NoneAdapter:
+            def name(self):
+                return "hermes"
+
+            async def enumerate_loaded_mcp_tools(self, config):
+                return None  # nothing observed yet — grace window
+
+        observed = await probe.capture_loaded_mcp_tools_at_init(
+            _NoneAdapter(), _cfg("/configs"), force=True
+        )
+        assert observed is None
+        assert pai.loaded_mcp_tools() is None
+
+    @pytest.mark.asyncio
+    async def test_base_adapter_default_delegates_to_core_probe(self, monkeypatch):
+        called = {}
+
+        async def _core(runtime, config_path):
+            called["runtime"] = runtime
+            called["config_path"] = config_path
+            return []
+        monkeypatch.setattr(probe, "enumerate_loaded_mcp_tools_async", _core)
+
+        out = await _ProbeAdapter("claude-code").enumerate_loaded_mcp_tools(_cfg("/configs"))
+        # base default delegates to the boot-safe core probe, keyed on the
+        # adapter's own name() and the config's config_path
+        assert out == []
+        assert called["runtime"] == "claude-code"
+        assert called["config_path"] == "/configs"

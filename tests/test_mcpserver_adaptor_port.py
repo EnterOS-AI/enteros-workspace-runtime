@@ -86,7 +86,7 @@ async def test_install_routes_each_server_through_port(tmp_path):
 @pytest.mark.asyncio
 async def test_privileged_plugin_raises_when_runtime_unsupported(tmp_path):
     """If the active runtime's register_mcp_server raises NotImplementedError
-    (gemini/hermes stub), the privileged management MCP install fails LOUDLY —
+    (gemini/google-adk stub), the privileged management MCP install fails LOUDLY —
     a concierge on that runtime must not boot without create_workspace."""
     root = _make_plugin(
         tmp_path, {"mcpServers": {"molecule-platform": {"command": "npx"}}}

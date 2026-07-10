@@ -899,7 +899,11 @@ async def main():  # pragma: no cover
             )
             global _LOADED_MCP_TOOLS_BG_TASK
             _LOADED_MCP_TOOLS_BG_TASK = asyncio.create_task(
-                capture_loaded_mcp_tools_with_retry(runtime, config_path)
+                # runtime#181: pass the resolved adapter so enumeration goes
+                # through the runtime-owns-discovery contract
+                # (adapter.enumerate_loaded_mcp_tools) — hermes reads its own
+                # config.yaml; claude/codex/openclaw use the base default.
+                capture_loaded_mcp_tools_with_retry(adapter, adapter_config)
             )
             print(
                 "loaded_mcp_tools: spawned background init-enumeration (retry until "

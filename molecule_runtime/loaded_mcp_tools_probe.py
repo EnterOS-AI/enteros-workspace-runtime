@@ -81,6 +81,10 @@ import asyncio
 import json
 import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoid an import cycle at runtime (adapter_base imports this module)
+    from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter
 
 logger = logging.getLogger("platform-agent.identity")
 
@@ -480,10 +484,24 @@ async def _enumerate_async(runtime: str, config_path: str | os.PathLike) -> list
         )
         return None
 
+    return await _probe_specs_async(servers)
+
+
+async def _probe_specs_async(servers: dict) -> list[str] | None:
+    """Probe an already-resolved ``{name: spec}`` map, folding the tri-state.
+
+    The generic stdio enumeration ENGINE — extracted from :func:`_enumerate_async`
+    so it is reusable by an adapter that read its OWN native MCP config (the
+    runtime-owns-discovery contract, :meth:`BaseAdapter.enumerate_loaded_mcp_tools`).
+    Given the ``{name: spec}`` map, spawn each STDIO server, handshake, and fold
+    the tri-state. Never raises; each per-server probe already maps failure to
+    None. HTTP/url specs (``_build_server_command`` returns None) are skipped — an
+    adapter that owns an HTTP server reports its tools another way.
+    """
     if not servers:
         logger.info(
-            "loaded_mcp_tools: no MCP servers declared in runtime=%r native config "
-            "— leaving producer unset (grace window applies)", runtime,
+            "loaded_mcp_tools: no MCP servers to probe — leaving producer unset "
+            "(grace window applies)",
         )
         return None
 
@@ -510,6 +528,35 @@ async def _enumerate_async(runtime: str, config_path: str | os.PathLike) -> list
         len(result), len(servers), result,
     )
     return result
+
+
+async def enumerate_from_specs_async(servers: dict) -> list[str] | None:
+    """Boot-safe, bounded, never-raise enumeration of an adapter-supplied specs map.
+
+    The public entry point an adapter override calls when IT read its runtime's
+    native MCP config (e.g. the hermes adapter parsing its own config.yaml
+    ``mcp_servers`` block). Same overall-deadline + tri-state + never-raise
+    guarantees as :func:`enumerate_loaded_mcp_tools_async`; the only difference is
+    the servers are supplied by the caller rather than read via the (legacy)
+    per-runtime switch.
+    """
+    try:
+        return await asyncio.wait_for(
+            _probe_specs_async(servers),
+            timeout=_MCP_ENUMERATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "loaded_mcp_tools: overall specs enumeration exceeded %.0fs — leaving "
+            "producer unset (grace window applies)", _MCP_ENUMERATION_TIMEOUT_SECONDS,
+        )
+        return None
+    except Exception:  # noqa: BLE001 — enumeration must never crash boot
+        logger.warning(
+            "loaded_mcp_tools: specs enumeration errored — leaving producer unset",
+            exc_info=True,
+        )
+        return None
 
 
 async def enumerate_loaded_mcp_tools_async(
@@ -620,17 +667,29 @@ def _is_platform_agent() -> bool:
 
 
 async def capture_loaded_mcp_tools_at_init(
-    runtime: str, config_path: str | os.PathLike, *, force: bool = False
+    adapter: "BaseAdapter",
+    config: "AdapterConfig",
+    *,
+    force: bool = False,
 ) -> list[str] | None:
     """Enumerate the loaded MCP tool inventory and PUBLISH it to the producer.
 
     This is the one-call entry point ``main.py`` invokes (awaits) right after the
     executor is created (after MCP wiring, before serving). It is a coroutine
-    because the call site is already async; it enumerates via
-    :func:`enumerate_loaded_mcp_tools_async` and, ONLY when a real observation was
-    made (non-``None``), calls ``set_loaded_mcp_tools`` so the first heartbeat
-    carries the field. When enumeration yields ``None`` it leaves the producer
-    untouched (``None``), preserving the fail-closed grace-window semantics.
+    because the call site is already async; it enumerates and, ONLY when a real
+    observation was made (non-``None``), calls ``set_loaded_mcp_tools`` so the
+    first heartbeat carries the field. When enumeration yields ``None`` it leaves
+    the producer untouched (``None``), preserving the fail-closed grace-window
+    semantics.
+
+    RUNTIME-OWNS-DISCOVERY CONTRACT: enumeration is ALWAYS delegated to
+    ``adapter.enumerate_loaded_mcp_tools(config)`` — each runtime owns HOW it
+    discovers its loaded MCP tools. The ``adapter`` and ``config`` are the only
+    inputs needed: ``adapter.name()`` is the runtime and ``config.config_path`` is
+    the configs dir, so there is no separate ``runtime``/``config_path`` to thread
+    through. The base default reads the standard ``.claude``-style layout via the
+    shared core probe (claude/codex/openclaw are byte-identical); hermes overrides
+    it to read its own ``config.yaml``.
 
     kind=platform GATE (REQUIREMENT 3): unless ``force=True`` (tests), the
     enumeration only runs for the concierge (``_is_platform_agent()``). A
@@ -651,7 +710,7 @@ async def capture_loaded_mcp_tools_at_init(
         return None
 
     try:
-        observed = await enumerate_loaded_mcp_tools_async(runtime, config_path)
+        observed = await adapter.enumerate_loaded_mcp_tools(config)
     except Exception:  # noqa: BLE001 — must never block boot
         logger.warning(
             "loaded_mcp_tools: init capture errored — leaving producer unset",
@@ -665,8 +724,8 @@ async def capture_loaded_mcp_tools_at_init(
 
 
 async def capture_loaded_mcp_tools_with_retry(
-    runtime: str,
-    config_path: str | os.PathLike,
+    adapter: "BaseAdapter",
+    config: "AdapterConfig",
     *,
     max_attempts: int = 40,
     interval_seconds: float = 2.0,
@@ -715,7 +774,7 @@ async def capture_loaded_mcp_tools_with_retry(
     for attempt in range(1, max_attempts + 1):
         try:
             observed = await capture_loaded_mcp_tools_at_init(
-                runtime, config_path, force=force
+                adapter, config, force=force
             )
         except Exception:  # noqa: BLE001 — a background task must never crash the loop
             logger.warning(

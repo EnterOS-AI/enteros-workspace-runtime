@@ -20,16 +20,19 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCHEMA_DIR="$REPO_ROOT/molecule_runtime/contracts"
 BASE="https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main"
 UA="curl/8.4.0"
 
-# vendored-copy basename  ->  path within molecule-ai-sdk (contracts/)
+# repo-relative vendored-copy path  ->  path within molecule-ai-sdk (contracts/).
+# Keys are REPO-RELATIVE (not bare basenames) so the gate can span both vendored
+# roots: molecule_runtime/contracts/ (the packaged schemas) AND the top-level
+# contracts/ (mcp-plugin-delivery, mirrored from the SDK's contracts/mcp/).
 declare -A MAP=(
-  [plugin-manifest.schema.json]="contracts/plugin-manifest/plugin-manifest.schema.json"
-  [idle-prompt.schema.json]="contracts/idle-prompt/idle-prompt.schema.json"
-  [idle-prompt.contract.json]="contracts/idle-prompt/idle-prompt.contract.json"
-  [workspace-data.contract.json]="contracts/workspace-data/workspace-data.contract.json"
+  [molecule_runtime/contracts/plugin-manifest.schema.json]="contracts/plugin-manifest/plugin-manifest.schema.json"
+  [molecule_runtime/contracts/idle-prompt.schema.json]="contracts/idle-prompt/idle-prompt.schema.json"
+  [molecule_runtime/contracts/idle-prompt.contract.json]="contracts/idle-prompt/idle-prompt.contract.json"
+  [molecule_runtime/contracts/workspace-data.contract.json]="contracts/workspace-data/workspace-data.contract.json"
+  [contracts/mcp-plugin-delivery.contract.json]="contracts/mcp/mcp-plugin-delivery.contract.json"
 )
 
 tmp="$(mktemp -d)"
@@ -37,24 +40,25 @@ trap 'rm -rf "$tmp"' EXIT
 
 drift=0
 fetch_fail=0
-for local_name in "${!MAP[@]}"; do
-  remote_path="${MAP[$local_name]}"
-  local_file="$SCHEMA_DIR/$local_name"
+for local_rel in "${!MAP[@]}"; do
+  remote_path="${MAP[$local_rel]}"
+  local_file="$REPO_ROOT/$local_rel"
+  slug="$(echo "$local_rel" | tr '/' '_')"
   if [ ! -f "$local_file" ]; then
-    echo "::error::vendored schema missing: molecule_runtime/contracts/$local_name"
+    echo "::error::vendored schema missing: $local_rel"
     drift=1
     continue
   fi
-  if ! curl -fsS -A "$UA" "$BASE/$remote_path" -o "$tmp/$local_name"; then
-    echo "::warning::could not fetch $remote_path from molecule-ai-sdk main (network/infra) — skipping drift check for $local_name"
+  if ! curl -fsS -A "$UA" "$BASE/$remote_path" -o "$tmp/$slug"; then
+    echo "::warning::could not fetch $remote_path from molecule-ai-sdk main (network/infra) — skipping drift check for $local_rel"
     fetch_fail=1
     continue
   fi
-  if diff -u "$local_file" "$tmp/$local_name" > "$tmp/$local_name.diff"; then
-    echo "OK   molecule_runtime/contracts/$local_name == molecule-ai-sdk:$remote_path"
+  if diff -u "$local_file" "$tmp/$slug" > "$tmp/$slug.diff"; then
+    echo "OK   $local_rel == molecule-ai-sdk:$remote_path"
   else
-    echo "::error::DRIFT molecule_runtime/contracts/$local_name has drifted from molecule-ai-sdk:$remote_path"
-    cat "$tmp/$local_name.diff"
+    echo "::error::DRIFT $local_rel has drifted from molecule-ai-sdk:$remote_path"
+    cat "$tmp/$slug.diff"
     drift=1
   fi
 done

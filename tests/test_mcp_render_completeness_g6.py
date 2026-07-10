@@ -26,10 +26,10 @@ from molecule_runtime import mcp_render
 # The kind=platform runtime allowlist (task #80): the runtimes a concierge is
 # allowed to run on AND that have been pinned against a live CLI. claude-code is
 # the base; codex (#142) and openclaw (#179 / phase P4) graduated to concrete
-# renderers in the de-bake. hermes is intentionally EXCLUDED — it remains a
-# fail-loud stub (format unverified) and a concierge must not be provisioned on
-# it until its renderer is pinned.
-PLATFORM_RUNTIME_ALLOWLIST = ("claude-code", "codex", "openclaw")
+# renderers in the de-bake; hermes (runtime#181) graduated once its native
+# ~/.hermes/config.yaml `mcp_servers` renderer + present-reader were pinned.
+# gemini/google-adk remain excluded (fail-loud stubs, format unverified).
+PLATFORM_RUNTIME_ALLOWLIST = ("claude-code", "codex", "openclaw", "hermes")
 
 
 @pytest.mark.parametrize("runtime", PLATFORM_RUNTIME_ALLOWLIST)
@@ -83,6 +83,9 @@ def test_platform_runtime_native_path_is_runtime_specific(runtime, tmp_path):
         assert ".claude/settings.json" not in path
     elif key == "openclaw":
         assert path.endswith("/.openclaw/openclaw.json")
+        assert ".claude/settings.json" not in path
+    elif key == "hermes":
+        assert path.endswith("/.hermes/config.yaml")
         assert ".claude/settings.json" not in path
     else:  # pragma: no cover — allowlist is the parametrize source
         pytest.fail(f"unexpected allowlist runtime {runtime!r}")

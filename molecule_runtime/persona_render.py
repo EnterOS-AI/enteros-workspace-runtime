@@ -94,6 +94,14 @@ CODEX_PERSONA_FILE = "AGENTS.md"
 # Gemini / google-adk read GEMINI.md as their durable context / identity file.
 GEMINI_PERSONA_FILE = "GEMINI.md"
 
+# Hermes reads its Layer-1 "Agent Identity" from ``$HERMES_HOME/SOUL.md``
+# (~/.hermes/SOUL.md). Pinned against NousResearch/hermes-agent's OWN prompt-
+# assembly doc (website/docs/developer-guide/prompt-assembly.md: "Layer 1: Agent
+# Identity (from ~/.hermes/SOUL.md)") and VERIFIED live: writing the concierge
+# persona there made a hermes concierge introduce itself as the Org Concierge
+# across the a2a-platform transport (which bypasses config.system_prompt).
+HERMES_PERSONA_FILE = "SOUL.md"
+
 # Fallback persona source when a workspace declares no ``prompt_files`` — the same
 # file build_system_prompt() falls back to. Keeps read_canonical_persona a
 # no-op-preserving mirror of the prompt builder's own fallback.
@@ -209,20 +217,18 @@ def materialize_gemini_persona(config_path: Path, persona: str) -> Path:
 
 
 def materialize_hermes_persona(config_path: Path, persona: str) -> Path:
-    """TODO: Hermes' native identity-file convention is unverified.
+    """Hermes — write the persona to ``$HERMES_HOME/SOUL.md`` (~/.hermes/SOUL.md),
+    hermes-agent's **Layer-1 Agent Identity** source.
 
-    Hermes wires identity through its own agent descriptor rather than a plain
-    markdown identity file, and the concrete location/format is not confirmed in
-    this repo. Rather than guess and write a file a hermes agent silently never
-    reads (the persona analogue of the #3159 MCP mis-attribution), this is a
-    marked fail-loud stub. The boot-path caller downgrades the NotImplementedError
-    to a non-fatal warning (a persona is not a privileged capability). Implement
-    concretely once the hermes adapter's identity convention is pinned against a
-    live runtime — one dict entry + one writer, no other change."""
-    raise NotImplementedError(
-        "hermes persona materialization not implemented — native identity "
-        "convention unverified"
-    )
+    Convention VERIFIED against NousResearch/hermes-agent's own prompt-assembly
+    doc (Layer 1 = ``~/.hermes/SOUL.md``) and confirmed live: this is the file the
+    gateway reads to set the agent's identity for EVERY session, INCLUDING the
+    a2a-platform transport that ignores ``config.system_prompt`` (the plugin-
+    transport bypass). ``config_path`` is unused — the identity file is HOME-based,
+    resolved via :func:`_hermes_persona_path`."""
+    target = _hermes_persona_path(config_path)
+    _write_persona_file(target, persona)
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +251,18 @@ def _gemini_persona_path(config_path: str | os.PathLike) -> Path:
     return Path(config_path) / GEMINI_PERSONA_FILE
 
 
+def _hermes_persona_path(config_path: str | os.PathLike) -> Path:
+    # Hermes reads its Layer-1 identity from ~/.hermes/SOUL.md. HERMES_HOME
+    # overrides the dir; the container sets HERMES_HOME=/tmp/.hermes with HOME=/tmp
+    # so both agree. config_path (the /configs dir) is unused — the identity file
+    # is HOME-based, mirroring mcp_render._hermes_path's HERMES_HOME-or-HOME
+    # resolution so persona + MCP config resolve against the same hermes home.
+    home = os.environ.get("HERMES_HOME") or os.path.join(
+        os.path.expanduser("~"), ".hermes"
+    )
+    return Path(home) / HERMES_PERSONA_FILE
+
+
 # ===========================================================================
 # Per-runtime dispatch — the production wiring.
 # ===========================================================================
@@ -260,8 +278,9 @@ _RUNTIME_PERSONA: dict[str, tuple] = {
     # Gemini and google-adk share the GEMINI.md context-file convention.
     "gemini": (_gemini_persona_path, materialize_gemini_persona),
     "google_adk": (_gemini_persona_path, materialize_gemini_persona),
-    # hermes: native identity convention unverified — fail-loud stub.
-    "hermes": (_claude_persona_path, materialize_hermes_persona),
+    # hermes: CONCRETE — writes ~/.hermes/SOUL.md (hermes-agent's Layer-1 Agent
+    # Identity, pinned against its own prompt-assembly doc + verified live).
+    "hermes": (_hermes_persona_path, materialize_hermes_persona),
 }
 
 # The runtime an UNMAPPED runtime falls back to. Derived from the LIVE_RUNTIMES
@@ -272,8 +291,11 @@ _RUNTIME_PERSONA: dict[str, tuple] = {
 # exemption (enforced by the Guard A meta-gate).
 _DEFAULT_RUNTIME = _SSOT_DEFAULT_RUNTIME
 
-# Runtimes whose materializer is a deliberate fail-loud stub (convention unverified).
-_UNVERIFIED_RUNTIMES = frozenset({"hermes"})
+# Runtimes whose materializer is a deliberate fail-loud stub (convention
+# unverified). hermes graduated OUT: its Layer-1 identity file (~/.hermes/SOUL.md)
+# is now pinned + verified live. (Empty = every live runtime has a concrete
+# materializer.)
+_UNVERIFIED_RUNTIMES = frozenset()
 
 
 def _spec_for(runtime: str) -> tuple:

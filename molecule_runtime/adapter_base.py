@@ -501,6 +501,38 @@ class BaseAdapter(ABC):
 
         return management_mcp_present_for(self.name(), config.config_path, MANAGEMENT_MCP_NAME)
 
+    async def enumerate_loaded_mcp_tools(
+        self, config: "AdapterConfig"
+    ) -> "list[str] | None":
+        """Return the LOADED MCP tool ids this runtime actually has, or None.
+
+        RUNTIME CONTRACT (runtime#181) — the seam that replaces core's hardcoded
+        per-runtime enumeration switch (``mcp_render.read_mcp_servers_for``). Each
+        adapter answers for ITS OWN runtime, however it knows best: the default
+        below stdio-spawns + probes the runtime's native config via the shared
+        boot-safe core engine (claude-code / codex / openclaw need no override);
+        a runtime whose MCP config lives in a place / format core can't guess
+        (hermes: its own ``config.yaml`` ``mcp_servers`` block) OVERRIDES this to
+        read its own config and hand the resolved ``{name: spec}`` map to
+        :func:`loaded_mcp_tools_probe.enumerate_from_specs_async`.
+
+        TRI-STATE (identical to the loaded_mcp_tools producer contract):
+          * ``None`` — nothing could be observed (no servers declared, or all
+            probes failed/stalled/unreadable). Producer left unset → heartbeat
+            omits the field → core's grace window applies. NEVER a guessed list.
+          * ``[]``   — a server genuinely connected and advertised zero tools.
+          * ``[ids]`` — deduped/sorted union of observed ``mcp__<server>__<tool>``
+            ids.
+
+        BOOT-SAFE + NEVER-RAISES: the default (and every override) is internally
+        bounded by the core enumeration deadline and maps every failure to None.
+        """
+        from molecule_runtime.loaded_mcp_tools_probe import (
+            enumerate_loaded_mcp_tools_async,
+        )
+
+        return await enumerate_loaded_mcp_tools_async(self.name(), config.config_path)
+
     def materialize_persona(self, config: "AdapterConfig") -> "Any":
         """Materialize the workspace's CANONICAL PERSONA into THIS runtime's
         native identity file (the persona-materialization PORT).

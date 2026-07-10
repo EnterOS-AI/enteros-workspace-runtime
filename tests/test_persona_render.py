@@ -139,9 +139,16 @@ def test_allowlisted_runtime_native_path_is_runtime_specific(runtime, tmp_path):
         assert not path.endswith("system-prompt.md")
 
 
-def test_hermes_is_unverified_failloud_stub(tmp_path):
-    """hermes has no verified native identity convention — its materializer is a
-    deliberate fail-loud stub."""
-    assert persona_render.is_persona_supported("hermes") is False
-    with pytest.raises(NotImplementedError):
-        persona_render.materialize_hermes_persona(tmp_path, PERSONA)
+def test_hermes_persona_writes_soul_md(tmp_path, monkeypatch):
+    """hermes graduated OUT of the fail-loud stubs: its identity convention is now
+    pinned to hermes-agent's Layer-1 ``~/.hermes/SOUL.md`` (verified live). The
+    materializer writes the persona there, resolving HERMES_HOME (config_path is
+    unused — the identity file is HOME-based)."""
+    assert persona_render.is_persona_supported("hermes") is True
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    target = persona_render.materialize_hermes_persona(tmp_path / "configs", PERSONA)
+    assert target == hermes_home / "SOUL.md"
+    assert target.read_text().strip().startswith(PERSONA.strip()[:20])
+    # the dispatch path-resolver agrees with the materializer's target
+    assert str(persona_render._spec_for("hermes")[0](tmp_path)).endswith("/.hermes/SOUL.md")
