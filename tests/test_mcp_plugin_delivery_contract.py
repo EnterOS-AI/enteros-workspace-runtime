@@ -53,6 +53,18 @@ def test_required_tool_matches_contract():
     assert pai.REQUIRED_TOOL == CONTRACT["required_tool"]
 
 
+def test_management_mcp_prebake_constants_match_contract():
+    # Guard D lockstep: the runtime's pre-bake constants (consumed by
+    # scripts/prebake-mgmt-mcp.sh) MUST equal the contract's SSOT
+    # management_mcp_server block — so the baked npm version can never silently
+    # drift from the pin the plugin fragment launches (#54, launch-side RCA #2970).
+    mms = CONTRACT["management_mcp_server"]
+    assert pai.MANAGEMENT_MCP_NPM_PACKAGE == mms["npm_package"]
+    assert pai.MANAGEMENT_MCP_PINNED_VERSION == mms["pinned_version"]
+    assert pai.MANAGEMENT_MCP_REGISTRY == mms["registry"]
+    assert pai.MANAGEMENT_MCP_REGISTRY_SCOPE == mms["registry_scope"]
+
+
 def test_provision_tool_id_derives_from_contract_literals():
     # The fully-qualified id the heartbeat's loaded_mcp_tools must carry is
     # composed from the two contract-pinned building blocks via the canonical

@@ -82,6 +82,23 @@ REQUIRED_TOOL = "provision_workspace"
 # to be marked online (core#3082 / runtime#181).
 MANAGEMENT_PROVISION_TOOL_ID = f"mcp__{MANAGEMENT_MCP_NAME}__{REQUIRED_TOOL}"
 
+# The management-MCP npm package, its SSOT-pinned version, and the scoped npm
+# registry it is published to (contract
+# ``management_mcp_server.{npm_package,pinned_version,registry,registry_scope}``).
+# The concierge boot launches ``npx --prefer-offline <npm_package>@<version>``
+# inside the runtime enumeration spawn (a HARD deadline), so every runtime IMAGE
+# must PRE-BAKE this EXACT version into the agent npm cache — the base-runtime
+# helper ``scripts/prebake-mgmt-mcp.sh`` does that, and templates DELEGATE to it
+# (ADR-004: SDK contract -> base-runtime default -> per-adapter override-if-needed;
+# no per-template bake fork). A stale/missing bake cold-pulls -> ETARGET / WAF
+# throttle -> #1027 fail-close (the LAUNCH-side of RCA #2970). Pinned to the
+# contract by tests/test_mcp_plugin_delivery_contract.py so the baked version can
+# never silently drift from the SSOT (Guard D lockstep).
+MANAGEMENT_MCP_NPM_PACKAGE = "@molecule-ai/mcp-server"
+MANAGEMENT_MCP_PINNED_VERSION = "1.8.2"
+MANAGEMENT_MCP_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
+MANAGEMENT_MCP_REGISTRY_SCOPE = "@molecule-ai"
+
 # Env marker baked into the platform-agent image (Dockerfile.platform-agent
 # ``ENV MOLECULE_PLATFORM_AGENT_IMAGE_BAKED=1``). When set, this container IS
 # the org-management concierge image: it bakes the ``@molecule-ai/mcp-server``

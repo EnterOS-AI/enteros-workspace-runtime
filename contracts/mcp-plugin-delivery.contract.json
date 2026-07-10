@@ -6,6 +6,22 @@
   "required_tool": "provision_workspace",
   "loaded_mcp_tools_field": "loaded_mcp_tools",
   "legacy_binary_path": "/opt/molecule-mcp-server",
+  "management_mcp_server": {
+    "npm_package": "@molecule-ai/mcp-server",
+    "pinned_version": "1.8.2",
+    "registry": "https://git.moleculesai.app/api/packages/molecule-ai/npm/",
+    "registry_scope": "@molecule-ai",
+    "launch": "npx -y --prefer-offline @molecule-ai/mcp-server@<pinned_version>",
+    "pin_ssot": "This contract is the SSOT for <pinned_version>. The plugin fragment (molecule-ai-plugin-molecule-platform-mcp/settings-fragment.json mcpServers.*.args) and every runtime image's baked version RECONCILE to it; Guard D asserts all three are identical.",
+    "prebake": {
+      "required": true,
+      "owner": "base runtime (molecule_runtime prebake helper) — the default EVERY runtime image inherits; a template adapter overrides ONLY for a divergent node location, and usually should not need to (ADR-004: SDK contract -> base-runtime default -> per-adapter override-if-needed).",
+      "cache_home": "/home/agent",
+      "rationale": "The kind=platform concierge launches the mgmt-MCP via `npx --prefer-offline @molecule-ai/mcp-server@<pinned_version>` inside the runtime boot enumeration spawn (a HARD deadline). The runtime image MUST pre-bake this EXACT version into the agent npm cache (/home/agent/.npm) at build time so the launch resolves ENTIRELY OFFLINE. A missing/stale bake -> cold pull -> ETARGET / CF-WAF throttle -> #1027 'management MCP FAILED TO LAUNCH' -> fail-close (the launch-side of RCA #2970; the fetch-side is the git-native plugin source).",
+      "conformance": "In the built image, `npx -y --offline @molecule-ai/mcp-server@<pinned_version>` (MOLECULE_MCP_MODE=management) MUST return a tools/list containing `required_tool` (provision_workspace) with ZERO network; the build FAILS otherwise.",
+      "lockstep": "Guard D: image-baked version == this contract's pinned_version == plugin fragment pin. Enforced ONCE centrally (SDK conformance suite / base runtime), never duplicated per template."
+    }
+  },
   "runtime_present_field": "mcp_server_present",
   "producer": "MCPServerAdaptor",
   "consumer": "claude_sdk_executor._load_settings_mcp",
