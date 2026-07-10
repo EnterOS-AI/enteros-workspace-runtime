@@ -9,7 +9,7 @@ server is declared. Today that env-merge lives ONLY in the openclaw template's
 ``register_mcp_server_hook`` override (``_oc-template/adapter.py``), which
 hardcodes a loop over the LEGACY names
 ``MOLECULE_CP_URL / MOLECULE_ADMIN_TOKEN / PLATFORM_URL / WORKSPACE_ID /
-MOLECULE_ORG_ID``. A codex/claude/gemini concierge using the BASE hook gets the
+MOLECULE_ORG_ID``. A codex/claude/hermes concierge using the BASE hook gets the
 management MCP rendered with NO admin env.
 
 This module lifts that merge into the base so EVERY runtime's privileged MCP is

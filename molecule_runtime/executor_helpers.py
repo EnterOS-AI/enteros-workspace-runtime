@@ -63,7 +63,7 @@ CONFIG_MOUNT = "/configs"
 DEFAULT_MCP_SERVER_PATH = str(Path(__file__).parent / "a2a_mcp_server.py")
 DEFAULT_DELEGATION_RESULTS_FILE = "/tmp/delegation_results.jsonl"
 # Tool-activity liveness file (MUST-FIX 1, source C). Subprocess runtimes
-# (codex / openclaw / hermes / gemini) that don't surface native on_tool_start
+# (codex / openclaw / hermes) that don't surface native on_tool_start
 # events bump this file on every tool call; the turn-lease liveness poller
 # touches the lease when its mtime advances. Same env-override pattern as
 # DELEGATION_RESULTS_FILE so the platform / adapter can point it at the durable
@@ -237,7 +237,7 @@ def ensure_tool_activity_file() -> str:
     and the file ``0600`` so the liveness file can't be forged by a foreign
     process (unlike a shared ``/tmp`` file), then exports the path via
     ``MOLECULE_TOOL_ACTIVITY_FILE`` so cross-repo subprocess executors
-    (codex / openclaw / hermes / gemini) inherit the SAME path in their
+    (codex / openclaw / hermes) inherit the SAME path in their
     environment and write to it automatically — keeping the env override.
 
     Best-effort: on Windows / a read-only parent the perms/creation are skipped

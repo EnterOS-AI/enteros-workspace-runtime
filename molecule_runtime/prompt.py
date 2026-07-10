@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # are the platform-agnostic canonical store the persistence discipline writes
 # to; the rest are each framework's NATIVE durable-context convention so an
 # agent that writes its framework's file (claude-code → CLAUDE.md; codex /
-# many tools → AGENTS.md; gemini/adk → GEMINI.md; openclaw → SOUL.md) also has
+# many tools → AGENTS.md; openclaw → SOUL.md) also has
 # it injected. Loading-if-present makes this safe across all runtimes without
 # threading a per-runtime param through every caller — an agent only ever has
 # the file(s) its framework uses. This is the "memory survives a context reset"
@@ -32,7 +32,6 @@ DEFAULT_MEMORY_SNAPSHOT_FILES = (
     "USER.md",
     "CLAUDE.md",
     "AGENTS.md",
-    "GEMINI.md",
     "SOUL.md",
 )
 

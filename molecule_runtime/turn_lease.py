@@ -22,7 +22,7 @@ A. Native runtime — ``a2a_executor`` calls :func:`touch_current` from
    ``on_tool_start`` / ``on_tool_end`` (next to ``AgencyTracker.on_tool_call``).
 B. Claude Code — its adapter exposes ``transcript_lines()``; a poller touches
    the lease when the tail advances (new jsonl lines under ``~/.claude``).
-C. codex / openclaw / hermes / gemini — subprocess runtimes export
+C. codex / openclaw / hermes — subprocess runtimes export
    ``MOLECULE_TOOL_ACTIVITY_FILE`` (see ``executor_helpers``); each tool call
    bumps that file and :func:`feed_from_activity_file` touches the lease when
    its mtime advances. Same pattern as ``DELEGATION_RESULTS_FILE``.
@@ -294,7 +294,7 @@ def turn_is_alive_despite_idle(path: str | os.PathLike[str]) -> bool:
 
     The executor's per-event ``asyncio.wait_for`` idle-cap fires when
     ``astream_events`` produces NO runtime event for the cap. For a subprocess
-    runtime (codex / openclaw / hermes / gemini) that surfaces no native event
+    runtime (codex / openclaw / hermes) that surfaces no native event
     while its child churns tools, that is NOT a stall: the child bumps
     ``MOLECULE_TOOL_ACTIVITY_FILE`` on every tool call. This refreshes the lease
     from that file (source C) and reports whether it is still within TTL, so the

@@ -38,7 +38,6 @@ LIVE_RUNTIMES: tuple[str, ...] = (
     "openclaw",     # operator DEFAULT (see DEFAULT_RUNTIME)
     "claude_code",
     "codex",
-    "google_adk",
     "hermes",
 )
 

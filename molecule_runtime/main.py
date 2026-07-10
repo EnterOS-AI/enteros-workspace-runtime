@@ -740,8 +740,8 @@ async def main():  # pragma: no cover
 
     # 4a. Wire the runtime-agnostic management-MCP gate probe (#3159). The
     # RCA#2970 online gate must ask the ACTIVE adapter whether the management
-    # MCP is wired into the file IT reads (codex config.toml, gemini
-    # settings.json, …) rather than unconditionally checking
+    # MCP is wired into the file IT reads (codex config.toml, hermes
+    # config.yaml, …) rather than unconditionally checking
     # .claude/settings.json. main.py is the one place that holds both the
     # adapter and its config, so it registers the probe here. The baked-binary
     # path and the claude-settings fallback both still apply inside
@@ -821,7 +821,7 @@ async def main():  # pragma: no cover
     )
 
     # 5b. Materialize the workspace's CANONICAL PERSONA into the ACTIVE runtime's
-    # native identity file (system-prompt.md / SOUL.md / AGENTS.md / GEMINI.md),
+    # native identity file (system-prompt.md / SOUL.md / AGENTS.md),
     # so a workspace on ANY runtime boots with its intended identity — even
     # runtimes (openclaw) whose gateway reads a native file and never consumes
     # config.system_prompt. Runtime-agnostic: dispatches on adapter.name() via the
@@ -987,13 +987,6 @@ async def main():  # pragma: no cover
         # Heartbeat keeps running so the platform marks the workspace as
         # reachable-but-misconfigured. Operators can then redeploy with the
         # correct env vars without having to chase a crash-loop.
-
-    # 6.5. Initialise Temporal durable execution wrapper (optional). Only
-    # meaningful when an executor exists; skipped on misconfigured boots.
-    if adapter_ready:
-        from molecule_runtime.builtin_tools.temporal_workflow import create_wrapper as _create_temporal_wrapper
-        temporal_wrapper = _create_temporal_wrapper()
-        await temporal_wrapper.start()
 
     # 7. Wrap in A2A.
     #
@@ -1732,9 +1725,6 @@ async def main():  # pragma: no cover
                 plugin_daemon_supervisor.stop()
             except Exception as daemon_stop_err:  # noqa: BLE001
                 print(f"Warning: plugin daemon stop failed: {daemon_stop_err}")
-        # Gracefully stop the Temporal worker background task on shutdown
-        await temporal_wrapper.stop()
-
 
 def main_sync():  # pragma: no cover
     """Synchronous entry point for the `molecule-runtime` console script.
