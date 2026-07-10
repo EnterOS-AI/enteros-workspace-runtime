@@ -17,6 +17,7 @@ import textwrap
 import time
 
 import pytest
+import yaml
 
 from molecule_runtime import loaded_mcp_tools_probe as probe
 from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter
@@ -622,10 +623,29 @@ class TestReadMcpServersFor:
         assert got["molecule-platform"]["args"] == ["-y", "@molecule-ai/mcp-server"]
         assert got["molecule-platform"]["env"] == {"MOLECULE_MCP_MODE": "management"}
 
+    def test_hermes_reads_config_yaml(self, tmp_path, monkeypatch):
+        from molecule_runtime.mcp_render import read_mcp_servers_for, render_hermes_config
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg = tmp_path / ".hermes" / "config.yaml"
+        render_hermes_config(
+            cfg, "molecule-platform",
+            {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"],
+             "env": {"MOLECULE_MCP_MODE": "management"}},
+        )
+        got = read_mcp_servers_for("hermes", str(tmp_path))
+        assert "molecule-platform" in got
+        assert got["molecule-platform"]["command"] == "npx"
+        assert got["molecule-platform"]["args"] == ["-y", "@molecule-ai/mcp-server"]
+        assert got["molecule-platform"]["env"] == {"MOLECULE_MCP_MODE": "management"}
+
+        parsed = yaml.safe_load(cfg.read_text())
+        assert parsed["mcp_servers"] == got
+
     def test_unverified_runtime_reads_empty(self, tmp_path):
         from molecule_runtime.mcp_render import read_mcp_servers_for
 
-        assert read_mcp_servers_for("hermes", str(tmp_path)) == {}
+        assert read_mcp_servers_for("gemini", str(tmp_path)) == {}
         # An unmapped/unknown runtime also fails closed to {}.
         assert read_mcp_servers_for("some-unmapped-runtime", str(tmp_path)) == {}
 

@@ -12,13 +12,10 @@ so an in-repo edit that changes a literal without the contract (or vice versa)
 fails ``unit-tests`` before any image ships. It also exercises the real delivery
 path by materializing a delivered ``settings.json`` and asserting that
 ``_settings_has_management_mcp()``, ``mcp_server_present()``, and
-``identity_gate_payload()`` report correctly. The BYTE-IDENTICAL guarantee — that
-this repo's vendored copy stays equal to the SDK SSOT
-(``molecule-ai-sdk:contracts/mcp/mcp-plugin-delivery.contract.json``) — is now
-enforced by this repo's own ``schema-sync`` workflow
-(``scripts/check-schemas-in-sync.sh`` fetches SDK main and diffs), alongside the
-core/template copies guarded by ``mcp-plugin-delivery-contract-drift`` in
-molecule-core.
+``identity_gate_payload()`` report correctly. The CROSS-REPO guarantee that the
+core/template/runtime copies stay byte-identical is enforced separately by the
+``mcp-plugin-delivery-contract-drift`` workflow in molecule-core; wiring this
+repo's copy into that byte-compare set is a tracked follow-up.
 """
 
 import json
@@ -244,6 +241,7 @@ def test_legacy_binary_alone_satisfies_contract_gate(
 
 import pytest  # noqa: E402
 import tomllib  # noqa: E402
+import yaml  # noqa: E402
 
 from molecule_runtime import mcp_render  # noqa: E402
 
@@ -255,13 +253,12 @@ _PLATFORM_SPEC = {
 
 
 def test_runtime_matrix_contract_present():
-    """The contract enumerates a per-runtime map; claude_code + codex must be
+    """The contract enumerates a per-runtime map; platform runtimes must be
     concretely implemented (not stubs)."""
     runtimes = CONTRACT["runtimes"]
     assert runtimes["claude_code"]["status"] == "implemented"
     assert runtimes["codex"]["status"] == "implemented"
-    # hermes graduated to a concrete renderer (runtime#181): its native
-    # ~/.hermes/config.yaml `mcp_servers` surface is pinned.
+    assert runtimes["openclaw"]["status"] == "implemented"
     assert runtimes["hermes"]["status"] == "implemented"
 
 
@@ -328,50 +325,29 @@ def test_codex_render_preserves_handwritten_config(tmp_path):
 
 @pytest.mark.parametrize("renderer_name", ["render_gemini_config"])
 def test_unverified_runtimes_are_explicit_stubs(tmp_path, renderer_name):
-    """The remaining unverified renderers (gemini/google-adk) are honest
-    NotImplementedError stubs (native MCP convention unpinned) — NOT a silent
-    wrong write. Implement concretely once the format is pinned against a live
-    CLI. hermes graduated OUT (runtime#181) and is covered by
-    test_hermes_render_writes_native_config below."""
+    """Unverified renderers are honest NotImplementedError stubs — NOT silent
+    wrong writes."""
     renderer = getattr(mcp_render, renderer_name)
     with pytest.raises(NotImplementedError):
         renderer(tmp_path / "out", "molecule-platform", _PLATFORM_SPEC)
 
 
-def test_hermes_render_writes_native_config(tmp_path, monkeypatch):
-    """hermes renderer writes ~/.hermes/config.yaml `mcp_servers.<name>` (and NOT
-    .claude/settings.json) — the #3159 cross-runtime-mis-attribution guard for the
-    hermes surface. Additive: an existing server + the `model` block survive."""
-    import yaml
+def test_hermes_render_writes_native_config(tmp_path):
+    """Hermes renders to ~/.hermes/config.yaml and NOT .claude/settings.json."""
+    config_yaml = tmp_path / ".hermes" / "config.yaml"
+    claude_settings = tmp_path / ".claude" / "settings.json"
 
-    home = tmp_path / "home"
-    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
-    cfg = home / ".hermes" / "config.yaml"
-    cfg.parent.mkdir(parents=True)
-    cfg.write_text(
-        yaml.safe_dump(
-            {"model": "nous:x", "mcp_servers": {"keep": {"url": "http://127.0.0.1:9100/mcp"}}},
-            sort_keys=False,
-        )
-    )
+    mcp_render.render_hermes_config(config_yaml, "molecule-platform", _PLATFORM_SPEC)
 
-    path = mcp_render.render_for_runtime(
-        "hermes", str(tmp_path / "configs"), "molecule-platform", _PLATFORM_SPEC
-    )
-    assert str(path).endswith("/.hermes/config.yaml")
-
-    parsed = yaml.safe_load(cfg.read_text())
-    assert parsed["model"] == "nous:x"                                   # preserved
-    assert parsed["mcp_servers"]["keep"] == {"url": "http://127.0.0.1:9100/mcp"}
+    assert config_yaml.is_file(), "hermes render must write ~/.hermes/config.yaml"
+    parsed = yaml.safe_load(config_yaml.read_text())
     entry = parsed["mcp_servers"]["molecule-platform"]
     assert entry["command"] == "npx"
+    assert entry["args"] == ["-y", "@molecule-ai/mcp-server"]
     assert entry["env"]["MOLECULE_MCP_MODE"] == "management"
-    # and crucially did NOT write the Claude settings.json (the #3159 bug)
-    assert not (tmp_path / "configs" / ".claude" / "settings.json").exists()
-    # present-reader agrees with what the renderer just wrote
-    assert mcp_render.management_mcp_present_for(
-        "hermes", str(tmp_path / "configs"), "molecule-platform"
-    ) is True
+    assert not claude_settings.exists(), (
+        "hermes render must NOT write .claude/settings.json (the #3159 bug)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +393,12 @@ class _CodexOnlyNameAdapter(_BaseTestAdapter):
         return "codex"
 
 
+class _HermesOnlyNameAdapter(_BaseTestAdapter):
+    @staticmethod
+    def name():
+        return "hermes"
+
+
 def test_default_hook_dispatches_claude_for_claude_runtime(tmp_path):
     cfg = AdapterConfig(model="anthropic:claude-sonnet-4-6", config_path=str(tmp_path))
     adapter = _ClaudeOnlyNameAdapter()
@@ -448,6 +430,27 @@ def test_default_hook_dispatches_CODEX_for_codex_runtime(tmp_path, monkeypatch):
     # Negative: claude settings.json NOT written by a codex run (#3159).
     assert not (tmp_path / "configs" / ".claude" / "settings.json").exists()
     # The gate probe also reads codex's config.toml, not claude settings.json.
+    assert adapter.management_mcp_present(cfg) is True
+
+
+def test_default_hook_dispatches_HERMES_for_hermes_runtime(tmp_path, monkeypatch):
+    """A Hermes adapter that overrides only name() gets Hermes config.yaml from
+    the DEFAULT hook — and NOT .claude/settings.json."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    cfg = AdapterConfig(model="nous:hermes", config_path=str(tmp_path / "configs"))
+    adapter = _HermesOnlyNameAdapter()
+    assert adapter.management_mcp_present(cfg) is False
+
+    adapter.register_mcp_server_hook(cfg, "molecule-platform", _PLATFORM_SPEC)
+
+    hermes_cfg = home / ".hermes" / "config.yaml"
+    assert hermes_cfg.is_file(), "default hook must render Hermes config.yaml"
+    parsed = yaml.safe_load(hermes_cfg.read_text())
+    assert "molecule-platform" in parsed["mcp_servers"]
+    assert not (tmp_path / "configs" / ".claude" / "settings.json").exists()
     assert adapter.management_mcp_present(cfg) is True
 
 
@@ -494,6 +497,44 @@ async def test_install_plugins_via_registry_codex_writes_config_toml_not_claude(
 
 
 @pytest.mark.asyncio
+async def test_install_plugins_via_registry_hermes_writes_config_yaml_not_claude(tmp_path, monkeypatch):
+    """END-TO-END through the REAL production path: a Hermes-configured run
+    installing molecule-platform-mcp lands the management MCP in
+    ~/.hermes/config.yaml and NOT in .claude/settings.json."""
+    from molecule_runtime.plugins import LoadedPlugins, Plugin
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    plugin_root = tmp_path / "molecule-platform-mcp"
+    plugin_root.mkdir()
+    (plugin_root / "settings-fragment.json").write_text(json.dumps({
+        "mcpServers": {"molecule-platform": {
+            "command": "npx", "args": ["-y", "@molecule-ai/mcp-server"],
+            "env": {"MOLECULE_MCP_MODE": "management"},
+        }}
+    }))
+
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    cfg = AdapterConfig(model="nous:hermes", config_path=str(configs))
+    adapter = _HermesOnlyNameAdapter()
+
+    plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
+    results = await adapter.install_plugins_via_registry(cfg, plugins)
+    assert results, "install must have run the MCPServerAdaptor"
+
+    hermes_cfg = home / ".hermes" / "config.yaml"
+    assert hermes_cfg.is_file(), "production path must write Hermes config.yaml"
+    parsed = yaml.safe_load(hermes_cfg.read_text())
+    assert parsed["mcp_servers"]["molecule-platform"]["command"] == "npx"
+    assert not (configs / ".claude" / "settings.json").exists(), \
+        "production Hermes path must NOT write .claude/settings.json (#3159)"
+    assert adapter.management_mcp_present(cfg) is True
+
+
+@pytest.mark.asyncio
 async def test_install_plugins_via_registry_claude_writes_claude_settings(tmp_path, monkeypatch):
     """Symmetric end-to-end for the claude runtime: the same production path
     writes .claude/settings.json (and the codex config.toml stays absent)."""
@@ -523,11 +564,10 @@ async def test_install_plugins_via_registry_claude_writes_claude_settings(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_install_plugins_via_registry_unverified_fails_loud_for_privileged(tmp_path, monkeypatch):
-    """A still-UNVERIFIED runtime (google-adk) installing the PRIVILEGED
-    management MCP fails LOUDLY through the production path rather than booting a
-    capability-less concierge — the deliberate fail-loud stub behavior. (hermes
-    graduated OUT — runtime#181 — so it renders concretely; see the next test.)"""
+async def test_install_plugins_via_registry_gemini_fails_loud_for_privileged(tmp_path, monkeypatch):
+    """An UNVERIFIED runtime (gemini) installing the PRIVILEGED management MCP
+    fails LOUDLY through the production path rather than booting a
+    capability-less concierge — the deliberate fail-loud stub behavior."""
     from molecule_runtime.plugins import LoadedPlugins, Plugin
     from molecule_runtime.adapter_base import PrivilegedPluginInstallError
 
@@ -543,46 +583,11 @@ async def test_install_plugins_via_registry_unverified_fails_loud_for_privileged
 
     cfg = AdapterConfig(model="x:y", config_path=str(tmp_path / "configs"))
 
-    class _GoogleAdkAdapter(_BaseTestAdapter):
+    class _GeminiAdapter(_BaseTestAdapter):
         @staticmethod
         def name():
-            return "google_adk"
+            return "gemini"
 
     plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
     with pytest.raises(PrivilegedPluginInstallError):
-        await _GoogleAdkAdapter().install_plugins_via_registry(cfg, plugins)
-
-
-@pytest.mark.asyncio
-async def test_install_plugins_via_registry_hermes_renders_into_native_config(tmp_path, monkeypatch):
-    """A hermes concierge installing the PRIVILEGED management MCP through the
-    production path renders it into ~/.hermes/config.yaml `mcp_servers` (NOT a
-    fail-loud stub, NOT .claude/settings.json) — the runtime#181 graduation."""
-    import yaml
-    from molecule_runtime.plugins import LoadedPlugins, Plugin
-
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
-
-    plugin_root = tmp_path / "molecule-platform-mcp"
-    plugin_root.mkdir()
-    (plugin_root / "settings-fragment.json").write_text(json.dumps({
-        "mcpServers": {"molecule-platform": {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"]}}
-    }))
-
-    cfg = AdapterConfig(model="x:y", config_path=str(tmp_path / "configs"))
-
-    class _HermesAdapter(_BaseTestAdapter):
-        @staticmethod
-        def name():
-            return "hermes"
-
-    adapter = _HermesAdapter()
-    plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
-    await adapter.install_plugins_via_registry(cfg, plugins)
-
-    parsed = yaml.safe_load((home / ".hermes" / "config.yaml").read_text())
-    assert parsed["mcp_servers"]["molecule-platform"]["command"] == "npx"
-    assert not (tmp_path / "configs" / ".claude" / "settings.json").exists()
-    assert adapter.management_mcp_present(cfg) is True
+        await _GeminiAdapter().install_plugins_via_registry(cfg, plugins)
