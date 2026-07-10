@@ -323,15 +323,6 @@ def test_codex_render_preserves_handwritten_config(tmp_path):
     assert "molecule-platform" in parsed["mcp_servers"]
 
 
-@pytest.mark.parametrize("renderer_name", ["render_gemini_config"])
-def test_unverified_runtimes_are_explicit_stubs(tmp_path, renderer_name):
-    """Unverified renderers are honest NotImplementedError stubs — NOT silent
-    wrong writes."""
-    renderer = getattr(mcp_render, renderer_name)
-    with pytest.raises(NotImplementedError):
-        renderer(tmp_path / "out", "molecule-platform", _PLATFORM_SPEC)
-
-
 def test_hermes_render_writes_native_config(tmp_path):
     """Hermes renders to ~/.hermes/config.yaml and NOT .claude/settings.json."""
     config_yaml = tmp_path / ".hermes" / "config.yaml"
@@ -561,33 +552,3 @@ async def test_install_plugins_via_registry_claude_writes_claude_settings(tmp_pa
     assert (configs / ".claude" / "settings.json").is_file()
     assert not (home / ".codex" / "config.toml").exists()
     assert adapter.management_mcp_present(cfg) is True
-
-
-@pytest.mark.asyncio
-async def test_install_plugins_via_registry_gemini_fails_loud_for_privileged(tmp_path, monkeypatch):
-    """An UNVERIFIED runtime (gemini) installing the PRIVILEGED management MCP
-    fails LOUDLY through the production path rather than booting a
-    capability-less concierge — the deliberate fail-loud stub behavior."""
-    from molecule_runtime.plugins import LoadedPlugins, Plugin
-    from molecule_runtime.adapter_base import PrivilegedPluginInstallError
-
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-
-    plugin_root = tmp_path / "molecule-platform-mcp"
-    plugin_root.mkdir()
-    (plugin_root / "settings-fragment.json").write_text(json.dumps({
-        "mcpServers": {"molecule-platform": {"command": "npx"}}
-    }))
-
-    cfg = AdapterConfig(model="x:y", config_path=str(tmp_path / "configs"))
-
-    class _GeminiAdapter(_BaseTestAdapter):
-        @staticmethod
-        def name():
-            return "gemini"
-
-    plugins = LoadedPlugins(plugins=[Plugin(name="molecule-platform-mcp", path=str(plugin_root))])
-    with pytest.raises(PrivilegedPluginInstallError):
-        await _GeminiAdapter().install_plugins_via_registry(cfg, plugins)

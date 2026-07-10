@@ -122,7 +122,7 @@ logger = logging.getLogger(PLATFORM_AGENT_IDENTITY_LOGGER)
 # ── Active-adapter MCP-config probe (runtime-agnostic gate) ─────────────────
 # The "is the management MCP wired?" signal must ask the ACTIVE runtime where
 # IT reads MCP servers from — not unconditionally read .claude/settings.json,
-# which is meaningless on a codex/gemini/hermes concierge (the #3159 bug). The
+# which is meaningless on a codex/hermes concierge (the #3159 bug). The
 # claude path stays the DEFAULT when no adapter probe is registered (so the
 # baked-image self-heal, the legacy binary path, and every existing test keep
 # working unchanged).
@@ -287,7 +287,7 @@ def mcp_server_present() -> bool:
     # Ask the ACTIVE runtime where IT reads MCP servers from. When a probe is
     # registered (main.py wires it from the resolved adapter), it answers "is
     # the management MCP wired into MY native config?" — codex reads
-    # config.toml, gemini reads its own settings.json, etc. When no probe is
+    # config.toml, hermes reads its own config.yaml, etc. When no probe is
     # registered, fall back to the claude settings.json check (the default and
     # the historical behavior). A probe error is swallowed and treated as the
     # claude fallback so a buggy probe can never crash the register/heartbeat.

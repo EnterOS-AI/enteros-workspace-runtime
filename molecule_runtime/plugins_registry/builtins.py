@@ -572,7 +572,7 @@ class MCPServerAdaptor:
                                 self.plugin_name, name, self.runtime)
             except NotImplementedError as exc:
                 # A runtime whose native MCP-config renderer is not yet
-                # implemented (gemini/google-adk stubs). For the privileged
+                # implemented (a documented fail-loud stub). For the privileged
                 # management MCP this is a loud failure — a concierge on that
                 # runtime would boot WITHOUT create_workspace, the exact #3159
                 # class of bug — so surface it like a privileged-install failure.

@@ -740,8 +740,8 @@ async def main():  # pragma: no cover
 
     # 4a. Wire the runtime-agnostic management-MCP gate probe (#3159). The
     # RCA#2970 online gate must ask the ACTIVE adapter whether the management
-    # MCP is wired into the file IT reads (codex config.toml, gemini
-    # settings.json, …) rather than unconditionally checking
+    # MCP is wired into the file IT reads (codex config.toml, hermes
+    # config.yaml, …) rather than unconditionally checking
     # .claude/settings.json. main.py is the one place that holds both the
     # adapter and its config, so it registers the probe here. The baked-binary
     # path and the claude-settings fallback both still apply inside
@@ -821,7 +821,7 @@ async def main():  # pragma: no cover
     )
 
     # 5b. Materialize the workspace's CANONICAL PERSONA into the ACTIVE runtime's
-    # native identity file (system-prompt.md / SOUL.md / AGENTS.md / GEMINI.md),
+    # native identity file (system-prompt.md / SOUL.md / AGENTS.md),
     # so a workspace on ANY runtime boots with its intended identity — even
     # runtimes (openclaw) whose gateway reads a native file and never consumes
     # config.system_prompt. Runtime-agnostic: dispatches on adapter.name() via the

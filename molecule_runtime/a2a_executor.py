@@ -627,7 +627,7 @@ class RuntimeA2AExecutor(AgentExecutor):
                     _turn_lease.reset_current()
                     # MUST-FIX 1/3: resolve the subprocess tool-activity file and
                     # (kernel-on only) start a background watcher that refreshes
-                    # the lease from it. A codex/openclaw/hermes/gemini turn whose
+                    # the lease from it. A codex/openclaw/hermes turn whose
                     # child is churning tools bumps this file even when astream
                     # emits no native event, so the watcher keeps the lease fresh
                     # and the idle-cap handler below does NOT mistake a live

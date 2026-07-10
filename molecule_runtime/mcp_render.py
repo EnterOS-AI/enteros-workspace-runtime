@@ -39,8 +39,8 @@ import yaml
 # fall back to (never a hand-set ``claude_code``). See live_runtimes.py.
 from molecule_runtime.live_runtimes import DEFAULT_RUNTIME as _SSOT_DEFAULT_RUNTIME
 
-# The settings.json map key under which MCP servers live for the JSON runtimes
-# (Claude Code, Gemini CLI). Tied to the cross-repo contract ``key``.
+# The settings.json map key under which MCP servers live for the Claude Code
+# runtime. Tied to the cross-repo contract ``key``.
 MCPSERVERS_KEY = "mcpServers"
 
 # Codex reads MCP servers from this TOML table.
@@ -213,28 +213,6 @@ def render_hermes_config(config_path: Path, name: str, spec: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gemini / google-adk — native MCP-wiring convention UNVERIFIED (fail-loud stub)
-# ---------------------------------------------------------------------------
-
-def render_gemini_config(config_path: Path, name: str, spec: dict) -> None:
-    """Fail-loud stub for the gemini / google-adk MCP-wiring convention.
-
-    google-adk wires MCP through its own toolset config (an ADK ``McpToolset`` /
-    connection descriptor), and the Gemini CLI reads ``mcpServers`` from its own
-    settings file — but neither native location has been pinned against a live
-    runtime in this repo. Rather than GUESS and silently render into a file the
-    runtime never reads (the exact #3159 mis-attribution — which is what the old
-    silent ``claude_code`` fallback did for these unmapped runtimes), this raises,
-    matching the ``builtins.py`` install path that already anticipates a
-    "gemini/google-adk" MCP stub. Implement concretely once the native format is
-    verified against a live gemini / google-adk CLI."""
-    raise NotImplementedError(
-        "gemini/google-adk MCP render not implemented — native MCP convention "
-        "unverified (no silent claude_code fallback; pin against a live CLI)"
-    )
-
-
-# ---------------------------------------------------------------------------
 # OpenClaw — ~/.openclaw/openclaw.json  mcp.servers.<name>  (phase P4)
 # ---------------------------------------------------------------------------
 # Native format PINNED against a live ``openclaw@2026.5.7`` CLI (phase P4).
@@ -333,14 +311,6 @@ def _hermes_path(config_path: str | os.PathLike) -> Path:
     return Path(os.path.expanduser("~")) / ".hermes" / "config.yaml"
 
 
-def _gemini_path(config_path: str | os.PathLike) -> Path:
-    # gemini / google-adk native MCP file is UNVERIFIED — this best-guess path
-    # (the Gemini CLI ~/.gemini/settings.json convention) exists only so
-    # mcp_settings_path_for returns a non-claude path; the renderer itself
-    # fail-loud raises before this file is ever written. Do NOT rely on it.
-    return Path(os.path.expanduser("~")) / ".gemini" / "settings.json"
-
-
 def _json_settings_has(settings_path: Path, name: str) -> bool:
     try:
         data = json.loads(Path(settings_path).read_text())
@@ -412,14 +382,6 @@ _RUNTIME_SPECS: dict[str, tuple] = {
     # Agent docs/source. Renders the stdio descriptor into
     # ~/.hermes/config.yaml mcp_servers.<name>.
     "hermes": (_hermes_path, render_hermes_config, _hermes_config_has),
-    # gemini / google-adk: native MCP convention UNVERIFIED — fail-loud stub,
-    # never falsely present. Registered EXPLICITLY (not left to the default
-    # fallback) so an MCP install on these runtimes fails loud instead of
-    # silently rendering into a file they never read (the old claude_code creep
-    # for these unmapped runtimes — the #3159 class of bug). Matches the
-    # builtins.py install path that already anticipates a "gemini/google-adk" stub.
-    "gemini": (_gemini_path, render_gemini_config, lambda p, n: False),
-    "google_adk": (_gemini_path, render_gemini_config, lambda p, n: False),
     # openclaw (phase P4): CONCRETE renderer + present-reader pinned against a
     # live openclaw@2026.5.7. Renders the stdio descriptor into
     # ~/.openclaw/openclaw.json mcp.servers.<name> (the file `openclaw mcp set`
@@ -438,10 +400,11 @@ _DEFAULT_RUNTIME = _SSOT_DEFAULT_RUNTIME
 
 
 # Runtimes whose renderer is a deliberate fail-loud stub (format unverified).
-# openclaw and hermes graduated out: they now have concrete renderers +
-# present-readers pinned against their native runtime contracts. gemini/google-adk
-# are fail-loud until their native MCP convention is pinned against a live CLI.
-_UNVERIFIED_RUNTIMES = frozenset({"gemini", "google_adk"})
+# Every LIVE runtime (claude_code, codex, hermes, openclaw) now has a concrete
+# renderer + present-reader pinned against its native runtime contract, so this
+# set is empty; it stays defined as the documented extension point for a future
+# runtime whose native MCP convention has not yet been pinned against a live CLI.
+_UNVERIFIED_RUNTIMES: frozenset[str] = frozenset()
 
 
 def _spec_for(runtime: str) -> tuple:
@@ -463,9 +426,10 @@ def _spec_for(runtime: str) -> tuple:
 def is_runtime_supported(runtime: str) -> bool:
     """True when this runtime has a CONCRETE (non-stub) renderer mapped.
 
-    Unmapped runtimes fall back to the claude renderer (supported); the
-    gemini/google-adk stubs are mapped but their renderers raise, so they are
-    reported unsupported."""
+    Unmapped runtimes fall back to the operator-default renderer (supported); a
+    runtime documented in ``_UNVERIFIED_RUNTIMES`` is mapped but its renderer
+    raises, so it is reported unsupported. (The set is currently empty — every
+    live runtime has a concrete renderer.)"""
     return normalize_runtime(runtime) not in _UNVERIFIED_RUNTIMES
 
 
@@ -477,8 +441,8 @@ def mcp_settings_path_for(runtime: str, config_path: str | os.PathLike) -> Path:
 def render_for_runtime(runtime: str, config_path: str | os.PathLike, name: str, spec: dict) -> Path:
     """Render ``name -> spec`` into the given runtime's native MCP config.
 
-    Returns the path written. Raises NotImplementedError for an unverified
-    runtime (gemini/google-adk) — the caller decides whether that's fatal (it is
+    Returns the path written. Raises NotImplementedError for a runtime whose
+    renderer is a fail-loud stub — the caller decides whether that's fatal (it is
     for the privileged management MCP)."""
     path_fn, render_fn, _ = _spec_for(runtime)
     target = path_fn(config_path)
@@ -561,10 +525,6 @@ _RUNTIME_READERS: dict[str, callable] = {
     "claude_code": _read_json_mcp_servers,
     "codex": _read_codex_mcp_servers,
     "hermes": _read_hermes_mcp_servers,
-    # gemini/google-adk native MCP format unverified — report nothing rather
-    # than guessing (same fail-loud-vs-fail-silent stance as their renderer).
-    "gemini": lambda _p: {},
-    "google_adk": lambda _p: {},
     "openclaw": _read_openclaw_mcp_servers,
 }
 

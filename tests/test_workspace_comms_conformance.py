@@ -165,7 +165,7 @@ def test_heartbeat_payload_conforms() -> None:
         platform_url="http://platform.test",
         workspace_id="0b8f2c4a-1d3e-4f56-9a7b-2c8d4e6f1a90",
     )
-    loop.current_task = "provisioning a google-adk workspace"
+    loop.current_task = "provisioning a codex workspace"
     loop.active_tasks = 1
     client = _CapturingSyncClient()
     loop._send_heartbeat(client)

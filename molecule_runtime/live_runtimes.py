@@ -10,9 +10,10 @@ import ``DEFAULT_RUNTIME`` from here for their unmapped-runtime fallback — so 
 Why a dedicated SSOT
 --------------------
 Before this module the runtime set lived implicitly and INCONSISTENTLY across the
-contract registries (``mcp_render._RUNTIME_SPECS`` lacked ``google_adk`` while
-``persona_render._RUNTIME_PERSONA`` had it) and the unmapped fallback was
-hand-set to ``claude_code`` in two places. That divergence is exactly how a
+contract registries (a runtime could be registered in
+``persona_render._RUNTIME_PERSONA`` yet missing from ``mcp_render._RUNTIME_SPECS``,
+or vice versa) and the unmapped fallback was hand-set to ``claude_code`` in two
+places. That divergence is exactly how a
 "claude-code only" contract slips in: a new runtime or a new contract is added
 without every cell being covered, and the silent ``claude_code`` fallback hides
 the gap at runtime. Deriving the axis + the default from one list makes the gap a
@@ -40,7 +41,6 @@ LIVE_RUNTIMES: tuple[str, ...] = (
     "openclaw",     # operator DEFAULT (see DEFAULT_RUNTIME)
     "claude_code",
     "codex",
-    "google_adk",
     "hermes",
 )
 

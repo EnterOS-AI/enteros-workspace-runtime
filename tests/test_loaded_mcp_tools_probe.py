@@ -607,11 +607,10 @@ class TestReadMcpServersFor:
         parsed = yaml.safe_load(cfg.read_text())
         assert parsed["mcp_servers"] == got
 
-    def test_unverified_runtime_reads_empty(self, tmp_path):
+    def test_unmapped_runtime_reads_empty(self, tmp_path):
         from molecule_runtime.mcp_render import read_mcp_servers_for
 
-        assert read_mcp_servers_for("gemini", str(tmp_path)) == {}
-        # An unmapped/unknown runtime also fails closed to {}.
+        # An unmapped/unknown runtime fails closed to {}.
         assert read_mcp_servers_for("some-unmapped-runtime", str(tmp_path)) == {}
 
     def test_missing_config_reads_empty(self, tmp_path):

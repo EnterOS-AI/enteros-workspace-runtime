@@ -2,7 +2,7 @@
 
 WHY THIS EXISTS (tenant-agent BUG 3 meta-cause)
 ===============================================
-Every subprocess-backed runtime adapter (openclaw, codex, google-adk, …) used to
+Every subprocess-backed runtime adapter (openclaw, codex, …) used to
 REIMPLEMENT ``AgentExecutor.execute()`` in its own template repo, and each one
 silently diverged from the session CONTRACT that the platform relies on:
 

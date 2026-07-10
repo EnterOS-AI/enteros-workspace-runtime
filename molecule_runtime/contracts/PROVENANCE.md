@@ -24,7 +24,7 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `870c151bc27a2176815ecc18240682fde62be994` (retired google-adk from the SDK runtime contracts)
+Source commit:        `870c151bc27a2176815ecc18240682fde62be994` (retired google-adk from the SDK runtime contracts, leaving claude-code/codex/hermes/openclaw/crewai/external)
 Vendored at sdk HEAD: `870c151bc27a2176815ecc18240682fde62be994` (main)
 
 Why vendored: `molecule_runtime/manifest_ssot.py` validates plugin manifests

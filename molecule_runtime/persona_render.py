@@ -26,8 +26,6 @@ convention:
                   with the materialized identity.
   * Codex       → ``<configs>/AGENTS.md`` — the AAIF / AGENTS.md convention codex
                   reads from its project directory.
-  * Gemini / google-adk → ``<configs>/GEMINI.md`` — the Gemini context-file
-                  convention (``gemini`` / ``google-adk`` map here).
   * Hermes      → native convention unverified — deliberate fail-loud stub.
 
 The bug this closes
@@ -90,9 +88,6 @@ OPENCLAW_CLEARED_FILES = ("BOOTSTRAP.md", "AGENTS.md")
 
 # Codex reads the AAIF-standard AGENTS.md from its project directory.
 CODEX_PERSONA_FILE = "AGENTS.md"
-
-# Gemini / google-adk read GEMINI.md as their durable context / identity file.
-GEMINI_PERSONA_FILE = "GEMINI.md"
 
 # Fallback persona source when a workspace declares no ``prompt_files`` — the same
 # file build_system_prompt() falls back to. Keeps read_canonical_persona a
@@ -200,14 +195,6 @@ def materialize_codex_persona(config_path: Path, persona: str) -> Path:
     return target
 
 
-def materialize_gemini_persona(config_path: Path, persona: str) -> Path:
-    """Gemini / google-adk — write the persona to ``<configs>/GEMINI.md``
-    (the Gemini context-file convention)."""
-    target = Path(config_path) / GEMINI_PERSONA_FILE
-    _write_persona_file(target, persona)
-    return target
-
-
 def materialize_hermes_persona(config_path: Path, persona: str) -> Path:
     """TODO: Hermes' native identity-file convention is unverified.
 
@@ -241,10 +228,6 @@ def _codex_persona_path(config_path: str | os.PathLike) -> Path:
     return Path(config_path) / CODEX_PERSONA_FILE
 
 
-def _gemini_persona_path(config_path: str | os.PathLike) -> Path:
-    return Path(config_path) / GEMINI_PERSONA_FILE
-
-
 # ===========================================================================
 # Per-runtime dispatch — the production wiring.
 # ===========================================================================
@@ -257,9 +240,6 @@ _RUNTIME_PERSONA: dict[str, tuple] = {
     "claude_code": (_claude_persona_path, materialize_claude_persona),
     "openclaw": (_openclaw_persona_path, materialize_openclaw_persona),
     "codex": (_codex_persona_path, materialize_codex_persona),
-    # Gemini and google-adk share the GEMINI.md context-file convention.
-    "gemini": (_gemini_persona_path, materialize_gemini_persona),
-    "google_adk": (_gemini_persona_path, materialize_gemini_persona),
     # hermes: native identity convention unverified — fail-loud stub.
     "hermes": (_claude_persona_path, materialize_hermes_persona),
 }

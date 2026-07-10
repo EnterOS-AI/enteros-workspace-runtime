@@ -463,7 +463,8 @@ class BaseAdapter(ABC):
         MCP written to a config file its runtime never reads and so booted
         without ``create_workspace``.
 
-        An unverified runtime (gemini/google-adk) renders via a deliberate
+        A runtime whose native MCP format is unverified (documented in
+        ``mcp_render._UNVERIFIED_RUNTIMES``) renders via a deliberate
         NotImplementedError stub — caught by ``MCPServerAdaptor.install``, which
         fails the privileged management-MCP install LOUDLY rather than booting a
         silently capability-less concierge. An adapter for such a runtime may
@@ -511,7 +512,7 @@ class BaseAdapter(ABC):
         workspace on ANY runtime boots with its intended identity — even runtimes
         whose gateway/CLI reads a native identity file and never consumes the
         base-assembled ``config.system_prompt`` (openclaw → SOUL.md, codex →
-        AGENTS.md, gemini/google-adk → GEMINI.md, claude-code → system-prompt.md).
+        AGENTS.md, claude-code → system-prompt.md).
 
         The canonical persona is read runtime-agnostically from the delivered
         ``config.prompt_files`` (a concierge's ``prompts/concierge.md``; a member's

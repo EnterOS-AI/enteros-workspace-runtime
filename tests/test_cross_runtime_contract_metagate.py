@@ -25,7 +25,7 @@ For every (contract × live runtime) cell the runtime must have ONE stance:
   * FAIL_LOUD     — a documented stub in ``_UNVERIFIED_RUNTIMES`` (raises loudly)
                     — never a silent no-op.
   * DOC_SKIP      — a documented not-on-disk skip in ``_PROMPT_EMBEDDED_RUNTIMES``
-                    (e.g. google-adk skills ride the prompt, not a file).
+                    (e.g. a runtime whose skills ride the prompt, not a file).
 
 A runtime that is NONE of these is UNGUARDED: it would silently resolve through
 ``_spec_for`` to the default runtime's renderer — the exact reference-runtime
@@ -235,8 +235,8 @@ def test_metagate_selftest_green_when_satisfied():
     once every live runtime has a concrete adapter or a documented exemption."""
     satisfied = Contract(
         name="synthetic_satisfied",
-        registered=frozenset(_norm(r) for r in LIVE_RUNTIMES if r != "google_adk"),
-        fail_loud=frozenset({"google_adk"}),   # documented fail-loud exemption
+        registered=frozenset(_norm(r) for r in LIVE_RUNTIMES if r != "hermes"),
+        fail_loud=frozenset({"hermes"}),   # documented fail-loud exemption
         doc_skip=frozenset(),
         default_runtime=_norm(DEFAULT_RUNTIME),
     )

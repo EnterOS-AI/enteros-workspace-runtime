@@ -18,15 +18,13 @@ from molecule_runtime import persona_render
 # The kind=platform runtime allowlist (mirrors test_mcp_render_completeness_g6):
 # the runtimes a concierge is allowed to run on AND that have a concrete, verified
 # native identity convention. hermes is EXCLUDED (fail-loud stub).
-PLATFORM_RUNTIME_ALLOWLIST = ("claude-code", "codex", "openclaw", "google-adk")
+PLATFORM_RUNTIME_ALLOWLIST = ("claude-code", "codex", "openclaw")
 
 # runtime -> the basename of the native identity file it must materialize into.
 EXPECTED_NATIVE_FILE = {
     "claude-code": "system-prompt.md",
     "openclaw": "SOUL.md",
     "codex": "AGENTS.md",
-    "google-adk": "GEMINI.md",
-    "gemini": "GEMINI.md",
 }
 
 PERSONA = "# You are test7 — the Org Concierge\n\nYou orchestrate; you don't do the work yourself."
