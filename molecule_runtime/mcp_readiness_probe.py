@@ -84,6 +84,7 @@ from molecule_runtime.platform_agent_identity import (
     MCPSERVERS_KEY,
     PLATFORM_AGENT_IDENTITY_LOGGER,
     SETTINGS_PATH,
+    resolve_mcp_launch_env,
     set_loaded_mcp_tools,
 )
 
@@ -135,6 +136,29 @@ def probe_enabled() -> bool:
 
 
 # ── Launch resolution ───────────────────────────────────────────────────────
+def _base_env_with_launch_overlay() -> dict:
+    """The child's base env: ``os.environ`` with the active adapter's launch-env
+    overlay merged ON TOP (but still UNDER the per-server ``env`` layered by the
+    caller — the descriptor always wins).
+
+    This is the readiness-prober analogue of the boot path's
+    ``loaded_mcp_tools_probe._merge_launch_env_into_spec``: a runtime that bundles
+    its own interpreter OFF the system PATH (e.g. hermes' Node under
+    ``$HERMES_HOME/node/bin``) contributes a ``PATH`` overlay via
+    ``BaseAdapter.mcp_launch_env`` (registered in main.py, read here via
+    ``resolve_mcp_launch_env``), so the spawned ``npx @molecule-ai/mcp-server``
+    resolves node/npx. CHILD-ONLY: it returns a COPY of ``os.environ`` — the
+    parent process env is never mutated. The overlay is opaque (this function
+    reads no runtime name and no path out of it). ``{}`` (the base default, on a
+    runtime whose interpreter is already on PATH) is a no-op.
+    """
+    env = dict(os.environ)
+    overlay = resolve_mcp_launch_env()
+    if overlay:
+        env.update(overlay)  # adapter overlay over os.environ; spec.env still wins
+    return env
+
+
 def _read_settings_entry() -> Optional[dict]:
     """Return the ``molecule-platform`` entry from the claude settings.json, or
     None when it isn't declared / the file is missing or malformed."""
@@ -165,8 +189,16 @@ def resolve_management_launch() -> Optional[tuple[list[str], dict]]:
          ``MANAGEMENT_MCP_SPEC``'s env (``MOLECULE_MCP_MODE=management``).
 
     In both cases the container's own env (``os.environ`` — org key, CP URL, …)
-    is the base; the entry/spec env layers on top, so the probed server is the
-    same management surface the agent's live instance loads.
+    is the base; the active adapter's ``mcp_launch_env`` overlay (registered in
+    main.py, read via ``resolve_mcp_launch_env`` — e.g. a ``PATH`` carrying the
+    runtime's bundled interpreter bin dir when it is off the system PATH) layers
+    on top of that; and finally the entry/spec env layers ON TOP of the overlay,
+    so the descriptor always wins and the probed server is the same management
+    surface the agent's live instance loads. This mirrors the boot enumeration
+    path (``loaded_mcp_tools_probe``), closing the follow-up #49 gap where the
+    heartbeat prober re-failed to resolve ``npx``/``node`` on a runtime whose
+    interpreter is off the system PATH (hermes). CHILD-ONLY: the returned env is a
+    fresh dict; the parent process env is never mutated.
     """
     entry = _read_settings_entry()
     if entry is not None:
@@ -174,7 +206,7 @@ def resolve_management_launch() -> Optional[tuple[list[str], dict]]:
         if isinstance(command, str) and command.strip():
             args = entry.get("args")
             arg_list = [str(a) for a in args] if isinstance(args, list) else []
-            env = dict(os.environ)
+            env = _base_env_with_launch_overlay()
             entry_env = entry.get("env")
             if isinstance(entry_env, dict):
                 env.update({str(k): str(v) for k, v in entry_env.items()})
@@ -187,7 +219,7 @@ def resolve_management_launch() -> Optional[tuple[list[str], dict]]:
     # binary onto PATH as ``molecule-platform-mcp``.
     resolved = shutil.which(MANAGEMENT_MCP_COMMAND)
     if resolved:
-        env = dict(os.environ)
+        env = _base_env_with_launch_overlay()
         spec_env = MANAGEMENT_MCP_SPEC.get("env") or {}
         env.update({str(k): str(v) for k, v in spec_env.items()})
         return [resolved], env

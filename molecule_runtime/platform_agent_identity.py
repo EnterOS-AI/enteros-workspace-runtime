@@ -146,6 +146,60 @@ def register_mcp_present_probe(probe) -> None:
     global _mcp_present_probe
     _mcp_present_probe = probe
 
+
+# ── Active-adapter MCP launch-env provider (heartbeat readiness probe) ──────
+# The heartbeat-driven readiness prober (``mcp_readiness_probe``) spawns the
+# management MCP from the runtime process, but — unlike the boot enumeration
+# path (``loaded_mcp_tools_probe`` / ``BaseAdapter.enumerate_loaded_mcp_tools``)
+# — it does NOT hold the adapter, so it could not apply the adapter's
+# ``mcp_launch_env`` overlay. On a runtime that bundles its interpreter OFF the
+# system PATH (e.g. hermes' Node under ``$HERMES_HOME/node/bin``) that meant the
+# prober's ``npx @molecule-ai/mcp-server`` spawn re-failed post-boot and could
+# degrade the concierge via the heartbeat path (follow-up #49). main.py, the one
+# place holding both the adapter and its config, registers the SAME overlay here
+# so the prober can fold it UNDER each server's own env (spec.env wins).
+_mcp_launch_env_provider = None  # type: callable | None
+
+
+def register_mcp_launch_env_provider(provider) -> None:
+    """Register the active adapter's ``mcp_launch_env`` overlay provider.
+
+    ``provider`` is a zero-arg callable returning the adapter's launch-env
+    overlay dict (``BaseAdapter.mcp_launch_env(config)`` — typically ``PATH``
+    carrying the runtime's bundled interpreter bin dir). Pass None to clear
+    (tests). main.py wires this from the resolved adapter so the heartbeat
+    readiness prober's MCP spawn resolves ``npx``/``node`` on a runtime whose
+    interpreter is off the system PATH, mirroring the boot enumeration path.
+    """
+    global _mcp_launch_env_provider
+    _mcp_launch_env_provider = provider
+
+
+def resolve_mcp_launch_env() -> dict:
+    """Return the registered adapter's launch-env overlay (str->str), or ``{}``.
+
+    Consulted by the heartbeat readiness prober's spawn to overlay the runtime's
+    bundled-interpreter bin dir. When no provider is registered (the default, on
+    the base claude-code runtime whose node is already on PATH) or the provider
+    errors, returns ``{}`` — never raises into the prober, so a buggy provider
+    can never crash readiness probing.
+    """
+    provider = _mcp_launch_env_provider
+    if provider is None:
+        return {}
+    try:
+        overlay = provider()
+    except Exception:  # noqa: BLE001 — never let a provider crash the prober
+        logger.exception(
+            "platform-agent.identity: mcp_launch_env provider raised; "
+            "spawning the readiness probe with no adapter overlay"
+        )
+        return {}
+    if not isinstance(overlay, dict):
+        return {}
+    return {str(k): str(v) for k, v in overlay.items()}
+
+
 def on_platform_agent_image() -> bool:
     """True when this container is the baked platform-agent (concierge) image.
 

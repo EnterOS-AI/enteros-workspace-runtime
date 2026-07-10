@@ -17,6 +17,7 @@ spawn + handshake path is covered without needing node / @molecule-ai/mcp-server
 """
 
 import json
+import os
 import sys
 import threading
 
@@ -365,3 +366,135 @@ async def test_heartbeat_start_wires_prober_and_stop_tears_down(monkeypatch):
     await loop.stop()
     assert calls["stop"] == 1
     assert loop._mcp_prober is None
+
+
+# ── runtime#49: adapter-aware launch env (mcp_launch_env overlay) ────────────
+# The heartbeat readiness prober spawns the management MCP from the runtime
+# process. Unlike the boot enumeration path (loaded_mcp_tools_probe), it did not
+# hold the adapter, so on a runtime bundling its interpreter OFF the system PATH
+# (hermes: Node under $HERMES_HOME/node/bin) its `npx @molecule-ai/mcp-server`
+# spawn re-failed post-boot and could degrade the concierge via the heartbeat.
+# These tests mirror test_loaded_mcp_tools_probe.py's launch-env tests: the same
+# overlay the boot path applies is registered (main.py wires it from the resolved
+# adapter) and folded UNDER the per-server env here (descriptor wins), child-only.
+class TestReadinessProberLaunchEnv:
+    def teardown_method(self):
+        # Always clear the registered provider so it can't leak into other tests.
+        pai.register_mcp_launch_env_provider(None)
+
+    def _write_bare_named_server(self, tmp_path, tools, cmd_name="fake-npx"):
+        """A fake stdio MCP server + a launcher exposed ONLY as a BARE command name
+        in a bin dir OFF the system PATH — exactly the hermes node-off-PATH shape
+        (mirrors test_loaded_mcp_tools_probe._write_bare_named_server). Returns
+        ``(bin_dir, cmd_name)``.
+
+        The tool list is BAKED into the server script (not passed as a shell arg)
+        so the launcher only forwards ``"$@"`` — the same shape the reference test
+        uses, and it sidesteps shell-quoting the JSON tool list."""
+        server = tmp_path / "bare_mcp_server.py"
+        # Reuse the shared fake-server body, but drive main() from a baked-in list
+        # instead of sys.argv[1] so the launcher passes no JSON through the shell.
+        server.write_text(
+            _FAKE_MCP_SERVER.replace(
+                'if __name__ == "__main__":\n    main(json.loads(sys.argv[1]))',
+                f'if __name__ == "__main__":\n    main({tools!r})',
+            )
+        )
+        bin_dir = tmp_path / "bundled-bin"
+        bin_dir.mkdir()
+        launcher = bin_dir / cmd_name
+        launcher.write_text(
+            "#!/bin/sh\n"
+            f'exec "{sys.executable}" "{server}" "$@"\n'
+        )
+        launcher.chmod(0o755)
+        return bin_dir, cmd_name
+
+    def test_resolve_folds_overlay_under_settings_env_and_leaves_parent_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        """The registered adapter overlay is merged over os.environ but UNDER the
+        settings entry's own env (descriptor wins), and os.environ is never mutated
+        (child-only) — the same precedence the boot path uses."""
+        settings = _write_settings(tmp_path, {
+            "command": "molecule-mcp",
+            "args": ["--stdio"],
+            # spec.env pins MOLECULE_MCP_MODE — it must win over any overlay key.
+            "env": {"MOLECULE_MCP_MODE": "management"},
+        })
+        monkeypatch.setattr(probe, "SETTINGS_PATH", str(settings))
+        monkeypatch.setattr(probe.shutil, "which", lambda c: "/usr/local/bin/molecule-mcp" if c == "molecule-mcp" else None)
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        # Adapter overlay: prepend a bundled bin dir to PATH + a key the spec pins.
+        overlay = {"PATH": "/bundled/node/bin:/usr/bin:/bin", "MOLECULE_MCP_MODE": "OVERLAY_SHOULD_LOSE"}
+        pai.register_mcp_launch_env_provider(lambda: overlay)
+
+        launch = probe.resolve_management_launch()
+        assert launch is not None
+        argv, env = launch
+        assert argv == ["/usr/local/bin/molecule-mcp", "--stdio"]
+        # Overlay PATH landed (adapter bin dir prepended for the child)…
+        assert env["PATH"] == "/bundled/node/bin:/usr/bin:/bin"
+        # …but the per-server spec.env WON the collision (descriptor wins).
+        assert env["MOLECULE_MCP_MODE"] == "management"
+        # Parent process env is never mutated (child-only overlay).
+        assert os.environ["PATH"] == "/usr/bin:/bin"
+
+    def test_resolve_no_provider_is_a_noop(self, tmp_path, monkeypatch):
+        """With no provider registered (base claude-code: node already on PATH) the
+        resolved env is just os.environ + spec.env — unchanged behaviour."""
+        settings = _write_settings(tmp_path, {"command": "molecule-mcp", "env": {"MOLECULE_MCP_MODE": "management"}})
+        monkeypatch.setattr(probe, "SETTINGS_PATH", str(settings))
+        monkeypatch.setattr(probe.shutil, "which", lambda c: c)
+        monkeypatch.setenv("MOLECULE_API_KEY", "from-container")
+        pai.register_mcp_launch_env_provider(None)  # explicit: none registered
+
+        _argv, env = probe.resolve_management_launch()
+        assert env["MOLECULE_API_KEY"] == "from-container"
+        assert env["MOLECULE_MCP_MODE"] == "management"
+
+    def test_resolve_swallows_a_buggy_provider(self, tmp_path, monkeypatch):
+        """A provider that raises must never crash the prober — resolve falls back
+        to no overlay (resolve_mcp_launch_env swallows + returns {})."""
+        settings = _write_settings(tmp_path, {"command": "molecule-mcp"})
+        monkeypatch.setattr(probe, "SETTINGS_PATH", str(settings))
+        monkeypatch.setattr(probe.shutil, "which", lambda c: c)
+
+        def _boom():
+            raise RuntimeError("provider blew up")
+        pai.register_mcp_launch_env_provider(_boom)
+
+        launch = probe.resolve_management_launch()  # must not raise
+        assert launch is not None
+
+    def test_probe_end_to_end_overlay_resolves_bare_command_off_path(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end through probe_management_mcp_tools (real subprocess): with the
+        bundled interpreter OFF the process PATH, NO overlay -> the bare command is
+        unresolvable -> None; WITH the registered adapter overlay -> the SAME server
+        resolves and its tools enumerate. This is the runtime#49 fix that the boot
+        path already had, now closed on the heartbeat path."""
+        bin_dir, cmd = self._write_bare_named_server(tmp_path, ["provision_workspace", "list_workspaces"])
+        # Declare the management MCP by the BARE command name (like `npx`); it is
+        # ONLY resolvable via bin_dir, which is OFF the system PATH.
+        settings = _write_settings(tmp_path, {"command": cmd})
+        monkeypatch.setattr(probe, "SETTINGS_PATH", str(settings))
+        # Real PATH resolution (no monkeypatched which): mirror the live spawn.
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        # 1) No overlay -> bare `cmd` off PATH -> Popen can't spawn it -> None.
+        pai.register_mcp_launch_env_provider(None)
+        assert probe.probe_management_mcp_tools(timeout=20.0) is None
+
+        # 2) Adapter overlay prepends the bundled bin dir -> resolves -> enumerate.
+        pai.register_mcp_launch_env_provider(
+            lambda: {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        )
+        result = probe.probe_management_mcp_tools(timeout=20.0)
+        assert result is not None
+        assert PROVISION_ID in result
+        assert probe.management_provision_ready(result) is True
+        # Child-only: the parent process PATH was never mutated by the overlay.
+        assert str(bin_dir) not in os.environ.get("PATH", "")

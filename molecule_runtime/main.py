@@ -747,9 +747,21 @@ async def main():  # pragma: no cover
     # path and the claude-settings fallback both still apply inside
     # mcp_server_present().
     try:
-        from molecule_runtime.platform_agent_identity import register_mcp_present_probe
+        from molecule_runtime.platform_agent_identity import (
+            register_mcp_launch_env_provider,
+            register_mcp_present_probe,
+        )
         register_mcp_present_probe(
             lambda _a=adapter, _c=adapter_config: _a.management_mcp_present(_c)
+        )
+        # runtime#49: give the heartbeat readiness prober the SAME adapter
+        # launch-env overlay the boot enumeration path uses, so its management-MCP
+        # spawn resolves npx/node on a runtime whose interpreter is off the system
+        # PATH (e.g. hermes). Registered here — the one place holding both the
+        # adapter and its config — because the prober runs on a heartbeat daemon
+        # thread that has neither in scope. Threaded opaquely (no runtime name).
+        register_mcp_launch_env_provider(
+            lambda _a=adapter, _c=adapter_config: _a.mcp_launch_env(_c)
         )
     except Exception as probe_err:  # noqa: BLE001
         # On a PLATFORM agent (concierge), silently falling back to the claude
