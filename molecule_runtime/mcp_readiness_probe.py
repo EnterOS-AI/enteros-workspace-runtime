@@ -59,7 +59,7 @@ DESIGN NOTES
   180s grace window absorbs it, and a genuine "management MCP removed" is caught
   independently by ``mcp_server_present`` going false (hard fail-closed).
 * This probe targets the claude-code delivery surfaces (plugin-delivered
-  settings.json + baked binary). Other runtimes (codex/gemini) keep relying on
+  settings.json + baked binary). Other runtimes (codex/openclaw/hermes) keep relying on
   the existing per-turn capture; this is a strict improvement for the dominant
   concierge path, never a regression for the others.
 """

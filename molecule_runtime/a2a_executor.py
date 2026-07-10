@@ -329,10 +329,6 @@ class RuntimeA2AExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Execute a task from an A2A request with SSE streaming.
 
-        Routes through the Temporal durable workflow when a global
-        ``TemporalWorkflowWrapper`` is initialised and connected to Temporal;
-        otherwise falls back to ``_core_execute()`` (direct path).
-
         Event emission sequence:
           1. TaskStatusUpdateEvent(working)           — immediate start signal
           2. TaskArtifactUpdateEvent chunks           — token-by-token via astream_events
@@ -340,28 +336,10 @@ class RuntimeA2AExecutor(AgentExecutor):
                                                         return on this; streaming clients
                                                         also receive it as the last SSE event.
         """
-        # ── Optional Temporal durable execution wrapper ──────────────────────
-        # When a TemporalWorkflowWrapper is active this routes execution through
-        # a MoleculeAIAgentWorkflow (task_receive → llm_call → task_complete).
-        # Falls back silently to _core_execute() on any error or if Temporal
-        # is unavailable, so the client always receives a response.
-        try:
-            from molecule_runtime.builtin_tools.temporal_workflow import get_wrapper as _get_temporal_wrapper
-
-            _tw = _get_temporal_wrapper()
-            if _tw is not None and _tw.is_available():
-                return await _tw.run(self, context, event_queue)
-        except Exception:
-            pass  # Never let the wrapper path crash the executor
-
         await self._core_execute(context, event_queue)
 
     async def _core_execute(self, context: RequestContext, event_queue: EventQueue) -> str:
-        """Core execution pipeline — called directly or from a Temporal activity.
-
-        This is the original ``execute()`` body, extracted so that the Temporal
-        ``llm_call`` activity can invoke it without re-entering the wrapper
-        check and causing infinite recursion.
+        """Core execution pipeline for an A2A request.
 
         Returns the final response text (empty string on empty input or error).
 
@@ -649,7 +627,7 @@ class RuntimeA2AExecutor(AgentExecutor):
                     _turn_lease.reset_current()
                     # MUST-FIX 1/3: resolve the subprocess tool-activity file and
                     # (kernel-on only) start a background watcher that refreshes
-                    # the lease from it. A codex/openclaw/hermes/gemini turn whose
+                    # the lease from it. A codex/openclaw/hermes turn whose
                     # child is churning tools bumps this file even when astream
                     # emits no native event, so the watcher keeps the lease fresh
                     # and the idle-cap handler below does NOT mistake a live

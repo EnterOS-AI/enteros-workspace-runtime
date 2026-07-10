@@ -333,7 +333,7 @@ def test_requirements_pin_regex_matches_canonical_dist_name() -> None:
     """RC 2026-07-05: the dist rename (`molecule-ai-workspace-runtime` ->
     `molecules-workspace-runtime`, dependency-confusion fix) left the
     requirements-pin regex matching only the LEGACY name, so dual-pin
-    templates (codex, google-adk) received .runtime-version-only bumps
+    templates (e.g. codex) received .runtime-version-only bumps
     while requirements.txt stayed frozen on registry-purged versions and
     their template validation failed on 'No matching distribution found'.
     The regex must bump the canonical name."""

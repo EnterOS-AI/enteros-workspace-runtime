@@ -149,7 +149,7 @@ class RuntimeCapabilities:
     provides_native_heartbeat: bool = False
 
     # Cron / schedule — adapter handles scheduled triggers internally
-    # (Temporal workflows, Durable Functions, sidecar daemons). Platform
+    # (external workflow engines, Durable Functions, sidecar daemons). Platform
     # scheduler skips polling workspace_schedules for this workspace,
     # avoiding double-fire on restart.
     provides_native_scheduler: bool = False

@@ -24,8 +24,8 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` (last commit touching the schema — ai-sdk#53 dropped langgraph/autogen/gemini-cli/deepagents from the runtime enum)
-Vendored at sdk HEAD: `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` (main)
+Source commit:        `c661ceb164ba41550900af77055b5cc29557a2ac` (retired crewai from the SDK runtime contracts; supersedes the google-adk retirement — leaving claude-code/codex/hermes/openclaw/external)
+Vendored at sdk HEAD: `c661ceb164ba41550900af77055b5cc29557a2ac` (main)
 
 Why vendored: `molecule_runtime/manifest_ssot.py` validates plugin manifests
 against this schema at plugin **load** (`plugins.load_plugin_manifest`) and at
@@ -105,3 +105,22 @@ Re-vendoring (instance):
     curl -fsS -A "curl/8.4.0" \
       "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/workspace-data/workspace-data.contract.json" \
       -o "molecule_runtime/contracts/workspace-data.contract.json"
+
+## credentials.contract.json
+
+Source: molecule-ai-sdk `contracts/credentials/credentials.contract.json`
+(sha `70ebf796c9494b7620be1c83712e75722d65557a`, PR sdk#78). The root-level
+credential/privilege SSOT.
+
+Why vendored: `tests/test_privileged_mcp_env.py` asserts `privileged_mcp_env`
+forwards EVERY env key in `management_mcp_env.required` — the enforcement that
+would have caught the concierge AUTH_ERROR (the forward-allowlist carried the
+unprefixed `ORG_API_KEY` and stripped the canonical `MOLECULE_ORG_API_KEY` the
+mcp-server reads). Drift-gated byte-identical to sdk main via
+`check-schemas-in-sync.sh`.
+
+Re-vendoring:
+
+    curl -fsS -A "curl/8.4.0" \
+      "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/credentials/credentials.contract.json" \
+      -o "molecule_runtime/contracts/credentials.contract.json"
