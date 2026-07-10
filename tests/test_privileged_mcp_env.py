@@ -12,11 +12,44 @@ openclaw template override:
 """
 from __future__ import annotations
 
+import json
+import pathlib
+
+import molecule_runtime
 from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
 from molecule_runtime.privileged_mcp_env import (
     PRIVILEGED_ENV_KEYS,
     inject_privileged_env,
 )
+
+
+def _credentials_contract() -> dict:
+    """The vendored molecule-ai-sdk contracts/credentials SSOT (drift-gated against
+    SDK main by scripts/check-schemas-in-sync.sh)."""
+    p = pathlib.Path(molecule_runtime.__file__).parent / "contracts" / "credentials.contract.json"
+    return json.loads(p.read_text())
+
+
+def test_forwards_every_contract_required_mgmt_mcp_env_key():
+    """ENFORCEMENT: privileged_mcp_env must forward EVERY env key the SDK
+    contracts/credentials `management_mcp_env.required` set names, under that exact
+    name. This is the gate that would have caught the concierge AUTH_ERROR — the
+    forward-allowlist carried the unprefixed ORG_API_KEY and stripped
+    MOLECULE_ORG_API_KEY. Regressing any canonical name fails here."""
+    mgmt = _credentials_contract()["management_mcp_env"]
+    required = mgmt["required"]
+    assert "MOLECULE_ORG_API_KEY" in required  # sanity: the org key IS a hard requirement
+
+    env = {k: f"val-{k}" for k in required}
+    child = inject_privileged_env(MANAGEMENT_MCP_NAME, {"command": "npx"}, env)["env"]
+    missing = [k for k in required if child.get(k) != env[k]]
+    assert not missing, (
+        f"privileged_mcp_env does NOT forward contract-required mgmt-MCP env key(s) {missing} "
+        f"— they'd be stripped from the management MCP child (the concierge AUTH_ERROR class)."
+    )
+    # the deprecated unprefixed name must never be the canonical org key
+    assert "ORG_API_KEY" in mgmt["deprecated_do_not_use"]
+    assert "MOLECULE_ORG_API_KEY" not in mgmt["deprecated_do_not_use"]
 
 
 def test_injects_all_canonical_keys_for_management_mcp():

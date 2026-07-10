@@ -30,6 +30,7 @@ declare -A MAP=(
   [idle-prompt.schema.json]="contracts/idle-prompt/idle-prompt.schema.json"
   [idle-prompt.contract.json]="contracts/idle-prompt/idle-prompt.contract.json"
   [workspace-data.contract.json]="contracts/workspace-data/workspace-data.contract.json"
+  [credentials.contract.json]="contracts/credentials/credentials.contract.json"
 )
 
 tmp="$(mktemp -d)"
