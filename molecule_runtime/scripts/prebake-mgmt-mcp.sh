@@ -37,32 +37,43 @@ _py="${MOLECULE_RUNTIME_PYTHON:-python3}"
 _read() { "$_py" -c "from molecule_runtime.platform_agent_identity import $1 as v; print(v)"; }
 PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"
 VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"
+RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"
 REG="$(_read MANAGEMENT_MCP_REGISTRY)"
 SCOPE="$(_read MANAGEMENT_MCP_REGISTRY_SCOPE)"
 TOOL="$(_read REQUIRED_TOOL)"
 SPEC="${PKG}@${VER}"
+# The agent npm cache the bake warms + the launch reads. Under `USER agent` the
+# build HOME is the agent home, so ${HOME}/.npm is /home/agent/.npm — the same
+# path the plugin fragment injects as npm_config_cache at LAUNCH.
+CACHE="${HOME}/.npm"
+# The per-user npmrc that supplies the scoped @molecule-ai registry. Written here
+# under the agent HOME; the LAUNCH reads it HOME-independently by pointing npx at
+# it with NPM_CONFIG_USERCONFIG (plugin fragment env). This FILE — not an env var
+# — is how the scoped registry travels: `npm_config_<scope>:registry` is not a
+# valid shell identifier (@/: ) AND npx ignores it as an env var.
+AGENT_NPMRC="${HOME}/.npmrc"
 
 command -v npm >/dev/null 2>&1 || { echo "prebake-mgmt-mcp: npm not reachable (set MOLECULE_PREBAKE_NODE_BIN=<node bin dir>)" >&2; exit 1; }
 command -v npx >/dev/null 2>&1 || { echo "prebake-mgmt-mcp: npx not reachable (set MOLECULE_PREBAKE_NODE_BIN=<node bin dir>)" >&2; exit 1; }
 
-echo "prebake-mgmt-mcp: baking ${SPEC} from ${REG}"
-mkdir -p "${HOME}/.npm"
-# Scoped @molecule-ai registry + npm cache, configured GLOBALLY (node prefix
-# etc/npmrc) so they are honored regardless of the $HOME the runtime later spawns
-# the mgmt-MCP under. The launch context's HOME is NOT guaranteed to be the agent
-# $HOME — the runtime's boot enumeration was observed spawning the mgmt-MCP under
-# HOME=/root, so a per-user ${HOME}/.npmrc (which npm reads ONLY when $HOME
-# matches) is MISSED and npx falls through to the public registry -> ETARGET on
-# the private @molecule-ai scope -> #1027 fail-close. A --global config is read by
-# npm/npx under ANY HOME, so the baked package resolves at LAUNCH, not just in this
-# build-time self-check. Anonymous (public org package): no token, same posture as
-# the git-native plugin source. Values are SSOT — from the contract-pinned runtime
-# constants (SCOPE/REG/HOME cache), never hand-typed here.
-npm config set "${SCOPE}:registry" "${REG}" --global
-npm config set cache "${HOME}/.npm" --global
-# Belt-and-suspenders: also write the per-user .npmrc for launch contexts that DO
-# run under the agent $HOME.
-printf '%s:registry=%s\n' "${SCOPE}" "${REG}" > "${HOME}/.npmrc"
+echo "prebake-mgmt-mcp: baking ${SPEC} (launch range ${RANGE}) into ${CACHE}"
+mkdir -p "${CACHE}"
+# NPM config WITHOUT `npm config set --global`. The --global write targets the
+# node-prefix etc/npmrc, which is ROOT-owned on any template that installs node
+# system-wide (apt -> /usr/local or /etc/npmrc). The prebake runs as the NON-ROOT
+# agent user, so --global EACCES-fails the image build there (it worked only on
+# templates whose node prefix is agent-writable, e.g. hermes ~/.local — the
+# regression this replaces). Instead:
+#  - npm cache location: `npm_config_cache` env (a VALID shell identifier),
+#    honored by npm/npx under any $HOME with no file write.
+#  - scoped @molecule-ai registry: the per-user npmrc FILE (agent-writable). It
+#    can NOT be an env var — `npm_config_@molecule-ai:registry` is an invalid
+#    shell identifier (breaks `export`) and npx ignores it as an env var anyway.
+# The LAUNCH points npx at this exact file via NPM_CONFIG_USERCONFIG (plugin
+# fragment env) so the scoped registry + cache resolve regardless of the $HOME
+# the runtime spawns the mgmt-MCP under (observed /root). SSOT values; anonymous.
+export npm_config_cache="${CACHE}"
+printf '%s:registry=%s\n' "${SCOPE}" "${REG}" > "${AGENT_NPMRC}"
 
 # Warm-install into a throwaway dir, then DISCARD it BEFORE the seeding npx runs
 # from a clean cwd (openclaw #210 ordering: a warm node_modules in cwd poisons
@@ -77,24 +88,36 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 # HARD offline self-check: the OFFLINE launch must expose the degrade-gate verb
 # (REQUIRED_TOOL == provision_workspace). Fails the image build if the bake is
-# broken — so a broken bake can never ship.
+# broken — so a broken bake can never ship. Takes the spec to resolve, so we can
+# assert BOTH the exact baked version AND the launch RANGE.
 _prebake_self_check() {
   printf '%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"verify","version":"1"}}}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-    | MOLECULE_MCP_MODE=management timeout 60 npx -y --offline "${SPEC}" 2>/dev/null | grep -q "${TOOL}"
+    | MOLECULE_MCP_MODE=management timeout 60 npx -y --offline "$1" 2>/dev/null | grep -q "${TOOL}"
 }
-# (1) under the build HOME (the agent home).
-_prebake_self_check \
-  || { echo "prebake-mgmt-mcp: ERROR — ${SPEC} did not resolve OFFLINE or ${TOOL} missing (build HOME); the concierge warm-up bake is broken" >&2; exit 1; }
-# (2) under a FOREIGN HOME — REGRESSION GUARD for the exact fail-close class this
-# fixes: the runtime spawns the mgmt-MCP under a non-agent HOME (observed /root),
-# and a HOME-local ${HOME}/.npmrc would ETARGET there while silently passing check
-# (1). This proves the scoped registry + cache are GLOBAL, so the LAUNCH resolves
-# regardless of HOME.
+# (1) under the build HOME + build env: the exact baked version resolves.
+_prebake_self_check "${SPEC}" \
+  || { echo "prebake-mgmt-mcp: ERROR — exact ${SPEC} did not resolve OFFLINE or ${TOOL} missing (build HOME); the bake is broken" >&2; exit 1; }
+# (2) the LAUNCH RANGE resolves offline to the baked version — this is what the
+# concierge boot actually runs (`npx @${PKG}@${RANGE}`), so it must resolve to a
+# baked in-range version with zero network.
+_prebake_self_check "${PKG}@${RANGE}" \
+  || { echo "prebake-mgmt-mcp: ERROR — launch range ${PKG}@${RANGE} did not resolve OFFLINE (no baked version satisfies it); the concierge boot would ETARGET" >&2; exit 1; }
+# (3) the RANGE resolves under a FOREIGN HOME *with the exact launch env the
+# plugin fragment injects*: npm_config_cache (the baked cache) + NPM_CONFIG_USERCONFIG
+# (the baked scoped-registry npmrc). REGRESSION GUARD for the exact fail-close
+# class this fixes: the runtime spawns the mgmt-MCP under a non-agent HOME
+# (observed /root); the config travels via these two env vars (NOT --global, NOT
+# a HOME-local ~/.npmrc, NOT the npx-ignored scoped-registry env var), so this
+# proves the LAUNCH resolves regardless of $HOME without any root-owned write.
 _foreign_home="$(mktemp -d)"
-( export HOME="${_foreign_home}"; _prebake_self_check ) \
-  || { rm -rf "${_foreign_home}"; echo "prebake-mgmt-mcp: ERROR — ${SPEC} did not resolve OFFLINE under a non-agent HOME; the scoped registry/cache is not GLOBAL — the runtime would ETARGET (#1027 fail-close) when it spawns the mgmt-MCP under a different HOME" >&2; exit 1; }
+(
+  export HOME="${_foreign_home}"
+  export npm_config_cache="${CACHE}"
+  export NPM_CONFIG_USERCONFIG="${AGENT_NPMRC}"
+  _prebake_self_check "${PKG}@${RANGE}"
+) || { rm -rf "${_foreign_home}"; echo "prebake-mgmt-mcp: ERROR — ${PKG}@${RANGE} did not resolve OFFLINE under a foreign HOME with the launch env (npm_config_cache + NPM_CONFIG_USERCONFIG); the runtime would ETARGET (#1027) when it spawns the mgmt-MCP under a different HOME" >&2; exit 1; }
 rm -rf "${_foreign_home}"
 
-echo "prebake-mgmt-mcp: OK — ${SPEC} resolves offline with ${TOOL} (HOME-independent)"
+echo "prebake-mgmt-mcp: OK — ${SPEC} baked; ${PKG}@${RANGE} resolves offline HOME-independently (npm_config_cache + NPM_CONFIG_USERCONFIG; no --global)"

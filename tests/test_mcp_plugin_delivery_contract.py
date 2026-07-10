@@ -61,8 +61,20 @@ def test_management_mcp_prebake_constants_match_contract():
     mms = CONTRACT["management_mcp_server"]
     assert pai.MANAGEMENT_MCP_NPM_PACKAGE == mms["npm_package"]
     assert pai.MANAGEMENT_MCP_PINNED_VERSION == mms["pinned_version"]
+    assert pai.MANAGEMENT_MCP_COMPATIBLE_RANGE == mms["compatible_range"]
     assert pai.MANAGEMENT_MCP_REGISTRY == mms["registry"]
     assert pai.MANAGEMENT_MCP_REGISTRY_SCOPE == mms["registry_scope"]
+
+
+def test_pinned_version_satisfies_compatible_range():
+    # Drift-tolerant Guard-D invariant: the concrete version the prebake BAKES
+    # must fall inside the RANGE the launch resolves (else a fresh image would
+    # bake something the launch range rejects). Minimal caret check.
+    base = pai.MANAGEMENT_MCP_COMPATIBLE_RANGE.lstrip("^")
+    pinned = tuple(int(x) for x in pai.MANAGEMENT_MCP_PINNED_VERSION.split("."))
+    floor = tuple(int(x) for x in base.split("."))
+    assert pinned[0] == floor[0], "pinned version outside range major"
+    assert pinned >= floor, "pinned version below range floor"
 
 
 def test_provision_tool_id_derives_from_contract_literals():
