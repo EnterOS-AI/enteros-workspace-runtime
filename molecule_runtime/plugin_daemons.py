@@ -363,6 +363,38 @@ class DaemonSupervisor:
                 pass
 
 
+async def wait_until_server_bound(
+    server,
+    *,
+    max_wait: float = 60.0,
+    poll_interval: float = 0.25,
+) -> bool:
+    """Wait until ``uvicorn.Server`` reports its socket bound, FAIL-OPEN.
+
+    ``uvicorn.Server`` flips ``started`` True once its socket is bound and
+    accepting connections. This is the single "is uvicorn bound?" gate shared
+    by every post-bind action (poll-delivery, daemon supervisor, initial
+    prompt) so they answer that question identically instead of drifting apart
+    (one of them once self-polled the agent-card over HTTP and FAIL-CLOSED
+    dropped the work on timeout).
+
+    Returns whether the server became bound within ``max_wait``. Crucially the
+    caller must proceed EITHER way: ``max_wait`` is a defensive backstop, not a
+    verdict — if startup somehow never reports bound the caller should still do
+    its work (its own retry/backoff is the net) rather than silently drop it.
+    A ``None``/attribute-less ``server`` is treated as never-bound (returns
+    False after the wait) so a mis-wired caller degrades to fail-OPEN, never a
+    crash.
+    """
+    waited = 0.0
+    while not getattr(server, "started", False):
+        if waited >= max_wait:
+            return False
+        await asyncio.sleep(poll_interval)
+        waited += poll_interval
+    return True
+
+
 async def start_supervisor_when_bound(
     server,
     supervisor,
@@ -379,15 +411,13 @@ async def start_supervisor_when_bound(
     still starts the daemons (their own retry loops are the net) rather than
     never starting them.
     """
-    waited = 0.0
-    while not getattr(server, "started", False):
-        if waited >= max_wait_seconds:
-            logger.warning(
-                "plugin daemons: uvicorn not reported bound after %.0fs; "
-                "starting daemons anyway", max_wait_seconds,
-            )
-            break
-        await asyncio.sleep(poll_interval)
-        waited += poll_interval
+    bound = await wait_until_server_bound(
+        server, max_wait=max_wait_seconds, poll_interval=poll_interval
+    )
+    if not bound:
+        logger.warning(
+            "plugin daemons: uvicorn not reported bound after %.0fs; "
+            "starting daemons anyway", max_wait_seconds,
+        )
     supervisor.start()
     return True

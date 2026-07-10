@@ -472,10 +472,26 @@ def identity_gate_payload() -> dict:
 
     `platform_mcp_diag` (cp#3164) ships the box-level diagnostic so a missing /
     failed management MCP is diagnosable from the controlplane without box SSH.
+
+    `mcp_launch_failure` (#228/#1027) ships the runtime-side REFUSE-ONLINE reason
+    when the management MCP could not be LAUNCHED AT ALL on this image (its pinned
+    version is unresolvable — a DETERMINISTIC hard fail, not a transient stall).
+    Its presence lets core fail the concierge CLOSED loudly and immediately rather
+    than absorbing a permanent failure into the degrade grace window and then
+    flapping. Omitted (key absent) in the healthy case so it never reads as a
+    false alarm. Read via a lazy import because ``loaded_mcp_tools_probe`` imports
+    THIS module — importing it at module load would be circular.
     """
     payload = {"mcp_server_present": mcp_server_present()}
     tools = loaded_mcp_tools()
     if tools is not None:
         payload["loaded_mcp_tools"] = tools
     payload["platform_mcp_diag"] = management_mcp_diagnostic()
+    try:
+        from molecule_runtime.loaded_mcp_tools_probe import launch_failure_reason
+        reason = launch_failure_reason()
+    except Exception:  # noqa: BLE001 — the gate payload must never crash a heartbeat
+        reason = None
+    if reason is not None:
+        payload["mcp_launch_failure"] = reason
     return payload

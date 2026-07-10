@@ -496,10 +496,24 @@ class MCPReadinessProber:
     def _run(self) -> None:
         while not self._stop.is_set():
             self.run_once()
-            # Tighter cadence until the first success so a post-boot delivery is
-            # reported within the core grace window; relax once confirmed.
-            wait = self._interval if self._succeeded_once else self._retry
-            self._stop.wait(wait)
+            # Retry on a tight cadence UNTIL the first success: a management MCP
+            # delivered a few seconds after boot (post-online plugin reconcile)
+            # is an external settings.json write with no in-process event, so a
+            # bounded retry is the correct capture-first mechanism.
+            #
+            # STOP once we've published at least once. The holder is STICKY —
+            # every heartbeat keeps reporting the last observed list between
+            # probes — and the only two edges that matter are already covered:
+            #   * "added"   → this retry loop catches it (up to first success);
+            #   * "removed" → caught INDEPENDENTLY by ``mcp_server_present()``
+            #                 going false (hard fail-closed, see DESIGN NOTES).
+            # The old steady-state 120s re-probe re-published a signal that only
+            # changes on those two edges, cold-spawning npx + a full
+            # handshake/tools-list every cycle FOREVER for nothing. Once
+            # succeeded, there is nothing left to capture — exit the loop.
+            if self._succeeded_once:
+                return
+            self._stop.wait(self._retry)
 
     def stop(self) -> None:
         self._stop.set()

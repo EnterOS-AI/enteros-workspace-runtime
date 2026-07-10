@@ -39,6 +39,7 @@ from molecule_runtime.plugin_daemons import (
     daemon_specs_from_manifest,
     discover_daemon_specs,
     start_supervisor_when_bound,
+    wait_until_server_bound,
 )
 
 
@@ -507,6 +508,58 @@ async def test_start_supervisor_when_bound_backstop_starts_anyway():
         NeverBound(), sup, poll_interval=0.01, max_wait_seconds=0.03
     )
     assert sup.started is True
+
+
+# ---------------------------------------------------------------------------
+# wait_until_server_bound — the shared "is uvicorn bound?" gate (EV1 fail-OPEN)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_wait_until_server_bound_returns_true_when_flips_late():
+    """runtime EV1: a server whose ``.started`` flips True LATE must be waited
+    for and reported bound — this is the exact shape the initial-prompt path now
+    uses instead of the old HTTP self-poll that fail-CLOSED dropped the prompt."""
+
+    class FakeServer:
+        started = False
+
+    server = FakeServer()
+    task = asyncio.create_task(
+        wait_until_server_bound(server, max_wait=5.0, poll_interval=0.01)
+    )
+    await asyncio.sleep(0.05)
+    assert not task.done()  # still waiting on the (unbound) server
+    server.started = True   # bind reported late
+    assert await asyncio.wait_for(task, timeout=2.0) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_server_bound_true_immediately_when_already_bound():
+    class FakeServer:
+        started = True
+
+    assert await wait_until_server_bound(FakeServer(), poll_interval=0.01) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_server_bound_returns_false_on_timeout_fail_open():
+    """The defensive backstop: never-bound returns False after max_wait so the
+    CALLER can fail-OPEN (send/start anyway) — it must NOT hang forever."""
+
+    class NeverBound:
+        started = False
+
+    result = await wait_until_server_bound(
+        NeverBound(), max_wait=0.03, poll_interval=0.01
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_wait_until_server_bound_none_server_degrades_fail_open():
+    """A mis-wired (None) server must degrade to fail-OPEN (False after the
+    bounded wait), never raise into the caller."""
+    result = await wait_until_server_bound(None, max_wait=0.02, poll_interval=0.01)
+    assert result is False
 
 
 def test_main_boot_wires_daemon_supervisor():

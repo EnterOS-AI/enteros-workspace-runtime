@@ -381,3 +381,27 @@ async def test_poll_delivery_max_wait_proceeds_as_backstop(monkeypatch):
     )
     assert started is True
     assert calls["pollers"] == 1
+
+
+# ---------------------------------------------------------------------------
+# EV1 — initial-prompt gate is fail-OPEN (must NOT self-poll-and-drop).
+# The initial-prompt sender lives inside main()'s boot closure (not runnable in
+# a unit test), so — following the repo convention for main()'s monolith wiring
+# (test_plugin_daemons.test_main_boot_wires_daemon_supervisor) — we pin the fix
+# by source inspection: the fail-CLOSED HTTP self-poll drop is GONE and the path
+# now gates on the SAME shared fail-OPEN bind helper the siblings use.
+# ---------------------------------------------------------------------------
+def test_initial_prompt_uses_shared_fail_open_bind_gate():
+    import inspect
+
+    src = inspect.getsource(m.main)
+    # The initial-prompt sender is wired at boot.
+    assert "_send_initial_prompt" in src
+    # It gates on the SHARED helper (same signal poll-delivery + daemons use),
+    # not a bespoke HTTP self-poll of the agent card.
+    assert "wait_until_server_bound(server" in src
+    # The fail-CLOSED drop message ("...skipping") that RETURNED WITHOUT SENDING
+    # must be GONE — that was the silent first-prompt drop this fix removes.
+    assert "server not ready after 30s, skipping" not in src
+    # And the old HTTP self-poll of the well-known agent-card path is gone.
+    assert "AGENT_CARD_WELL_KNOWN_PATH" not in src

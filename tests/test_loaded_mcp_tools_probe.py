@@ -68,8 +68,15 @@ def _cfg(config_root):
 @pytest.fixture(autouse=True)
 def _reset_producer():
     set_loaded_mcp_tools(None)
+    # The launch-failure REFUSE-ONLINE signal is a module-global. Real-subprocess
+    # tests in this file spawn servers that exit non-zero and legitimately RECORD a
+    # reason; without this reset it leaks into later tests and (correctly) trips the
+    # retry loop's new hard-fail short-circuit. Mirror test_mcp_launch_failure_alarm's
+    # _reset_launch_signal so every test starts from a clean signal.
+    probe.record_launch_failure(None)
     yield
     set_loaded_mcp_tools(None)
+    probe.record_launch_failure(None)
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +696,51 @@ class TestRetryUntilReady:
             return result
 
         monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _flaky)
+        out = await probe.capture_loaded_mcp_tools_with_retry(
+            _ProbeAdapter(), _cfg("/cfg"), max_attempts=5, interval_seconds=0.01
+        )
+        assert out == result
+        assert calls["n"] == 3
+
+    @pytest.mark.asyncio
+    async def test_hard_launch_failure_short_circuits_the_retry_loop(self, monkeypatch):
+        # runtime EV4: a DETERMINISTIC hard launch-failure (npx ETARGET: the pinned
+        # mcp-server version is unresolvable on this image) will NEVER self-heal, so
+        # the moment _classify_launch_failure records launch_failure_reason() the
+        # retry loop must STOP — not re-spin all remaining attempts into the grace
+        # window. The recorded reason is the refuse-online signal core reads.
+        calls = {"n": 0}
+
+        async def _fail_then_record(adapter, config, *, force=False, **_kw):
+            calls["n"] += 1
+            # The real init path records the reason as a side effect when it sees
+            # the child exit non-zero; simulate that recording here.
+            probe.record_launch_failure("mcp-server: exit=1 ETARGET")
+            return None
+
+        monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _fail_then_record)
+        out = await probe.capture_loaded_mcp_tools_with_retry(
+            _ProbeAdapter(), _cfg("/cfg"), max_attempts=40, interval_seconds=0.01
+        )
+        assert out is None
+        # Stopped after the FIRST attempt that recorded a hard fail — not 40.
+        assert calls["n"] == 1, "should stop on the deterministic hard fail, not retry"
+        # The refuse-online reason remains recorded for the heartbeat to surface.
+        assert probe.launch_failure_reason() == "mcp-server: exit=1 ETARGET"
+
+    @pytest.mark.asyncio
+    async def test_transient_miss_without_launch_failure_still_retries(self, monkeypatch):
+        # Guard the discrimination: a plain None (transient stall, no recorded
+        # launch failure) must NOT short-circuit — the loop keeps retrying and
+        # succeeds late, exactly as before EV4.
+        calls = {"n": 0}
+        result = ["mcp__molecule-platform__create_workspace"]
+
+        async def _miss_then_ok(adapter, config, *, force=False, **_kw):
+            calls["n"] += 1
+            return None if calls["n"] < 3 else result
+
+        monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _miss_then_ok)
         out = await probe.capture_loaded_mcp_tools_with_retry(
             _ProbeAdapter(), _cfg("/cfg"), max_attempts=5, interval_seconds=0.01
         )

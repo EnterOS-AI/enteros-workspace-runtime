@@ -317,6 +317,49 @@ class TestProberPublishing:
         assert pr.start() is None  # disabled -> no thread
         assert pai.loaded_mcp_tools() is None
 
+    def test_run_retries_until_first_success_then_stops_reprobing(self):
+        # runtime EV3: the prober must KEEP retrying (tight cadence) until the
+        # first success — a management MCP delivered a few seconds post-boot is
+        # still picked up — and then STOP. The old loop re-spawned npx +
+        # handshake + tools/list FOREVER every 120s to re-publish a sticky signal
+        # that only changes on the added/removed edges (removed is caught by
+        # mcp_server_present() independently), so a running concierge cold-spawned
+        # a subprocess for nothing for its whole life.
+        calls = {"n": 0}
+        done = threading.Event()
+
+        def _probe(_t):
+            calls["n"] += 1
+            # First TWO attempts miss (MCP not connectable yet) -> None; the third
+            # succeeds. Proves the retry-until-first-success loop still runs.
+            if calls["n"] < 3:
+                return None
+            done.set()
+            return [PROVISION_ID]
+
+        pr = probe.MCPReadinessProber(retry_interval=0.01, interval=0.01, probe=_probe)
+        pr.start()
+        assert done.wait(5.0), "prober never reached its first success"
+        # After the first success the loop must EXIT: no further run_once calls.
+        # Give it well more than a retry interval's worth of chances to (wrongly)
+        # re-probe; the count must stay pinned at the success attempt.
+        threading.Event().wait(0.2)
+        assert calls["n"] == 3, (
+            "prober kept re-spawning after first success (steady-state re-probe "
+            "was not removed)"
+        )
+        # The sticky holder still carries the published tools after the loop ends.
+        assert pai.loaded_mcp_tools() == [PROVISION_ID]
+        # And the thread has actually terminated (returned), not just idling.
+        for _ in range(200):
+            if pr._thread is None or not pr._thread.is_alive():
+                break
+            threading.Event().wait(0.01)
+        assert pr._thread is None or not pr._thread.is_alive(), (
+            "prober thread did not terminate after first success"
+        )
+        pr.stop()
+
 
 def test_probe_enabled_default_on_and_toggle(monkeypatch):
     monkeypatch.delenv(probe.PROBE_ENABLED_ENV, raising=False)

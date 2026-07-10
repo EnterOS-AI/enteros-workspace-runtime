@@ -491,18 +491,17 @@ async def start_poll_delivery_when_bound(
     """
     if delivery_mode != "poll":
         return False
-    waited = 0.0
-    while not getattr(server, "started", False):
-        if waited >= max_wait_seconds:
-            print(
-                "Delivery mode: poll — uvicorn not reported bound after "
-                f"{max_wait_seconds:.0f}s; starting poller anyway "
-                "(consumer retries connection-refused as backstop)",
-                flush=True,
-            )
-            break
-        await asyncio.sleep(poll_interval)
-        waited += poll_interval
+    from molecule_runtime.plugin_daemons import wait_until_server_bound
+    bound = await wait_until_server_bound(
+        server, max_wait=max_wait_seconds, poll_interval=poll_interval
+    )
+    if not bound:
+        print(
+            "Delivery mode: poll — uvicorn not reported bound after "
+            f"{max_wait_seconds:.0f}s; starting poller anyway "
+            "(consumer retries connection-refused as backstop)",
+            flush=True,
+        )
     return maybe_start_poll_delivery(
         delivery_mode,
         platform_url,
@@ -1234,32 +1233,27 @@ async def main():  # pragma: no cover
             )
         async def _send_initial_prompt():
             """Wait for server to be ready, then send initial_prompt as self-message."""
-            # Wait for the A2A server to accept connections.
-            # Use the SDK's own constant for the well-known path so this
-            # probe and the route mounted by create_agent_card_routes()
-            # never drift apart. Pre-fix this hardcoded the pre-1.x
-            # well-known path string; a2a-sdk 1.x renamed it (the
-            # canonical value lives in a2a.utils.constants now), so
-            # the probe got 404 every attempt and fell through to
-            # "server not ready after 30s, skipping" even though the
-            # server was actually serving fine. Net effect: every
-            # workspace silently dropped its `initial_prompt`.
-            from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
-            ready = False
-            for attempt in range(30):
-                await asyncio.sleep(1)
-                try:
-                    async with httpx.AsyncClient(timeout=5.0) as client:
-                        resp = await client.get(f"http://127.0.0.1:{port}{AGENT_CARD_WELL_KNOWN_PATH}")
-                        if resp.status_code == 200:
-                            ready = True
-                            break
-                except Exception:
-                    continue
-
-            if not ready:
-                print("Initial prompt: server not ready after 30s, skipping", flush=True)
-                return
+            # Gate on the SAME "is uvicorn bound?" signal every other post-bind
+            # action uses (poll-delivery, daemon supervisor): the in-process
+            # ``server.started`` flag, via the shared fail-OPEN helper. The old
+            # path here instead self-polled the agent-card over HTTP for 30s and
+            # RETURNED WITHOUT SENDING on timeout — a fail-CLOSED drop of the
+            # user's very first prompt. (It was doubly broken: a2a-sdk 1.x renamed
+            # the well-known path constant, so the probe 404'd every attempt and
+            # ALWAYS fell through to "skipping" even when the server was serving
+            # fine.) Fail-OPEN like the siblings: after the wait, send anyway —
+            # ``max_wait`` is a defensive bound, not a verdict, and the send path
+            # below already has its own connection-refused retry/backoff as the
+            # net if the server is genuinely a beat behind.
+            from molecule_runtime.plugin_daemons import wait_until_server_bound
+            bound = await wait_until_server_bound(server, max_wait=60)
+            if not bound:
+                print(
+                    "Initial prompt: uvicorn not reported bound after 60s; "
+                    "sending anyway (send-path retry is the backstop) — NOT dropping "
+                    "the user's first prompt",
+                    flush=True,
+                )
 
             # Send initial prompt through the platform A2A proxy (not directly to self).
             # The proxy logs an a2a_receive with source_id=NULL (canvas-style),
