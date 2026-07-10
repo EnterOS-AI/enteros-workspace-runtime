@@ -506,6 +506,35 @@ class BaseAdapter(ABC):
 
         return json_mcp_servers_has(Path(self.mcp_settings_path(config)), MANAGEMENT_MCP_NAME)
 
+    def mcp_launch_env(self, config: "AdapterConfig") -> dict[str, str]:
+        """Runtime-specific environment overlay for SPAWNED MCP-server children.
+
+        ADR-004 socket (adapters own runtime-specific concerns; the shared engine
+        stays runtime-agnostic). When the runtime spawns a stdio MCP server — the
+        boot enumeration probe, and the live model's MCP launch — the child inherits
+        the runtime process env. But a runtime that bundles its OWN interpreter (its
+        node/python) OFF the system PATH (e.g. hermes ships Node 22 under
+        ``$HERMES_HOME/node/bin``, NOT on PATH) leaves the child unable to resolve
+        ``npx``/``node`` — so ``npx @molecule-ai/mcp-server`` never launches, the
+        management MCP never enumerates, and the concierge is stuck provisioning.
+
+        This method contributes the DELTA an adapter needs merged into each spawned
+        MCP server's env (typically ``PATH`` with the runtime's bundled interpreter
+        bin dir prepended). Merge precedence at the spawn site is:
+        ``os.environ`` (base) < this overlay (adapter) < the per-server ``spec.env``
+        (descriptor always wins), so a server that pins its own env is never
+        overridden by the adapter overlay.
+
+        BASE default: ``{}`` — NO runtime-specific injection. The name-agnostic base
+        (ADR-004: no ``self.name()`` dispatch) assumes the runtime's interpreter is
+        already on the process PATH (system node), so the child inherits it as-is.
+        A runtime bundling its own interpreter OVERRIDES this to DYNAMICALLY resolve
+        + verify its bin dir at launch (never a static image-build PATH hardcode) and
+        prepend it — resolution stays in the adapter, so the engine spells no runtime
+        name and no interpreter path.
+        """
+        return {}
+
     async def enumerate_loaded_mcp_tools(
         self, config: "AdapterConfig"
     ) -> "list[str] | None":
@@ -545,7 +574,12 @@ class BaseAdapter(ABC):
                 self.name(), exc_info=True,
             )
             return None
-        return await enumerate_from_specs_async(servers)
+        # Pass the adapter's launch-env overlay so a runtime bundling its own
+        # interpreter (off the system PATH) can make node/npx resolvable for the
+        # spawned server; the base default is {} (system interpreter on PATH).
+        return await enumerate_from_specs_async(
+            servers, launch_env=self.mcp_launch_env(config)
+        )
 
     def materialize_persona(self, config: "AdapterConfig") -> "Any":
         """Materialize the workspace's CANONICAL PERSONA into the default native

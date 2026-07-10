@@ -12,6 +12,7 @@ Proves REQUIREMENT 5:
 
 import asyncio
 import json
+import os
 import sys
 import textwrap
 import time
@@ -764,8 +765,9 @@ class TestAdapterEnumerationContract:
         """
         captured = {}
 
-        async def _engine(servers):
+        async def _engine(servers, launch_env=None):
             captured["servers"] = servers
+            captured["launch_env"] = launch_env
             return []
         monkeypatch.setattr(probe, "enumerate_from_specs_async", _engine)
 
@@ -780,3 +782,120 @@ class TestAdapterEnumerationContract:
         assert captured["servers"] == {
             "molecule-platform": {"command": "npx", "args": ["x"]}
         }
+        # ADR-004 mcp_launch_env socket: the base default contributes NO overlay
+        # ({}), so the spawn inherits the process env (system interpreter on PATH).
+        assert captured["launch_env"] == {}
+
+
+# ---------------------------------------------------------------------------
+# ADR-004 mcp_launch_env socket — DYNAMIC, adapter-resolved launch env.
+#
+# The live bug (hermes): the image bundles Node under $HERMES_HOME/node/bin but
+# it is OFF the runtime process PATH, so a bare `npx @molecule-ai/mcp-server`
+# child cannot resolve its interpreter and the management MCP never launches.
+# These tests reproduce that shape hermetically — a stdio MCP server invoked by a
+# BARE command name that is ONLY on PATH via a bin dir OFF the system PATH — and
+# prove:
+#   * base mcp_launch_env() == {}  -> no injection -> the bare command is
+#     UNRESOLVABLE (spawn fails) -> None (the stuck-provisioning shape), and
+#   * an adapter that prepends that bin dir to PATH via mcp_launch_env() makes the
+#     SAME server resolvable -> its tools enumerate. Node-off-PATH now resolves via
+#     the adapter, dynamically at launch, with zero runtime-name in the engine.
+# ---------------------------------------------------------------------------
+
+
+def _write_bare_named_server(tmp_path, *, tools, cmd_name="fake-npx"):
+    """Write a fake stdio MCP server + a launcher exposed under a BARE command name
+    in a bin dir. Returns ``(bin_dir, cmd_name)``.
+
+    The launcher is invocable ONLY as the bare ``cmd_name`` resolved on PATH (like
+    ``npx``), so a child whose PATH lacks ``bin_dir`` cannot spawn it — exactly the
+    hermes node-off-PATH failure. The server script speaks the minimal
+    initialize -> tools/list handshake (same shape as ``_write_fake_server``)."""
+    server = _write_fake_server(tmp_path, tools=tools, name="bare_server.py")
+    bin_dir = tmp_path / "bundled-bin"
+    bin_dir.mkdir()
+    launcher = bin_dir / cmd_name
+    launcher.write_text(
+        "#!/bin/sh\n"
+        f'exec "{sys.executable}" "{server}" "$@"\n'
+    )
+    launcher.chmod(0o755)
+    return bin_dir, cmd_name
+
+
+class _LaunchEnvAdapter(_ProbeAdapter):
+    """Adapter that injects a PATH overlay via the ADR-004 mcp_launch_env socket —
+    the generic stand-in for a runtime (hermes) bundling its interpreter off PATH.
+    ``_bin_dir=None`` models the base behaviour (no injection)."""
+
+    def __init__(self, name="hermes", bin_dir=None):
+        super().__init__(name=name)
+        self._bin_dir = bin_dir
+
+    def mcp_launch_env(self, config):
+        if not self._bin_dir:
+            return {}
+        existing = os.environ.get("PATH", "")
+        return {"PATH": f"{self._bin_dir}:{existing}" if existing else str(self._bin_dir)}
+
+
+class TestAdapterMcpLaunchEnv:
+    @pytest.mark.asyncio
+    async def test_base_no_injection_leaves_bundled_interpreter_off_path_unresolvable(
+        self, tmp_path, monkeypatch
+    ):
+        """With node/npx OFF the system PATH and the base mcp_launch_env() == {}
+        (no injection), a bare-named MCP command cannot be spawned -> None. This IS
+        the stuck-provisioning shape the adapter override exists to fix."""
+        bin_dir, cmd = _write_bare_named_server(tmp_path, tools=["create_workspace"])
+        # Ensure the bundled bin dir is NOT on the process PATH (node off PATH).
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        specs = {"molecule-platform": {"command": cmd}}
+        # Base default overlay is {} -> bare cmd unresolvable -> None.
+        out = await probe.enumerate_from_specs_async(specs, launch_env={})
+        assert out is None
+        assert str(bin_dir) not in os.environ.get("PATH", "")
+
+    @pytest.mark.asyncio
+    async def test_adapter_launch_env_prepends_bin_dir_and_resolves_node_off_path(
+        self, tmp_path, monkeypatch
+    ):
+        """The adapter's mcp_launch_env() prepends the bundled bin dir to PATH, so
+        the SAME bare-named MCP command resolves and its tools enumerate — even
+        though the interpreter is OFF the process PATH. Dynamic, adapter-resolved,
+        no runtime name in the engine."""
+        bin_dir, cmd = _write_bare_named_server(tmp_path, tools=["create_workspace"])
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        specs = {"molecule-platform": {"command": cmd}}
+        overlay = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        out = await probe.enumerate_from_specs_async(specs, launch_env=overlay)
+        assert out == ["mcp__molecule-platform__create_workspace"]
+        # The engine never mutated the parent process PATH — the overlay is
+        # child-only (dynamic launch-time resolution, not a global mutation).
+        assert str(bin_dir) not in os.environ.get("PATH", "")
+
+    @pytest.mark.asyncio
+    async def test_adapter_override_end_to_end_via_enumerate_loaded_mcp_tools(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end through the adapter socket: an adapter whose mcp_launch_env()
+        returns the bin-dir overlay resolves the off-PATH interpreter, while the
+        SAME adapter with no overlay (base behaviour) does not — proving the socket
+        is what threads the launch env into the spawn."""
+        bin_dir, cmd = _write_bare_named_server(tmp_path, tools=["create_workspace"])
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        # Seed the generic JSON config the base reader consumes (bare command).
+        config_root = _claude_settings_with(tmp_path, {"molecule-platform": {"command": cmd}})
+
+        # No overlay -> off-PATH interpreter unresolvable -> None.
+        base_out = await _LaunchEnvAdapter(bin_dir=None).enumerate_loaded_mcp_tools(
+            _cfg(config_root)
+        )
+        assert base_out is None
+
+        # Overlay prepends the bundled bin dir -> resolves -> tools enumerate.
+        inj_out = await _LaunchEnvAdapter(bin_dir=bin_dir).enumerate_loaded_mcp_tools(
+            _cfg(config_root)
+        )
+        assert inj_out == ["mcp__molecule-platform__create_workspace"]

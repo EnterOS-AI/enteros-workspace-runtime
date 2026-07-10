@@ -378,6 +378,29 @@ async def _handshake(proc, server: str) -> list[str] | None:
     return ids
 
 
+def _merge_launch_env_into_spec(spec: dict, launch_env: dict | None) -> dict:
+    """Fold the adapter's ``launch_env`` overlay UNDER a spec's own ``env``.
+
+    Returns a shallow copy of ``spec`` whose ``env`` is
+    ``launch_env`` (the adapter overlay, e.g. a PATH carrying the runtime's bundled
+    interpreter bin dir) with the spec's declared ``env`` layered ON TOP — so a
+    server that pins its own env always wins, while the adapter overlay fills in
+    what the spec doesn't set (typically PATH). A no-op returning ``spec`` unchanged
+    when ``launch_env`` is falsy. Doing this at the per-server descriptor level (not
+    at the spawn seam) keeps the single spawn function's signature stable — the seam
+    the SDK conformance suite patches stays adapter-shape-agnostic.
+    """
+    if not launch_env:
+        return spec
+    merged = dict(spec)
+    env = {str(k): str(v) for k, v in launch_env.items()}
+    spec_env = spec.get("env")
+    if isinstance(spec_env, dict):
+        env.update({str(k): str(v) for k, v in spec_env.items()})  # descriptor wins
+    merged["env"] = env
+    return merged
+
+
 async def _list_tools_from_mcp_server(server: str, spec: dict) -> list[str] | None:
     """Spawn one MCP server over stdio, handshake, and return its ``mcp__*`` ids.
 
@@ -388,6 +411,13 @@ async def _list_tools_from_mcp_server(server: str, spec: dict) -> list[str] | No
           handshake timed out/stalled, bad/missing response) — a SIGNAL distinct
           from "connected with zero tools" so the caller can tell "this server is
           broken" from "this server is fine but toolless".
+
+    The adapter's launch-env overlay (``BaseAdapter.mcp_launch_env`` — e.g. a
+    ``PATH`` carrying the runtime's bundled interpreter bin dir when it is off the
+    system PATH) is already folded into ``spec['env']`` by
+    :func:`_merge_launch_env_into_spec` before this is called, so the child inherits
+    it here via the normal ``spec.env`` merge below. The single spawn seam therefore
+    keeps a stable ``(server, spec)`` signature.
 
     BOOT-SAFE: the entire spawn+handshake is wrapped in
     ``asyncio.wait_for(..., _MCP_HANDSHAKE_TIMEOUT_SECONDS)`` AND every read is
@@ -402,7 +432,9 @@ async def _list_tools_from_mcp_server(server: str, spec: dict) -> list[str] | No
         )
         return None
 
-    # Child env = our env overlaid with the server's declared env (str->str).
+    # Child env = our env overlaid with the server's declared env (str->str). The
+    # adapter's launch-env overlay is already inside spec['env'] (folded UNDER the
+    # descriptor by _merge_launch_env_into_spec), so this one merge carries it.
     child_env = dict(os.environ)
     spec_env = spec.get("env")
     if isinstance(spec_env, dict):
@@ -469,16 +501,19 @@ async def _list_tools_from_mcp_server(server: str, spec: dict) -> list[str] | No
         await _kill_proc(proc)
 
 
-async def _probe_specs_async(servers: dict) -> list[str] | None:
+async def _probe_specs_async(
+    servers: dict, launch_env: dict | None = None
+) -> list[str] | None:
     """Probe an already-resolved ``{name: spec}`` map, folding the tri-state.
 
     The generic, runtime-name-free stdio enumeration ENGINE, fed a resolved
     ``{name: spec}`` map by an adapter that read its OWN native MCP config (the
     runtime-owns-discovery contract, :meth:`BaseAdapter.enumerate_loaded_mcp_tools`).
-    Given the ``{name: spec}`` map, spawn each STDIO server, handshake, and fold
-    the tri-state. Never raises; each per-server probe already maps failure to
-    None. HTTP/url specs (``_build_server_command`` returns None) are skipped — an
-    adapter that owns an HTTP server reports its tools another way.
+    Given the ``{name: spec}`` map, spawn each STDIO server (each with the adapter's
+    ``launch_env`` overlay applied), handshake, and fold the tri-state. Never raises;
+    each per-server probe already maps failure to None. HTTP/url specs
+    (``_build_server_command`` returns None) are skipped — an adapter that owns an
+    HTTP server reports its tools another way.
     """
     if not servers:
         logger.info(
@@ -490,7 +525,11 @@ async def _probe_specs_async(servers: dict) -> list[str] | None:
     any_connected = False
     collected: set[str] = set()
     for name, spec in servers.items():
-        ids = await _list_tools_from_mcp_server(name, spec if isinstance(spec, dict) else {})
+        server_spec = spec if isinstance(spec, dict) else {}
+        # Fold the adapter's launch-env overlay UNDER this server's own env, so the
+        # spawn seam (patched by the SDK conformance suite) keeps a stable signature.
+        server_spec = _merge_launch_env_into_spec(server_spec, launch_env)
+        ids = await _list_tools_from_mcp_server(name, server_spec)
         if ids is None:
             continue  # broken/unreachable/stalled server — degrade-safe skip
         any_connected = True
@@ -512,7 +551,9 @@ async def _probe_specs_async(servers: dict) -> list[str] | None:
     return result
 
 
-async def enumerate_from_specs_async(servers: dict) -> list[str] | None:
+async def enumerate_from_specs_async(
+    servers: dict, launch_env: dict | None = None
+) -> list[str] | None:
     """Boot-safe, bounded, never-raise enumeration of an adapter-supplied specs map.
 
     The public entry point an adapter override calls when IT read its runtime's
@@ -521,10 +562,16 @@ async def enumerate_from_specs_async(servers: dict) -> list[str] | None:
     guarantees as :func:`enumerate_loaded_mcp_tools_async`; the only difference is
     the servers are supplied by the caller rather than read via the (legacy)
     per-runtime switch.
+
+    ``launch_env`` is the adapter's env overlay
+    (:meth:`BaseAdapter.mcp_launch_env`) applied to every spawned server child so a
+    runtime bundling its own interpreter off the system PATH can still resolve
+    ``npx``/``node`` (default ``None`` = inherit the process env unchanged). It is
+    threaded opaquely — the engine spells no runtime name and reads no path from it.
     """
     try:
         return await asyncio.wait_for(
-            _probe_specs_async(servers),
+            _probe_specs_async(servers, launch_env),
             timeout=_MCP_ENUMERATION_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
