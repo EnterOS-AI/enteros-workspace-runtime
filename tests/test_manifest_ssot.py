@@ -53,7 +53,7 @@ def _valid_manifest() -> dict:
         "name": "test-plugin",
         "version": "1.2.0",
         "description": "A conformant test plugin.",
-        "runtimes": ["claude-code", "codex", "crewai", "google-adk"],
+        "runtimes": ["claude-code", "codex", "crewai"],
         "kind": "env-mutator",
     }
 
@@ -96,6 +96,14 @@ def test_bogus_runtime_is_enum_violation():
     assert len(violations) == 1
     assert "runtimes" in violations[0]
     assert "bogus-runtime" in violations[0]
+
+
+def test_retired_google_adk_runtime_is_enum_violation():
+    manifest = _valid_manifest()
+    manifest["runtimes"] = ["google-adk"]
+    violations = manifest_ssot.validate_manifest_ssot(manifest)
+    assert len(violations) == 1
+    assert "google-adk" in violations[0]
 
 
 def test_legacy_underscore_alias_accepted():

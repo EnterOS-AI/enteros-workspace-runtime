@@ -24,8 +24,8 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` (last commit touching the schema — ai-sdk#53 dropped langgraph/autogen/gemini-cli/deepagents from the runtime enum)
-Vendored at sdk HEAD: `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` (main)
+Source commit:        `870c151bc27a2176815ecc18240682fde62be994` (retired google-adk from the SDK runtime contracts)
+Vendored at sdk HEAD: `870c151bc27a2176815ecc18240682fde62be994` (main)
 
 Why vendored: `molecule_runtime/manifest_ssot.py` validates plugin manifests
 against this schema at plugin **load** (`plugins.load_plugin_manifest`) and at
