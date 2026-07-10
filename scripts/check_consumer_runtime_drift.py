@@ -102,6 +102,22 @@ class ReconcileUnavailable(RuntimeError):
     """
 
 
+class PropagationStatusUnavailable(RuntimeError):
+    """The propagation-in-flight probe (listing a consumer repo's open PRs) could
+    not be completed for an INFRASTRUCTURE reason — absent token, network blip, or
+    an auth/API failure — as opposed to returning a definitive "no in-flight bump
+    PR" answer.
+
+    Propagation-lag tolerance (this file): a consumer pin that lags the runtime
+    SSOT is a HARD FAILURE only when we can AFFIRMATIVELY confirm there is no open
+    ``.runtime-version`` bump PR resolving it — i.e. the runtime#91 propagation bot
+    is genuinely stuck. If we merely could not check (this exception), we must NOT
+    block a runtime PR on an undeterminable cross-repo signal: we degrade to an
+    ADVISORY warning (fail-soft), symmetric with the absent-token skip in
+    consumer-drift.yml and the ReconcileUnavailable org-scan degrade.
+    """
+
+
 @dataclass(frozen=True)
 class DriftFinding:
     repo: str
@@ -313,6 +329,165 @@ def reconcile_org_consumers(
     return unaccounted
 
 
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Best-effort parse of a runtime version pin into a comparable tuple.
+
+    Mirrors the propagation bot's tolerant parser (propagate_runtime_version.py):
+    strips any pre-release/build suffix and coerces each dotted chunk to its
+    leading integer so pins compare numerically (0.3.6 < 0.3.20)."""
+    parts: list[int] = []
+    for chunk in v.strip().split("-")[0].split("+")[0].split("."):
+        num = ""
+        for ch in chunk:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    return tuple(parts)
+
+
+def _extract_bump_target(pr: dict) -> str | None:
+    """Return the version an open PR bumps ``.runtime-version`` to, or None if the
+    PR is not a runtime propagation bump PR.
+
+    Keys on the runtime#91 propagation bot's canonical shape — either is
+    sufficient (title is primary; head branch is the fallback if a title was
+    hand-edited):
+      - title:  ``chore(runtime): bump .runtime-version to <ver>``
+      - head:   ``bump/runtime-<ver>``
+    """
+    import re
+
+    title = (pr.get("title") or "").strip()
+    m = re.match(r"chore\(runtime\):\s*bump\s+\.runtime-version\s+to\s+(\S+)", title)
+    if m:
+        return m.group(1)
+    head = (pr.get("head") or {}).get("ref") or ""
+    m = re.match(r"^bump/runtime-(\S+)$", head)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _open_bump_pr_target(
+    repo: str,
+    *,
+    pinned: str,
+    gitea_url: str,
+    token: str,
+    org: str = "molecule-ai",
+) -> str | None:
+    """Return the version an OPEN ``.runtime-version`` bump PR on ``repo`` would
+    advance the pin to — the highest bump target strictly greater than the lagging
+    ``pinned`` value — or None if no such in-flight PR exists.
+
+    This is the propagation-in-flight probe. After a runtime release the runtime#91
+    bot opens a ``chore(runtime): bump .runtime-version to <ver>`` PR on each
+    consumer and a human gates the merge, so during a burst of back-to-back
+    releases a consumer pin legitimately lags the SSOT for the window between
+    "release cut" and "bump PR merged". An OPEN bump PR that raises the pin is
+    proof propagation is IN FLIGHT (self-healing) rather than STUCK.
+
+    Raises PropagationStatusUnavailable if the open-PR listing cannot be fetched
+    (network / auth / decode), so the caller can fail-soft to ADVISORY instead of
+    blocking a runtime PR on an undeterminable cross-repo signal.
+    """
+    import json
+    import urllib.request
+
+    url = f"{gitea_url}/api/v1/repos/{org}/{repo}/pulls?state=open&limit=50"
+    headers = {"User-Agent": "curl/8.4.0"}  # CF edge 403s the default urllib UA
+    if token:
+        headers["Authorization"] = f"token {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            prs = json.load(resp)
+    except Exception as exc:  # noqa: BLE001 - any failure => undeterminable => fail-soft
+        raise PropagationStatusUnavailable(
+            f"{repo}: cannot list open PRs to determine propagation-in-flight status: {exc}"
+        )
+    pinned_t = _version_tuple(pinned) if pinned else ()
+    best: str | None = None
+    for pr in prs if isinstance(prs, list) else []:
+        target = _extract_bump_target(pr)
+        if not target:
+            continue
+        # Only count a PR that actually advances the pin above its current lag
+        # value (would resolve the lag). If we couldn't parse the pin, accept any
+        # bump PR (fail toward advisory).
+        if not pinned_t or _version_tuple(target) > pinned_t:
+            if best is None or _version_tuple(target) > _version_tuple(best):
+                best = target
+    return best
+
+
+def classify_pin_drift(
+    findings: list[DriftFinding],
+    *,
+    pins: dict[str, str],
+    gitea_url: str,
+    token: str,
+    org: str = "molecule-ai",
+) -> tuple[list[DriftFinding], list[str]]:
+    """Apply propagation-lag tolerance, splitting findings into
+    ``(blocking, advisory_messages)``.
+
+    Disposition:
+      * NON pin-drift findings (forbidden top-level ``workspace/`` tree, vendored
+        ``molecule_runtime/`` package) are ALWAYS blocking — they concern vendoring
+        runtime SOURCE and have nothing to do with release-propagation timing.
+      * A ``.runtime-version`` pin-drift finding is BLOCKING only when the consumer
+        is STUCK: it lags the SSOT AND has no open bump PR advancing the pin. When
+        an open ``chore(runtime): bump .runtime-version to <ver>`` PR (runtime#91)
+        is in flight, the lag is transient/self-healing -> ADVISORY (not counted as
+        a failure).
+      * If in-flight status is UNDETERMINABLE (absent token, or the open-PR query
+        failed) we fail-soft to ADVISORY rather than block a runtime PR on a signal
+        we could not check.
+    """
+    blocking: list[DriftFinding] = []
+    advisory: list[str] = []
+    for finding in findings:
+        is_pin_drift = (
+            finding.path == ".runtime-version"
+            and finding.reason.startswith("runtime pin drift")
+        )
+        if not is_pin_drift:
+            blocking.append(finding)
+            continue
+
+        pinned = pins.get(finding.repo, "")
+        if not token:
+            advisory.append(
+                f"{finding.repo}: {finding.reason} — cannot verify "
+                f"propagation-in-flight status without a token; treating as ADVISORY "
+                f"(fail-soft, not blocking)."
+            )
+            continue
+        try:
+            target = _open_bump_pr_target(
+                finding.repo, pinned=pinned, gitea_url=gitea_url, token=token, org=org
+            )
+        except PropagationStatusUnavailable as exc:
+            advisory.append(
+                f"{finding.repo}: {finding.reason} — could not determine "
+                f"propagation-in-flight status ({exc}); treating as ADVISORY "
+                f"(fail-soft, not blocking)."
+            )
+            continue
+        if target:
+            advisory.append(
+                f"{finding.repo}: {finding.reason} — propagation IN FLIGHT "
+                f"(open bump PR advancing pin to {target}); ADVISORY, transient/"
+                f"self-healing (bot filed the bump; awaiting merge)."
+            )
+        else:
+            blocking.append(finding)
+    return blocking, advisory
+
+
 def _git_clone_with_token(dest: Path, url: str, token: str) -> subprocess.CompletedProcess[str]:
     """Clone using GIT_ASKPASS so the token never appears in argv or remote URL.
 
@@ -493,14 +668,50 @@ def main(argv: list[str] | None = None) -> int:
 
         findings: list[DriftFinding] = []
         runtime_root = Path(__file__).resolve().parents[1]
+        pins: dict[str, str] = {}
         for repo, path in paths.items():
             findings.extend(find_runtime_drift(repo, path, runtime_root=runtime_root))
+            rv = path / ".runtime-version"
+            if rv.is_file():
+                pins[repo] = rv.read_text().strip()
 
-        if findings:
-            print(format_findings(findings), file=sys.stderr)
+        # Propagation-lag tolerance: a consumer pin that lags the SSOT is only a
+        # HARD FAILURE when the runtime#91 propagation bot is STUCK (no open bump
+        # PR resolving it). A lag WITH an in-flight bump PR is a transient,
+        # self-healing burst-window state -> ADVISORY, not a failure. Vendoring
+        # findings (workspace/ tree, molecule_runtime/ package) always block.
+        blocking, advisory = classify_pin_drift(
+            findings, pins=pins, gitea_url=args.gitea_url, token=token
+        )
+
+        for msg in advisory:
+            print(f"::warning::{msg}", file=sys.stderr)
+
+        if blocking:
+            print(format_findings(blocking), file=sys.stderr)
+            if any(
+                f.path == ".runtime-version" and f.reason.startswith("runtime pin drift")
+                for f in blocking
+            ):
+                print(
+                    "\nThe .runtime-version pin(s) above lag the runtime SSOT AND "
+                    "have NO in-flight `chore(runtime): bump .runtime-version to ...` "
+                    "PR — propagation is STUCK, not a transient burst-window lag. "
+                    "This is the real signal: investigate/unwedge the runtime#91 "
+                    "propagation bot (or merge the missing bump PR) before cutting "
+                    "further releases.",
+                    file=sys.stderr,
+                )
             return 1
 
-        print(f"Runtime SSOT drift guard passed for {len(paths)} consumer repo(s).")
+        if advisory:
+            print(
+                f"Runtime SSOT drift guard passed for {len(paths)} consumer repo(s) "
+                f"— {len(advisory)} lagging consumer(s) have propagation IN FLIGHT "
+                f"(advisory, self-healing; see ::warning:: lines above), 0 stuck."
+            )
+        else:
+            print(f"Runtime SSOT drift guard passed for {len(paths)} consumer repo(s).")
         return 0
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -318,3 +318,264 @@ def test_clone_consumers_never_puts_token_in_argv(monkeypatch: pytest.MonkeyPatc
     assert "s3cr3t-t0k3n" not in cmd_str, "token leaked into subprocess argv"
     assert "x-access-token" not in cmd_str, "username leaked into subprocess argv"
     assert env.get("GIT_ASKPASS") is not None, "GIT_ASKPASS not set in clone env"
+
+
+# ---------------------------------------------------------------------------
+# Propagation-lag tolerance (block only on STUCK consumers; advisory in-flight)
+# ---------------------------------------------------------------------------
+
+
+def _pin_drift_finding(repo: str, pinned: str = "0.3.15", ssot: str = "0.3.20"):
+    import check_consumer_runtime_drift as guard
+
+    return guard.DriftFinding(
+        repo=repo,
+        path=".runtime-version",
+        reason=f"runtime pin drift: pinned={pinned}, SSOT={ssot}",
+    )
+
+
+def test_extract_bump_target_matches_title_and_branch() -> None:
+    """The in-flight probe recognises the runtime#91 bot's PR by title OR branch."""
+    import check_consumer_runtime_drift as guard
+
+    assert guard._extract_bump_target(
+        {"title": "chore(runtime): bump .runtime-version to 0.3.20", "head": {"ref": "x"}}
+    ) == "0.3.20"
+    # Title hand-edited but canonical head branch present -> still recognised.
+    assert guard._extract_bump_target(
+        {"title": "please bump", "head": {"ref": "bump/runtime-0.3.19"}}
+    ) == "0.3.19"
+    # Unrelated PR -> not a bump PR.
+    assert guard._extract_bump_target(
+        {"title": "feat: add thing", "head": {"ref": "feature/thing"}}
+    ) is None
+
+
+def test_open_bump_pr_target_returns_highest_advancing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Returns the highest open bump target strictly greater than the lagging pin,
+    ignoring non-bump PRs and any target that would not advance the pin."""
+    import io
+    import json
+    import urllib.request
+
+    import check_consumer_runtime_drift as guard
+
+    prs = [
+        {"title": "feat: unrelated", "head": {"ref": "feature/x"}},
+        {"title": "chore(runtime): bump .runtime-version to 0.3.19", "head": {"ref": "bump/runtime-0.3.19"}},
+        {"title": "chore(runtime): bump .runtime-version to 0.3.20", "head": {"ref": "bump/runtime-0.3.20"}},
+        # A stale bump to a version <= pin must NOT count as advancing.
+        {"title": "chore(runtime): bump .runtime-version to 0.3.10", "head": {"ref": "bump/runtime-0.3.10"}},
+    ]
+
+    class FakeResp(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda req, timeout=15: FakeResp(json.dumps(prs).encode())
+    )
+    got = guard._open_bump_pr_target(
+        "molecule-ai-workspace-template-hermes",
+        pinned="0.3.15",
+        gitea_url="https://git.example.test",
+        token="tok",
+    )
+    assert got == "0.3.20"
+
+
+def test_open_bump_pr_target_none_when_no_advancing_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No open bump PR advancing the pin -> None (the STUCK signal)."""
+    import io
+    import json
+    import urllib.request
+
+    import check_consumer_runtime_drift as guard
+
+    prs = [{"title": "feat: unrelated", "head": {"ref": "feature/x"}}]
+
+    class FakeResp(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda req, timeout=15: FakeResp(json.dumps(prs).encode())
+    )
+    assert (
+        guard._open_bump_pr_target(
+            "molecule-core", pinned="0.3.15", gitea_url="https://git.example.test", token="tok"
+        )
+        is None
+    )
+
+
+def test_open_bump_pr_target_raises_on_query_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed open-PR listing surfaces as PropagationStatusUnavailable so the
+    caller can fail-soft to ADVISORY (never block on an undeterminable signal)."""
+    import urllib.request
+
+    import check_consumer_runtime_drift as guard
+
+    def boom(req, timeout=15):  # noqa: ANN001
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with pytest.raises(guard.PropagationStatusUnavailable):
+        guard._open_bump_pr_target(
+            "molecule-core", pinned="0.3.15", gitea_url="https://git.example.test", token="tok"
+        )
+
+
+def test_classify_lag_with_inflight_pr_is_advisory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """(1) lag + open bump PR -> ADVISORY, not a failure."""
+    import check_consumer_runtime_drift as guard
+
+    monkeypatch.setattr(
+        guard, "_open_bump_pr_target", lambda repo, **kw: "0.3.20"
+    )
+    finding = _pin_drift_finding("molecule-ai-workspace-template-hermes")
+    blocking, advisory = guard.classify_pin_drift(
+        [finding],
+        pins={"molecule-ai-workspace-template-hermes": "0.3.15"},
+        gitea_url="https://git.example.test",
+        token="tok",
+    )
+    assert blocking == []
+    assert len(advisory) == 1 and "IN FLIGHT" in advisory[0]
+
+
+def test_classify_lag_without_inflight_pr_is_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """(2) lag + NO open bump PR -> HARD FAILURE (blocking), the stuck signal."""
+    import check_consumer_runtime_drift as guard
+
+    monkeypatch.setattr(guard, "_open_bump_pr_target", lambda repo, **kw: None)
+    finding = _pin_drift_finding("molecule-core")
+    blocking, advisory = guard.classify_pin_drift(
+        [finding],
+        pins={"molecule-core": "0.3.15"},
+        gitea_url="https://git.example.test",
+        token="tok",
+    )
+    assert blocking == [finding]
+    assert advisory == []
+
+
+def test_classify_all_current_passes() -> None:
+    """(3) no drift findings -> nothing blocking, nothing advisory."""
+    import check_consumer_runtime_drift as guard
+
+    assert guard.classify_pin_drift(
+        [], pins={}, gitea_url="https://git.example.test", token="tok"
+    ) == ([], [])
+
+
+def test_classify_absent_token_is_advisory_failsoft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No token -> can't check in-flight status -> ADVISORY (fail-soft), and the
+    network probe is never even attempted."""
+    import check_consumer_runtime_drift as guard
+
+    def must_not_call(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("must not probe PRs when no token is available")
+
+    monkeypatch.setattr(guard, "_open_bump_pr_target", must_not_call)
+    finding = _pin_drift_finding("molecule-core")
+    blocking, advisory = guard.classify_pin_drift(
+        [finding], pins={"molecule-core": "0.3.15"}, gitea_url="https://git.example.test", token=""
+    )
+    assert blocking == []
+    assert len(advisory) == 1 and "without a token" in advisory[0]
+
+
+def test_classify_probe_failure_is_advisory_failsoft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Probe raises PropagationStatusUnavailable -> ADVISORY (fail-soft), not block."""
+    import check_consumer_runtime_drift as guard
+
+    def boom(repo, **kw):  # noqa: ANN001, ANN003
+        raise guard.PropagationStatusUnavailable("cannot list open PRs: 502")
+
+    monkeypatch.setattr(guard, "_open_bump_pr_target", boom)
+    finding = _pin_drift_finding("molecule-core")
+    blocking, advisory = guard.classify_pin_drift(
+        [finding], pins={"molecule-core": "0.3.15"}, gitea_url="https://git.example.test", token="tok"
+    )
+    assert blocking == []
+    assert len(advisory) == 1 and "could not determine" in advisory[0]
+
+
+def test_classify_vendoring_finding_always_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A forbidden workspace/ tree or vendored molecule_runtime/ package is NOT a
+    propagation-lag concern and must ALWAYS block, regardless of in-flight PRs."""
+    import check_consumer_runtime_drift as guard
+
+    def must_not_call(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("vendoring findings must not trigger a PR probe")
+
+    monkeypatch.setattr(guard, "_open_bump_pr_target", must_not_call)
+    vendoring = guard.DriftFinding(
+        repo="molecule-core",
+        path="workspace/",
+        reason="top-level workspace/ runtime tree is forbidden; use the runtime package",
+    )
+    blocking, advisory = guard.classify_pin_drift(
+        [vendoring], pins={}, gitea_url="https://git.example.test", token="tok"
+    )
+    assert blocking == [vendoring]
+    assert advisory == []
+
+
+def _make_root_with_pins(guard, tmp_path, lagging: dict[str, str], ssot: str):
+    """Build a --root tree of DEFAULT_CONSUMERS; each carries `ssot` unless
+    overridden in `lagging` (repo -> pinned)."""
+    root = tmp_path / "consumers"
+    for repo in guard.DEFAULT_CONSUMERS:
+        d = root / repo
+        d.mkdir(parents=True)
+        (d / ".runtime-version").write_text((lagging.get(repo, ssot)) + "\n")
+    return root
+
+
+def test_main_pin_lag_inflight_is_green(monkeypatch: pytest.MonkeyPatch, capsys, tmp_path) -> None:
+    """End-to-end (main): a consumer lags the SSOT but has an in-flight bump PR ->
+    the gate exits 0 (green) with an advisory, not red."""
+    import check_consumer_runtime_drift as guard
+
+    monkeypatch.setattr(guard, "current_runtime_version", lambda *a, **k: "9.9.9")
+    laggard = "molecule-core"
+    root = _make_root_with_pins(guard, tmp_path, {laggard: "9.9.8"}, "9.9.9")
+    monkeypatch.setattr(
+        guard, "_open_bump_pr_target",
+        lambda repo, **kw: "9.9.9" if repo == laggard else None,
+    )
+    monkeypatch.setenv("GITEA_TOKEN", "tok")
+    rc = guard.main(["--root", str(root)])
+    out = capsys.readouterr()
+    assert rc == 0, "in-flight lag must be advisory/green, not red"
+    assert "IN FLIGHT" in out.err
+    assert "propagation IN FLIGHT" in out.out
+
+
+def test_main_pin_lag_stuck_is_red(monkeypatch: pytest.MonkeyPatch, capsys, tmp_path) -> None:
+    """End-to-end (main): a consumer lags the SSOT and has NO in-flight bump PR ->
+    the gate exits 1 (red) — the genuinely-stuck signal is preserved."""
+    import check_consumer_runtime_drift as guard
+
+    monkeypatch.setattr(guard, "current_runtime_version", lambda *a, **k: "9.9.9")
+    laggard = "molecule-core"
+    root = _make_root_with_pins(guard, tmp_path, {laggard: "9.9.8"}, "9.9.9")
+    monkeypatch.setattr(guard, "_open_bump_pr_target", lambda repo, **kw: None)
+    monkeypatch.setenv("GITEA_TOKEN", "tok")
+    rc = guard.main(["--root", str(root)])
+    err = capsys.readouterr().err
+    assert rc == 1, "stuck consumer (lag + no bump PR) must stay red"
+    assert "STUCK" in err
