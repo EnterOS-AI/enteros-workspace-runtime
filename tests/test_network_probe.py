@@ -55,4 +55,9 @@ class TestGetMachineIp:
         with patch("socket.socket", side_effect=OSError("no route")):
             ip = get_machine_ip()
 
-        assert ip == "127.0.0.1"
+        # On probe failure we return the ONE loopback token the platform's
+        # push-guard SSRF allowlist accepts by name ("localhost"), NOT the
+        # literal 127.0.0.1 — advertising 127.0.0.1 as the self-URL 400s
+        # /registry/register (validateAgentURL loopback block). See
+        # resolve_workspace_url's push-mode loopback guard.
+        assert ip == "localhost"
