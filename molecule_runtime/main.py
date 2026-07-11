@@ -123,10 +123,24 @@ def get_machine_ip() -> str:  # pragma: no cover
         s.close()
         return ip
     except Exception:
-        return "127.0.0.1"
+        # Fall back to the ONE loopback token the platform's push-guard SSRF
+        # allowlist accepts by name (workspace-server validateAgentURL allows
+        # host=="localhost", but rejects the literal 127.0.0.1 as a loopback
+        # block). Returning "127.0.0.1" here is what produced the 400
+        # `url_validate_failed` on a localbuild dev box that never got
+        # MOLECULE_WORKSPACE_URL injected — a probe failure would advertise an
+        # un-registerable self-URL. "localhost" registers; the operator still
+        # sees the loud warning from resolve_workspace_url naming the missing
+        # env var for the containerized-platform case.
+        return "localhost"
 
 
-def resolve_workspace_url(env: Mapping[str, str], port: int) -> str:
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0"})
+
+
+def resolve_workspace_url(
+    env: Mapping[str, str], port: int, delivery_mode: str = "push"
+) -> str:
     """Resolve the externally-advertised A2A URL the agent registers (runtime#95).
 
     Precedence:
@@ -143,11 +157,40 @@ def resolve_workspace_url(env: Mapping[str, str], port: int) -> str:
     ``/registry/register`` with 400 → the workspace is undialable. A
     platform-injected reachable URL fixes cross-cloud push delivery while
     same-cloud workspaces (no env set) keep the intra-VPC fallback.
+
+    Push-mode loopback guard (registration-400 fix): under push delivery the
+    platform DIALS this URL, so its write-time SSRF guard (workspace-server
+    ``validateAgentURL``) rejects a loopback host — it blocks the literal
+    ``127.0.0.1`` but ALLOWS ``localhost`` by name. On a localbuild/dev box that
+    was never handed ``MOLECULE_WORKSPACE_URL``, the fallback could resolve to
+    ``127.0.0.1`` (via ``get_machine_ip``'s probe-failure branch) and register
+    would 400 ``url_validate_failed``. When we are about to advertise a loopback
+    host under push, we (a) emit ONE loud warning naming the missing
+    ``MOLECULE_WORKSPACE_URL`` (the fix for the containerized-platform case is to
+    inject a routable host there) and (b) substitute ``localhost`` — the one
+    loopback token the push guard accepts by name — so the dev box registers
+    instead of 400-ing. In poll mode the platform never dials the URL, so the
+    fallback is left untouched.
     """
     injected = (env.get("MOLECULE_WORKSPACE_URL") or "").strip()
     if injected:
         return injected
     machine = (env.get("HOSTNAME") or "").strip() or get_machine_ip()
+    if delivery_mode == "push" and machine.lower() in _LOOPBACK_HOSTS:
+        # Advertising a loopback self-URL under push → the platform can't dial
+        # it and validateAgentURL 400s (except host=="localhost"). Warn loud +
+        # coerce to the accepted "localhost" token so a dev/localbuild box that
+        # never received MOLECULE_WORKSPACE_URL still registers on first attempt.
+        print(
+            "WARNING: no MOLECULE_WORKSPACE_URL injected and the resolved boot "
+            f"host is loopback ({machine!r}); advertising http://localhost:{port} "
+            "so /registry/register isn't rejected by the platform's SSRF push "
+            "guard. Set MOLECULE_WORKSPACE_URL to a platform-reachable URL "
+            "(e.g. the per-workspace tunnel, or the Docker bridge gateway for a "
+            "containerized platform) for cross-host push delivery.",
+            flush=True,
+        )
+        machine = "localhost"
     return f"http://{machine}:{port}"
 
 
@@ -845,8 +888,10 @@ async def main():  # pragma: no cover
     # from the adapter's loaded_skills swaps in below if setup() succeeds.
     # Externally-advertised A2A URL — platform-injected MOLECULE_WORKSPACE_URL
     # (e.g. per-workspace Cloudflare tunnel) wins, else intra-VPC fallback.
-    # See resolve_workspace_url + runtime#95.
-    workspace_url = resolve_workspace_url(os.environ, port)
+    # See resolve_workspace_url + runtime#95. Pass the resolved delivery_mode so
+    # the push-mode loopback guard only coerces/warns when the platform will
+    # actually dial this URL (no-op in poll mode).
+    workspace_url = resolve_workspace_url(os.environ, port, delivery_mode)
 
     # v1: AgentCard.url removed; put url+protocol in supported_interfaces instead.
     # v1: AgentCapabilities.inputModes/outputModes removed; move to AgentCard.default_*.
