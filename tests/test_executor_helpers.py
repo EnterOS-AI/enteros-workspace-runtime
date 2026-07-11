@@ -1948,6 +1948,10 @@ def test_extract_attached_files_accepts_real_strings_unaffected():
     from molecule_runtime.executor_helpers import extract_attached_files
 
     with tempfile.TemporaryDirectory() as tmp:
+        # macOS exposes /var as a symlink to /private/var. Match the production
+        # resolver's canonicalization so the workspace-boundary assertion is
+        # portable instead of treating this in-workspace file as remote.
+        tmp = os.path.realpath(tmp)
         monkeypatch_path = os.path.join(tmp, "real-file.png")
         with open(monkeypatch_path, "wb") as fh:
             fh.write(b"png-bytes")
