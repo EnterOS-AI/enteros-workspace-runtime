@@ -1,7 +1,9 @@
 name: auto-release
 
-# CTO standing directive (2026-06-10): a GREEN merge to `main` must AUTO-release the
-# runtime and publish to prod — no manual `runtime-v*` tag / approval gate.
+# CTO standing directive (2026-06-10): a GREEN package-affecting merge to `main`
+# must AUTO-release the runtime and publish to prod. Test, docs, and CI-only
+# merges finish successfully without creating a no-op package version. A manual
+# workflow dispatch deliberately overrides classification and forces a release.
 #
 # TAG-ONLY design (root cause, 2026-06-10): `main` is strictly PR-only — branch
 # protection sets `enable_push: false` + `required_approvals: 2`, so NO identity (not
@@ -61,10 +63,29 @@ env:
   GITEA_URL: https://git.moleculesai.app
 
 jobs:
+  classify:
+    name: Release decision
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.release_decision.outputs.should_release }}
+      reason: ${{ steps.release_decision.outputs.reason }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Classify package-affecting changes
+        id: release_decision
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: python3 .gitea/scripts/classify_runtime_release.py
+
   # Re-run the two merge-BLOCKING gates inline so we release ONLY on green.
   # (Mirrors ci.yml's unit-tests + responsiveness-e2e jobs verbatim.)
   unit-tests:
     name: Gate — unit-tests
+    needs: classify
+    if: ${{ needs.classify.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -85,6 +106,8 @@ jobs:
 
   responsiveness-e2e:
     name: Gate — responsiveness-e2e
+    needs: classify
+    if: ${{ needs.classify.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -112,8 +135,8 @@ jobs:
 
   release:
     name: Cut runtime-v<next> tag at main HEAD
-    needs: [unit-tests, responsiveness-e2e]
-    if: ${{ success() }}
+    needs: [classify, unit-tests, responsiveness-e2e]
+    if: ${{ needs.classify.outputs.should_release == 'true' && success() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
