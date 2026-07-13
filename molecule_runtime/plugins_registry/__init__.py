@@ -169,8 +169,9 @@ def _resolve_mcp_default(
     Because the MCP-wiring PORT made ``MCPServerAdaptor`` runtime-AGNOSTIC (it
     calls ``ctx.register_mcp_server`` and the active adapter renders the native
     config), an MCP plugin no longer needs a hand-written ``adapters/<runtime>.py``
-    per runtime. A plugin is MCP-shaped when it ships an ``mcpServers`` descriptor
-    (``mcp-servers.json`` or a ``settings-fragment.json`` carrying ``mcpServers``).
+    per runtime. A plugin is MCP-shaped when it ships the canonical
+    ``plugin.yaml`` ``contributes.mcpServers`` list, or one of the legacy JSON
+    descriptor forms.
 
     This is what lets a CODEX concierge resolve ``MCPServerAdaptor`` for the
     ``molecule-platform-mcp`` plugin without that plugin shipping a ``codex.py``
@@ -180,26 +181,10 @@ def _resolve_mcp_default(
     the MCP wired (``MCPServerAdaptor`` delegates skills/rules to
     ``AgentskillsAdaptor`` internally).
     """
-    try:
-        if (plugin_root / "mcp-servers.json").is_file():
-            shaped = True
-        else:
-            frag = plugin_root / "settings-fragment.json"
-            shaped = False
-            if frag.is_file():
-                import json as _json
-                try:
-                    data = _json.loads(frag.read_text())
-                except (OSError, ValueError):
-                    data = None
-                shaped = isinstance(data, dict) and isinstance(
-                    data.get("mcpServers"), dict
-                ) and bool(data["mcpServers"])
-    except OSError:
+    from .builtins import MCPServerAdaptor, _read_mcp_descriptor
+
+    if not _read_mcp_descriptor(plugin_root):
         return None
-    if not shaped:
-        return None
-    from .builtins import MCPServerAdaptor
 
     return MCPServerAdaptor(plugin_name, runtime)
 

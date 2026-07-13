@@ -58,6 +58,40 @@ def test_read_descriptor_prefers_mcp_servers_json(tmp_path):
     assert _read_mcp_descriptor(root) == {"new": {"command": "b"}}
 
 
+def test_read_descriptor_from_canonical_plugin_manifest(tmp_path):
+    root = tmp_path / "plugin"
+    root.mkdir()
+    (root / "plugin.yaml").write_text(
+        "name: demo-mcp\n"
+        "version: 0.1.0\n"
+        "description: demo\n"
+        "contributes:\n"
+        "  mcpServers:\n"
+        "    - name: demo-mcp\n"
+        "      command: python\n"
+        "      args: [server.py]\n"
+    )
+
+    assert _read_mcp_descriptor(root) == {
+        "demo-mcp": {"command": "python", "args": ["server.py"]}
+    }
+
+
+def test_read_descriptor_does_not_follow_manifest_symlink(tmp_path):
+    root = tmp_path / "plugin"
+    root.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text(
+        "contributes:\n"
+        "  mcpServers:\n"
+        "    - name: escaped\n"
+        "      command: outside\n"
+    )
+    (root / "plugin.yaml").symlink_to(outside)
+
+    assert _read_mcp_descriptor(root) == {}
+
+
 @pytest.mark.asyncio
 async def test_install_routes_each_server_through_port(tmp_path):
     """install() calls ctx.register_mcp_server per descriptor entry — it does
