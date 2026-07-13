@@ -165,11 +165,9 @@ class RuntimeCapabilities:
     flags only switch WHO IMPLEMENTS the behavior, not whether the
     platform sees it.
 
-    All defaults are False so introducing this dataclass is a no-op:
-    every existing adapter inherits BaseAdapter.capabilities() which
-    returns RuntimeCapabilities() with everything off, matching today's
-    "platform does it all" behavior. Each capability gets a platform-
-    side consumer in a follow-up PR; this class is the foundation.
+    Adapter-owned capabilities default to False. ``channel_dispatch`` is the
+    exception: runtime 0.4+ itself hosts that provider-plugin boundary, so it
+    is true independently of the selected agent adapter.
 
     See project memory `project_runtime_native_pluggable.md` for the
     architecture principle these flags encode.
@@ -215,10 +213,11 @@ class RuntimeCapabilities:
     # rows alongside the platform-defined columns.
     provides_activity_decoration: bool = False
 
-    # Channel dispatch — adapter sends to external channels (Slack,
-    # Lark, etc.) directly instead of routing through platform channels
-    # manager. Used when the SDK has built-in channel integrations.
-    provides_channel_dispatch: bool = False
+    # Channel dispatch — runtime 0.4+ hosts the authenticated SDK API v1
+    # capability for supervised ``kind: channel`` plugin daemons. This is a
+    # runtime-level facility rather than an agent-adapter implementation, so
+    # every current adapter advertises it by default.
+    provides_channel_dispatch: bool = True
 
     def to_dict(self) -> dict[str, bool]:
         """Serializable shape for the heartbeat payload + /capabilities
@@ -286,9 +285,9 @@ class BaseAdapter(ABC):
         """Declare which cross-cutting capabilities this adapter owns
         natively vs delegates to platform fallback.
 
-        Default returns RuntimeCapabilities() — every flag False, meaning
-        the platform owns everything (today's behavior). Adapters override
-        to declare native ownership; e.g. claude-code's adapter returns
+        Default returns RuntimeCapabilities(): adapter-owned flags are false,
+        while the runtime-owned channel-plugin host remains advertised.
+        Adapters override to declare native ownership; e.g. claude-code returns
         RuntimeCapabilities(provides_native_heartbeat=True,
                              provides_native_session=True).
 

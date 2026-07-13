@@ -27,6 +27,8 @@ from starlette.routing import Route
 from molecule_runtime.channel_events import (
     CHANNEL_A2A_SOCKET_ENV,
     CHANNEL_A2A_TOKEN_ENV,
+    CHANNEL_API_VERSION,
+    CHANNEL_API_VERSION_ENV,
     CHANNEL_PLUGIN_ID_ENV,
     ChannelEventDeliveryUnknown,
     ChannelEventProtocolError,
@@ -60,10 +62,6 @@ def _message(method: str = "message/send") -> dict:
                 "role": "user",
                 "messageId": "evt-1",
                 "parts": [{"kind": "text", "text": "hello"}],
-                "metadata": {
-                    "source": "second-spoof",
-                    "chat_id": "oc_123",
-                },
             },
         },
     }
@@ -95,8 +93,8 @@ def test_reusable_message_builder_emits_exact_platform_request_shape():
 
 @pytest.mark.asyncio
 async def test_reusable_sender_fails_closed_when_runtime_capability_absent(monkeypatch):
-    monkeypatch.delenv(CHANNEL_A2A_SOCKET_ENV, raising=False)
-    with pytest.raises(ChannelEventUnavailable, match=CHANNEL_A2A_SOCKET_ENV):
+    monkeypatch.delenv(CHANNEL_API_VERSION_ENV, raising=False)
+    with pytest.raises(ChannelEventUnavailable, match=CHANNEL_API_VERSION_ENV):
         await send_channel_message("hello")
 
 
@@ -107,6 +105,7 @@ async def test_reusable_sender_never_marks_socket_failure_safe_to_replay(tmp_pat
             "hello",
             socket_path=tmp_path / "missing.sock",
             capability_token="test-capability",
+            api_version=CHANNEL_API_VERSION,
             timeout_seconds=0.1,
         )
 
@@ -159,7 +158,7 @@ def test_response_text_helper_supports_legacy_message_result_and_errors():
         channel_message_response_text(error)
 
 
-def test_runtime_overrides_claimed_source_on_both_metadata_surfaces():
+def test_runtime_stamps_source_only_on_canonical_params_metadata():
     captured: dict = {}
 
     async def endpoint(request: Request) -> JSONResponse:
@@ -184,7 +183,7 @@ def test_runtime_overrides_claimed_source_on_both_metadata_surfaces():
     assert response.status_code == 200
     params = captured["params"]
     assert params["metadata"]["source"] == "lark-channel-molecule"
-    assert params["message"]["metadata"]["source"] == "lark-channel-molecule"
+    assert "metadata" not in params["message"]
     # The remaining channel fields are already part of the platform A2A
     # contract.  The transport must not rename or move them.
     assert params["metadata"]["chat_id"] == "oc_123"
@@ -214,7 +213,6 @@ def test_runtime_adds_canonical_metadata_when_client_omits_it():
 
     body = _message()
     del body["params"]["metadata"]
-    del body["params"]["message"]["metadata"]
     app = RuntimeStampedChannelProvenance(
         Starlette(routes=[Route("/", endpoint, methods=["POST"])]),
         plugin_id="slack-channel-molecule",
@@ -232,7 +230,37 @@ def test_runtime_adds_canonical_metadata_when_client_omits_it():
 
     params = captured["params"]
     assert params["metadata"]["source"] == "slack-channel-molecule"
-    assert params["message"]["metadata"]["source"] == "slack-channel-molecule"
+    assert "metadata" not in params["message"]
+
+
+def test_client_claimed_source_on_message_metadata_is_rejected_before_dispatch():
+    dispatched = False
+
+    async def endpoint(_request: Request) -> JSONResponse:
+        nonlocal dispatched
+        dispatched = True
+        return JSONResponse({"ok": True})
+
+    body = _message()
+    body["params"]["message"]["metadata"] = {"source": "spoofed-channel"}
+    app = RuntimeStampedChannelProvenance(
+        Starlette(routes=[Route("/", endpoint, methods=["POST"])]),
+        plugin_id="slack-channel-molecule",
+        capability_token=TEST_CAPABILITY,
+    )
+
+    from starlette.testclient import TestClient
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/",
+            json=body,
+            headers={"x-molecule-channel-capability": TEST_CAPABILITY},
+        )
+
+    assert response.status_code == 400
+    assert "params.message.metadata.source" in response.json()["error"]["message"]
+    assert dispatched is False
 
 
 def test_non_a2a_routes_are_byte_for_byte_passthrough():
@@ -297,10 +325,12 @@ async def test_manager_binds_private_uds_injects_env_and_preserves_jsonrpc():
     spec = DaemonSpec(
         name="bridge",
         plugin="lark-channel-molecule",
+        kind="channel",
         command=["does-not-spawn-in-this-test"],
         env={
             CHANNEL_A2A_SOCKET_ENV: "/tmp/client-claimed.sock",
             CHANNEL_PLUGIN_ID_ENV: "client-claimed-plugin",
+            CHANNEL_API_VERSION_ENV: "manifest-claimed-version",
         },
     )
     manager = ChannelEventSocketManager(
@@ -314,6 +344,7 @@ async def test_manager_binds_private_uds_injects_env_and_preserves_jsonrpc():
         socket_path = spec.env[CHANNEL_A2A_SOCKET_ENV]
         assert socket_path != "/tmp/client-claimed.sock"
         assert spec.env[CHANNEL_PLUGIN_ID_ENV] == "lark-channel-molecule"
+        assert spec.env[CHANNEL_API_VERSION_ENV] == CHANNEL_API_VERSION
 
         root_mode = stat.S_IMODE(os.stat(os.path.dirname(socket_path)).st_mode)
         socket_mode = stat.S_IMODE(os.stat(socket_path).st_mode)
@@ -352,8 +383,7 @@ async def test_manager_binds_private_uds_injects_env_and_preserves_jsonrpc():
             metadata={"chat_id": "oc_helper", "user_id": "ou_helper"},
             request_id="helper-request",
             message_id="helper-message",
-            socket_path=socket_path,
-            capability_token=spec.env[CHANNEL_A2A_TOKEN_ENV],
+            environ=spec.env,
             timeout_seconds=3,
         )
         assert helper_response == {
@@ -422,7 +452,9 @@ async def test_reusable_helper_round_trips_real_a2a_sdk_completed_task(monkeypat
     )
     executor = RuntimeA2AExecutor(Agent(), heartbeat=Heartbeat(), model="test")
     app = Starlette(routes=build_routes(card, executor, adapter_error=None))
-    spec = DaemonSpec(name="bridge", plugin="slack-channel-molecule", command=["x"])
+    spec = DaemonSpec(
+        name="bridge", plugin="slack-channel-molecule", kind="channel", command=["x"]
+    )
     manager = ChannelEventSocketManager(app, [spec])
 
     await manager.start()
@@ -432,8 +464,7 @@ async def test_reusable_helper_round_trips_real_a2a_sdk_completed_task(monkeypat
             metadata={"chat_id": "C123", "user_id": "U456"},
             request_id="real-request",
             message_id="real-message",
-            socket_path=spec.env[CHANNEL_A2A_SOCKET_ENV],
-            capability_token=spec.env[CHANNEL_A2A_TOKEN_ENV],
+            environ=spec.env,
             timeout_seconds=5,
         )
     finally:
@@ -461,7 +492,9 @@ async def test_streaming_ack_and_turn_complete_events_pass_through_unchanged():
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
-    spec = DaemonSpec(name="bridge", plugin="lark-channel-molecule", command=["x"])
+    spec = DaemonSpec(
+        name="bridge", plugin="lark-channel-molecule", kind="channel", command=["x"]
+    )
     manager = ChannelEventSocketManager(
         Starlette(routes=[Route("/", stream, methods=["POST"])]),
         [spec],
@@ -497,9 +530,15 @@ async def test_streaming_ack_and_turn_complete_events_pass_through_unchanged():
 @pytest.mark.asyncio
 async def test_same_plugin_shares_identity_socket_different_plugins_do_not():
     specs = [
-        DaemonSpec(name="one", plugin="lark-channel-molecule", command=["x"]),
-        DaemonSpec(name="two", plugin="lark-channel-molecule", command=["x"]),
-        DaemonSpec(name="one", plugin="slack-channel-molecule", command=["x"]),
+        DaemonSpec(
+            name="one", plugin="lark-channel-molecule", kind="channel", command=["x"]
+        ),
+        DaemonSpec(
+            name="two", plugin="lark-channel-molecule", kind="channel", command=["x"]
+        ),
+        DaemonSpec(
+            name="one", plugin="slack-channel-molecule", kind="channel", command=["x"]
+        ),
     ]
     manager = ChannelEventSocketManager(Starlette(), specs)
     try:
@@ -524,8 +563,12 @@ async def test_plugin_capability_prevents_cross_plugin_provenance_spoof():
         captured.append(await request.json())
         return JSONResponse({"jsonrpc": "2.0", "id": "evt-1", "result": {}})
 
-    lark = DaemonSpec(name="bridge", plugin="lark-channel", command=["x"])
-    slack = DaemonSpec(name="bridge", plugin="slack-channel", command=["x"])
+    lark = DaemonSpec(
+        name="bridge", plugin="lark-channel", kind="channel", command=["x"]
+    )
+    slack = DaemonSpec(
+        name="bridge", plugin="slack-channel", kind="channel", command=["x"]
+    )
     manager = ChannelEventSocketManager(
         Starlette(routes=[Route("/", endpoint, methods=["POST"])]), [lark, slack]
     )
@@ -559,11 +602,13 @@ async def test_plugin_capability_prevents_cross_plugin_provenance_spoof():
 async def test_missing_plugin_identity_withholds_manifest_claimed_capability():
     spec = DaemonSpec(
         name="bridge",
+        kind="channel",
         command=["x"],
         env={
             CHANNEL_A2A_SOCKET_ENV: "/tmp/manifest-claimed.sock",
             CHANNEL_A2A_TOKEN_ENV: "manifest-claimed-token",
             CHANNEL_PLUGIN_ID_ENV: "manifest-claimed-plugin",
+            CHANNEL_API_VERSION_ENV: "manifest-claimed-version",
         },
     )
     manager = ChannelEventSocketManager(Starlette(), [spec])
@@ -572,6 +617,30 @@ async def test_missing_plugin_identity_withholds_manifest_claimed_capability():
     assert CHANNEL_A2A_SOCKET_ENV not in spec.env
     assert CHANNEL_A2A_TOKEN_ENV not in spec.env
     assert CHANNEL_PLUGIN_ID_ENV not in spec.env
+    assert CHANNEL_API_VERSION_ENV not in spec.env
+
+
+@pytest.mark.asyncio
+async def test_non_channel_daemon_receives_no_channel_capability():
+    spec = DaemonSpec(
+        name="worker",
+        plugin="background-worker",
+        kind="mcp-server",
+        command=["x"],
+        env={
+            CHANNEL_A2A_SOCKET_ENV: "/tmp/manifest-claimed.sock",
+            CHANNEL_A2A_TOKEN_ENV: "manifest-claimed-token",
+            CHANNEL_PLUGIN_ID_ENV: "manifest-claimed-plugin",
+            CHANNEL_API_VERSION_ENV: "manifest-claimed-version",
+        },
+    )
+    manager = ChannelEventSocketManager(Starlette(), [spec])
+
+    assert await manager.start() is True
+    assert CHANNEL_A2A_SOCKET_ENV not in spec.env
+    assert CHANNEL_A2A_TOKEN_ENV not in spec.env
+    assert CHANNEL_PLUGIN_ID_ENV not in spec.env
+    assert CHANNEL_API_VERSION_ENV not in spec.env
 
 
 @pytest.mark.asyncio
@@ -580,7 +649,9 @@ async def test_unsafe_socket_directory_fails_closed_without_spawning(tmp_path):
     real_dir.mkdir()
     link = tmp_path / "channel-events"
     link.symlink_to(real_dir, target_is_directory=True)
-    spec = DaemonSpec(name="bridge", plugin="lark-channel-molecule", command=["x"])
+    spec = DaemonSpec(
+        name="bridge", plugin="lark-channel-molecule", kind="channel", command=["x"]
+    )
     manager = ChannelEventSocketManager(Starlette(), [spec], socket_dir=link)
 
     with pytest.raises(RuntimeError, match="symlink"):
@@ -591,7 +662,7 @@ async def test_unsafe_socket_directory_fails_closed_without_spawning(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_bind_failure_removes_capability_then_starts_poll_fallback():
+async def test_bind_failure_removes_capability_then_starts_daemon_supervisor():
     class BoundServer:
         started = True
 

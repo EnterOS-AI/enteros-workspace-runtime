@@ -16,8 +16,9 @@ release bot) may push a commit directly to ``main``. The previous design committ
 push to a protected branch and FAILED every run (~17s). So we DROP the bump-commit
 entirely and only CUT THE TAG:
 
-  1. Compute the NEXT patch version from the latest ``runtime-v*`` tag
-     (e.g. 0.3.14 -> 0.3.15).
+  1. Compute the NEXT patch version from the latest ``runtime-v*`` tag, then
+     honor a higher explicit ``pyproject.toml`` version as the release floor
+     (e.g. latest 0.3.125 + project 0.4.0 -> 0.4.0).
   2. Create the tag ``runtime-v<next>`` pointing at the current ``main`` HEAD via the
      Gitea tags API (``POST /repos/{owner}/{repo}/tags``). Tag creation targets the
      TAG ref, not the branch ref, so branch *push* protection does not block it
@@ -45,8 +46,10 @@ import json
 import os
 import re
 import sys
+import tomllib
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 ORG = "molecule-ai"
 REPO = "molecule-ai-workspace-runtime"
@@ -94,9 +97,30 @@ def latest_release_tag(base, token):
     return best
 
 
-def next_patch(ver):
-    maj, minor, patch = ver
-    return f"{maj}.{minor}.{patch + 1}"
+def _semver(value: str, *, label: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value.strip())
+    if not match:
+        raise RuntimeError(f"{label} must be numeric semver (X.Y.Z), got {value!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def project_version(path: Path) -> str:
+    """Read the explicit version floor from the checked-out project."""
+    try:
+        value = tomllib.loads(path.read_text()).get("project", {}).get("version", "")
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"cannot read release floor from {path}: {error}") from error
+    if not isinstance(value, str):
+        raise RuntimeError(f"project.version in {path} must be a string")
+    _semver(value, label=f"project.version in {path}")
+    return value
+
+
+def release_target(latest: tuple[int, int, int], floor: str) -> str:
+    """Choose the next patch unless the reviewed project floor is higher."""
+    candidate = (latest[0], latest[1], latest[2] + 1)
+    selected = max(candidate, _semver(floor, label="release floor"))
+    return ".".join(str(part) for part in selected)
 
 
 def tag_exists(base, token, tag):
@@ -133,6 +157,12 @@ def main(argv):
     p.add_argument("--token-env", default="RELEASE_BOT_TOKEN",
                    help="Env var holding the write token (molecule-runtime-release-bot).")
     p.add_argument("--branch", default="main")
+    p.add_argument(
+        "--pyproject",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "pyproject.toml",
+        help="Project file whose version is the reviewed release floor.",
+    )
     p.add_argument("--dry-run", action="store_true",
                    help="Compute + print the plan without mutating anything.")
     args = p.parse_args(argv)
@@ -150,9 +180,12 @@ def main(argv):
         return 1
 
     tag_name, ver = latest_release_tag(base, read_token)
-    target = next_patch(ver)
+    floor = project_version(args.pyproject)
+    target = release_target(ver, floor)
     next_tag = f"{TAG_PREFIX}{target}"
-    print(f"latest release tag: {tag_name} -> next: {next_tag}")
+    print(
+        f"latest release tag: {tag_name}; project floor: {floor} -> next: {next_tag}"
+    )
 
     if tag_exists(base, read_token, next_tag):
         print(f"::notice::{next_tag} already exists — nothing to release")

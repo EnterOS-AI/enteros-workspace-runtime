@@ -7,11 +7,11 @@ the same ``message/send`` or ``message/stream`` JSON-RPC body it would send to
 the platform HTTP lane and receives the same result / SSE events back.
 
 The per-plugin binding is also the runtime's provenance anchor.  The wrapper
-on that binding overwrites ``params.metadata.source`` (and the mirrored
-``params.message.metadata.source``) with the plugin identity discovered from
-``plugin.yaml``.  A client-supplied source is never trusted.  Other existing
-channel metadata (``chat_id``, ``user_id``, ``username``, ``message_id``) stays
-in the platform wire shape unchanged.
+on that binding overwrites only the canonical ``params.metadata.source`` with
+the plugin identity discovered from ``plugin.yaml``.  A client-supplied source
+is never trusted, and a second source claim in ``params.message.metadata`` is
+rejected.  Other existing channel metadata (``chat_id``, ``user_id``,
+``username``, ``message_id``) stays in the platform wire shape unchanged.
 
 Security boundary: sockets live in a runtime-created mode-0700 directory and
 are chmod 0600 before a daemon is spawned. Because plugin daemons share the
@@ -34,214 +34,65 @@ import re
 import secrets
 import stat
 import tempfile
-import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
-import httpx
 import uvicorn
+
+from molecule_runtime.channel_sdk import (
+    CHANNEL_A2A_SOCKET_ENV,
+    CHANNEL_A2A_TOKEN_ENV,
+    CHANNEL_API_VERSION,
+    CHANNEL_API_VERSION_ENV,
+    CHANNEL_CAPABILITY_HEADER,
+    CHANNEL_PLUGIN_ID_ENV,
+    ChannelCapabilityUnavailable,
+    ChannelDeliveryUnknown,
+    ChannelMessageSender,
+    ChannelProtocolError,
+    build_channel_message_send_request,
+    channel_message_response_text,
+    send_channel_message,
+)
 
 logger = logging.getLogger(__name__)
 
 
-CHANNEL_A2A_SOCKET_ENV = "MOLECULE_CHANNEL_A2A_SOCKET"
-"""Unix socket path injected into a manifest-declared daemon."""
+# Compatibility aliases for existing runtime consumers. Plugin authors import
+# the SDK-owned names from ``molecule_plugin.channel`` instead.
+ChannelEventUnavailable = ChannelCapabilityUnavailable
+ChannelEventProtocolError = ChannelProtocolError
+ChannelEventDeliveryUnknown = ChannelDeliveryUnknown
 
-CHANNEL_PLUGIN_ID_ENV = "MOLECULE_CHANNEL_PLUGIN_ID"
-"""Runtime-assigned plugin identity stamped on requests from the socket."""
+_CAPABILITY_HEADER = CHANNEL_CAPABILITY_HEADER.encode("ascii")
 
-CHANNEL_A2A_TOKEN_ENV = "MOLECULE_CHANNEL_A2A_TOKEN"
-"""Per-plugin runtime capability required by the local A2A listener."""
-
-_CAPABILITY_HEADER = b"x-molecule-channel-capability"
+__all__ = [
+    "CHANNEL_A2A_SOCKET_ENV",
+    "CHANNEL_A2A_TOKEN_ENV",
+    "CHANNEL_API_VERSION",
+    "CHANNEL_API_VERSION_ENV",
+    "CHANNEL_CAPABILITY_HEADER",
+    "CHANNEL_PLUGIN_ID_ENV",
+    "ChannelCapabilityUnavailable",
+    "ChannelDeliveryUnknown",
+    "ChannelEventDeliveryUnknown",
+    "ChannelEventProtocolError",
+    "ChannelEventSocketManager",
+    "ChannelEventUnavailable",
+    "ChannelMessageSender",
+    "ChannelProtocolError",
+    "RuntimeStampedChannelProvenance",
+    "build_channel_message_send_request",
+    "channel_message_response_text",
+    "send_channel_message",
+]
 
 # Match molecule-core's public A2A proxy request ceiling.  The local fast path
-# must not accept a larger body than the remote fallback path.
+# must not accept a larger body than the public A2A lane.
 MAX_A2A_REQUEST_BYTES = 16 << 20
 
 _SOCKET_PATH_MAX_BYTES = 100  # conservative across Linux (108) and macOS (104)
 _SOURCE_KEY = "source"
-
-
-class ChannelEventUnavailable(RuntimeError):
-    """The runtime did not publish a usable local channel capability."""
-
-
-class ChannelEventProtocolError(RuntimeError):
-    """The local A2A listener returned a non-contract response."""
-
-
-class ChannelEventDeliveryUnknown(RuntimeError):
-    """A local turn may have been accepted and therefore must not be replayed."""
-
-
-def build_channel_message_send_request(
-    text: str,
-    *,
-    metadata: dict[str, Any] | None = None,
-    request_id: str | None = None,
-    message_id: str | None = None,
-    attachments: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Build the canonical A2A ``message/send`` JSON-RPC request.
-
-    This is a thin transport-facing wrapper around
-    :func:`a2a_client.build_message_send_params`, the runtime's existing
-    a2a-sdk-backed wire builder.  Channel plugins should use this rather than
-    copying a JSON literal.  ``source`` may be omitted (and any supplied value
-    is ignored by the server); the per-plugin socket stamps it runtime-side.
-    """
-    from molecule_runtime.a2a_client import build_message_send_params
-
-    request_id = request_id or str(uuid.uuid4())
-    return {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "message/send",
-        "params": build_message_send_params(
-            text,
-            message_id=message_id or request_id,
-            metadata=metadata,
-            attachments=attachments,
-        ),
-    }
-
-
-def channel_message_response_text(payload: dict[str, Any]) -> str:
-    """Extract reply text from current A2A v1 or legacy message results.
-
-    a2a-sdk 1.x returns a completed ``Task`` whose terminal agent ``Message``
-    lives at ``result.status.message``.  Older v0.3-compatible responders may
-    return a ``Message`` directly at ``result``.  Keep this compatibility
-    adapter beside the local sender so channel plugins do not fork response
-    parsing.  JSON-RPC errors raise :class:`ChannelEventProtocolError`.
-    """
-    error = payload.get("error")
-    if error is not None:
-        if isinstance(error, dict):
-            detail = error.get("message") or str(error)
-        else:
-            detail = str(error)
-        raise ChannelEventProtocolError(f"local channel A2A error: {detail[:500]}")
-
-    result = payload.get("result")
-    if not isinstance(result, dict):
-        raise ChannelEventProtocolError("local channel A2A result was not an object")
-
-    status = result.get("status")
-    if isinstance(status, dict):
-        message = status.get("message")
-        if isinstance(message, dict):
-            text = _text_from_parts(message.get("parts"))
-            if text:
-                return text
-
-    # v0.3 / direct-message compatibility.
-    text = _text_from_parts(result.get("parts"))
-    if text:
-        return text
-
-    # Defensive fallback for a task implementation that omits status.message
-    # but carries the emitted text artifacts.
-    artifacts = result.get("artifacts")
-    if isinstance(artifacts, list):
-        artifact_text = "".join(
-            _text_from_parts(artifact.get("parts"))
-            for artifact in artifacts
-            if isinstance(artifact, dict)
-        )
-        if artifact_text:
-            return artifact_text
-    return ""
-
-
-def _text_from_parts(parts: object) -> str:
-    if not isinstance(parts, list):
-        return ""
-    return "".join(
-        str(part.get("text", ""))
-        for part in parts
-        if isinstance(part, dict) and part.get("kind") == "text"
-    )
-
-
-async def send_channel_message(
-    text: str,
-    *,
-    metadata: dict[str, Any] | None = None,
-    request_id: str | None = None,
-    message_id: str | None = None,
-    attachments: list[dict[str, Any]] | None = None,
-    socket_path: str | os.PathLike[str] | None = None,
-    capability_token: str | None = None,
-    timeout_seconds: float = 600.0,
-) -> dict[str, Any]:
-    """Send one canonical ``message/send`` turn over the local Unix binding.
-
-    Returns the decoded, unchanged JSON-RPC response (either ``result`` or
-    ``error``). Absence of a complete runtime-issued capability raises
-    :class:`ChannelEventUnavailable`, which is the only safe signal for using a
-    remote fallback. Once a local send is attempted, any HTTP/transport failure
-    raises :class:`ChannelEventDeliveryUnknown`; callers must not replay the
-    same turn because the agent may already have accepted it.
-    """
-    resolved_path = os.fspath(socket_path) if socket_path is not None else ""
-    resolved_path = (
-        resolved_path.strip() or os.environ.get(CHANNEL_A2A_SOCKET_ENV, "").strip()
-    )
-    if not resolved_path:
-        raise ChannelEventUnavailable(
-            f"{CHANNEL_A2A_SOCKET_ENV} is absent; use the platform HTTP/poll fallback"
-        )
-    resolved_token = (
-        (capability_token or "").strip()
-        or os.environ.get(CHANNEL_A2A_TOKEN_ENV, "").strip()
-    )
-    if not resolved_token:
-        raise ChannelEventUnavailable(
-            f"{CHANNEL_A2A_TOKEN_ENV} is absent; use the platform HTTP/poll fallback"
-        )
-
-    request = build_channel_message_send_request(
-        text,
-        metadata=metadata,
-        request_id=request_id,
-        message_id=message_id,
-        attachments=attachments,
-    )
-    transport = httpx.AsyncHTTPTransport(uds=resolved_path)
-    timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 5.0))
-    async with httpx.AsyncClient(
-        transport=transport,
-        base_url="http://molecule.local",
-        timeout=timeout,
-    ) as client:
-        try:
-            response = await client.post(
-                "/",
-                json=request,
-                headers={_CAPABILITY_HEADER.decode("ascii"): resolved_token},
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as error:
-            raise ChannelEventDeliveryUnknown(
-                "local channel delivery outcome is unknown; this turn must not be replayed"
-            ) from error
-    try:
-        payload = response.json()
-    except ValueError as error:
-        raise ChannelEventDeliveryUnknown(
-            "local channel response was invalid after send; this turn must not be replayed"
-        ) from error
-    if not (
-        isinstance(payload, dict)
-        and payload.get("jsonrpc") == "2.0"
-        and ("result" in payload or "error" in payload)
-    ):
-        raise ChannelEventDeliveryUnknown(
-            "local channel response was malformed after send; this turn must not be replayed"
-        )
-    return payload
 
 
 class RuntimeStampedChannelProvenance:
@@ -381,6 +232,17 @@ def _stamp_source(payload: object, plugin_id: str) -> str | None:
     if not isinstance(params, dict):
         return "local channel A2A request must contain object params"
 
+    message = params.get("message")
+    if isinstance(message, dict):
+        message_metadata = message.get("metadata")
+        if message_metadata is not None and not isinstance(message_metadata, dict):
+            return "params.message.metadata must be an object"
+        if isinstance(message_metadata, dict) and _SOURCE_KEY in message_metadata:
+            return (
+                "params.message.metadata.source is not allowed; channel provenance "
+                "lives at params.metadata"
+            )
+
     metadata = params.get("metadata")
     if metadata is None:
         metadata = {}
@@ -388,19 +250,6 @@ def _stamp_source(payload: object, plugin_id: str) -> str | None:
     if not isinstance(metadata, dict):
         return "params.metadata must be an object"
     metadata[_SOURCE_KEY] = plugin_id
-
-    message = params.get("message")
-    if isinstance(message, dict):
-        message_metadata = message.get("metadata")
-        if message_metadata is None:
-            message_metadata = {}
-            message["metadata"] = message_metadata
-        if not isinstance(message_metadata, dict):
-            return "params.message.metadata must be an object"
-        # Mirror the trusted identity onto the message surface as well.  Some
-        # A2A SDK versions surface params metadata on RequestContext and message
-        # metadata on Message; stamping both prevents an ambiguous second claim.
-        message_metadata[_SOURCE_KEY] = plugin_id
     return None
 
 
@@ -447,7 +296,7 @@ class _LocalUvicornServer(uvicorn.Server):
 
 
 class ChannelEventSocketManager:
-    """Own one private A2A Unix binding per discovered plugin identity."""
+    """Own one private A2A Unix binding per ``kind: channel`` plugin."""
 
     def __init__(
         self,
@@ -471,7 +320,7 @@ class ChannelEventSocketManager:
         self._started = False
 
     async def start(self) -> bool:
-        """Bind every socket, chmod it, then publish paths to daemon env."""
+        """Bind channel sockets, chmod them, then publish daemon env."""
         if self._started:
             return True
         # Manifest env is untrusted for these reserved keys.  Clear claims up
@@ -514,9 +363,12 @@ class ChannelEventSocketManager:
             self._inject_daemon_env()
             self._started = True
             logger.info(
-                "channel events: %d private A2A socket(s) ready for %d daemon(s)",
+                "channel events: %d private A2A socket(s) ready for %d channel daemon(s)",
                 len(self._paths),
-                len(self.specs),
+                sum(
+                    str(getattr(spec, "kind", "") or "").strip() == "channel"
+                    for spec in self.specs
+                ),
             )
             return True
         except BaseException:
@@ -537,6 +389,7 @@ class ChannelEventSocketManager:
     def clear_daemon_env(self) -> None:
         """Remove reserved capability variables after a bind failure."""
         for spec in self.specs:
+            spec.env.pop(CHANNEL_API_VERSION_ENV, None)
             spec.env.pop(CHANNEL_A2A_SOCKET_ENV, None)
             spec.env.pop(CHANNEL_A2A_TOKEN_ENV, None)
             spec.env.pop(CHANNEL_PLUGIN_ID_ENV, None)
@@ -545,6 +398,8 @@ class ChannelEventSocketManager:
         identities: list[str] = []
         seen: set[str] = set()
         for spec in self.specs:
+            if str(getattr(spec, "kind", "") or "").strip() != "channel":
+                continue
             identity = str(getattr(spec, "plugin", "") or "").strip()
             if not identity:
                 logger.warning(
@@ -637,12 +492,15 @@ class ChannelEventSocketManager:
 
     def _inject_daemon_env(self) -> None:
         for spec in self.specs:
+            if str(getattr(spec, "kind", "") or "").strip() != "channel":
+                continue
             plugin_id = str(getattr(spec, "plugin", "") or "").strip()
             path = self._paths.get(plugin_id)
             token = self._tokens.get(plugin_id)
             if path is None or token is None:
                 continue
             # Reserved runtime values overwrite manifest env claims.
+            spec.env[CHANNEL_API_VERSION_ENV] = CHANNEL_API_VERSION
             spec.env[CHANNEL_A2A_SOCKET_ENV] = str(path)
             spec.env[CHANNEL_A2A_TOKEN_ENV] = token
             spec.env[CHANNEL_PLUGIN_ID_ENV] = plugin_id

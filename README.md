@@ -30,9 +30,13 @@ This package provides the core machinery every Molecule AI workspace container n
 
 ## Channel plugin local A2A transport
 
-A plugin can declare a workspace-owned channel daemon with
-`contributes.daemons`. At boot the runtime discovers and supervises that
-process and, when the local binding is available, injects:
+A plugin whose `plugin.yaml` declares `kind: channel` can declare a
+workspace-owned daemon with `contributes.daemons`. At boot the runtime
+discovers and supervises every declared daemon, but injects the local channel
+capability only into daemons owned by `kind: channel` plugins:
+
+- `MOLECULE_CHANNEL_API_VERSION` — the SDK/host contract version. Version `1`
+  is required by the current client.
 
 - `MOLECULE_CHANNEL_A2A_SOCKET` — a private Unix socket serving the
   workspace's existing A2A HTTP/JSON-RPC application.
@@ -41,13 +45,12 @@ process and, when the local binding is available, injects:
 - `MOLECULE_CHANNEL_PLUGIN_ID` — the installed plugin identity the runtime
   stamps as channel provenance.
 
-The socket does **not** define a second event envelope. Runtime-dependent
-plugins should use `molecule_runtime.channel_events.send_channel_message`,
-which reuses the canonical a2a-sdk-backed request builder and reads the socket
-env automatically:
+The socket does **not** define a second event envelope. Provider plugins import
+the provider-neutral client from `molecule-ai-sdk`; they do not import the
+runtime's private host implementation:
 
 ```python
-from molecule_runtime.channel_events import (
+from molecule_plugin.channel import (
     channel_message_response_text,
     send_channel_message,
 )
@@ -85,9 +88,11 @@ targets `message/send`; streaming clients use an UDS-aware HTTP client directly.
 
 Channel provenance uses the existing platform fields under `params.metadata`:
 `source`, `chat_id`, `user_id`, `username`, and `message_id`. The daemon
-supplies channel event fields, but the runtime always overwrites `source` on
-both params and message metadata with `MOLECULE_CHANNEL_PLUGIN_ID`. Before
-stamping, the listener requires the plugin-specific
+supplies channel event fields, but the runtime always overwrites only the
+canonical `params.metadata.source` with `MOLECULE_CHANNEL_PLUGIN_ID`. A client
+claim at `params.message.metadata.source` is rejected before dispatch rather
+than mirrored into a second provenance surface. Before stamping, the listener
+requires the plugin-specific
 `MOLECULE_CHANNEL_A2A_TOKEN`; another same-UID daemon finding the socket path
 does not receive that token through its own injected environment and cannot
 select a different source merely by changing request JSON. Plugins still run
@@ -96,16 +101,26 @@ principals. The socket directory is mode 0700 and each socket is mode 0600
 before the daemon starts. Paths and tokens are ephemeral per-boot capabilities
 and must not be persisted.
 
-Clients must keep their existing platform HTTP/poll path as fallback. If the
-socket bind fails, the runtime removes all three capability variables and still
-starts the daemon; absence of the socket/token pair is the fail-closed signal
-to use the remote path. `send_channel_message` raises
-`ChannelEventUnavailable` only when the complete local capability is absent;
-that is the safe remote-fallback case. Once a local send is attempted, a
-connection, timeout, or HTTP failure raises `ChannelEventDeliveryUnknown` and
-the same external event must **not** be replayed remotely because the agent may
-already have accepted the turn. Off-host and poll-mode bridges remain valid
-when the runtime never supplied the local capability.
+If the socket bind fails, the runtime removes all four reserved capability
+variables and still starts the daemon. `send_channel_message` raises
+`ChannelCapabilityUnavailable` when the version, socket, or token is absent or
+unsupported, which means this host cannot run the channel plugin. Once a local
+send is attempted, a connection, timeout, or HTTP failure raises
+`ChannelDeliveryUnknown`; the same external event must **not** be replayed
+because the agent may already have accepted the turn.
+
+The runtime intentionally does not depend on `molecule-ai-sdk`. Instead,
+`molecule_runtime/channel_sdk.py` is a byte-for-byte copy of the SDK-owned
+`molecule_plugin/channel.py`; `molecule_runtime.channel_events` hosts the socket
+and retains `ChannelEvent*` aliases only for runtime compatibility. Check a
+local SDK checkout before updating the vendor:
+
+```bash
+scripts/check-channel-sdk-vendor.sh ../molecule-ai-sdk
+```
+
+CI runs the same exact-copy gate against `molecule-ai-sdk` main, in addition to
+the client/host conformance tests.
 
 ## MCP SSOT public surface (issue #38)
 
@@ -213,11 +228,11 @@ Releases are **automatic on a green merge to `main`** (CTO standing directive,
    (`unit-tests` + `responsiveness-e2e`) inline. Gitea has no `workflow_run`
    trigger, so the release workflow re-runs the gate itself rather than
    subscribing to the `ci` workflow's success.
-3. On green it computes the **next patch** version from the latest `runtime-v*`
-   tag, bumps `[project].version` in `pyproject.toml` to match (preserving the
-   `pyproject == tag` invariant), commits that bump to `main` and cuts tag
-   `runtime-vX.Y.Z` — all via the Gitea API as the `molecule-runtime-release-bot`
-   identity (`RELEASE_BOT_TOKEN`; no token on disk).
+3. On green it computes the next patch from the latest `runtime-v*` tag and
+   compares it with the reviewed `[project].version` floor. The higher version
+   becomes `runtime-vX.Y.Z` (so an explicit `0.4.0` cutover is not flattened to
+   `0.3.126`). The release bot creates only that tag through the Gitea API;
+   protected `main` is never mutated and no token is written to disk.
 4. The tag trips `publish-runtime.yml` → builds wheel + sdist → publishes to the
    Gitea package registry → its `propagate` job opens `.runtime-version` bump PRs
    on each consumer template. Merging a template bump trips that template's

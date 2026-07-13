@@ -2,7 +2,7 @@
 
 Plugins provide skills, rules, and prompt fragments to agent workspaces.
 Each plugin is a directory containing:
-  - plugin.yaml    — manifest (name, version, description, skills, rules)
+  - plugin.yaml    — manifest (name, kind, version, contributions, skills, rules)
   - rules/*.md     — always-on guidelines injected into every prompt
   - skills/        — skill directories with SKILL.md + tools/*.py
   - *.md           — prompt fragments (excluding README, CHANGELOG, etc.)
@@ -31,6 +31,7 @@ SHARED_PLUGINS_DIR = os.environ.get("PLUGINS_DIR", "/plugins")
 @dataclass
 class PluginManifest:
     name: str = ""
+    kind: str = ""
     version: str = "0.0.0"
     description: str = ""
     author: str = ""
@@ -102,6 +103,7 @@ def load_plugin_manifest(plugin_path: str) -> PluginManifest | None:
                 return None
         return PluginManifest(
             name=raw.get("name", os.path.basename(plugin_path)),
+            kind=raw.get("kind", ""),
             version=raw.get("version", "0.0.0"),
             description=raw.get("description", ""),
             author=raw.get("author", ""),

@@ -11,7 +11,8 @@ name: auto-release
 # committed a `pyproject.toml` version bump to `main` via the contents API; that PUT
 # is a direct push to a protected branch and FAILED every run (~17s). So this
 # workflow now does NOT touch `main` at all: on a green merge it only CUTS THE TAG
-# `runtime-v<next>` at `main` HEAD via the Gitea tags API. Tag creation targets the
+# `runtime-v<target>` at `main` HEAD via the Gitea tags API. The target is the
+# higher of latest-tag patch+1 and the reviewed pyproject version floor. Tag creation targets the
 # TAG ref, not the branch ref, so branch push protection does not block it (proven:
 # the manual `runtime-v0.3.14` cut returned HTTP 201 with this same release token).
 #
@@ -22,7 +23,7 @@ name: auto-release
 #
 # Release → prod chain this kicks off (mapped in the SOP PR body):
 #   merge to main → THIS workflow re-runs the merge-blocking gates inline and, on
-#   green, pushes tag runtime-v<next> at main HEAD → publish-runtime.yml (existing,
+#   green, pushes tag runtime-v<target> at main HEAD → publish-runtime.yml (existing,
 #   tag-triggered) writes the tag version into pyproject + builds+publishes the wheel
 #   to the Gitea PyPI registry, and its `propagate` job opens `.runtime-version` bump
 #   PRs on each consumer template → merging a template bump trips that template's
@@ -134,7 +135,7 @@ jobs:
         run: pytest -q tests/integration
 
   release:
-    name: Cut runtime-v<next> tag at main HEAD
+    name: Cut runtime-v<target> tag at main HEAD
     needs: [classify, unit-tests, responsiveness-e2e]
     if: ${{ needs.classify.outputs.should_release == 'true' && success() }}
     runs-on: ubuntu-latest

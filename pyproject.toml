@@ -14,11 +14,11 @@ build-backend = "setuptools.build_meta"
 # `molecule_runtime` (unchanged) — only the pip/dist name changed.
 name = "molecules-workspace-runtime"
 
-# 0.3.70 continues the runtime version line under the new dist name (last
-# publish under the legacy name was 0.3.69). The publish workflow stamps the
-# tag version at build time, so main's pyproject value is only the manual/local
-# fallback.
-version = "0.3.70"
+# 0.3.70 began the runtime version line under the new dist name (the last
+# publish under the legacy name was 0.3.69). 0.4.0 marks the channel API v1
+# cutover. The publish workflow stamps the tag version at build time, so main's
+# pyproject value is only the manual/local fallback.
+version = "0.4.0"
 
 description = "Molecule AI workspace runtime — shared infrastructure for all agent adapters"
 requires-python = ">=3.11"
