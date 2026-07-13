@@ -1001,12 +1001,11 @@ def test_real_git_fetches_a_real_commit_sha(tmp_path):
     skill = content / "SKILL.md"
     assert skill.is_file()
     assert skill.read_text() == "# real"          # the PIN, not the branch tip
-    if os.name != "nt":
-        # VCS metadata stripped. Enforced on the platform the runtime actually
-        # runs on (Linux). Skipped on Windows only because git marks its objects
-        # read-only there and rmtree(ignore_errors=True) cannot unlink them — an
-        # artifact of running this suite on a dev laptop, not of the fetch.
-        assert not (content / ".git").exists()
+    # VCS metadata stripped — on EVERY platform. git marks .git objects
+    # read-only, which a plain rmtree(ignore_errors=True) silently fails to
+    # remove, shipping .git inside the plugins tree. Asserted unconditionally
+    # so that stays fixed.
+    assert not (content / ".git").exists()
 
 
 @pytest.mark.skipif(not _git_available(), reason="git binary not on PATH")

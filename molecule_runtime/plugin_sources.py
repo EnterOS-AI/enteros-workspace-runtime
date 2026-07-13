@@ -487,6 +487,25 @@ def _is_commit_sha(ref: str) -> bool:
     return bool(_COMMIT_SHA_RE.match((ref or "").strip().lower()))
 
 
+def _rmtree_force(path: Path) -> None:
+    """``rmtree`` that also removes read-only entries.
+
+    git marks objects in ``.git`` read-only. A plain
+    ``rmtree(..., ignore_errors=True)`` cannot unlink those on platforms that
+    enforce the read-only bit (Windows), so it silently gives up and the ``.git``
+    dir SHIPS INSIDE the plugins tree — the strip looks like it worked because
+    the errors were swallowed. Chmod-then-retry on each failure.
+    """
+    def _on_error(func, p, _exc):
+        try:
+            os.chmod(p, 0o700)
+            func(p)
+        except OSError:
+            pass  # genuinely stuck — fail soft, as before
+
+    shutil.rmtree(path, onerror=_on_error)
+
+
 def _iter_dirs(parent: Path) -> "list[Path]":
     """Immediate sub-directories of ``parent`` ([] when it does not exist).
 
@@ -620,7 +639,7 @@ def _git_fetch_tree(
     # Strip VCS metadata so the installed tree matches the old archive semantics
     # (a tarball of the tree carried no ``.git``) and the plugins dir never holds
     # a nested repo.
-    shutil.rmtree(clone_dir / ".git", ignore_errors=True)
+    _rmtree_force(clone_dir / ".git")
 
     content_dir = clone_dir / subpath if subpath else clone_dir
     if not _is_within(clone_dir, content_dir):
