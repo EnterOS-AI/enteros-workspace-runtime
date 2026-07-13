@@ -595,14 +595,31 @@ def _git_fetch_tree(
         return [git_binary, *cred_args, *args]
 
     if _is_commit_sha(ref):
-        # Fetch a single commit by object id. `--depth 1` keeps it as cheap as
-        # the clone path; the remote must allow uploadpack.allowReachableSHA1
-        # (Gitea does).
+        # PROVIDER-AGNOSTIC by necessity: a plugin source can name ANY forge
+        # (gitea://, or a full git URL to github / gitlab / a self-hosted box —
+        # see _PROVIDERS), and forges do NOT agree on whether a bare object id
+        # may be requested directly.
+        #
+        # Preferred: fetch the single commit by object id — cheap (--depth 1),
+        # one round trip. This needs `uploadpack.allowReachableSHA1InWant` on the
+        # REMOTE. Gitea, GitHub and GitLab all enable it; plain `git` ships with
+        # it OFF, so a self-hosted remote answers "Server does not allow request
+        # for unadvertised object" and this path fails.
+        #
+        # Fallback: clone the repo normally and check the pin out of local
+        # history. Costs full history, but works against EVERY git server, so a
+        # SHA-pinned plugin on a restrictive forge still resolves instead of
+        # failing the boot. Correctness does not depend on the remote's config —
+        # only speed does.
         cmds = [
             _git("init", "--quiet", str(clone_dir)),
             _git("-C", str(clone_dir), "remote", "add", "origin", clone_url),
             _git("-C", str(clone_dir), "fetch", "--depth", "1", "origin", ref),
             _git("-C", str(clone_dir), "checkout", "--quiet", "--detach", "FETCH_HEAD"),
+        ]
+        fallback_cmds = [
+            _git("clone", "--quiet", clone_url, str(clone_dir)),
+            _git("-C", str(clone_dir), "checkout", "--quiet", "--detach", ref),
         ]
     else:
         cmds = [
@@ -615,9 +632,10 @@ def _git_fetch_tree(
                 str(clone_dir),
             )
         ]
+        fallback_cmds = []
 
-    try:
-        for cmd in cmds:
+    def _run_all(sequence: "list[list[str]]") -> None:
+        for cmd in sequence:
             subprocess.run(
                 cmd,
                 check=True,
@@ -626,15 +644,44 @@ def _git_fetch_tree(
                 timeout=timeout,
                 env=child_env,
             )
+
+    try:
+        _run_all(cmds)
     except (subprocess.SubprocessError, OSError) as exc:
         stderr = (getattr(exc, "stderr", "") or "").strip()
-        log.warning(
-            "[plugins] fetch/extract failed: %s (%s) %s",
+        if not fallback_cmds:
+            # The label is host/path only and the stderr is redacted of the
+            # token, the ref, and any URL userinfo/query before it reaches the
+            # log — a cred must never surface even if git echoes one.
+            log.warning(
+                "[plugins] fetch/extract failed: %s (%s) %s",
+                _source_log_label(raw),
+                exc.__class__.__name__,
+                _redact_log_text(stderr, token, ref)[:500],
+            )
+            return None
+
+        # SHA pin, and fetch-by-object-id was refused (most likely the remote
+        # does not allow requesting an unadvertised object). Retry the
+        # server-agnostic way: clone, then check the pin out of local history.
+        log.info(
+            "[plugins] fetch-by-object-id refused for %s (%s) — retrying via "
+            "clone+checkout (works on any git server)",
             _source_log_label(raw),
-            exc.__class__.__name__,
-            _redact_log_text(stderr, token, ref)[:500],
+            _redact_log_text(stderr, token, ref)[:200],
         )
-        return None
+        _rmtree_force(clone_dir)  # the half-initialized repo must not poison it
+        try:
+            _run_all(fallback_cmds)
+        except (subprocess.SubprocessError, OSError) as exc2:
+            stderr2 = (getattr(exc2, "stderr", "") or "").strip()
+            log.warning(
+                "[plugins] fetch/extract failed: %s (%s) %s",
+                _source_log_label(raw),
+                exc2.__class__.__name__,
+                _redact_log_text(stderr2, token, ref)[:500],
+            )
+            return None
 
     # Strip VCS metadata so the installed tree matches the old archive semantics
     # (a tarball of the tree carried no ``.git``) and the plugins dir never holds

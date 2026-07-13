@@ -1035,3 +1035,97 @@ def test_real_git_still_fetches_a_branch_ref(tmp_path):
     )
     assert content is not None
     assert (content / "SKILL.md").read_text() == "# tip"
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider reality: forges disagree about fetch-by-object-id.
+#
+# A plugin source can name ANY forge (gitea://, or a full git URL to github /
+# gitlab / a self-hosted box). Serving a bare SHA requires
+# `uploadpack.allowReachableSHA1InWant` on the REMOTE. Gitea/GitHub/GitLab
+# enable it; plain git ships with it OFF, so a self-hosted remote refuses with
+# "Server does not allow request for unadvertised object". The fetcher must
+# still resolve the pin there — via clone + checkout — or a SHA-pinned plugin on
+# a customer's own forge fails exactly like Lark did on ours.
+# ---------------------------------------------------------------------------
+def test_sha_pin_falls_back_to_clone_checkout_on_a_restrictive_forge(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if "fetch" in cmd:
+            # A forge with SHA-in-want disabled.
+            raise ps.subprocess.CalledProcessError(
+                128, cmd, output="",
+                stderr="error: Server does not allow request for unadvertised object",
+            )
+        if "clone" in cmd:                       # the fallback's full clone
+            _materialize(Path(cmd[-1]), {"SKILL.md": b"# pinned"})
+            return _completed(cmd, 0)
+        return _completed(cmd, 0)                # init / remote add / checkout
+
+    monkeypatch.setattr(ps.subprocess, "run", fake_run)
+    plugins_dir = tmp_path / "plugins"
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": f"https://self-hosted.example/o/r#{LARK_SHA}"},
+    )
+
+    assert report.failed == [], "a restrictive forge must not fail a SHA-pinned plugin"
+    assert (plugins_dir / "r" / "SKILL.md").read_text() == "# pinned"
+
+    flat = [" ".join(c) for c in calls]
+    assert any("fetch" in c for c in flat), "must TRY the cheap object-id fetch first"
+    assert any("checkout" in c and LARK_SHA in c for c in flat), \
+        "fallback must check the pin out of local history"
+
+
+@pytest.mark.skipif(not _git_available(), reason="git binary not on PATH")
+def test_real_git_fallback_resolves_the_pin_without_sha_in_want(tmp_path, monkeypatch):
+    """The fallback, against REAL git: force the object-id fetch to fail and
+    assert clone+checkout still lands the pinned commit."""
+    origin = tmp_path / "origin3"
+    origin.mkdir()
+
+    def git(*args, cwd=origin):
+        return _subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        )
+
+    git("init", "--quiet", "--initial-branch=main")
+    git("config", "user.email", "t@t.t")
+    git("config", "user.name", "t")
+    (origin / "SKILL.md").write_text("# pinned")
+    git("add", "-A")
+    git("commit", "--quiet", "-m", "c1")
+    sha = git("rev-parse", "HEAD").stdout.strip()
+    (origin / "SKILL.md").write_text("# tip")     # move the tip past the pin
+    git("commit", "--quiet", "-am", "c2")
+
+    # Simulate a forge that refuses fetch-by-object-id, leaving every OTHER git
+    # command real. This is the only honest way to exercise the fallback: the
+    # file:// transport bypasses upload-pack's want-checks, so a fixture cannot
+    # actually refuse the way an http/ssh remote does.
+    real_run = _subprocess.run
+
+    def run_but_refuse_fetch(cmd, **kwargs):
+        if isinstance(cmd, list) and "fetch" in cmd:
+            raise ps.subprocess.CalledProcessError(
+                128, cmd, output="",
+                stderr="error: Server does not allow request for unadvertised object",
+            )
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(ps.subprocess, "run", run_but_refuse_fetch)
+
+    workdir = tmp_path / "wd3"
+    workdir.mkdir()
+    content = ps._git_fetch_tree(
+        clone_url=origin.as_uri(), host="", scheme="https", ref=sha, subpath="",
+        raw=f"https://self-hosted.example/o/r#{sha}", token="", git_binary="git",
+        workdir=workdir, timeout=60.0,
+    )
+
+    assert content is not None, "fallback failed — a restrictive forge would brick the plugin"
+    assert (content / "SKILL.md").read_text() == "# pinned"   # the PIN, not the tip
+    assert not (content / ".git").exists()
