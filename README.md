@@ -235,10 +235,10 @@ Releases are **automatic on a green merge to `main`** (CTO standing directive,
 2026-06-10) — no manual tag or approval gate:
 
 1. Land changes via reviewed PR (2 non-author approvals + CI green).
-2. On merge to `main`, `auto-release.yml` re-runs the merge-blocking gates
-   (`unit-tests` + `responsiveness-e2e`) inline. Gitea has no `workflow_run`
-   trigger, so the release workflow re-runs the gate itself rather than
-   subscribing to the `ci` workflow's success.
+2. On merge to `main`, `auto-release.yml` re-runs the release-blocking gates
+   (`unit-tests`, `responsiveness-e2e`, and the fail-closed SDK schema-sync
+   check) inline. Gitea has no `workflow_run` trigger, so the release workflow
+   re-runs the gates itself rather than subscribing to parallel workflows.
 3. On green it computes the next patch from the latest `runtime-v*` tag and
    compares it with the reviewed `[project].version` floor. The higher version
    becomes `runtime-vX.Y.Z` (so an explicit `0.4.0` cutover is not flattened to

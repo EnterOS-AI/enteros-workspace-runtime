@@ -38,9 +38,10 @@ name: auto-release
 # WHY re-run the gate here instead of `on: workflow_run`: Gitea (1.22.x..1.26.2) has
 # NO `workflow_run` trigger (same limitation that forced publish-image.yml's
 # promote-pin to be an in-workflow job). So a release workflow cannot subscribe to the
-# `ci` workflow's success. We re-run the two merge-BLOCKING gates (unit-tests +
-# responsiveness-e2e) inline and only release if BOTH pass — making "release on green"
-# self-contained and not dependent on an unavailable event.
+# `ci` workflow's success. We re-run unit-tests, responsiveness-e2e, and the SDK
+# schema-sync gate inline and only release if all three pass — making "release on
+# green" self-contained and preventing a tag when the packaged contract mirror is
+# stale or cannot be verified.
 #
 # LOOP SAFETY (structural): this workflow makes NO commit to `main`, and the only
 # write it performs is the TAG push. A tag push does NOT match `on: push:
@@ -82,8 +83,9 @@ jobs:
           AFTER_SHA: ${{ github.sha }}
         run: python3 .gitea/scripts/classify_runtime_release.py
 
-  # Re-run the two merge-BLOCKING gates inline so we release ONLY on green.
-  # (Mirrors ci.yml's unit-tests + responsiveness-e2e jobs verbatim.)
+  # Re-run the release-blocking gates inline so we release ONLY on green.
+  # Gitea has no workflow_run trigger, so the tag job cannot depend on the
+  # independent CI/schema-sync workflows that a main push starts in parallel.
   unit-tests:
     name: Gate — unit-tests
     needs: classify
@@ -135,9 +137,22 @@ jobs:
           RESP_E2E_POLL_DEADLINE: "25"
         run: pytest -q tests/integration
 
+  schema-sync:
+    name: Gate — SDK schema sync
+    needs: classify
+    if: ${{ needs.classify.outputs.should_release == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Verify packaged SDK contract mirrors
+        # Fail closed here, including the script's exit 2 (fetch unavailable):
+        # a release must not cut a tag when it cannot prove the packaged schema.
+        run: bash scripts/check-schemas-in-sync.sh
+
   release:
     name: Cut runtime-v<target> tag at main HEAD
-    needs: [classify, unit-tests, responsiveness-e2e]
+    needs: [classify, unit-tests, responsiveness-e2e, schema-sync]
     if: ${{ needs.classify.outputs.should_release == 'true' && success() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
