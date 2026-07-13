@@ -3,8 +3,8 @@
 PR-2 (advisory) locks in:
   * ``validate_manifest_ssot`` — parsed-value validation against the vendored
     molecule-ai-sdk schema (required name/version/description, dotted-numeric
-    version, runtimes list + canonical enum incl. the ``claude_code`` legacy
-    alias, additionalProperties:true forward-compat).
+    version, runtimes list + open bounded/path-safe RuntimeId incl. the
+    ``claude_code`` legacy alias, additionalProperties:true forward-compat).
   * ``advisory_check`` — file-level entry (missing file / bad YAML reported as
     violations, never raised) with the caller-supplied log prefix.
   * jsonschema-unavailable — the gate turns OFF with ONE loud logger.error,
@@ -89,25 +89,33 @@ def test_runtimes_scalar_string_is_violation():
     assert "runtimes" in violations[0]
 
 
-def test_bogus_runtime_is_enum_violation():
+def test_third_party_runtime_slug_is_accepted():
     manifest = _valid_manifest()
-    manifest["runtimes"] = ["bogus-runtime"]
-    violations = manifest_ssot.validate_manifest_ssot(manifest)
-    assert len(violations) == 1
-    assert "runtimes" in violations[0]
-    assert "bogus-runtime" in violations[0]
+    manifest["runtimes"] = ["acme-runtime"]
+    assert manifest_ssot.validate_manifest_ssot(manifest) == []
 
 
-def test_retired_google_adk_runtime_is_enum_violation():
+def test_retired_first_party_id_remains_valid_as_third_party_slug():
     manifest = _valid_manifest()
     manifest["runtimes"] = ["google-adk"]
+    assert manifest_ssot.validate_manifest_ssot(manifest) == []
+
+
+@pytest.mark.parametrize(
+    "runtime_id",
+    ["Uppercase", "path/runtime", "double--separator", "trailing-", "x" * 65],
+)
+def test_unsafe_runtime_slug_is_violation(runtime_id):
+    manifest = _valid_manifest()
+    manifest["runtimes"] = [runtime_id]
     violations = manifest_ssot.validate_manifest_ssot(manifest)
-    assert len(violations) == 1
-    assert "google-adk" in violations[0]
+    assert violations
+    assert all("runtimes" in violation for violation in violations)
+    assert any(runtime_id in violation for violation in violations)
 
 
 def test_legacy_underscore_alias_accepted():
-    # claude_code is an accepted legacy alias in the SSOT runtime enum.
+    # claude_code remains a valid RuntimeId spelling for compatibility.
     manifest = _valid_manifest()
     manifest["runtimes"] = ["claude_code"]
     assert manifest_ssot.validate_manifest_ssot(manifest) == []

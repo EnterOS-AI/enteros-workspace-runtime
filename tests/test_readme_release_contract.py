@@ -40,3 +40,19 @@ def test_auto_release_narrative_does_not_promise_production_promotion() -> None:
     assert 'fully "in prod"' not in AUTO_RELEASE
     assert "staging runtime_image_pins" in AUTO_RELEASE
     assert "Production pin promotion remains separate and explicit" in AUTO_RELEASE
+
+
+def test_auto_release_requires_sdk_schema_sync_before_tagging() -> None:
+    assert "schema-sync:" in AUTO_RELEASE
+    assert "Gate — SDK schema sync" in AUTO_RELEASE
+    assert "bash scripts/check-schemas-in-sync.sh" in AUTO_RELEASE
+    assert (
+        "needs: [classify, unit-tests, responsiveness-e2e, schema-sync]"
+        in AUTO_RELEASE
+    )
+
+
+def test_auto_release_tags_the_exact_commit_that_passed_the_gates() -> None:
+    assert "TESTED_COMMIT_SHA: ${{ github.sha }}" in AUTO_RELEASE
+    assert '--commit-sha "$TESTED_COMMIT_SHA"' in AUTO_RELEASE
+    assert "tag at main HEAD" not in AUTO_RELEASE

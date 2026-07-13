@@ -19,11 +19,11 @@ consumed by the SDK registry and any membership/policy check that needs the axis
 
 Membership policy
 -----------------
-``LIVE_RUNTIMES`` is the set of runtimes a workspace can actually boot on today. It
-is a curated subset of the broader manifest ``runtimes`` enum
-(``contracts/plugin-manifest.schema.json`` — which also carries not-yet-live /
-external values like ``crewai`` / ``external``). Adding a runtime here declares it
-part of the officially-supported axis; its adapter (in the template repo) is what
+``LIVE_RUNTIMES`` is the set of runtimes a workspace can actually boot on today.
+The manifest ``runtimes`` field accepts a bounded, open RuntimeId namespace so
+third-party adapters do not require a central schema edit. This tuple is the
+separate curated registry of officially supported runtimes. Adding a runtime here
+declares it part of that supported axis; its adapter (in the template repo) is what
 implements the SDK adapter socket for it — the engine holds nothing per-runtime.
 """
 from __future__ import annotations
