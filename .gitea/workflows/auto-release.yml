@@ -11,7 +11,8 @@ name: auto-release
 # committed a `pyproject.toml` version bump to `main` via the contents API; that PUT
 # is a direct push to a protected branch and FAILED every run (~17s). So this
 # workflow now does NOT touch `main` at all: on a green merge it only CUTS THE TAG
-# `runtime-v<target>` at `main` HEAD via the Gitea tags API. The target is the
+# `runtime-v<target>` at the exact `github.sha` that passed the release gates. It
+# never re-reads a moving `main` after those gates. The version target is the
 # higher of latest-tag patch+1 and the reviewed pyproject version floor. Tag creation targets the
 # TAG ref, not the branch ref, so branch push protection does not block it (proven:
 # the manual `runtime-v0.3.14` cut returned HTTP 201 with this same release token).
@@ -22,8 +23,9 @@ name: auto-release
 # cosmetic.
 #
 # Release → registry + staging chain this kicks off (mapped in the SOP PR body):
-#   merge to main → THIS workflow re-runs the merge-blocking gates inline and, on
-#   green, pushes tag runtime-v<target> at main HEAD → publish-runtime.yml (existing,
+#   merge to main → THIS workflow re-runs the release-blocking gates inline and, on
+#   green, pushes tag runtime-v<target> at the gated event commit →
+#   publish-runtime.yml (existing,
 #   tag-triggered) writes the tag version into pyproject + builds+publishes the wheel
 #   to the Gitea PyPI registry, and its `propagate` job opens `.runtime-version` bump
 #   PRs on each consumer template → merging a template bump trips that template's
@@ -151,7 +153,7 @@ jobs:
         run: bash scripts/check-schemas-in-sync.sh
 
   release:
-    name: Cut runtime-v<target> tag at main HEAD
+    name: Cut runtime-v<target> tag at gated commit
     needs: [classify, unit-tests, responsiveness-e2e, schema-sync]
     if: ${{ needs.classify.outputs.should_release == 'true' && success() }}
     runs-on: ubuntu-latest
@@ -209,7 +211,7 @@ jobs:
           echo "RELEASE_BOT_TOKEN=$RUNTIME_BOT_TOKEN" >> "$GITHUB_ENV"
           echo "RUNTIME_BOT_TOKEN loaded from Infisical /shared/runtime-bot (non-empty, len=${#RUNTIME_BOT_TOKEN})"
 
-      - name: Compute next version + cut tag at main HEAD
+      - name: Compute next version + cut tag at gated commit
         env:
           # molecule-runtime-release-bot identity with write on this repo, now
           # sourced from the Infisical SSOT (/shared/runtime-bot, RUNTIME_BOT_TOKEN)
@@ -219,10 +221,13 @@ jobs:
           # pushes to main. The old per-repo Gitea secret RELEASE_BOT_TOKEN is
           # kept in place until a green run validates this path (validate-before-delete).
           RELEASE_BOT_TOKEN: ${{ env.RELEASE_BOT_TOKEN }}
+          TESTED_COMMIT_SHA: ${{ github.sha }}
         run: |
           set -eu
           if [ -z "${RELEASE_BOT_TOKEN:-}" ]; then
             echo "::error::RELEASE_BOT_TOKEN empty after Infisical fetch — cannot auto-release. Check the 'Fetch RUNTIME_BOT_TOKEN from Infisical SSOT' step and /shared/runtime-bot."
             exit 1
           fi
-          python scripts/auto_release_runtime.py --token-env RELEASE_BOT_TOKEN
+          python scripts/auto_release_runtime.py \
+            --token-env RELEASE_BOT_TOKEN \
+            --commit-sha "$TESTED_COMMIT_SHA"

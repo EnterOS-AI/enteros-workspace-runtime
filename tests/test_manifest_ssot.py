@@ -115,7 +115,7 @@ def test_unsafe_runtime_slug_is_violation(runtime_id):
 
 
 def test_legacy_underscore_alias_accepted():
-    # claude_code is an accepted legacy alias in the SSOT runtime enum.
+    # claude_code remains a valid RuntimeId spelling for compatibility.
     manifest = _valid_manifest()
     manifest["runtimes"] = ["claude_code"]
     assert manifest_ssot.validate_manifest_ssot(manifest) == []
