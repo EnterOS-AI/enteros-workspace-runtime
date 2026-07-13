@@ -1,12 +1,13 @@
 """Plugin-declared channel daemons — manifest-declared long-running sidecars.
 
-PR-1 of issue #215 (daemon lifecycle only). A plugin can declare a
+PR-1 of issue #215 introduced the daemon lifecycle. A plugin can declare a
 long-running daemon — e.g. a channel bridge like ``lark-channel-molecule`` —
 under ``contributes.daemons`` in its ``plugin.yaml``; the workspace runtime
 spawns it at boot, restarts it on crash, and kills it with the workspace. The
 connected workspace owns its channel processes — no CP supervision domain.
-The local event socket / runtime-stamped provenance / turn-complete lane is
-PR-2 and intentionally absent here.
+PR-2 adds the private local A2A binding in :mod:`molecule_runtime.channel_events`;
+this module's post-bind starter coordinates that binding before spawn while
+keeping the daemon's platform HTTP/poll fallback valid.
 
 Manifest shape (mirrors the ``mcpServerContribution`` descriptor —
 ``name`` + ``command``/``args?``/``env?`` — rather than inventing a new one;
@@ -288,10 +289,23 @@ class DaemonSupervisor:
 
     def _spawn(self, spec: DaemonSpec) -> subprocess.Popen | None:
         """Popen the daemon in its own session/pgroup; None on failure."""
+        # The local A2A socket is a runtime-issued capability, not an ordinary
+        # workspace env var.  Never inherit a stale/operator-supplied parent
+        # value; ChannelEventSocketManager publishes authoritative values into
+        # spec.env only after its private listener is bound and chmodded.
+        from molecule_runtime.channel_events import (
+            CHANNEL_A2A_SOCKET_ENV,
+            CHANNEL_PLUGIN_ID_ENV,
+        )
+
+        child_env = dict(os.environ)
+        child_env.pop(CHANNEL_A2A_SOCKET_ENV, None)
+        child_env.pop(CHANNEL_PLUGIN_ID_ENV, None)
+        child_env.update(spec.env)
         try:
             proc = subprocess.Popen(
                 spec.command,
-                env={**os.environ, **spec.env},
+                env=child_env,
                 cwd=spec.cwd or None,
                 start_new_session=True,  # own pgroup — group kill reaps grandchildren
             )
@@ -399,6 +413,7 @@ async def start_supervisor_when_bound(
     server,
     supervisor,
     *,
+    event_transport=None,
     poll_interval: float = 0.25,
     max_wait_seconds: float = 60.0,
 ) -> bool:
@@ -419,5 +434,19 @@ async def start_supervisor_when_bound(
             "plugin daemons: uvicorn not reported bound after %.0fs; "
             "starting daemons anyway", max_wait_seconds,
         )
+    # PR-2: bind the existing A2A app on the private per-plugin socket before
+    # any channel daemon starts.  The socket is a local optimization, never a
+    # correctness dependency: if binding fails, withhold/remove the capability
+    # env and start the daemon on its existing platform HTTP/poll fallback.
+    if event_transport is not None:
+        try:
+            await event_transport.start()
+        except Exception as e:  # noqa: BLE001 — agent boot + poll fallback survive
+            logger.error(
+                "plugin daemons: local channel event socket unavailable (%s); "
+                "starting without the local capability",
+                e,
+            )
+            event_transport.clear_daemon_env()
     supervisor.start()
     return True

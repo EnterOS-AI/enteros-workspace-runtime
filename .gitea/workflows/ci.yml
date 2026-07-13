@@ -52,6 +52,12 @@ jobs:
         # the fast unit lane.
         run: pytest -q --ignore=tests/integration
 
+      - name: Run channel-plugin local A2A contract gate
+        # runtime#215 PR-2: real Unix HTTP binding, source prove-fail,
+        # private filesystem modes, standard JSON-RPC + SSE passthrough, and
+        # fail-closed capability removal must stay merge-blocking and loud.
+        run: pytest -v -rs tests/test_channel_events.py tests/test_plugin_daemons.py
+
       - name: Run build_routes real-subprocess regression gate
         # Explicit, loud step for issue #88: the 4-branch build_routes contract
         # must be exercised against the REAL a2a-sdk in child processes. A skip

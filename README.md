@@ -28,6 +28,76 @@ This package provides the core machinery every Molecule AI workspace container n
   process serve N workspaces concurrently (introduced in the multi-WS PR
   series, finalised in 0.2.0)
 
+## Channel plugin local A2A transport
+
+A plugin can declare a workspace-owned channel daemon with
+`contributes.daemons`. At boot the runtime discovers and supervises that
+process and, when the local binding is available, injects:
+
+- `MOLECULE_CHANNEL_A2A_SOCKET` — a private Unix socket serving the
+  workspace's existing A2A HTTP/JSON-RPC application.
+- `MOLECULE_CHANNEL_PLUGIN_ID` — the installed plugin identity the runtime
+  stamps as channel provenance.
+
+The socket does **not** define a second event envelope. Runtime-dependent
+plugins should use `molecule_runtime.channel_events.send_channel_message`,
+which reuses the canonical a2a-sdk-backed request builder and reads the socket
+env automatically:
+
+```python
+from molecule_runtime.channel_events import (
+    channel_message_response_text,
+    send_channel_message,
+)
+
+response = await send_channel_message(
+    text,
+    metadata={
+        "chat_id": chat_id,
+        "user_id": sender_id,
+        "username": sender_name,
+        "message_id": external_message_id,
+    },
+)
+reply_text = channel_message_response_text(response)
+```
+
+The helper sends the existing platform request shape (IDs shown explicitly):
+
+```json
+{"jsonrpc":"2.0","id":"req-1","method":"message/send","params":{"message":{"kind":"message","role":"user","messageId":"msg-1","parts":[{"kind":"text","text":"hello"}]},"metadata":{"chat_id":"C123","user_id":"U456","username":"Ada","message_id":"171.1"}}}
+```
+
+With a2a-sdk 1.x, a completed turn returns the existing JSON-RPC `Task` shape;
+IDs and timestamp are generated per turn:
+
+```json
+{"jsonrpc":"2.0","id":"req-1","result":{"kind":"task","id":"task-1","contextId":"ctx-1","artifacts":[{"artifactId":"artifact-1","parts":[{"kind":"text","text":"pong"}]}],"status":{"state":"completed","timestamp":"2026-07-13T03:44:52Z","message":{"kind":"message","messageId":"reply-1","role":"agent","taskId":"task-1","contextId":"ctx-1","parts":[{"kind":"text","text":"pong"}]}}}}
+```
+
+`message/send` returns that synchronous result when the turn completes.
+Clients that need an explicit start acknowledgement plus completion can post
+the same envelope with `method: "message/stream"` and consume the existing A2A
+working-status and terminal-message SSE events. The reusable helper intentionally
+targets `message/send`; streaming clients use an UDS-aware HTTP client directly.
+
+Channel provenance uses the existing platform fields under `params.metadata`:
+`source`, `chat_id`, `user_id`, `username`, and `message_id`. The daemon
+supplies channel event fields, but the runtime always overwrites `source` on
+both params and message metadata with `MOLECULE_CHANNEL_PLUGIN_ID`; a daemon
+cannot impersonate another plugin by claiming a different source. The socket
+directory is mode 0700 and each socket is mode 0600 before the daemon starts.
+The path is an ephemeral per-boot capability and must not be persisted.
+
+Clients must keep their existing platform HTTP/poll path as fallback. If the
+socket bind fails, the runtime removes the two capability variables and still
+starts the daemon; absence of `MOLECULE_CHANNEL_A2A_SOCKET` is the fail-closed
+signal to use the remote path. `send_channel_message` raises
+`ChannelEventUnavailable` for that case and leaves socket connection failures
+as `httpx.TransportError`, so the plugin can fall back without treating an
+agent JSON-RPC error as a transport outage. This preserves off-host and
+poll-mode channel bridges unchanged.
+
 ## MCP SSOT public surface (issue #38)
 
 Adapters (a2a_mcp_server, langchain integrations, future SDKs) consume
