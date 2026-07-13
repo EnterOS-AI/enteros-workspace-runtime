@@ -706,3 +706,137 @@ def test_install_mixed_gitea_and_retired_presign(monkeypatch, tmp_path):
     assert report.swapped is True
     assert (config_path / "plugins" / "repo" / "SKILL.md").read_text() == "# git"
     assert not (config_path / "plugins" / "relayed").exists()
+
+
+# ---------------------------------------------------------------------------
+# SHA-pinned refs (the test5 incident, 2026-07-13)
+#
+# The catalog pins declared plugins BY COMMIT. `git clone --branch <sha>` cannot
+# resolve a bare object id — real git answers "Remote branch <sha> not found in
+# upstream origin" — so every SHA-pinned plugin failed to fetch. And since a
+# failed source aborts the tree swap, a concierge on a de-baked image lost its
+# management MCP along with it and fail-closed to `failed`.
+#
+# `_fake_git_server` models REAL git: `--branch <sha>` raises, and the only way
+# to land a commit is init + fetch <sha> + checkout FETCH_HEAD.
+# ---------------------------------------------------------------------------
+LARK_SHA = "973a35b70d17694c6412b40fe963689fae2a353f"
+
+
+def _fake_git_server(monkeypatch, files: dict[str, bytes], *, known_sha: str):
+    """A subprocess.run fake that behaves like git against a real remote."""
+    calls: list[list[str]] = []
+    state: dict[str, object] = {"fetched": False}
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+
+        if "clone" in cmd:
+            ref = cmd[cmd.index("--branch") + 1] if "--branch" in cmd else "HEAD"
+            if ps._is_commit_sha(ref):
+                # THE BUG: real git refuses a bare SHA as --branch.
+                raise ps.subprocess.CalledProcessError(
+                    128, cmd, output="",
+                    stderr=f"fatal: Remote branch {ref} not found in upstream origin",
+                )
+            dest = Path(cmd[-1])
+            _materialize(dest, files)
+            return _completed(cmd, 0)
+
+        if "init" in cmd:
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return _completed(cmd, 0)
+
+        if "fetch" in cmd:
+            ref = cmd[-1]
+            if ref != known_sha:
+                raise ps.subprocess.CalledProcessError(
+                    128, cmd, output="", stderr=f"fatal: couldn't find remote ref {ref}",
+                )
+            state["fetched"] = True
+            return _completed(cmd, 0)
+
+        if "checkout" in cmd:
+            if not state["fetched"]:
+                raise ps.subprocess.CalledProcessError(
+                    128, cmd, output="", stderr="fatal: FETCH_HEAD unavailable",
+                )
+            dest = Path(cmd[cmd.index("-C") + 1])
+            _materialize(dest, files)
+            return _completed(cmd, 0)
+
+        return _completed(cmd, 0)  # remote add, config, ...
+
+    monkeypatch.setattr(ps.subprocess, "run", fake_run)
+    return calls
+
+
+def _materialize(dest: Path, files: dict[str, bytes]) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / ".git").mkdir(exist_ok=True)
+    (dest / ".git" / "HEAD").write_text("ref: refs/heads/x\n")
+    for rel, data in files.items():
+        p = dest / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+
+def test_is_commit_sha_classifies_refs():
+    assert ps._is_commit_sha(LARK_SHA) is True
+    assert ps._is_commit_sha("a" * 64) is True          # sha256 object format
+    assert ps._is_commit_sha(LARK_SHA.upper()) is True  # case-insensitive
+    for ref in ("main", "v0.5.1", "release/x", "", "abc123", "z" * 40):
+        assert ps._is_commit_sha(ref) is False, ref
+
+
+def test_install_plugin_pinned_to_commit_sha(monkeypatch, tmp_path):
+    """A SHA-pinned plugin installs — via init+fetch+checkout, not clone --branch."""
+    calls = _fake_git_server(
+        monkeypatch, {"plugin.py": b"print('lark')"}, known_sha=LARK_SHA
+    )
+    plugins_dir = tmp_path / "plugins"
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": f"gitea://molecule-ai/lark-channel-molecule#{LARK_SHA}"},
+    )
+
+    assert report.failed == [], "SHA-pinned plugin must not fail to fetch"
+    assert report.installed == [f"gitea://molecule-ai/lark-channel-molecule#{LARK_SHA}"]
+    assert (plugins_dir / "lark-channel-molecule" / "plugin.py").exists()
+    assert not (plugins_dir / "lark-channel-molecule" / ".git").exists()
+
+    flat = [" ".join(c) for c in calls]
+    assert any("fetch" in c and LARK_SHA in c for c in flat), "must fetch the object id"
+    assert any("checkout" in c and "FETCH_HEAD" in c for c in flat)
+    assert not any("--branch" in c for c in flat), "must NOT try clone --branch <sha>"
+
+
+def test_branch_and_tag_refs_still_use_clone(monkeypatch, tmp_path):
+    """The common branch/tag path is unchanged — no init/fetch plumbing."""
+    for ref in ("main", "v0.5.1"):
+        calls = _fake_git_server(monkeypatch, {"a.txt": b"x"}, known_sha=LARK_SHA)
+        report = ps.install_declared_plugins(
+            plugins_dir=tmp_path / f"p-{ref.replace('/', '_')}",
+            env={"MOLECULE_DECLARED_PLUGINS": f"gitea://owner/repo#{ref}"},
+        )
+        assert report.failed == []
+        flat = [" ".join(c) for c in calls]
+        assert any("clone" in c and f"--branch {ref}" in c for c in flat)
+        assert not any(" fetch " in f" {c} " for c in flat)
+
+
+def test_sha_fetch_carries_the_credential_helper(monkeypatch, tmp_path):
+    """A private SHA-pinned repo still authenticates: the 401-only cred helper
+    must be wired onto the FETCH argv (it is not a clone), and the token must
+    never appear in the URL or on argv."""
+    calls = _fake_git_server(monkeypatch, {"a.txt": b"x"}, known_sha=LARK_SHA)
+    ps.install_declared_plugins(
+        plugins_dir=tmp_path / "plugins",
+        env={
+            "MOLECULE_DECLARED_PLUGINS": f"gitea://owner/repo#{LARK_SHA}",
+            "MOLECULE_TEMPLATE_REPO_TOKEN": "tok-SECRET",
+        },
+    )
+    fetch = next(c for c in calls if "fetch" in c)
+    assert any(a.startswith("credential.https://") for a in fetch), "cred helper missing on fetch"
+    assert not any("tok-SECRET" in a for a in fetch), "token leaked onto argv"

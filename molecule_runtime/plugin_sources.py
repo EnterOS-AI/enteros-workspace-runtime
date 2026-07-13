@@ -475,6 +475,18 @@ def _atomic_swap_dir(staging_dir: Path, target_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 # Fetch core — one git-clone path shared by every provider.
 # ---------------------------------------------------------------------------
+# A git object id: 40 hex chars (sha1) or 64 (sha256, for repos on the newer
+# object format). Anything else — `main`, `v0.5.1`, `release/x` — is a ref name
+# git can resolve remotely, and takes the `clone --branch` path.
+_COMMIT_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
+
+def _is_commit_sha(ref: str) -> bool:
+    """True when ``ref`` is a bare commit SHA (needs fetch-by-object-id, not
+    ``clone --branch``, which only resolves branch/tag NAMES)."""
+    return bool(_COMMIT_SHA_RE.match((ref or "").strip().lower()))
+
+
 def _host_cred_config_args(scheme: str, host: str) -> list[str]:
     """git ``-c`` args wiring a per-host inline credential helper.
 
@@ -506,20 +518,30 @@ def _git_fetch_tree(
     workdir: Path,
     timeout: float,
 ) -> Path | None:
-    """``git clone`` ``clone_url`` at ``ref`` into ``workdir`` and return the dir
-    whose contents become ``<plugins_dir>/<name>/`` (the clone root, or
-    ``<clone_root>/<subpath>``), or None on a clone/subpath failure.
+    """Fetch ``clone_url`` at ``ref`` into ``workdir`` and return the dir whose
+    contents become ``<plugins_dir>/<name>/`` (the clone root, or
+    ``<clone_root>/<subpath>``), or None on a fetch/subpath failure.
 
     Anonymous by default: the token (if any) is supplied ONLY via a per-host
     credential helper that git consults on a 401, never on the URL/argv. Fail-
     soft: any error logs ``[plugins] fetch/extract failed`` and returns None so
     the caller continues with the next source.
 
-    NOTE (ref shape): ``--branch`` accepts a branch or tag name (the common case
-    for declared plugins, incl. the mgmt-MCP's ``main``). A raw commit SHA is NOT
-    a valid ``--branch`` argument — the old archive-by-<sha> path accepted one;
-    pinning a declared plugin to a bare SHA is unsupported by this git-native
-    fetch and would need an ``init``+``fetch``+``checkout`` variant.
+    REF SHAPE — two paths, because git needs different plumbing for each:
+
+    * a branch or tag name -> ``clone --depth 1 --branch <ref>``.
+    * a bare commit SHA    -> ``init`` + ``fetch --depth 1 origin <sha>`` +
+      ``checkout FETCH_HEAD``. ``--branch`` does NOT accept a raw SHA; git
+      resolves it against the remote's refs and fails with "Remote branch <sha>
+      not found in upstream origin".
+
+    The SHA path is not hypothetical: the catalog pins declared plugins BY
+    COMMIT (that is what a pin is for). When the fetch moved from archive-by-SHA
+    to git-clone, the producer kept emitting SHA pins the consumer could no
+    longer resolve, so every SHA-pinned plugin failed to install — and because a
+    failed source aborts the tree swap, a concierge on a de-baked image lost its
+    management MCP with it and fail-closed to `failed`. Ref: the test5 incident,
+    2026-07-13.
     """
     if token and scheme.lower() != "https":
         log.warning(
@@ -530,31 +552,49 @@ def _git_fetch_tree(
 
     clone_dir = workdir / "clone"
 
-    cmd = [git_binary]
     child_env = dict(os.environ)
     child_env["GIT_TERMINAL_PROMPT"] = "0"  # never block boot on a cred prompt
+    cred_args: list[str] = []
     if token and host:
         # Wire the 401-only per-host helper and hand git the token via env.
-        cmd += _host_cred_config_args(scheme, host)
+        cred_args = _host_cred_config_args(scheme, host)
         child_env[_CRED_TOKEN_ENVVAR] = token
-    cmd += [
-        "clone",
-        "--depth", "1",
-        "--single-branch",
-        "--branch", ref,
-        clone_url,
-        str(clone_dir),
-    ]
+
+    def _git(*args: str) -> list[str]:
+        return [git_binary, *cred_args, *args]
+
+    if _is_commit_sha(ref):
+        # Fetch a single commit by object id. `--depth 1` keeps it as cheap as
+        # the clone path; the remote must allow uploadpack.allowReachableSHA1
+        # (Gitea does).
+        cmds = [
+            _git("init", "--quiet", str(clone_dir)),
+            _git("-C", str(clone_dir), "remote", "add", "origin", clone_url),
+            _git("-C", str(clone_dir), "fetch", "--depth", "1", "origin", ref),
+            _git("-C", str(clone_dir), "checkout", "--quiet", "--detach", "FETCH_HEAD"),
+        ]
+    else:
+        cmds = [
+            _git(
+                "clone",
+                "--depth", "1",
+                "--single-branch",
+                "--branch", ref,
+                clone_url,
+                str(clone_dir),
+            )
+        ]
 
     try:
-        subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=child_env,
-        )
+        for cmd in cmds:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=child_env,
+            )
     except (subprocess.SubprocessError, OSError) as exc:
         stderr = (getattr(exc, "stderr", "") or "").strip()
         log.warning(
