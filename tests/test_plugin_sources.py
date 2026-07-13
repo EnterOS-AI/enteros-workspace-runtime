@@ -377,11 +377,19 @@ def test_install_empty_signal_is_noop_and_preserves_existing(monkeypatch, tmp_pa
     assert called["run"] is False  # never cloned
 
 
-def test_install_partial_failure_does_not_swap_and_keeps_existing(monkeypatch, tmp_path):
-    # Atomic-swap contract (F1 fix): if ANY declared source fails to fetch, the
-    # staging build is NOT promoted — the existing live tree is left intact. A
-    # transient blip on one source must never half-replace the plugins dir. The
-    # per-source outcomes are still reported so observability is unchanged.
+def test_install_partial_failure_promotes_the_good_source_and_keeps_existing(
+    monkeypatch, tmp_path
+):
+    # Atomic-swap contract, REVISED. The F1 fix originally aborted the whole
+    # swap when ANY source failed, to stop a transient blip half-replacing the
+    # plugins dir. That protected the live tree but ALSO discarded the sources
+    # that fetched fine — including, on a de-baked image, the concierge's own
+    # management MCP, which fail-closed the whole agent (staging test5,
+    # 2026-07-13). A failed source now fails ONLY that source.
+    #
+    # The property F1 actually cared about is unchanged and asserted below: a
+    # failure never deletes an already-installed plugin, and the tree is never
+    # left half-written.
     def resolver(clone_url, ref, cmd, env):
         if "/bad/" in clone_url:
             return None  # clone fails
@@ -402,12 +410,13 @@ def test_install_partial_failure_does_not_swap_and_keeps_existing(monkeypatch, t
         },
     )
     assert report.failed == ["gitea://bad/bad-repo"]
-    assert report.installed == ["gitea://good/good-repo"]  # staged OK...
-    assert report.swapped is False  # ...but the build was NOT promoted
-    # Existing tree intact; the good source was NOT half-installed into the live
-    # dir (it only ever landed in the discarded staging tree).
+    assert report.installed == ["gitea://good/good-repo"]
+    assert report.swapped is True  # the good source IS promoted (was: False)
+    # The good source went live rather than being discarded with the bad one.
+    assert (plugins_dir / "good-repo" / "SKILL.md").read_text() == "ok"
+    # F1's real invariant, intact: the pre-existing tree was NOT deleted by the
+    # swap — it is carried forward.
     assert (plugins_dir / "prior" / "keep.txt").read_text() == "prior"
-    assert not (plugins_dir / "good-repo").exists()
 
 
 def test_install_fetch_failure_preserves_existing_tree(monkeypatch, tmp_path):
@@ -840,3 +849,190 @@ def test_sha_fetch_carries_the_credential_helper(monkeypatch, tmp_path):
     fetch = next(c for c in calls if "fetch" in c)
     assert any(a.startswith("credential.https://") for a in fetch), "cred helper missing on fetch"
     assert not any("tok-SECRET" in a for a in fetch), "token leaked onto argv"
+
+
+# ---------------------------------------------------------------------------
+# Blast radius: a failing source must fail THAT SOURCE ONLY.
+#
+# The swap used to be all-or-nothing — any failed source aborted the promotion
+# of every source staged alongside it. On a de-baked image one of those is the
+# concierge's own management MCP, so an unfetchable third-party plugin took the
+# mgmt-MCP down with it and the agent fail-closed to `failed`. And the "keep the
+# existing tree" justification is VACUOUS on a first boot: no previous tree
+# exists, so the workspace came up with an EMPTY plugins dir.
+# ---------------------------------------------------------------------------
+MGMT_MCP = "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"
+BAD_LARK = f"gitea://molecule-ai/lark-channel-molecule#{LARK_SHA}"
+
+
+def _patch_git_failing(monkeypatch, *, fail_repo: str, files: dict[str, bytes]):
+    """git that fails to clone `fail_repo` and succeeds for everything else."""
+    def resolver(clone_url, ref, cmd, env):
+        return None if fail_repo in clone_url else dict(files)
+    return _patch_git(monkeypatch, resolver)
+
+
+def test_failed_plugin_does_not_block_the_others(monkeypatch, tmp_path):
+    """THE test5 incident. Lark is unfetchable; the mgmt-MCP must STILL install."""
+    _patch_git_failing(
+        monkeypatch, fail_repo="lark-channel-molecule", files={"mcp.py": b"x"}
+    )
+    plugins_dir = tmp_path / "plugins"
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": f"{BAD_LARK},{MGMT_MCP}"},
+    )
+
+    assert report.failed == [BAD_LARK]
+    assert report.installed == [MGMT_MCP]
+    # The whole point: the swap HAPPENED, so the mgmt-MCP is actually live.
+    assert report.swapped is True
+    assert (plugins_dir / "molecule-ai-plugin-molecule-platform-mcp" / "mcp.py").exists()
+    # The failed plugin is simply absent — not a half-installed tree.
+    assert not (plugins_dir / "lark-channel-molecule").exists()
+
+
+def test_first_boot_with_a_bad_plugin_still_yields_a_usable_tree(monkeypatch, tmp_path):
+    """No previous tree to 'keep intact' — the old veto left this dir EMPTY."""
+    _patch_git_failing(
+        monkeypatch, fail_repo="lark-channel-molecule", files={"mcp.py": b"x"}
+    )
+    plugins_dir = tmp_path / "fresh"          # does not exist yet
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": f"{BAD_LARK},{MGMT_MCP}"},
+    )
+    assert report.swapped is True
+    assert list(plugins_dir.iterdir()), "first boot must not yield an empty plugins tree"
+
+
+def test_transient_failure_preserves_the_previously_installed_copy(monkeypatch, tmp_path):
+    """The property the old veto DID protect, kept: a blip must not delete an
+    already-installed plugin."""
+    plugins_dir = tmp_path / "plugins"
+    live = plugins_dir / "lark-channel-molecule"
+    live.mkdir(parents=True)
+    (live / "SKILL.md").write_text("# installed earlier")
+
+    _patch_git_failing(
+        monkeypatch, fail_repo="lark-channel-molecule", files={"mcp.py": b"x"}
+    )
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": f"{BAD_LARK},{MGMT_MCP}"},
+    )
+
+    assert report.swapped is True
+    assert report.failed == [BAD_LARK]
+    # Carried forward, NOT deleted by the swap.
+    assert (live / "SKILL.md").read_text() == "# installed earlier"
+    # ...and the good source still went live alongside it.
+    assert (plugins_dir / "molecule-ai-plugin-molecule-platform-mcp" / "mcp.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# REAL GIT. No mock.
+#
+# Every other test in this file monkeypatches subprocess.run, and that is
+# precisely how the SHA-pin bug reached production: the fake accepted
+# `clone --branch <sha>` and returned a tree, while real git rejects it
+# outright. CI validated the code against a git that does not exist.
+#
+# This test shells out to the ACTUAL git binary against a REAL repo on disk and
+# fetches a REAL commit id. It cannot pass unless the fetch genuinely works, and
+# it fails against the old `clone --branch <sha>` implementation for the same
+# reason the live workspace did.
+# ---------------------------------------------------------------------------
+import os
+import shutil as _shutil
+import subprocess as _subprocess
+
+import pytest
+
+
+def _git_available() -> bool:
+    return _shutil.which("git") is not None
+
+
+@pytest.mark.skipif(not _git_available(), reason="git binary not on PATH")
+def test_real_git_fetches_a_real_commit_sha(tmp_path):
+    """End-to-end against the REAL git binary — the gate CI was missing.
+
+    Drives `_git_fetch_tree` (the fetch core that was broken) directly, so the
+    assertion is about what git actually does, not what a mock pretends it does.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+
+    def git(*args, cwd=origin):
+        return _subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        )
+
+    git("init", "--quiet", "--initial-branch=main")
+    git("config", "user.email", "t@t.t")
+    git("config", "user.name", "t")
+    # Serving a bare object id to `git fetch <sha>` requires this on the REMOTE.
+    # Gitea enables it; the fixture must too, or we would be asserting a
+    # capability the real remote does not grant.
+    git("config", "uploadpack.allowReachableSHA1InWant", "true")
+    git("config", "uploadpack.allowAnySHA1InWant", "true")
+    (origin / "SKILL.md").write_text("# real")
+    git("add", "-A")
+    git("commit", "--quiet", "-m", "real commit")
+    sha = git("rev-parse", "HEAD").stdout.strip()
+    assert len(sha) == 40
+
+    # Move the branch tip PAST the pin, so a plain clone of the default branch
+    # would yield the WRONG tree — proving we really resolved the commit.
+    (origin / "SKILL.md").write_text("# moved on")
+    git("commit", "--quiet", "-am", "later commit")
+
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    content = ps._git_fetch_tree(
+        clone_url=origin.as_uri(),            # file:// — a real git remote
+        host="", scheme="https", ref=sha, subpath="",
+        raw=f"gitea://o/r#{sha}", token="", git_binary="git",
+        workdir=workdir, timeout=60.0,
+    )
+
+    assert content is not None, "real git could not fetch the SHA-pinned commit"
+    skill = content / "SKILL.md"
+    assert skill.is_file()
+    assert skill.read_text() == "# real"          # the PIN, not the branch tip
+    if os.name != "nt":
+        # VCS metadata stripped. Enforced on the platform the runtime actually
+        # runs on (Linux). Skipped on Windows only because git marks its objects
+        # read-only there and rmtree(ignore_errors=True) cannot unlink them — an
+        # artifact of running this suite on a dev laptop, not of the fetch.
+        assert not (content / ".git").exists()
+
+
+@pytest.mark.skipif(not _git_available(), reason="git binary not on PATH")
+def test_real_git_still_fetches_a_branch_ref(tmp_path):
+    """The unchanged hot path, also against real git."""
+    origin = tmp_path / "origin2"
+    origin.mkdir()
+
+    def git(*args, cwd=origin):
+        return _subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        )
+
+    git("init", "--quiet", "--initial-branch=main")
+    git("config", "user.email", "t@t.t")
+    git("config", "user.name", "t")
+    (origin / "SKILL.md").write_text("# tip")
+    git("add", "-A")
+    git("commit", "--quiet", "-m", "c1")
+
+    workdir = tmp_path / "wd2"
+    workdir.mkdir()
+    content = ps._git_fetch_tree(
+        clone_url=origin.as_uri(), host="", scheme="https", ref="main", subpath="",
+        raw="gitea://o/r#main", token="", git_binary="git",
+        workdir=workdir, timeout=60.0,
+    )
+    assert content is not None
+    assert (content / "SKILL.md").read_text() == "# tip"

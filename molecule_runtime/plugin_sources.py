@@ -487,6 +487,18 @@ def _is_commit_sha(ref: str) -> bool:
     return bool(_COMMIT_SHA_RE.match((ref or "").strip().lower()))
 
 
+def _iter_dirs(parent: Path) -> "list[Path]":
+    """Immediate sub-directories of ``parent`` ([] when it does not exist).
+
+    Used to carry an already-installed plugins tree forward across a swap when
+    some source failed this boot.
+    """
+    try:
+        return [p for p in parent.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+
+
 def _host_cred_config_args(scheme: str, host: str) -> list[str]:
     """git ``-c`` args wiring a per-host inline credential helper.
 
@@ -898,17 +910,66 @@ def install_declared_plugins(
             )
             report.installed.append(source.raw)
 
-        # Atomic swap — ONLY when every declared source materialized. On any
-        # failure keep the existing live tree (no swap), so a transient gitea
-        # blip never deletes already-installed skills for this boot.
-        if report.failed:
+        # A failed source fails THAT SOURCE — not the whole tree.
+        #
+        # This used to abort the swap entirely whenever any source failed, to
+        # protect already-installed skills from a transient gitea blip. But the
+        # veto is indiscriminate: it also discards the sources that fetched
+        # FINE, and on a de-baked image one of those is the concierge's own
+        # management MCP. So an unfetchable third-party plugin took the mgmt-MCP
+        # down with it, `register` fail-closed on mcp_server_present=false, and
+        # the agent parked in `failed` — permanently, since every retry hit the
+        # same bad source. Worse, the "keep the existing tree" safety net is
+        # VACUOUS on a first boot: there is no previous tree to keep, so the
+        # workspace booted with an EMPTY plugins dir. A guard meant to preserve
+        # state, applied where no state exists, destroyed the boot instead.
+        # (Live: staging test5, 2026-07-13 — Lark pinned to an unfetchable SHA.)
+        #
+        # We keep the original intent WITHOUT the collateral damage. On a
+        # partial failure, carry EVERY live dir the successful sources are not
+        # replacing into staging, then swap. So:
+        #
+        #   * a source that fetched fine goes live regardless of its neighbours
+        #     (the mgmt-MCP is no longer hostage to a third-party plugin);
+        #   * a transient blip cannot delete an already-installed plugin — its
+        #     previous copy is carried forward byte-for-byte;
+        #   * anything else already live (e.g. a plugin added at runtime via
+        #     install_plugin, absent from MOLECULE_DECLARED_PLUGINS) is carried
+        #     forward too, exactly as the old no-swap path preserved it;
+        #   * a plugin that never installed and has no previous copy is simply
+        #     absent — not a half-written tree.
+        #
+        # A boot where EVERY source fails promotes nothing: there is nothing to
+        # promote, so we skip the swap and leave the live tree untouched (the
+        # cheapest correct thing, and it keeps the swap off the failure path).
+        if report.failed and not report.installed:
             log.warning(
-                "[plugins] %d of %d source(s) failed — keeping existing plugins "
-                "tree intact (no swap); will retry next boot",
-                len(report.failed), len(sources),
+                "[plugins] all %d source(s) failed — keeping the existing plugins "
+                "tree intact (no swap); will retry next boot", len(sources),
             )
             report.swapped = False
             return report
+
+        if report.failed:
+            for previous in _iter_dirs(target_dir):
+                if (staging_dir / previous.name).exists():
+                    continue  # a successful source owns this name — it wins
+                try:
+                    shutil.copytree(previous, staging_dir / previous.name)
+                    log.info(
+                        "[plugins] carrying the already-installed %s forward "
+                        "(a source failed this boot; not deleting it)",
+                        previous.name,
+                    )
+                except OSError as exc:
+                    log.warning(
+                        "[plugins] could not carry %s forward (%s)", previous.name, exc,
+                    )
+            log.warning(
+                "[plugins] %d of %d source(s) failed — promoting the %d that "
+                "succeeded; failed sources retry next boot",
+                len(report.failed), len(sources), len(report.installed),
+            )
 
         try:
             _atomic_swap_dir(staging_dir, target_dir)
