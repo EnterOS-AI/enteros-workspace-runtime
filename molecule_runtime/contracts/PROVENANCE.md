@@ -24,8 +24,8 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `c661ceb164ba41550900af77055b5cc29557a2ac` (retired crewai from the SDK runtime contracts; supersedes the google-adk retirement — leaving claude-code/codex/hermes/openclaw/external)
-Vendored at sdk HEAD: `c661ceb164ba41550900af77055b5cc29557a2ac` (main)
+Source commit:        `a3d70972ee082a8d862fd083ec6f92bbea133185` (SDK RuntimeId became an open bounded/path-safe slug; official runtime support moved to the adapter registry)
+Vendored at sdk HEAD: `656eb86eb53d00718fa5a8f60bf98cc01ccf3353` (`sdk-v0.5.2`, main)
 
 Why vendored: `molecule_runtime/manifest_ssot.py` validates plugin manifests
 against this schema at plugin **load** (`plugins.load_plugin_manifest`) and at
