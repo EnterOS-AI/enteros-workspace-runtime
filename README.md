@@ -5,7 +5,8 @@ agent adapters and workspace template images.
 
 > **This repo is the canonical source of truth as of 2026-05-20.**
 > Direct PRs are the editable path. The monorepo `molecule-core/workspace-server`
-> pins this wheel by version (`molecule-ai-workspace-runtime==X.Y.Z`).
+> installs the published wheel under its canonical distribution name,
+> `molecules-workspace-runtime`.
 >
 > Previously the monorepo `workspace/` directory was the source and this
 > repo was a publish-time mirror. That arrangement is reversed by the
@@ -179,10 +180,20 @@ ID and token returned by each tenant.
 
 ## Installation
 
+The runtime distribution is served by Molecule's Gitea registry. Public PyPI is
+used only for its public dependencies; do not install the retired
+`molecule-ai-workspace-runtime` distribution name.
+
 ```bash
-pip install molecule-ai-workspace-runtime
-# Or, recommended for the external MCP server:
-pipx install molecule-ai-workspace-runtime
+pip install \
+  --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  "molecules-workspace-runtime==0.4.0"
+
+# Recommended when installing the external MCP server as an isolated CLI:
+pipx install \
+  --pip-args='--index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ --extra-index-url https://pypi.org/simple/' \
+  "molecules-workspace-runtime==0.4.0"
 ```
 
 ## Contributing
@@ -235,16 +246,17 @@ Releases are **automatic on a green merge to `main`** (CTO standing directive,
    protected `main` is never mutated and no token is written to disk.
 4. The tag trips `publish-runtime.yml` → builds wheel + sdist → publishes to the
    Gitea package registry → its `propagate` job opens `.runtime-version` bump PRs
-   on each consumer template. Merging a template bump trips that template's
-   `publish-image.yml`, which bakes the pinned wheel into a fresh image, pushes
-   ECR `:latest` + `:sha-<7>`, and auto-promotes the digest into the
-   control-plane `runtime_image_pins` (prod + staging). Agents boot from the
+   on each of the four maintained workspace templates. Merging a template bump
+   trips that template's `publish-image.yml`, which bakes the pinned wheel into a
+   fresh image, pushes ECR `:latest` + `:sha-<7>`, and auto-promotes the digest
+   into the control-plane staging `runtime_image_pins`. Agents boot from the
    promoted pinned image (runtime baked at build, not pip-installed at boot).
+   Production pin promotion remains a separate, explicit operation while the
+   production freeze is in effect.
 
-**Loop guard:** the bump commit is authored by the release bot and its message
-carries `[skip-bump]`; `auto-release.yml`'s `guard` job skips when `github.actor`
-is the bot OR the HEAD message contains `[skip-bump]`. The tag push does not match
-`on: push: branches:[main]`, so cutting the tag never re-enters `auto-release.yml`.
+**Loop safety:** the release bot creates a tag only; there is no bump commit or
+bot-actor guard. The tag push does not match `on: push: branches:[main]`, so
+cutting the tag never re-enters `auto-release.yml`.
 
 **Manual bump (escape hatch):** edit `version =` in `pyproject.toml` in a PR and
 tag `runtime-vX.Y.Z` on `main` post-merge; `publish-runtime.yml` still fires on
@@ -252,13 +264,15 @@ any `runtime-v*` tag.
 
 ## Consumer pinning
 
-Monorepo `workspace-server` (and the 8 workspace template Dockerfiles) pin
-this package by exact version:
+The four maintained workspace templates pin this package by exact version.
+Molecule Core installs the published wheel separately and does not carry a
+`.runtime-version` template pin.
 
 ```dockerfile
 RUN pip install --no-cache-dir \
     --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
-    molecule-ai-workspace-runtime==0.2.0
+    --extra-index-url https://pypi.org/simple/ \
+    molecules-workspace-runtime==0.4.0
 ```
 
 The version bump in this repo is the gating event; consumers pick up the
@@ -267,9 +281,9 @@ directly).
 
 ## Architecture: why a separate repo
 
-The runtime needs to ship as a PyPI artifact (so the 8 workspace template
-images can `pip install` it AND so operators can run `molecule-mcp` outside
-our container fleet) while still evolving fast.
+The runtime needs to ship as a PyPI artifact (so the four maintained workspace
+template images can `pip install` it AND so operators can run `molecule-mcp`
+outside our container fleet) while still evolving fast.
 
 A standalone editable repo with independent CI cadence avoids two problems
 the previous mirror arrangement had:
