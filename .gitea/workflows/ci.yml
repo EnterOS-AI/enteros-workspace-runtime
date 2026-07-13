@@ -226,6 +226,12 @@ jobs:
           from molecule_runtime.llm_auth import normalise_llm_env
           from molecule_runtime.credential_helper import install_credential_helper
           from molecule_runtime.precommit_hook import install_pre_commit_hook
+          import importlib
+          import molecule_runtime.plugins_registry as canonical_registry
+          legacy_registry = importlib.import_module('plugins_registry')
+          assert legacy_registry.resolve is canonical_registry.resolve
+          assert importlib.import_module('plugins_registry.builtins') is importlib.import_module('molecule_runtime.plugins_registry.builtins')
+          assert importlib.import_module('plugins_registry.protocol') is importlib.import_module('molecule_runtime.plugins_registry.protocol')
           print('smoke-import: all canonical surfaces import cleanly')
           "
           # CLI entry-point — molecule-mcp must be installed + show help.

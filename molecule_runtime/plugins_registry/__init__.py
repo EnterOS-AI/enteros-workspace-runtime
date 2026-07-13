@@ -4,12 +4,14 @@ Resolution order for ``(plugin_name, runtime)``:
 
   1. Platform registry  → ``workspace/plugins_registry/<plugin>/<runtime>.py``
   2. Plugin-shipped     → ``<plugin_root>/adapters/<runtime>.py``
-  3. Raw filesystem     → :class:`RawDropAdaptor` (warns, drops files only)
+  3. MCP-shaped default → :class:`MCPServerAdaptor`
+  4. Skill-shaped default → :class:`AgentskillsAdaptor`
+  5. Raw filesystem     → :class:`RawDropAdaptor` (warns, drops files only)
 
 Path #1 wins so the platform can override or hot-fix a third-party adaptor
 without forking the upstream plugin repo. Path #2 is the SDK contract: a
 single GitHub repo ships its own adaptors and is installable on day one.
-Path #3 is the escape hatch — power users can still bring unsupported
+Path #5 is the escape hatch — power users can still bring unsupported
 plugins onto a workspace, they just don't get tools wired up.
 
 A registered adaptor module must expose either:
@@ -61,11 +63,18 @@ def _load_module_from_path(module_name: str, path: Path):
     # from ... import statements resolve correctly.
     import sys
     import molecule_runtime.plugins_registry as plugins_registry
-    sys.modules.setdefault("plugins_registry", plugins_registry)
+
+    # Always repair the legacy aliases to the canonical module objects. Importing
+    # through ``plugins_registry.<sub>`` after aliasing only the package would
+    # execute the same source a second time under a different module name,
+    # splitting class identity and registry state.
+    sys.modules["plugins_registry"] = plugins_registry
     for _sub in ("builtins", "protocol", "raw_drop"):
         try:
-            sub = importlib.import_module(f"plugins_registry.{_sub}")
-            sys.modules.setdefault(f"plugins_registry.{_sub}", sub)
+            sub = importlib.import_module(
+                f"molecule_runtime.plugins_registry.{_sub}"
+            )
+            sys.modules[f"plugins_registry.{_sub}"] = sub
         except Exception:
             # Submodule may not exist in all versions; skip if absent.
             pass
@@ -137,7 +146,8 @@ def resolve(
     """Resolve the adaptor for ``(plugin_name, runtime)``.
 
     Returns ``(adaptor, source)`` where ``source`` is one of
-    :class:`AdaptorSource` (``"registry"``, ``"plugin"``, ``"raw_drop"``).
+    :class:`AdaptorSource` (registry, plugin, MCP default, agentskills default,
+    or raw-drop).
     Always returns an adaptor — the raw-drop fallback ensures plugin installs
     never hard-fail on missing adaptors; instead the warning is surfaced via
     :class:`InstallResult.warnings`.
