@@ -75,6 +75,28 @@ def test_openclaw_privileged_mcp_resolves_to_mcp_adaptor(tmp_path):
     assert not isinstance(adaptor, RawDropAdaptor)
 
 
+def test_canonical_manifest_mcp_resolves_to_mcp_adaptor(tmp_path):
+    """SDK-generated MCP plugins wire tools without legacy JSON descriptors."""
+    from molecule_runtime.plugins_registry import AdaptorSource, resolve
+    from molecule_runtime.plugins_registry.builtins import MCPServerAdaptor
+
+    (tmp_path / "plugin.yaml").write_text(
+        "name: demo-mcp\n"
+        "version: 0.1.0\n"
+        "description: demo\n"
+        "contributes:\n"
+        "  mcpServers:\n"
+        "    - name: demo-mcp\n"
+        "      command: python\n"
+        "      args: [server.py]\n"
+    )
+
+    adaptor, source = resolve("demo-mcp", "codex", tmp_path)
+
+    assert source == AdaptorSource.MCP_SERVER
+    assert isinstance(adaptor, MCPServerAdaptor)
+
+
 if __name__ == "__main__":
     test_load_adapter_with_plugins_registry_import()
     test_load_adapter_with_full_plugins_registry_import()

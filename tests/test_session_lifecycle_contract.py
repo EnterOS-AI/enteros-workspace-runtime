@@ -67,8 +67,8 @@ def test_capability_flag_is_additive_and_off_by_default():
     d = caps.to_dict()
     assert d["session_lifecycle"] is False
     assert d["session"] is False  # provides_native_session unchanged
-    # Every other existing flag still defaults False — no behavior flipped.
-    assert not any(d.values())
+    # Runtime-level channel dispatch is the sole non-adapter default capability.
+    assert {name for name, enabled in d.items() if enabled} == {"channel_dispatch"}
 
 
 @pytest.mark.asyncio

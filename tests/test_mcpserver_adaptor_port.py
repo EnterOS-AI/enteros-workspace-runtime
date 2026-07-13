@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -58,6 +61,40 @@ def test_read_descriptor_prefers_mcp_servers_json(tmp_path):
     assert _read_mcp_descriptor(root) == {"new": {"command": "b"}}
 
 
+def test_read_descriptor_from_canonical_plugin_manifest(tmp_path):
+    root = tmp_path / "plugin"
+    root.mkdir()
+    (root / "plugin.yaml").write_text(
+        "name: demo-mcp\n"
+        "version: 0.1.0\n"
+        "description: demo\n"
+        "contributes:\n"
+        "  mcpServers:\n"
+        "    - name: demo-mcp\n"
+        "      command: python\n"
+        "      args: [server.py]\n"
+    )
+
+    assert _read_mcp_descriptor(root) == {
+        "demo-mcp": {"command": "python", "args": ["server.py"]}
+    }
+
+
+def test_read_descriptor_does_not_follow_manifest_symlink(tmp_path):
+    root = tmp_path / "plugin"
+    root.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text(
+        "contributes:\n"
+        "  mcpServers:\n"
+        "    - name: escaped\n"
+        "      command: outside\n"
+    )
+    (root / "plugin.yaml").symlink_to(outside)
+
+    assert _read_mcp_descriptor(root) == {}
+
+
 @pytest.mark.asyncio
 async def test_install_routes_each_server_through_port(tmp_path):
     """install() calls ctx.register_mcp_server per descriptor entry — it does
@@ -81,6 +118,66 @@ async def test_install_routes_each_server_through_port(tmp_path):
     # The adaptor itself wrote no claude settings.json — the PORT (which we
     # stubbed) owns that. This is the #3159 separation.
     assert not (configs / ".claude" / "settings.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_generated_mcp_server_launches_from_runtime_working_directory(tmp_path):
+    """The SDK scaffold declares ``python server.py`` relative to its plugin.
+
+    Runtime MCP processes start from the workspace/runtime working directory,
+    so the adaptor must make plugin-local executable arguments location-safe
+    before handing them to the native renderer.
+    """
+    root = tmp_path / "generated-mcp"
+    root.mkdir()
+    (root / "plugin.yaml").write_text(
+        "name: generated-mcp\n"
+        "version: 0.1.0\n"
+        "description: generated MCP scaffold\n"
+        "kind: mcp-server\n"
+        "contributes:\n"
+        "  mcpServers:\n"
+        "    - name: generated-mcp\n"
+        "      command: python\n"
+        "      args: [server.py]\n"
+    )
+    (root / "server.py").write_text(
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], "
+        "'result': {'content': [{'type': 'text', 'text': 'hello'}]}}), flush=True)\n"
+    )
+    unrelated_cwd = tmp_path / "runtime-cwd"
+    unrelated_cwd.mkdir()
+    test_bin = tmp_path / "bin"
+    test_bin.mkdir()
+    (test_bin / "python").symlink_to(sys.executable)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    calls = []
+
+    await MCPServerAdaptor("generated-mcp", "claude_code").install(
+        _ctx(root, configs, lambda n, s: calls.append((n, s)))
+    )
+
+    assert len(calls) == 1
+    name, spec = calls[0]
+    assert name == "generated-mcp"
+    assert spec["args"] == [str((root / "server.py").resolve())]
+    process = subprocess.run(
+        [spec["command"], *spec["args"]],
+        input='{"jsonrpc":"2.0","id":1,"method":"tools/call"}\n',
+        cwd=unrelated_cwd,
+        env={**os.environ, "PATH": f"{test_bin}{os.pathsep}{os.environ.get('PATH', '')}"},
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    response = json.loads(process.stdout)
+    assert response["result"]["content"][0]["text"] == "hello"
 
 
 @pytest.mark.asyncio

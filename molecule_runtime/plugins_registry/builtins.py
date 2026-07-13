@@ -19,12 +19,14 @@ Shape taxonomy (one class per shape; add more as the ecosystem evolves):
   we support (the spec's filesystem layout makes activation trivial on
   Claude Code, and our adapter code does the equivalent on the other
   runtimes we support). **This is the default and covers the common case.**
+* :class:`MCPServerAdaptor` — consumes canonical
+  ``plugin.yaml`` ``contributes.mcpServers`` entries (plus legacy JSON
+  descriptors) and registers them through the active runtime's MCP port.
 
-Planned as the ecosystem matures (none are implemented yet — rule of
+Planned as the ecosystem matures (rule of
 three: promote a class here only after 3+ plugins ship the same custom
 shape via their own ``adapters/<runtime>.py``):
 
-* :class:`MCPServerAdaptor` — install a plugin as an MCP server ✅ (issue #847)
 * ``SubagentAdaptor`` — register a runtime-native sub-agent *(backlog)*
 * ``RAGPipelineAdaptor`` — wire a retriever + index *(backlog)*
 * ``SwarmAdaptor`` — bind a multi-agent swarm *(backlog)*
@@ -43,6 +45,8 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+
+import yaml
 
 from .protocol import SKILLS_SUBDIR, InstallContext, InstallResult
 
@@ -464,18 +468,46 @@ def _deep_merge_hooks(existing: dict, fragment: dict) -> dict:
 def _read_mcp_descriptor(plugin_root: Path) -> dict[str, dict]:
     """Parse the runtime-agnostic ``mcpServers`` descriptor a plugin ships.
 
-    The plugin is the SSOT for the descriptor (RFC §2b). Today it is carried in
-    ``settings-fragment.json``'s ``mcpServers`` block — historically the Claude
-    adapter's *rendering*, now read as the canonical descriptor and re-rendered
-    per runtime via the MCP-wiring PORT. A dedicated ``mcp-servers.json`` (a
-    pure descriptor, no Claude framing) takes precedence if present, so a plugin
-    can drop the Claude-specific filename entirely once consumers migrate.
+    The canonical SDK contract is ``plugin.yaml``'s
+    ``contributes.mcpServers`` list. Legacy plugins may instead carry a dedicated
+    ``mcp-servers.json`` descriptor or a Claude-shaped
+    ``settings-fragment.json``. The canonical manifest wins when more than one
+    form is present, so generated plugins have one source of truth.
 
-    Returns ``{name: spec}`` (possibly empty). Malformed JSON yields ``{}``.
+    Returns ``{name: spec}`` (possibly empty). Malformed descriptors are ignored.
     """
+    manifest_path = plugin_root / "plugin.yaml"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            manifest = yaml.safe_load(manifest_path.read_text())
+        except (OSError, yaml.YAMLError):
+            manifest = None
+        if isinstance(manifest, dict):
+            contributes = manifest.get("contributes")
+            entries = (
+                contributes.get("mcpServers")
+                if isinstance(contributes, dict)
+                else None
+            )
+            if isinstance(entries, list):
+                servers: dict[str, dict] = {}
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = entry.get("name")
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    spec = {
+                        key: value for key, value in entry.items() if key != "name"
+                    }
+                    if spec:
+                        servers[name] = spec
+                if servers:
+                    return servers
+
     for candidate in ("mcp-servers.json", "settings-fragment.json"):
         path = plugin_root / candidate
-        if not path.is_file():
+        if not path.is_file() or path.is_symlink():
             continue
         try:
             data = json.loads(path.read_text())
@@ -491,13 +523,53 @@ def _read_mcp_descriptor(plugin_root: Path) -> dict[str, dict]:
     return {}
 
 
+def _resolve_plugin_local_mcp_paths(plugin_root: Path, spec: dict) -> dict:
+    """Make direct plugin-local command/argument paths launch-location safe.
+
+    Native MCP renderers persist ``command`` and ``args`` and the runtime later
+    launches them from its own working directory.  SDK scaffolds intentionally
+    use the portable ``python server.py`` shape, so any relative value that
+    names a real regular file inside the plugin is rewritten to its absolute
+    path. Flags, package names, URLs, absolute paths, missing files, symlinks,
+    and paths escaping the plugin root remain untouched.
+    """
+    resolved = dict(spec)
+    try:
+        root = plugin_root.resolve(strict=True)
+    except OSError:
+        return resolved
+
+    def local_file(value: object) -> object:
+        if not isinstance(value, str) or not value or Path(value).is_absolute():
+            return value
+        candidate = plugin_root / value
+        try:
+            if candidate.is_symlink():
+                return value
+            target = candidate.resolve(strict=True)
+            target.relative_to(root)
+            if not target.is_file():
+                return value
+        except (OSError, ValueError):
+            return value
+        return str(target)
+
+    if "command" in resolved:
+        resolved["command"] = local_file(resolved["command"])
+    args = resolved.get("args")
+    if isinstance(args, list):
+        resolved["args"] = [local_file(arg) for arg in args]
+    return resolved
+
+
 class MCPServerAdaptor:
     """Sub-type adaptor for plugins that wrap an MCP server.
 
     The plugin ships:
 
-    * ``settings-fragment.json`` with an ``mcpServers`` block — standard
-      Claude Code ``claude_desktop_config`` format, e.g.:
+    * canonical ``plugin.yaml`` with ``contributes.mcpServers``. Legacy
+      ``mcp-servers.json`` and Claude-shaped ``settings-fragment.json``
+      descriptors remain accepted during migration, e.g.:
 
       .. code-block:: json
 
@@ -519,8 +591,8 @@ class MCPServerAdaptor:
 
     On ``install()``:
 
-      1. The ``mcpServers`` descriptor (from ``mcp-servers.json`` or
-         ``settings-fragment.json``) is parsed and each entry is wired via the
+      1. The ``mcpServers`` descriptor (canonical manifest or legacy JSON) is
+         parsed and each entry is wired via the
          MCP-wiring PORT: ``ctx.register_mcp_server(name, spec)``. The active
          runtime's adapter renders the descriptor into the file IT reads —
          ``.claude/settings.json`` for Claude Code (the default hook),
@@ -567,7 +639,9 @@ class MCPServerAdaptor:
         descriptor = _read_mcp_descriptor(ctx.plugin_root)
         for name, spec in descriptor.items():
             try:
-                ctx.register_mcp_server(name, spec)
+                ctx.register_mcp_server(
+                    name, _resolve_plugin_local_mcp_paths(ctx.plugin_root, spec)
+                )
                 ctx.logger.info("%s: wired MCP server %r via register_mcp_server (runtime=%s)",
                                 self.plugin_name, name, self.runtime)
             except NotImplementedError as exc:

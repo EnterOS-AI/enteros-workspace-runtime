@@ -1,12 +1,14 @@
 """Plugin-declared channel daemons — manifest-declared long-running sidecars.
 
-PR-1 of issue #215 (daemon lifecycle only). A plugin can declare a
+PR-1 of issue #215 introduced the daemon lifecycle. A plugin can declare a
 long-running daemon — e.g. a channel bridge like ``lark-channel-molecule`` —
 under ``contributes.daemons`` in its ``plugin.yaml``; the workspace runtime
 spawns it at boot, restarts it on crash, and kills it with the workspace. The
 connected workspace owns its channel processes — no CP supervision domain.
-The local event socket / runtime-stamped provenance / turn-complete lane is
-PR-2 and intentionally absent here.
+PR-2 adds the private local A2A binding in :mod:`molecule_runtime.channel_events`;
+this module's post-bind starter coordinates that binding before spawn. Only a
+plugin whose manifest declares ``kind: channel`` receives that capability;
+other supervised daemons never inherit or receive its reserved environment.
 
 Manifest shape (mirrors the ``mcpServerContribution`` descriptor —
 ``name`` + ``command``/``args?``/``env?`` — rather than inventing a new one;
@@ -14,6 +16,7 @@ Manifest shape (mirrors the ``mcpServerContribution`` descriptor —
 ``contributes.additionalProperties: true``, so it never fails the
 molecule-core#3383 install/load gates)::
 
+    kind: channel
     contributes:
       daemons:
         - name: bridge
@@ -62,6 +65,7 @@ class DaemonSpec:
     name: str
     command: list[str]  # full argv ([command, *args] from the manifest entry)
     plugin: str = ""  # owning plugin name (log context; PR-2 identity anchor)
+    kind: str = ""  # owning manifest kind; only "channel" gets local A2A
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
 
@@ -73,7 +77,10 @@ class DaemonSpec:
 
 
 def daemon_specs_from_manifest(
-    plugin_name: str, plugin_path: str, raw_daemons: object
+    plugin_name: str,
+    plugin_path: str,
+    raw_daemons: object,
+    plugin_kind: str = "",
 ) -> list[DaemonSpec]:
     """Parse a manifest's ``contributes.daemons`` value into specs.
 
@@ -109,6 +116,7 @@ def daemon_specs_from_manifest(
             DaemonSpec(
                 name=entry["name"],
                 plugin=plugin_name,
+                kind=plugin_kind,
                 command=[entry["command"], *entry.get("args", [])],
                 env={k: str(v) for k, v in (entry.get("env") or {}).items()},
                 cwd=cwd,
@@ -154,9 +162,38 @@ def discover_daemon_specs(
         or os.environ.get("PLUGINS_DIR", "/plugins"),
     )
     specs: list[DaemonSpec] = []
+    channel_identity_paths: dict[str, str] = {}
+    daemon_keys: set[str] = set()
     for plugin in loaded.plugins:
         raw = plugin.manifest.contributes.get("daemons")
-        specs.extend(daemon_specs_from_manifest(plugin.name, plugin.path, raw))
+        # Channel provenance is the validated manifest identity, not the
+        # checkout/install directory (which is commonly the repository name
+        # and may differ after a rename). Keep the established directory-name
+        # identity for generic daemons, whose supervisor keys predate this API.
+        daemon_owner = str(
+            plugin.manifest.name
+            if plugin.manifest.kind == "channel"
+            else plugin.name
+        ).strip()
+        plugin_specs = daemon_specs_from_manifest(
+            daemon_owner,
+            plugin.path,
+            raw,
+            plugin_kind=plugin.manifest.kind,
+        )
+        if plugin_specs and plugin.manifest.kind == "channel":
+            prior_path = channel_identity_paths.get(daemon_owner)
+            if prior_path is not None and prior_path != plugin.path:
+                raise ValueError(
+                    f"duplicate channel plugin identity {daemon_owner!r}: "
+                    f"{prior_path!r} and {plugin.path!r}"
+                )
+            channel_identity_paths[daemon_owner] = plugin.path
+        for spec in plugin_specs:
+            if spec.key in daemon_keys:
+                raise ValueError(f"duplicate plugin daemon key {spec.key!r}")
+            daemon_keys.add(spec.key)
+        specs.extend(plugin_specs)
     if specs:
         logger.info(
             "discovered %d plugin daemon(s): %s",
@@ -288,10 +325,27 @@ class DaemonSupervisor:
 
     def _spawn(self, spec: DaemonSpec) -> subprocess.Popen | None:
         """Popen the daemon in its own session/pgroup; None on failure."""
+        # The local A2A socket is a runtime-issued capability, not an ordinary
+        # workspace env var.  Never inherit a stale/operator-supplied parent
+        # value; ChannelEventSocketManager publishes authoritative values into
+        # spec.env only after its private listener is bound and chmodded.
+        from molecule_runtime.channel_events import (
+            CHANNEL_A2A_SOCKET_ENV,
+            CHANNEL_A2A_TOKEN_ENV,
+            CHANNEL_API_VERSION_ENV,
+            CHANNEL_PLUGIN_ID_ENV,
+        )
+
+        child_env = dict(os.environ)
+        child_env.pop(CHANNEL_API_VERSION_ENV, None)
+        child_env.pop(CHANNEL_A2A_SOCKET_ENV, None)
+        child_env.pop(CHANNEL_A2A_TOKEN_ENV, None)
+        child_env.pop(CHANNEL_PLUGIN_ID_ENV, None)
+        child_env.update(spec.env)
         try:
             proc = subprocess.Popen(
                 spec.command,
-                env={**os.environ, **spec.env},
+                env=child_env,
                 cwd=spec.cwd or None,
                 start_new_session=True,  # own pgroup — group kill reaps grandchildren
             )
@@ -399,6 +453,7 @@ async def start_supervisor_when_bound(
     server,
     supervisor,
     *,
+    event_transport=None,
     poll_interval: float = 0.25,
     max_wait_seconds: float = 60.0,
 ) -> bool:
@@ -419,5 +474,18 @@ async def start_supervisor_when_bound(
             "plugin daemons: uvicorn not reported bound after %.0fs; "
             "starting daemons anyway", max_wait_seconds,
         )
+    # PR-2: bind the existing A2A app on the private per-plugin socket before
+    # any channel daemon starts. A bind failure withholds the channel
+    # capability but does not block generic daemon supervision or agent boot.
+    if event_transport is not None:
+        try:
+            await event_transport.start()
+        except Exception as e:  # noqa: BLE001 — daemon supervision + agent boot survive
+            logger.error(
+                "plugin daemons: local channel event socket unavailable (%s); "
+                "starting without the local capability",
+                e,
+            )
+            event_transport.clear_daemon_env()
     supervisor.start()
     return True

@@ -46,9 +46,10 @@ Two accepted source forms (any forge)
   * ``gitea://owner/repo[/subpath][#ref]`` — host resolved from config
     (``MOLECULE_GITEA_BASE_URL``); back-compat form, ``#ref`` default ``main``.
   * a full git URL — ``https://host/owner/repo[.git/subpath][#ref]`` (also
-    ``http://``, ``git+https://``, ``git+http://``) — self-contained host, works
-    for github/gitlab/self-hosted. A ``.git/`` in the path delimits the repo
-    from an in-repo subpath.
+    ``git+https://``) — self-contained host, works for
+    github/gitlab/self-hosted. Plain HTTP is rejected so plugin code and any
+    configured repository credential never cross an unauthenticated transport.
+    A ``.git/`` in the path delimits the repo from an in-repo subpath.
 Any other scheme (e.g. ``github://``, ``presign://``) is skipped + logged,
 exactly like the shell.
 
@@ -98,6 +99,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -134,12 +136,53 @@ _CRED_TOKEN_ENVVAR = "MOLECULE_GIT_CRED_TOKEN"
 
 # Git URL schemes accepted as a full self-contained source (any forge). ``git+``
 # variants are normalized to plain http(s) for the actual clone.
-_GIT_URL_SCHEMES = ("https", "http", "git+https", "git+http")
+_GIT_URL_SCHEMES = ("https", "git+https")
 
 # Clone timeout — mirrors the shell ``--max-time``/``timeout`` guard. Overridable
 # so an operator on a slow link can widen it without a code change.
 _DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 _FETCH_TIMEOUT_ENV = "MOLECULE_PLUGIN_FETCH_TIMEOUT"
+
+_URL_USERINFO_RE = re.compile(r"(?i)\b((?:git\+)?https?://)[^/\s@]+@")
+_URL_QUERY_VALUE_RE = re.compile(r"([?&][^=\s&]+)=[^&\s]+")
+_URL_FRAGMENT_RE = re.compile(
+    r"((?:git\+)?https?://[^\s#]+)#[^\s]+", re.IGNORECASE
+)
+
+
+def _redact_log_text(value: object, *secrets: str) -> str:
+    """Remove credentials from untrusted text before it reaches a log."""
+    text = str(value)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    text = _URL_USERINFO_RE.sub(r"\1<redacted>@", text)
+    text = _URL_QUERY_VALUE_RE.sub(r"\1=<redacted>", text)
+    return _URL_FRAGMENT_RE.sub(r"\1#<redacted>", text)
+
+
+def _source_log_label(raw: str) -> str:
+    """Return a useful source label without userinfo, query, or ref values."""
+    try:
+        parts = urlsplit(raw)
+        scheme = parts.scheme.lower()
+        hostname = parts.hostname
+        port = parts.port
+        has_userinfo = parts.username is not None or parts.password is not None
+    except (TypeError, ValueError):
+        return "<invalid plugin source>"
+    if not scheme:
+        return "<invalid plugin source>"
+
+    host = hostname or "<invalid-host>"
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None:
+        host = f"{host}:{port}"
+    userinfo = "<redacted>@" if has_userinfo else ""
+    query = "?<redacted>" if parts.query else ""
+    fragment = "#<ref>" if parts.fragment else ""
+    return f"{scheme}://{userinfo}{host}{parts.path}{query}{fragment}"
 
 
 @dataclass(frozen=True)
@@ -197,6 +240,35 @@ class InstallReport:
 # ---------------------------------------------------------------------------
 # Parsing — pure, side-effect-light (logs skips like the shell), unit-testable.
 # ---------------------------------------------------------------------------
+def _is_safe_install_name(name: str) -> bool:
+    """Return whether *name* is one portable directory entry.
+
+    Source names become children of the private staging directory. Reject dot
+    components and either platform's separator so that contract remains safe
+    if parsing or installation is reused outside the current Linux runtime.
+    """
+    return bool(name) and name not in {".", ".."} and not any(
+        marker in name for marker in ("/", "\\", "\x00")
+    )
+
+
+def _install_destination(staging_dir: Path, name: str) -> Path:
+    """Resolve a source destination and prove it remains below staging."""
+    if not _is_safe_install_name(name):
+        raise ValueError(f"unsafe plugin install name: {name!r}")
+
+    staging_root = staging_dir.resolve()
+    destination = staging_dir / name
+    resolved_destination = destination.resolve()
+    try:
+        resolved_destination.relative_to(staging_root)
+    except ValueError as exc:
+        raise ValueError(f"plugin destination escapes staging: {name!r}") from exc
+    if resolved_destination == staging_root:
+        raise ValueError(f"plugin destination is staging root: {name!r}")
+    return destination
+
+
 def _parse_gitea(token: str) -> PluginSource | None:
     """Parse a ``gitea://owner/repo[/subpath][#ref]`` token (host resolved later).
 
@@ -204,6 +276,16 @@ def _parse_gitea(token: str) -> PluginSource | None:
     last path segment of subpath else repo; a structurally-invalid spec is
     skipped + logged like the shell's ``bad source`` branch.
     """
+    try:
+        parts = urlsplit(token)
+        has_userinfo = parts.username is not None or parts.password is not None
+    except ValueError:
+        log.info("[plugins] bad source: %s", _source_log_label(token))
+        return None
+    if has_userinfo or parts.query:
+        log.info("[plugins] bad source: %s", _source_log_label(token))
+        return None
+
     spec = token.split("://", 1)[1]
 
     # '#ref' suffix -> ref; default 'main'. Faithful to the shell:
@@ -219,8 +301,8 @@ def _parse_gitea(token: str) -> PluginSource | None:
     # name = last path segment of subpath, else repo (entrypoint.sh:255-256)
     name = subpath.rsplit("/", 1)[-1] if subpath else repo
 
-    if not owner or not repo or not name:
-        log.info("[plugins] bad source: %s", token)
+    if not owner or not repo or not _is_safe_install_name(name):
+        log.info("[plugins] bad source: %s", _source_log_label(token))
         return None
 
     return PluginSource(
@@ -235,23 +317,38 @@ def _parse_gitea(token: str) -> PluginSource | None:
 
 
 def _parse_git_url(token: str) -> PluginSource | None:
-    """Parse a full git URL source (``https|http|git+https|git+http://...``).
+    """Parse a full git URL source (``https|git+https://...``).
 
     Self-contained host; ``#ref`` default ``main``. A ``.git/`` in the path
     delimits the repo (clone target) from an in-repo subpath; otherwise the whole
     path is the repo and there is no subpath. ``name`` = last subpath segment
     else the repo's last segment (trailing ``.git`` stripped). Malformed → skip.
     """
-    parts = urlsplit(token)
+    try:
+        parts = urlsplit(token)
+        username = parts.username
+        password = parts.password
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        log.info("[plugins] bad source: %s", _source_log_label(token))
+        return None
     scheme = parts.scheme.lower()
     # Normalize git+https -> https for the actual clone URL.
     clone_scheme = scheme[len("git+"):] if scheme.startswith("git+") else scheme
-    host = parts.netloc
+    if username is not None or password is not None or parts.query:
+        log.info("[plugins] bad source: %s", _source_log_label(token))
+        return None
+    host = hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None:
+        host = f"{host}:{port}"
     ref = parts.fragment or "main"
     path = parts.path
 
     if not host or not path.strip("/"):
-        log.info("[plugins] bad source: %s", token)
+        log.info("[plugins] bad source: %s", _source_log_label(token))
         return None
 
     # Split repo vs in-repo subpath on a ``.git/`` delimiter (optional).
@@ -270,8 +367,8 @@ def _parse_git_url(token: str) -> PluginSource | None:
         repo_seg = repo_seg[: -len(".git")]
     name = subpath.rsplit("/", 1)[-1] if subpath else repo_seg
 
-    if not name:
-        log.info("[plugins] bad source: %s", token)
+    if not _is_safe_install_name(name):
+        log.info("[plugins] bad source: %s", _source_log_label(token))
         return None
 
     return PluginSource(
@@ -293,11 +390,11 @@ def _parse_one(token: str) -> PluginSource | None:
     ``skip unsupported source`` / ``bad source`` branches.
     """
     if "://" not in token:
-        log.info("[plugins] skip unsupported source: %s", token)
+        log.info("[plugins] skip unsupported source: %s", _source_log_label(token))
         return None
     scheme = token.split("://", 1)[0].lower()
     if scheme not in _PROVIDERS:
-        log.info("[plugins] skip unsupported source: %s", token)
+        log.info("[plugins] skip unsupported source: %s", _source_log_label(token))
         return None
     if scheme == "gitea":
         return _parse_gitea(token)
@@ -424,6 +521,13 @@ def _git_fetch_tree(
     pinning a declared plugin to a bare SHA is unsupported by this git-native
     fetch and would need an ``init``+``fetch``+``checkout`` variant.
     """
+    if token and scheme.lower() != "https":
+        log.warning(
+            "[plugins] refusing credential over non-HTTPS source: %s",
+            _source_log_label(raw),
+        )
+        return None
+
     clone_dir = workdir / "clone"
 
     cmd = [git_binary]
@@ -452,12 +556,12 @@ def _git_fetch_tree(
             env=child_env,
         )
     except (subprocess.SubprocessError, OSError) as exc:
-        # The clone URL is token-free by construction, so it is safe to surface;
-        # git never echoes the credential to stderr. Truncate for log hygiene.
         stderr = (getattr(exc, "stderr", "") or "").strip()
         log.warning(
             "[plugins] fetch/extract failed: %s (%s) %s",
-            raw, exc.__class__.__name__, stderr[:500],
+            _source_log_label(raw),
+            exc.__class__.__name__,
+            _redact_log_text(stderr, token, ref)[:500],
         )
         return None
 
@@ -468,11 +572,17 @@ def _git_fetch_tree(
 
     content_dir = clone_dir / subpath if subpath else clone_dir
     if not _is_within(clone_dir, content_dir):
-        log.warning("[plugins] subpath escapes repo: %s (%s)", subpath, raw)
+        log.warning(
+            "[plugins] subpath escapes repo: %s (%s)",
+            _redact_log_text(subpath, token),
+            _source_log_label(raw),
+        )
         return None
     if not content_dir.is_dir():
         log.warning(
-            "[plugins] subpath not in repo: %s (%s)", subpath, raw
+            "[plugins] subpath not in repo: %s (%s)",
+            _redact_log_text(subpath, token),
+            _source_log_label(raw),
         )
         return None
     return content_dir
@@ -492,12 +602,14 @@ def _fetch_gitea(
 ) -> Path | None:
     """Resolve the gitea host from config and git-clone ``owner/repo``."""
     base = base_url.rstrip("/")
-    host = urlsplit(base).netloc
+    base_parts = urlsplit(base)
+    host = base_parts.netloc
+    clone_scheme = base_parts.scheme.lower()
     clone_url = f"{base}/{source.owner}/{source.repo}.git"
     return _git_fetch_tree(
         clone_url=clone_url,
         host=host,
-        scheme="https",
+        scheme=clone_scheme,
         ref=source.ref,
         subpath=source.subpath,
         raw=source.raw,
@@ -537,13 +649,11 @@ def _fetch_git_url(
 # A future provider registers its scheme here and ``parse_declared_plugins``
 # accepts it automatically (the source-provider-ecosystem seam).
 #   * ``gitea``                              — host from config, box clones itself.
-#   * ``https``/``http``/``git+https``/``git+http`` — full self-contained git URL.
+#   * ``https``/``git+https`` — full self-contained git URL.
 _PROVIDERS: dict[str, Callable[..., "Path | None"]] = {
     "gitea": _fetch_gitea,
     "https": _fetch_git_url,
-    "http": _fetch_git_url,
     "git+https": _fetch_git_url,
-    "git+http": _fetch_git_url,
 }
 
 
@@ -609,6 +719,31 @@ def install_declared_plugins(
     target_dir = _resolve_plugins_dir(env, plugins_dir)
     report.plugins_dir = str(target_dir)
 
+    # Every source must own one distinct child directory. ``copytree`` with
+    # ``dirs_exist_ok=True`` would otherwise merge two same-basename sources,
+    # allowing later files to overwrite earlier ones and (for a bare-skill
+    # source) inherit another source's plugin.yaml during manifest validation.
+    # Reject the whole desired set before any fetch so the last promoted tree
+    # remains intact.
+    sources_by_name: dict[str, list[PluginSource]] = {}
+    for source in sources:
+        sources_by_name.setdefault(source.name, []).append(source)
+    collisions = {
+        name: grouped
+        for name, grouped in sources_by_name.items()
+        if len(grouped) > 1
+    }
+    if collisions:
+        for name, grouped in collisions.items():
+            log.warning(
+                "[plugins] duplicate install destination %r from %s — "
+                "keeping existing plugins tree intact",
+                name,
+                ", ".join(_source_log_label(source.raw) for source in grouped),
+            )
+            report.failed.extend(source.raw for source in grouped)
+        return report
+
     base_url = _resolve_gitea_base(env)
     host_tokens = _host_token_map(env, base_url)
     git_binary = (env.get(_GIT_BINARY_ENV) or "").strip() or _DEFAULT_GIT_BINARY
@@ -647,8 +782,21 @@ def install_declared_plugins(
         for source in sources:
             fetch = _PROVIDERS.get(source.scheme)
             if fetch is None:  # defensive — parse already filtered unknown schemes
-                log.info("[plugins] skip unsupported source: %s", source.raw)
+                log.info(
+                    "[plugins] skip unsupported source: %s",
+                    _source_log_label(source.raw),
+                )
                 report.skipped.append(source.raw)
+                continue
+            try:
+                dest = _install_destination(staging_dir, source.name)
+            except ValueError as exc:
+                log.warning(
+                    "[plugins] unsafe destination: %s (%s)",
+                    _source_log_label(source.raw),
+                    exc,
+                )
+                report.failed.append(source.raw)
                 continue
             # Resolve the per-host token for THIS source's host. gitea:// resolves
             # its host from base_url; a full URL carries its own host.
@@ -666,11 +814,14 @@ def install_declared_plugins(
                 if content_dir is None:
                     report.failed.append(source.raw)
                     continue
-                dest = staging_dir / source.name
                 try:
                     shutil.copytree(content_dir, dest, dirs_exist_ok=True)
                 except OSError as exc:
-                    log.warning("[plugins] copy failed: %s (%s)", source.raw, exc)
+                    log.warning(
+                        "[plugins] copy failed: %s (%s)",
+                        _source_log_label(source.raw),
+                        exc,
+                    )
                     report.failed.append(source.raw)
                     continue
             # molecule-core#3383 plugin-manifest SSOT gate. advisory_check
@@ -694,11 +845,17 @@ def install_declared_plugins(
                 log.warning(
                     "[plugins] SSOT manifest ENFORCEMENT: rejecting %s: "
                     "%d violation(s): %s",
-                    source.raw, len(violations), "; ".join(violations),
+                    _source_log_label(source.raw),
+                    len(violations),
+                    "; ".join(violations),
                 )
                 report.failed.append(source.raw)
                 continue
-            log.info("[plugins] staged %s <- %s", source.name, source.raw)
+            log.info(
+                "[plugins] staged %s <- %s",
+                source.name,
+                _source_log_label(source.raw),
+            )
             report.installed.append(source.raw)
 
         # Atomic swap — ONLY when every declared source materialized. On any

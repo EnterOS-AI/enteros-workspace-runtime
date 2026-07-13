@@ -1808,27 +1808,38 @@ async def main():  # pragma: no cover
             )
         )
 
-    # 9c. Plugin-declared channel daemons (issue #215, PR-1). Manifest-declared
+    # 9c. Plugin-declared channel daemons (issue #215). Manifest-declared
     # long-running sidecars (`contributes.daemons` — e.g. a channel bridge like
     # lark-channel-molecule) are spawned only AFTER uvicorn binds (same gate as
     # the poll-delivery starter above: a bridge posting at the local A2A server
     # must never race the bind) and terminated in the finally below — daemons
     # die with the workspace. Fail-open for the agent itself: discovery/spawn
     # failures are logged, never fatal, and zero-daemon workspaces skip the
-    # task entirely. The event socket / provenance lane is PR-2.
+    # task entirely. PR-2 binds this SAME built A2A app on a private Unix
+    # socket per plugin identity; the post-bind starter waits for those local
+    # listeners and only then publishes the path + spawns the daemons.
     plugin_daemon_supervisor = None
     plugin_daemon_task = None
+    channel_event_transport = None
     try:
         from molecule_runtime import plugin_daemons
+        from molecule_runtime.channel_events import ChannelEventSocketManager
 
         daemon_specs = plugin_daemons.discover_daemon_specs(
             workspace_plugins_dir=os.path.join(config_path, "plugins"),
         )
         if daemon_specs:
             plugin_daemon_supervisor = plugin_daemons.DaemonSupervisor(daemon_specs)
+            channel_event_transport = ChannelEventSocketManager(
+                built_app,
+                daemon_specs,
+                log_level=uvicorn_log_level,
+            )
             plugin_daemon_task = asyncio.create_task(
                 plugin_daemons.start_supervisor_when_bound(
-                    server, plugin_daemon_supervisor
+                    server,
+                    plugin_daemon_supervisor,
+                    event_transport=channel_event_transport,
                 )
             )
     except Exception as e:  # noqa: BLE001 — daemons must never block boot
@@ -1868,13 +1879,31 @@ async def main():  # pragma: no cover
         # Cancel the daemon-supervisor starter if it never got past the
         # bind-wait, then terminate any spawned plugin daemons (issue #215 —
         # the workspace owns its channel processes; they die with it).
-        if plugin_daemon_task and not plugin_daemon_task.done():
-            plugin_daemon_task.cancel()
+        if plugin_daemon_task:
+            if not plugin_daemon_task.done():
+                plugin_daemon_task.cancel()
+            # The starter may be inside ChannelEventSocketManager.start().
+            # Await its cancellation so its bind rollback finishes before the
+            # supervisor/socket cleanup below touches the same state.
+            try:
+                await plugin_daemon_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as daemon_start_err:  # noqa: BLE001
+                print(f"Warning: plugin daemon starter failed: {daemon_start_err}")
         if plugin_daemon_supervisor is not None:
             try:
                 plugin_daemon_supervisor.stop()
             except Exception as daemon_stop_err:  # noqa: BLE001
                 print(f"Warning: plugin daemon stop failed: {daemon_stop_err}")
+        if channel_event_transport is not None:
+            try:
+                await channel_event_transport.stop()
+            except Exception as channel_event_stop_err:  # noqa: BLE001
+                print(
+                    "Warning: channel event socket stop failed: "
+                    f"{channel_event_stop_err}"
+                )
 
 def main_sync():  # pragma: no cover
     """Synchronous entry point for the `molecule-runtime` console script.

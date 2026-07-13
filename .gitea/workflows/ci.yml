@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
@@ -51,6 +53,24 @@ jobs:
         # it boots real uvicorn servers and a 50s busy window, too slow for
         # the fast unit lane.
         run: pytest -q --ignore=tests/integration
+
+      - name: Run channel-plugin local A2A contract gate
+        # runtime#215 PR-2: real Unix HTTP binding, source prove-fail,
+        # private filesystem modes, standard JSON-RPC + SSE passthrough, and
+        # fail-closed capability removal must stay merge-blocking and loud.
+        run: pytest -v -rs tests/test_channel_sdk_contract.py tests/test_channel_events.py tests/test_plugin_daemons.py
+
+      - name: Check vendored channel client against molecule-ai-sdk
+        # The runtime hosts the private socket without depending on the SDK at
+        # runtime. Its provider-facing client is therefore an exact vendored
+        # copy, checked against the exact reviewed SDK contract commit.
+        run: |
+          sdk_source="$(mktemp)"
+          trap 'rm -f "$sdk_source"' EXIT
+          curl -fsS -A curl/8.4.0 \
+            https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-sdk/raw/molecule_plugin/channel.py?ref=da42c7f2dae122aaa6f34a74c13e598a87870586 \
+            -o "$sdk_source"
+          bash scripts/check-channel-sdk-vendor.sh "$sdk_source"
 
       - name: Run build_routes real-subprocess regression gate
         # Explicit, loud step for issue #88: the 4-branch build_routes contract
@@ -89,6 +109,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
@@ -124,6 +146,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
@@ -147,6 +171,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
@@ -177,6 +203,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
@@ -210,6 +238,12 @@ jobs:
           from molecule_runtime.llm_auth import normalise_llm_env
           from molecule_runtime.credential_helper import install_credential_helper
           from molecule_runtime.precommit_hook import install_pre_commit_hook
+          import importlib
+          import molecule_runtime.plugins_registry as canonical_registry
+          legacy_registry = importlib.import_module('plugins_registry')
+          assert legacy_registry.resolve is canonical_registry.resolve
+          assert importlib.import_module('plugins_registry.builtins') is importlib.import_module('molecule_runtime.plugins_registry.builtins')
+          assert importlib.import_module('plugins_registry.protocol') is importlib.import_module('molecule_runtime.plugins_registry.protocol')
           print('smoke-import: all canonical surfaces import cleanly')
           "
           # CLI entry-point — molecule-mcp must be installed + show help.
@@ -225,9 +259,14 @@ jobs:
   # IS up+configured but the trace never shows up. Runs for real only on the
   # on-box runner that can reach the local stack.
   obs-smoke:
+    # Never expose the live Infisical identity to a PR-head checkout. This
+    # smoke is an explicitly dispatched, reviewed-main operation only.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Live Langfuse trace smoke (gated when Langfuse off)
         env:

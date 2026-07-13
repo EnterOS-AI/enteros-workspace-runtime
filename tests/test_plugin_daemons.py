@@ -33,6 +33,12 @@ import pytest
 
 import molecule_runtime.main as m
 from molecule_runtime import manifest_ssot
+from molecule_runtime.channel_events import (
+    CHANNEL_A2A_SOCKET_ENV,
+    CHANNEL_A2A_TOKEN_ENV,
+    CHANNEL_API_VERSION_ENV,
+    CHANNEL_PLUGIN_ID_ENV,
+)
 from molecule_runtime.plugin_daemons import (
     DaemonSpec,
     DaemonSupervisor,
@@ -82,6 +88,7 @@ DAEMON_MANIFEST = """\
 name: lark-bridge
 version: 1.0.0
 description: channel bridge plugin
+kind: channel
 contributes:
   daemons:
     - name: bridge
@@ -121,11 +128,83 @@ def test_discover_reads_contributes_daemons(tmp_path):
     assert len(specs) == 1
     spec = specs[0]
     assert spec.plugin == "lark-bridge"
+    assert spec.kind == "channel"
     assert spec.name == "bridge"
     assert spec.command == ["python", "-m", "lark_channel_molecule.bridge"]
     assert spec.env == {"LARK_DOMAIN": "feishu"}
     # default cwd is the plugin dir — the daemon's files live there
     assert spec.cwd == str(plugin_dir)
+
+
+def test_channel_daemon_identity_comes_from_manifest_not_install_directory(tmp_path):
+    ws = tmp_path / "configs" / "plugins"
+    _write_plugin(
+        ws,
+        "legacy-repository-name",
+        "name: molecule-slack-channel\n"
+        "version: 3.0.0\n"
+        "description: Slack channel plugin\n"
+        "kind: channel\n"
+        "contributes:\n"
+        "  daemons:\n"
+        "    - {name: bridge, command: python}\n",
+    )
+
+    specs = discover_daemon_specs(
+        workspace_plugins_dir=str(ws),
+        shared_plugins_dir=str(tmp_path / "no-shared"),
+    )
+
+    assert len(specs) == 1
+    assert specs[0].plugin == "molecule-slack-channel"
+
+
+def test_duplicate_channel_manifest_identities_fail_closed(tmp_path):
+    ws = tmp_path / "configs" / "plugins"
+    manifest = (
+        "name: molecule-slack-channel\n"
+        "version: 3.0.0\n"
+        "description: Slack channel plugin\n"
+        "kind: channel\n"
+        "contributes:\n"
+        "  daemons:\n"
+        "    - {name: bridge, command: python}\n"
+    )
+    _write_plugin(ws, "slack-repository-a", manifest)
+    _write_plugin(ws, "slack-repository-b", manifest)
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate channel plugin identity 'molecule-slack-channel'",
+    ):
+        discover_daemon_specs(
+            workspace_plugins_dir=str(ws),
+            shared_plugins_dir=str(tmp_path / "no-shared"),
+        )
+
+
+def test_duplicate_daemon_keys_fail_closed(tmp_path):
+    ws = tmp_path / "configs" / "plugins"
+    _write_plugin(
+        ws,
+        "duplicate-daemon",
+        "name: duplicate-daemon\n"
+        "version: 1.0.0\n"
+        "description: duplicate daemon names\n"
+        "contributes:\n"
+        "  daemons:\n"
+        "    - {name: worker, command: python}\n"
+        "    - {name: worker, command: python}\n",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate plugin daemon key 'duplicate-daemon/worker'",
+    ):
+        discover_daemon_specs(
+            workspace_plugins_dir=str(ws),
+            shared_plugins_dir=str(tmp_path / "no-shared"),
+        )
 
 
 def test_discover_zero_daemon_manifests_is_noop(tmp_path):
@@ -279,6 +358,36 @@ def test_supervisor_env_injection(tmp_path, monkeypatch):
     try:
         assert _wait_for(out.exists)
         assert out.read_text() == "from-workspace|from-spec"
+    finally:
+        sup.stop()
+
+
+def test_supervisor_does_not_inherit_stale_channel_capability(tmp_path, monkeypatch):
+    """Only the socket manager may publish its reserved local capability.
+
+    A runtime launched from a shell/process that happens to carry an old socket
+    env must not forward that dead or attacker-selected path to a daemon after
+    the local bind fails and the spec capability has been cleared.
+    """
+    monkeypatch.setenv(CHANNEL_A2A_SOCKET_ENV, "/tmp/stale-parent.sock")
+    monkeypatch.setenv(CHANNEL_A2A_TOKEN_ENV, "stale-parent-token")
+    monkeypatch.setenv(CHANNEL_API_VERSION_ENV, "stale-parent-version")
+    monkeypatch.setenv(CHANNEL_PLUGIN_ID_ENV, "stale-parent-plugin")
+    out = tmp_path / "reserved-env.txt"
+    script = (
+        "import os\n"
+        f"open({str(out)!r}, 'w').write("
+        f"str({CHANNEL_A2A_SOCKET_ENV!r} in os.environ) + '|' + "
+        f"str({CHANNEL_A2A_TOKEN_ENV!r} in os.environ) + '|' + "
+        f"str({CHANNEL_API_VERSION_ENV!r} in os.environ) + '|' + "
+        f"str({CHANNEL_PLUGIN_ID_ENV!r} in os.environ))\n"
+    )
+    spec = DaemonSpec(name="env", plugin="p", command=[sys.executable, "-c", script])
+    sup = _fast_supervisor([spec])
+    sup.start()
+    try:
+        assert _wait_for(out.exists)
+        assert out.read_text() == "False|False|False|False"
     finally:
         sup.stop()
 
@@ -573,11 +682,18 @@ def test_main_boot_wires_daemon_supervisor():
     assert "discover_daemon_specs" in src
     # spawn gated on the server bind (never blocks boot)
     assert "start_supervisor_when_bound" in src
+    # PR-2 local binding wraps the SAME built A2A app and is handed to the
+    # post-bind starter before any daemon process can observe its socket env.
+    assert "ChannelEventSocketManager" in src
+    assert "event_transport=channel_event_transport" in src
     # supervisor shutdown wired
     assert "plugin_daemon_supervisor.stop()" in src
+    assert "await channel_event_transport.stop()" in src
     # stop lives in the shutdown path (the `finally:` of server.serve())
     finally_block = src.split("await server.serve()", 1)[1]
+    assert "await plugin_daemon_task" in finally_block
     assert "plugin_daemon_supervisor.stop()" in finally_block
+    assert "await channel_event_transport.stop()" in finally_block
 
 
 def test_main_boot_daemon_wiring_is_fail_open():
