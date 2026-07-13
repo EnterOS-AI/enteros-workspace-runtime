@@ -81,7 +81,8 @@ class InstallContext:
     """Wire an MCP server into the active runtime's native config.
 
     ``name`` is the server's ``mcpServers`` key (e.g. ``molecule-platform``);
-    ``spec`` is the runtime-agnostic descriptor ``{command, args?, env?}``. The
+    ``spec`` is the runtime-agnostic descriptor ``{command, args?, env?}``;
+    direct plugin-local executable paths have already been made absolute. The
     adapter behind this hook renders ``spec`` into whatever file its runtime
     reads MCP servers from — ``.claude/settings.json`` for Claude Code,
     ``~/.codex/config.toml`` for codex, etc.

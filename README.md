@@ -36,6 +36,8 @@ process and, when the local binding is available, injects:
 
 - `MOLECULE_CHANNEL_A2A_SOCKET` — a private Unix socket serving the
   workspace's existing A2A HTTP/JSON-RPC application.
+- `MOLECULE_CHANNEL_A2A_TOKEN` — a distinct, ephemeral bearer capability for
+  that plugin's socket. The helper sends it in the local-only capability header.
 - `MOLECULE_CHANNEL_PLUGIN_ID` — the installed plugin identity the runtime
   stamps as channel provenance.
 
@@ -84,19 +86,26 @@ targets `message/send`; streaming clients use an UDS-aware HTTP client directly.
 Channel provenance uses the existing platform fields under `params.metadata`:
 `source`, `chat_id`, `user_id`, `username`, and `message_id`. The daemon
 supplies channel event fields, but the runtime always overwrites `source` on
-both params and message metadata with `MOLECULE_CHANNEL_PLUGIN_ID`; a daemon
-cannot impersonate another plugin by claiming a different source. The socket
-directory is mode 0700 and each socket is mode 0600 before the daemon starts.
-The path is an ephemeral per-boot capability and must not be persisted.
+both params and message metadata with `MOLECULE_CHANNEL_PLUGIN_ID`. Before
+stamping, the listener requires the plugin-specific
+`MOLECULE_CHANNEL_A2A_TOKEN`; another same-UID daemon finding the socket path
+does not receive that token through its own injected environment and cannot
+select a different source merely by changing request JSON. Plugins still run
+under the workspace UID and are trusted code, not mutually sandboxed
+principals. The socket directory is mode 0700 and each socket is mode 0600
+before the daemon starts. Paths and tokens are ephemeral per-boot capabilities
+and must not be persisted.
 
 Clients must keep their existing platform HTTP/poll path as fallback. If the
-socket bind fails, the runtime removes the two capability variables and still
-starts the daemon; absence of `MOLECULE_CHANNEL_A2A_SOCKET` is the fail-closed
-signal to use the remote path. `send_channel_message` raises
-`ChannelEventUnavailable` for that case and leaves socket connection failures
-as `httpx.TransportError`, so the plugin can fall back without treating an
-agent JSON-RPC error as a transport outage. This preserves off-host and
-poll-mode channel bridges unchanged.
+socket bind fails, the runtime removes all three capability variables and still
+starts the daemon; absence of the socket/token pair is the fail-closed signal
+to use the remote path. `send_channel_message` raises
+`ChannelEventUnavailable` only when the complete local capability is absent;
+that is the safe remote-fallback case. Once a local send is attempted, a
+connection, timeout, or HTTP failure raises `ChannelEventDeliveryUnknown` and
+the same external event must **not** be replayed remotely because the agent may
+already have accepted the turn. Off-host and poll-mode bridges remain valid
+when the runtime never supplied the local capability.
 
 ## MCP SSOT public surface (issue #38)
 

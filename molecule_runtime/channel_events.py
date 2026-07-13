@@ -14,9 +14,12 @@ channel metadata (``chat_id``, ``user_id``, ``username``, ``message_id``) stays
 in the platform wire shape unchanged.
 
 Security boundary: sockets live in a runtime-created mode-0700 directory and
-are chmod 0600 before a daemon is spawned.  There is deliberately no parallel
-token/auth protocol: filesystem access plus the runtime-selected binding is
-the local capability described by issue #215.
+are chmod 0600 before a daemon is spawned. Because plugin daemons share the
+workspace UID, filesystem mode alone is not an identity boundary. Each plugin
+therefore receives a distinct ephemeral capability token, and provenance is
+stamped only after constant-time token verification on its selected binding.
+Plugins remain trusted same-UID code; this prevents accidental cross-plugin
+routing but does not claim process isolation from a malicious plugin.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import stat
 import tempfile
 import uuid
@@ -46,6 +50,11 @@ CHANNEL_A2A_SOCKET_ENV = "MOLECULE_CHANNEL_A2A_SOCKET"
 CHANNEL_PLUGIN_ID_ENV = "MOLECULE_CHANNEL_PLUGIN_ID"
 """Runtime-assigned plugin identity stamped on requests from the socket."""
 
+CHANNEL_A2A_TOKEN_ENV = "MOLECULE_CHANNEL_A2A_TOKEN"
+"""Per-plugin runtime capability required by the local A2A listener."""
+
+_CAPABILITY_HEADER = b"x-molecule-channel-capability"
+
 # Match molecule-core's public A2A proxy request ceiling.  The local fast path
 # must not accept a larger body than the remote fallback path.
 MAX_A2A_REQUEST_BYTES = 16 << 20
@@ -60,6 +69,10 @@ class ChannelEventUnavailable(RuntimeError):
 
 class ChannelEventProtocolError(RuntimeError):
     """The local A2A listener returned a non-contract response."""
+
+
+class ChannelEventDeliveryUnknown(RuntimeError):
+    """A local turn may have been accepted and therefore must not be replayed."""
 
 
 def build_channel_message_send_request(
@@ -160,15 +173,17 @@ async def send_channel_message(
     message_id: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     socket_path: str | os.PathLike[str] | None = None,
+    capability_token: str | None = None,
     timeout_seconds: float = 600.0,
 ) -> dict[str, Any]:
     """Send one canonical ``message/send`` turn over the local Unix binding.
 
     Returns the decoded, unchanged JSON-RPC response (either ``result`` or
-    ``error``).  Absence of the runtime-issued socket raises
-    :class:`ChannelEventUnavailable`; connection failures remain ordinary
-    :class:`httpx.TransportError` instances so a plugin can select its existing
-    platform HTTP/poll fallback without misclassifying an agent JSON-RPC error.
+    ``error``). Absence of a complete runtime-issued capability raises
+    :class:`ChannelEventUnavailable`, which is the only safe signal for using a
+    remote fallback. Once a local send is attempted, any HTTP/transport failure
+    raises :class:`ChannelEventDeliveryUnknown`; callers must not replay the
+    same turn because the agent may already have accepted it.
     """
     resolved_path = os.fspath(socket_path) if socket_path is not None else ""
     resolved_path = (
@@ -177,6 +192,14 @@ async def send_channel_message(
     if not resolved_path:
         raise ChannelEventUnavailable(
             f"{CHANNEL_A2A_SOCKET_ENV} is absent; use the platform HTTP/poll fallback"
+        )
+    resolved_token = (
+        (capability_token or "").strip()
+        or os.environ.get(CHANNEL_A2A_TOKEN_ENV, "").strip()
+    )
+    if not resolved_token:
+        raise ChannelEventUnavailable(
+            f"{CHANNEL_A2A_TOKEN_ENV} is absent; use the platform HTTP/poll fallback"
         )
 
     request = build_channel_message_send_request(
@@ -193,21 +216,30 @@ async def send_channel_message(
         base_url="http://molecule.local",
         timeout=timeout,
     ) as client:
-        response = await client.post("/", json=request)
-    response.raise_for_status()
+        try:
+            response = await client.post(
+                "/",
+                json=request,
+                headers={_CAPABILITY_HEADER.decode("ascii"): resolved_token},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as error:
+            raise ChannelEventDeliveryUnknown(
+                "local channel delivery outcome is unknown; this turn must not be replayed"
+            ) from error
     try:
         payload = response.json()
     except ValueError as error:
-        raise ChannelEventProtocolError(
-            "local channel A2A response was not valid JSON"
+        raise ChannelEventDeliveryUnknown(
+            "local channel response was invalid after send; this turn must not be replayed"
         ) from error
     if not (
         isinstance(payload, dict)
         and payload.get("jsonrpc") == "2.0"
         and ("result" in payload or "error" in payload)
     ):
-        raise ChannelEventProtocolError(
-            "local channel A2A response was not a JSON-RPC result/error envelope"
+        raise ChannelEventDeliveryUnknown(
+            "local channel response was malformed after send; this turn must not be replayed"
         )
     return payload
 
@@ -219,6 +251,7 @@ class RuntimeStampedChannelProvenance:
         self,
         app: Any,
         plugin_id: str,
+        capability_token: str,
         *,
         max_request_bytes: int = MAX_A2A_REQUEST_BYTES,
     ) -> None:
@@ -229,6 +262,10 @@ class RuntimeStampedChannelProvenance:
             )
         self.app = app
         self.plugin_id = identity
+        token = capability_token.strip()
+        if not token:
+            raise ValueError("channel event binding requires a non-empty capability token")
+        self._capability_token = token.encode("utf-8")
         self.max_request_bytes = max_request_bytes
 
     async def __call__(self, scope, receive, send) -> None:
@@ -238,6 +275,23 @@ class RuntimeStampedChannelProvenance:
             and scope.get("path") == "/"
         ):
             await self.app(scope, receive, send)
+            return
+
+        provided = [
+            value
+            for key, value in scope.get("headers", [])
+            if key.lower() == _CAPABILITY_HEADER
+        ]
+        if len(provided) != 1 or not secrets.compare_digest(
+            provided[0], self._capability_token
+        ):
+            await _jsonrpc_error(
+                send,
+                request_id=None,
+                status=401,
+                code=-32001,
+                message="invalid local channel capability",
+            )
             return
 
         body = bytearray()
@@ -294,7 +348,7 @@ class RuntimeStampedChannelProvenance:
         headers = [
             (name, value)
             for name, value in scope.get("headers", [])
-            if name.lower() != b"content-length"
+            if name.lower() not in {b"content-length", _CAPABILITY_HEADER}
         ]
         headers.append((b"content-length", str(len(stamped_body)).encode("ascii")))
         stamped_scope["headers"] = headers
@@ -413,6 +467,7 @@ class ChannelEventSocketManager:
         self._servers: dict[str, _LocalUvicornServer] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._paths: dict[str, Path] = {}
+        self._tokens: dict[str, str] = {}
         self._started = False
 
     async def start(self) -> bool:
@@ -430,9 +485,12 @@ class ChannelEventSocketManager:
         try:
             socket_dir = self._prepare_socket_dir()
             for plugin_id in plugin_ids:
+                token = secrets.token_urlsafe(32)
                 path = socket_dir / _socket_name(plugin_id)
                 self._prepare_socket_path(path)
-                wrapped_app = RuntimeStampedChannelProvenance(self.app, plugin_id)
+                wrapped_app = RuntimeStampedChannelProvenance(
+                    self.app, plugin_id, token
+                )
                 config = uvicorn.Config(
                     wrapped_app,
                     uds=str(path),
@@ -445,6 +503,7 @@ class ChannelEventSocketManager:
                 server = _LocalUvicornServer(config)
                 self._servers[plugin_id] = server
                 self._paths[plugin_id] = path
+                self._tokens[plugin_id] = token
                 self._tasks[plugin_id] = asyncio.create_task(
                     server.serve(), name=f"channel-a2a:{plugin_id}"
                 )
@@ -462,6 +521,7 @@ class ChannelEventSocketManager:
             return True
         except BaseException:
             self.clear_daemon_env()
+            self._tokens.clear()
             await self._shutdown_servers()
             self._cleanup_paths()
             raise
@@ -469,13 +529,16 @@ class ChannelEventSocketManager:
     async def stop(self) -> None:
         """Stop local listeners and remove their filesystem capabilities."""
         await self._shutdown_servers()
+        self.clear_daemon_env()
         self._cleanup_paths()
+        self._tokens.clear()
         self._started = False
 
     def clear_daemon_env(self) -> None:
         """Remove reserved capability variables after a bind failure."""
         for spec in self.specs:
             spec.env.pop(CHANNEL_A2A_SOCKET_ENV, None)
+            spec.env.pop(CHANNEL_A2A_TOKEN_ENV, None)
             spec.env.pop(CHANNEL_PLUGIN_ID_ENV, None)
 
     def _plugin_ids(self) -> list[str]:
@@ -576,10 +639,12 @@ class ChannelEventSocketManager:
         for spec in self.specs:
             plugin_id = str(getattr(spec, "plugin", "") or "").strip()
             path = self._paths.get(plugin_id)
-            if path is None:
+            token = self._tokens.get(plugin_id)
+            if path is None or token is None:
                 continue
             # Reserved runtime values overwrite manifest env claims.
             spec.env[CHANNEL_A2A_SOCKET_ENV] = str(path)
+            spec.env[CHANNEL_A2A_TOKEN_ENV] = token
             spec.env[CHANNEL_PLUGIN_ID_ENV] = plugin_id
 
     async def _shutdown_servers(self) -> None:

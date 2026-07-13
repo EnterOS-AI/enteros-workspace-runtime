@@ -523,6 +523,45 @@ def _read_mcp_descriptor(plugin_root: Path) -> dict[str, dict]:
     return {}
 
 
+def _resolve_plugin_local_mcp_paths(plugin_root: Path, spec: dict) -> dict:
+    """Make direct plugin-local command/argument paths launch-location safe.
+
+    Native MCP renderers persist ``command`` and ``args`` and the runtime later
+    launches them from its own working directory.  SDK scaffolds intentionally
+    use the portable ``python server.py`` shape, so any relative value that
+    names a real regular file inside the plugin is rewritten to its absolute
+    path. Flags, package names, URLs, absolute paths, missing files, symlinks,
+    and paths escaping the plugin root remain untouched.
+    """
+    resolved = dict(spec)
+    try:
+        root = plugin_root.resolve(strict=True)
+    except OSError:
+        return resolved
+
+    def local_file(value: object) -> object:
+        if not isinstance(value, str) or not value or Path(value).is_absolute():
+            return value
+        candidate = plugin_root / value
+        try:
+            if candidate.is_symlink():
+                return value
+            target = candidate.resolve(strict=True)
+            target.relative_to(root)
+            if not target.is_file():
+                return value
+        except (OSError, ValueError):
+            return value
+        return str(target)
+
+    if "command" in resolved:
+        resolved["command"] = local_file(resolved["command"])
+    args = resolved.get("args")
+    if isinstance(args, list):
+        resolved["args"] = [local_file(arg) for arg in args]
+    return resolved
+
+
 class MCPServerAdaptor:
     """Sub-type adaptor for plugins that wrap an MCP server.
 
@@ -600,7 +639,9 @@ class MCPServerAdaptor:
         descriptor = _read_mcp_descriptor(ctx.plugin_root)
         for name, spec in descriptor.items():
             try:
-                ctx.register_mcp_server(name, spec)
+                ctx.register_mcp_server(
+                    name, _resolve_plugin_local_mcp_paths(ctx.plugin_root, spec)
+                )
                 ctx.logger.info("%s: wired MCP server %r via register_mcp_server (runtime=%s)",
                                 self.plugin_name, name, self.runtime)
             except NotImplementedError as exc:

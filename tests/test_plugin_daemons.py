@@ -35,6 +35,7 @@ import molecule_runtime.main as m
 from molecule_runtime import manifest_ssot
 from molecule_runtime.channel_events import (
     CHANNEL_A2A_SOCKET_ENV,
+    CHANNEL_A2A_TOKEN_ENV,
     CHANNEL_PLUGIN_ID_ENV,
 )
 from molecule_runtime.plugin_daemons import (
@@ -295,12 +296,14 @@ def test_supervisor_does_not_inherit_stale_channel_capability(tmp_path, monkeypa
     the local bind fails and the spec capability has been cleared.
     """
     monkeypatch.setenv(CHANNEL_A2A_SOCKET_ENV, "/tmp/stale-parent.sock")
+    monkeypatch.setenv(CHANNEL_A2A_TOKEN_ENV, "stale-parent-token")
     monkeypatch.setenv(CHANNEL_PLUGIN_ID_ENV, "stale-parent-plugin")
     out = tmp_path / "reserved-env.txt"
     script = (
         "import os\n"
         f"open({str(out)!r}, 'w').write("
         f"str({CHANNEL_A2A_SOCKET_ENV!r} in os.environ) + '|' + "
+        f"str({CHANNEL_A2A_TOKEN_ENV!r} in os.environ) + '|' + "
         f"str({CHANNEL_PLUGIN_ID_ENV!r} in os.environ))\n"
     )
     spec = DaemonSpec(name="env", plugin="p", command=[sys.executable, "-c", script])
@@ -308,7 +311,7 @@ def test_supervisor_does_not_inherit_stale_channel_capability(tmp_path, monkeypa
     sup.start()
     try:
         assert _wait_for(out.exists)
-        assert out.read_text() == "False|False"
+        assert out.read_text() == "False|False|False"
     finally:
         sup.stop()
 

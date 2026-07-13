@@ -295,11 +295,13 @@ class DaemonSupervisor:
         # spec.env only after its private listener is bound and chmodded.
         from molecule_runtime.channel_events import (
             CHANNEL_A2A_SOCKET_ENV,
+            CHANNEL_A2A_TOKEN_ENV,
             CHANNEL_PLUGIN_ID_ENV,
         )
 
         child_env = dict(os.environ)
         child_env.pop(CHANNEL_A2A_SOCKET_ENV, None)
+        child_env.pop(CHANNEL_A2A_TOKEN_ENV, None)
         child_env.pop(CHANNEL_PLUGIN_ID_ENV, None)
         child_env.update(spec.env)
         try:

@@ -26,7 +26,9 @@ from starlette.routing import Route
 
 from molecule_runtime.channel_events import (
     CHANNEL_A2A_SOCKET_ENV,
+    CHANNEL_A2A_TOKEN_ENV,
     CHANNEL_PLUGIN_ID_ENV,
+    ChannelEventDeliveryUnknown,
     ChannelEventProtocolError,
     ChannelEventUnavailable,
     ChannelEventSocketManager,
@@ -36,6 +38,8 @@ from molecule_runtime.channel_events import (
     send_channel_message,
 )
 from molecule_runtime.plugin_daemons import DaemonSpec, start_supervisor_when_bound
+
+TEST_CAPABILITY = "test-channel-capability"
 
 
 def _message(method: str = "message/send") -> dict:
@@ -96,6 +100,17 @@ async def test_reusable_sender_fails_closed_when_runtime_capability_absent(monke
         await send_channel_message("hello")
 
 
+@pytest.mark.asyncio
+async def test_reusable_sender_never_marks_socket_failure_safe_to_replay(tmp_path):
+    with pytest.raises(ChannelEventDeliveryUnknown, match="must not be replayed"):
+        await send_channel_message(
+            "hello",
+            socket_path=tmp_path / "missing.sock",
+            capability_token="test-capability",
+            timeout_seconds=0.1,
+        )
+
+
 def test_response_text_helper_reads_real_a2a_v1_completed_task_shape():
     response = {
         "jsonrpc": "2.0",
@@ -154,12 +169,17 @@ def test_runtime_overrides_claimed_source_on_both_metadata_surfaces():
     app = RuntimeStampedChannelProvenance(
         Starlette(routes=[Route("/", endpoint, methods=["POST"])]),
         plugin_id="lark-channel-molecule",
+        capability_token=TEST_CAPABILITY,
     )
 
     from starlette.testclient import TestClient
 
     with TestClient(app) as client:
-        response = client.post("/", json=_message())
+        response = client.post(
+            "/",
+            json=_message(),
+            headers={"x-molecule-channel-capability": TEST_CAPABILITY},
+        )
 
     assert response.status_code == 200
     params = captured["params"]
@@ -198,12 +218,17 @@ def test_runtime_adds_canonical_metadata_when_client_omits_it():
     app = RuntimeStampedChannelProvenance(
         Starlette(routes=[Route("/", endpoint, methods=["POST"])]),
         plugin_id="slack-channel-molecule",
+        capability_token=TEST_CAPABILITY,
     )
 
     from starlette.testclient import TestClient
 
     with TestClient(app) as client:
-        assert client.post("/", json=body).status_code == 200
+        assert client.post(
+            "/",
+            json=body,
+            headers={"x-molecule-channel-capability": TEST_CAPABILITY},
+        ).status_code == 200
 
     params = captured["params"]
     assert params["metadata"]["source"] == "slack-channel-molecule"
@@ -217,6 +242,7 @@ def test_non_a2a_routes_are_byte_for_byte_passthrough():
     app = RuntimeStampedChannelProvenance(
         Starlette(routes=[Route("/.well-known/agent-card.json", card)]),
         plugin_id="lark-channel-molecule",
+        capability_token=TEST_CAPABILITY,
     )
 
     from starlette.testclient import TestClient
@@ -239,12 +265,17 @@ def test_malformed_metadata_fails_closed_before_agent_dispatch():
     app = RuntimeStampedChannelProvenance(
         Starlette(routes=[Route("/", endpoint, methods=["POST"])]),
         plugin_id="lark-channel-molecule",
+        capability_token=TEST_CAPABILITY,
     )
 
     from starlette.testclient import TestClient
 
     with TestClient(app) as client:
-        response = client.post("/", json=body)
+        response = client.post(
+            "/",
+            json=body,
+            headers={"x-molecule-channel-capability": TEST_CAPABILITY},
+        )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == -32600
     assert dispatched is False
@@ -253,9 +284,11 @@ def test_malformed_metadata_fails_closed_before_agent_dispatch():
 @pytest.mark.asyncio
 async def test_manager_binds_private_uds_injects_env_and_preserves_jsonrpc():
     captured: dict = {}
+    captured_headers: dict = {}
 
     async def endpoint(request: Request) -> JSONResponse:
         captured.update(await request.json())
+        captured_headers.update(request.headers)
         return JSONResponse(
             {"jsonrpc": "2.0", "id": captured["id"], "result": {"parts": []}}
         )
@@ -295,7 +328,13 @@ async def test_manager_binds_private_uds_injects_env_and_preserves_jsonrpc():
             base_url="http://molecule.local",
             timeout=3,
         ) as client:
-            response = await client.post("/", json=body)
+            response = await client.post(
+                "/",
+                json=body,
+                headers={
+                    "x-molecule-channel-capability": spec.env[CHANNEL_A2A_TOKEN_ENV]
+                },
+            )
 
         # The existing JSON-RPC method and response cross the local transport
         # unchanged; only provenance is runtime-owned.
@@ -306,6 +345,7 @@ async def test_manager_binds_private_uds_injects_env_and_preserves_jsonrpc():
             "result": {"parts": []},
         }
         assert captured["params"]["metadata"]["source"] == "lark-channel-molecule"
+        assert "x-molecule-channel-capability" not in captured_headers
 
         helper_response = await send_channel_message(
             "from helper",
@@ -313,6 +353,7 @@ async def test_manager_binds_private_uds_injects_env_and_preserves_jsonrpc():
             request_id="helper-request",
             message_id="helper-message",
             socket_path=socket_path,
+            capability_token=spec.env[CHANNEL_A2A_TOKEN_ENV],
             timeout_seconds=3,
         )
         assert helper_response == {
@@ -392,6 +433,7 @@ async def test_reusable_helper_round_trips_real_a2a_sdk_completed_task(monkeypat
             request_id="real-request",
             message_id="real-message",
             socket_path=spec.env[CHANNEL_A2A_SOCKET_ENV],
+            capability_token=spec.env[CHANNEL_A2A_TOKEN_ENV],
             timeout_seconds=5,
         )
     finally:
@@ -432,7 +474,12 @@ async def test_streaming_ack_and_turn_complete_events_pass_through_unchanged():
             transport=transport, base_url="http://molecule.local", timeout=3
         ) as client:
             async with client.stream(
-                "POST", "/", json=_message("message/stream")
+                "POST",
+                "/",
+                json=_message("message/stream"),
+                headers={
+                    "x-molecule-channel-capability": spec.env[CHANNEL_A2A_TOKEN_ENV]
+                },
             ) as response:
                 lines = response.aiter_lines()
                 assert await anext(lines) == (
@@ -463,6 +510,47 @@ async def test_same_plugin_shares_identity_socket_different_plugins_do_not():
         assert (
             specs[0].env[CHANNEL_A2A_SOCKET_ENV] != specs[2].env[CHANNEL_A2A_SOCKET_ENV]
         )
+        assert specs[0].env[CHANNEL_A2A_TOKEN_ENV] == specs[1].env[CHANNEL_A2A_TOKEN_ENV]
+        assert specs[0].env[CHANNEL_A2A_TOKEN_ENV] != specs[2].env[CHANNEL_A2A_TOKEN_ENV]
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_plugin_capability_prevents_cross_plugin_provenance_spoof():
+    captured = []
+
+    async def endpoint(request: Request) -> JSONResponse:
+        captured.append(await request.json())
+        return JSONResponse({"jsonrpc": "2.0", "id": "evt-1", "result": {}})
+
+    lark = DaemonSpec(name="bridge", plugin="lark-channel", command=["x"])
+    slack = DaemonSpec(name="bridge", plugin="slack-channel", command=["x"])
+    manager = ChannelEventSocketManager(
+        Starlette(routes=[Route("/", endpoint, methods=["POST"])]), [lark, slack]
+    )
+    await manager.start()
+    try:
+        transport = httpx.AsyncHTTPTransport(uds=lark.env[CHANNEL_A2A_SOCKET_ENV])
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://molecule.local", timeout=3
+        ) as client:
+            missing = await client.post("/", json=_message())
+            wrong = await client.post(
+                "/",
+                json=_message(),
+                headers={"x-molecule-channel-capability": slack.env[CHANNEL_A2A_TOKEN_ENV]},
+            )
+            accepted = await client.post(
+                "/",
+                json=_message(),
+                headers={"x-molecule-channel-capability": lark.env[CHANNEL_A2A_TOKEN_ENV]},
+            )
+        assert missing.status_code == 401
+        assert wrong.status_code == 401
+        assert accepted.status_code == 200
+        assert len(captured) == 1
+        assert captured[0]["params"]["metadata"]["source"] == "lark-channel"
     finally:
         await manager.stop()
 
@@ -474,6 +562,7 @@ async def test_missing_plugin_identity_withholds_manifest_claimed_capability():
         command=["x"],
         env={
             CHANNEL_A2A_SOCKET_ENV: "/tmp/manifest-claimed.sock",
+            CHANNEL_A2A_TOKEN_ENV: "manifest-claimed-token",
             CHANNEL_PLUGIN_ID_ENV: "manifest-claimed-plugin",
         },
     )
@@ -481,6 +570,7 @@ async def test_missing_plugin_identity_withholds_manifest_claimed_capability():
 
     assert await manager.start() is True
     assert CHANNEL_A2A_SOCKET_ENV not in spec.env
+    assert CHANNEL_A2A_TOKEN_ENV not in spec.env
     assert CHANNEL_PLUGIN_ID_ENV not in spec.env
 
 
@@ -496,6 +586,7 @@ async def test_unsafe_socket_directory_fails_closed_without_spawning(tmp_path):
     with pytest.raises(RuntimeError, match="symlink"):
         await manager.start()
     assert CHANNEL_A2A_SOCKET_ENV not in spec.env
+    assert CHANNEL_A2A_TOKEN_ENV not in spec.env
     assert CHANNEL_PLUGIN_ID_ENV not in spec.env
 
 
