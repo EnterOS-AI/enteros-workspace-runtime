@@ -3,9 +3,12 @@
 
 The canonical assembler *implementation* the contract names
 (``ownership.assembler_owner = molecule_runtime``). This package is the pure
-engine + provider machinery; the idle *controller* that wires it into the boot
-loop behind ``MOLECULE_MAILBOX_KERNEL`` is a follow-up. Nothing here touches
-the loop, the network, or the filesystem.
+engine + provider machinery; the idle *controller*
+(:mod:`~molecule_runtime.idle_digest.controller`) wires it into the boot loop
+— NATIVE runtime behavior since the kernel default flipped ON (2026-07-13);
+``MOLECULE_MAILBOX_KERNEL=0`` opts a workspace back to the legacy static idle
+loop. Nothing in this package touches the loop, the network, or the
+filesystem.
 
 Public surface:
   * :mod:`~molecule_runtime.idle_digest.contract` — envelope + enums + Policy

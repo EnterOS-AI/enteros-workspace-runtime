@@ -121,7 +121,7 @@ async def test_kernel_on_stalled_turn_is_ended_by_lease(monkeypatch):
 async def test_kernel_off_idle_cap_still_ends_turn(monkeypatch):
     """Kernel OFF (no lease): the turn still ends on the native idle-cap alone —
     the lease wiring changed NOTHING in the default flow (byte-identical)."""
-    monkeypatch.delenv(mailbox_dir.KERNEL_FLAG_ENV, raising=False)
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     kernel.install()  # no-op when disabled -> no lease
     assert tl.current() is None, "kernel off -> no lease installed"
     executor, updater = _hang_executor(monkeypatch)

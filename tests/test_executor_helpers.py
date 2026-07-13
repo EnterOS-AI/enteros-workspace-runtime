@@ -2024,8 +2024,8 @@ def test_capabilities_preamble_empty_for_cli_runtime():
 
 
 def test_tool_activity_file_legacy_tmp_when_kernel_off(monkeypatch):
-    """Kernel OFF: byte-identical legacy /tmp default; explicit override wins."""
-    monkeypatch.delenv("MOLECULE_MAILBOX_KERNEL", raising=False)
+    """Kernel opt-out: byte-identical legacy /tmp default; explicit override wins."""
+    monkeypatch.setenv("MOLECULE_MAILBOX_KERNEL", "0")
     monkeypatch.delenv("MOLECULE_TOOL_ACTIVITY_FILE", raising=False)
     assert eh.tool_activity_file() == eh.DEFAULT_TOOL_ACTIVITY_FILE
     monkeypatch.setenv("MOLECULE_TOOL_ACTIVITY_FILE", "/custom/act")

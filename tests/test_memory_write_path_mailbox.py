@@ -140,7 +140,8 @@ def test_prompt_files_memory_kernel_off_byte_identical(tmp_path, monkeypatch):
 
 
 def test_kernel_off_reads_configs_byte_identical(tmp_path, monkeypatch):
-    """Kernel OFF: memory snapshots load from /configs exactly as before."""
+    """Kernel opt-out: memory snapshots load from /configs exactly as before."""
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     configs = tmp_path / "configs"
     configs.mkdir()
     (configs / "system-prompt.md").write_text("BASE-ROLE", encoding="utf-8")
@@ -176,7 +177,8 @@ def test_append_to_memory_hook_writes_mailbox_when_on(tmp_path, monkeypatch):
     assert not (configs / "CLAUDE.md").exists()
 
 
-def test_append_to_memory_hook_writes_configs_when_off(tmp_path):
+def test_append_to_memory_hook_writes_configs_when_off(tmp_path, monkeypatch):
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter
 
     configs = tmp_path / "configs"
@@ -205,6 +207,6 @@ def test_consolidation_mirror_noop_when_off(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKSPACE_ID", "00000000-0000-0000-0000-0000deadbeef")
     import molecule_runtime.consolidation as consolidation
 
-    # No exception, no file written when kernel off.
-    monkeypatch.delenv(mailbox_dir.KERNEL_FLAG_ENV, raising=False)
+    # No exception, no file written when kernel off (explicit opt-out).
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     consolidation._mirror_consolidated_to_mailbox("ignored")  # must not raise

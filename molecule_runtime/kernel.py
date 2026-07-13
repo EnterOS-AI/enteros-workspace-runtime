@@ -1,10 +1,11 @@
 """Mailbox kernel — coordinator for durable, acked, guard-safe autonomous turns.
 
-This is the seam that ties the mailbox-kernel pieces together WITHOUT changing
-the default flow. Everything here is gated on ``MOLECULE_MAILBOX_KERNEL``
-(:func:`molecule_runtime.mailbox_dir.kernel_enabled`); when the flag is off the
-kernel installs nothing and its helpers fall back to the exact legacy behavior,
-so the proven push / hard-gate flow stays byte-identical.
+This is the seam that ties the mailbox-kernel pieces together. The kernel is
+NATIVE runtime behavior (default ON — operator ruling 2026-07-13, task #219);
+``MOLECULE_MAILBOX_KERNEL=0`` (:func:`molecule_runtime.mailbox_dir.kernel_enabled`)
+is the emergency opt-out under which the kernel installs nothing and every
+helper falls back to the exact legacy behavior (legacy state paths, static
+idle loop) — byte-identical to the pre-kernel runtime.
 
 Responsibilities
 ----------------
@@ -116,13 +117,20 @@ def should_inject_autonomous_turn(kind: str = KIND_IDLE) -> bool:
 
 
 def install() -> None:
-    """Publish the process-global turn lease — kernel-on only.
+    """Migrate legacy state + publish the process-global turn lease.
 
-    No-op when the flag is off, so nothing is installed and the executor's
-    tool-activity touches stay no-ops (default flow byte-identical).
+    No-op under the ``MOLECULE_MAILBOX_KERNEL=0`` opt-out, so nothing is
+    installed and the executor's tool-activity touches stay no-ops (legacy
+    flow byte-identical).
     """
     if not enabled():
         return
+    # Legacy-state migration FIRST (design §7.2): the inbox cursor and
+    # delegation tombstones must be in place before the inbox poller and
+    # heartbeat read them, or a previously kernel-off workspace replays its
+    # whole inbound backlog / re-harvests delegations on this boot.
+    mailbox_dir.migrate_legacy_state()
+
     from molecule_runtime import turn_lease
 
     lease = turn_lease.TurnLease()

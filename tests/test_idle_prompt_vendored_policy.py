@@ -58,7 +58,10 @@ def test_hardcoded_mirror_matches_vendored_instance():
     )
 
 
-def test_default_uses_instance_values_by_default():
+def test_default_uses_instance_values_by_default(monkeypatch):
+    # An ambient MOLECULE_IDLE_FIRE_SECONDS (dev shell, canary env) must not
+    # bleed into the vendored-default assertion.
+    monkeypatch.delenv("MOLECULE_IDLE_FIRE_SECONDS", raising=False)
     p = Policy.default()
     assert p.idle_fire_after_seconds == 300  # the ruled production value
 

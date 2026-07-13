@@ -32,17 +32,21 @@ Why not ``$HOME`` or ``/configs``?
     re-provision and (b) the wrong layering — ``/configs`` is *read* for the
     param-rendered system prompt, never the *write* target for evolving memory.
 
-Gating (byte-identical default)
--------------------------------
-``MOLECULE_MAILBOX_KERNEL`` unset / false (DEFAULT)
-    :func:`resolve` returns the LEGACY location (``configs_dir.resolve()``), so
-    every migrated call site behaves EXACTLY as it did before. The proven
-    push / hard-gate flow is unchanged — no new directory, no path move.
+Gating (native default — kernel ON)
+-----------------------------------
+``MOLECULE_MAILBOX_KERNEL`` unset / true (DEFAULT)
+    The mailbox kernel is NATIVE runtime behavior (operator ruling 2026-07-13,
+    task #219): :func:`resolve` returns ``/workspace/.molecule`` (overridable
+    via ``MOLECULE_MAILBOX_DIR``), created ``0700`` so per-file ``0600`` perms
+    are not undermined by a world-readable parent. First kernel-on boot runs
+    :func:`migrate_legacy_state` so pre-existing workspaces carry their inbox
+    cursor / delegation tombstones / queued results over — no inbound replay,
+    no delegation re-harvest (design §7.2).
 
-``MOLECULE_MAILBOX_KERNEL`` true
-    :func:`resolve` returns ``/workspace/.molecule`` (overridable via
-    ``MOLECULE_MAILBOX_DIR``), created ``0700`` so per-file ``0600`` perms are
-    not undermined by a world-readable parent.
+``MOLECULE_MAILBOX_KERNEL`` explicitly false (``0`` / ``false`` / ``no`` / ``off``)
+    Emergency escape hatch: :func:`resolve` returns the LEGACY location
+    (``configs_dir.resolve()``) and every kernel call site behaves exactly as
+    the pre-kernel runtime did (static idle_prompt loop, legacy state paths).
 
 Not cached: the flag + one ``mkdir`` are cheap and reading ``os.environ`` live
 keeps tests that monkeypatch ``MOLECULE_MAILBOX_KERNEL`` between cases working
@@ -60,9 +64,10 @@ import molecule_runtime.configs_dir as configs_dir
 
 logger = logging.getLogger(__name__)
 
-#: Env flag that turns the mailbox kernel (durable-volume state) on. Default
-#: OFF — when unset the runtime keeps every durable path at its legacy location
-#: so the proven push flow is byte-identical.
+#: Env flag for the mailbox kernel (durable-volume state). Default ON — the
+#: kernel is native runtime behavior. Set explicitly falsy ("0"/"false"/"no"/
+#: "off") as an emergency escape hatch back to the legacy paths + static idle
+#: loop.
 KERNEL_FLAG_ENV = "MOLECULE_MAILBOX_KERNEL"
 
 #: Override for the durable base dir (kernel-on only). Defaults to the durable
@@ -71,18 +76,20 @@ MAILBOX_DIR_ENV = "MOLECULE_MAILBOX_DIR"
 
 _DEFAULT_MAILBOX_DIR = "/workspace/.molecule"
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
 
 
 def kernel_enabled() -> bool:
-    """True iff the mailbox kernel is switched on via ``MOLECULE_MAILBOX_KERNEL``.
+    """True unless ``MOLECULE_MAILBOX_KERNEL`` is set explicitly falsy.
 
-    Read live (not cached) so a test toggling the env var between cases sees
-    the change without a reset hook. This is the SINGLE flag every migrated
-    call site consults; when it returns False the runtime is byte-identical to
-    the pre-migration behavior.
+    The mailbox kernel is NATIVE runtime behavior (default ON, operator ruling
+    2026-07-13); the env var survives only as an emergency opt-out. Read live
+    (not cached) so a test toggling the env var between cases sees the change
+    without a reset hook. This is the SINGLE flag every kernel call site
+    consults; when it returns False the runtime is byte-identical to the
+    pre-kernel behavior (legacy paths, static idle loop).
     """
-    return os.environ.get(KERNEL_FLAG_ENV, "").strip().lower() in _TRUTHY
+    return os.environ.get(KERNEL_FLAG_ENV, "").strip().lower() not in _FALSY
 
 
 def resolve() -> Path:
@@ -332,6 +339,118 @@ def verify_durability() -> str:
             base,
         )
     return _last_durability_status
+
+
+# --- Legacy-state migrator (design §7.2 — replay safety) -------------------
+#
+# The kernel default flipped ON 2026-07-13 (task #219 operator ruling: native
+# ability, not flag-gated). For a workspace that previously ran kernel-OFF,
+# durable state lives at the LEGACY locations: the inbox cursor + delegation
+# tombstones under ``configs_dir.resolve()`` and the delegation-results queue
+# on ``/tmp``. Resolving the mailbox root to ``/workspace/.molecule`` without
+# carrying that state over orphans it: an empty inbox cursor ⇒ FULL INBOUND
+# REPLAY of the historical backlog, missing tombstones ⇒ DELEGATION RE-HARVEST
+# — exactly the 2026-06-29 re-narration incident class. This migrator runs on
+# the first kernel-on boot (marker-gated, idempotent) BEFORE the inbox poller
+# and heartbeat start, copying the legacy files into the mailbox root.
+#
+# Copy — never move: the legacy files stay in place so an emergency
+# ``MOLECULE_MAILBOX_KERNEL=0`` opt-out still finds its state. Never clobber:
+# a file already present at the mailbox root is newer kernel-authored state
+# and always wins. The marker is committed LAST (atomic tmp+rename), so a
+# crash mid-migration re-runs the whole (idempotent) pass next boot.
+
+_MIGRATED_MARKER = ".legacy_state_migrated"
+
+#: Legacy basenames migrated from the configs dir. ``.mcp_inbox_cursor`` also
+#: covers the per-workspace suffixed variants (``.mcp_inbox_cursor_<wsid>``),
+#: matched by prefix below.
+_LEGACY_CONFIG_BASENAMES = (
+    ".mcp_inbox_cursor",
+    ".delegation_tombstones",
+    ".agent_snapshot.json",
+)
+
+#: Legacy memory-snapshot files (kernel-off writers targeted the configs dir;
+#: kernel-on readers ONLY consult ``<mailbox>/memory`` — prompt.py's stale-
+#: shadow rule). Without carrying these over, a workspace's accumulated memory
+#: silently vanishes from the system prompt on the first kernel-on boot. Kept
+#: in lockstep with ``prompt.DEFAULT_MEMORY_SNAPSHOT_FILES`` (duplicated here
+#: to avoid a prompt->mailbox_dir import cycle; the migrator test pins the two
+#: tuples equal).
+_LEGACY_MEMORY_BASENAMES = (
+    "MEMORY.md",
+    "USER.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "SOUL.md",
+)
+
+
+def migrate_legacy_state() -> bool:
+    """Copy legacy kernel-off durable state into the mailbox root, once.
+
+    Returns True when a migration pass ran (marker was absent), False when
+    already migrated or not applicable. Never raises — a migration failure
+    must not crash boot; unmigrated state degrades to the pre-kernel replay
+    behavior, which the LOUD log below makes observable.
+    """
+    if not kernel_enabled():
+        return False
+    base = resolve()
+    legacy = configs_dir.resolve()
+    if os.path.normpath(str(base)) == os.path.normpath(str(legacy)):
+        return False  # MOLECULE_MAILBOX_DIR pointed at the legacy dir — nothing to do
+    marker = base / _MIGRATED_MARKER
+    try:
+        if marker.exists():
+            return False
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        migrated: list[str] = []
+
+        def _copy(src: Path, dst: Path) -> None:
+            if not src.is_file() or dst.exists():
+                return
+            tmp = dst.with_name(dst.name + ".migrating")
+            tmp.write_bytes(src.read_bytes())
+            os.replace(tmp, dst)
+            migrated.append(src.name)
+
+        if legacy.is_dir():
+            for entry in sorted(legacy.iterdir()):
+                if entry.name.startswith(".mcp_inbox_cursor") or entry.name in _LEGACY_CONFIG_BASENAMES:
+                    _copy(entry, base / entry.name)
+            # Memory snapshots move into the kernel's memory dir — the ONLY
+            # place kernel-on prompt assembly reads them from.
+            mem = base / "memory"
+            mem.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for name in _LEGACY_MEMORY_BASENAMES:
+                _copy(legacy / name, mem / name)
+        # Legacy delegation-results queue (env override or the /tmp default).
+        legacy_queue = Path(
+            os.environ.get("DELEGATION_RESULTS_FILE", "").strip()
+            or _DEFAULT_DELEGATION_RESULTS_FILE
+        )
+        _copy(legacy_queue, base / "delegation_results.jsonl")
+
+        tmp_marker = base / (_MIGRATED_MARKER + ".migrating")
+        tmp_marker.write_text(json.dumps({"migrated": migrated}), encoding="utf-8")
+        os.replace(tmp_marker, marker)
+        if migrated:
+            logger.info(
+                "mailbox migrate: carried legacy durable state into %s: %s",
+                base,
+                ", ".join(migrated),
+            )
+        return True
+    except OSError:
+        logger.exception(
+            "mailbox migrate: FAILED to carry legacy state into %s — inbox cursor / "
+            "delegation tombstones may be orphaned (replay risk, design §7.2). "
+            "Will retry next boot (marker not committed).",
+            base,
+        )
+        return False
 
 
 def memory_dir() -> Path:

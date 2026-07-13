@@ -1522,15 +1522,16 @@ async def main():  # pragma: no cover
     # per-workspace to enable.
     idle_loop_task = None
 
-    # 10c-kernel. Contract-driven idle DIGEST (task #219, MOLECULE_MAILBOX_KERNEL
-    # only). When the mailbox kernel is on, the static idle_prompt self-post
-    # below is replaced by the assembled provider digest (identity header +
-    # task-queue + goal-state). Kernel-OFF (the fleet default) keeps the legacy
-    # loop below byte-identical. The whole block is wrapped so a wiring fault
-    # degrades to "no idle loop", never a boot crash. The controller LOGIC is
-    # unit-tested (tests/test_idle_controller.py); the boot-integration path is
-    # validated by `make dev` before the flag is flipped on a workspace (the
-    # operator-gated §7.2 rollout).
+    # 10c-kernel. Contract-driven idle DIGEST (task #219). The mailbox kernel
+    # is NATIVE (default ON, operator ruling 2026-07-13): the assembled provider
+    # digest (identity header + task-queue + goal-state) replaces the static
+    # idle_prompt self-post below. The legacy loop below survives only behind
+    # the MOLECULE_MAILBOX_KERNEL=0 emergency opt-out. The whole block is
+    # wrapped so a wiring fault degrades to "no idle loop", never a boot crash.
+    # The controller LOGIC is unit-tested (tests/test_idle_controller.py); the
+    # boot-integration path was validated live on the local stack 2026-07-13
+    # (idle-digest canary) and is asserted by the ephemeral-CP gate's
+    # idle-digest sub-step.
     _idle_digest_enabled = False
     if adapter_ready:
         try:

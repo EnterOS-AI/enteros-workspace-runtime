@@ -142,6 +142,7 @@ def _a2a_row(row_id: str, seq: int) -> dict:
 
 
 def test_no_ack_when_kernel_off(monkeypatch, tmp_path):
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     posts: list = []
     _install_stub_httpx(monkeypatch, [_a2a_row("10", 7)], posts)
     state = inbox.InboxState(cursor_path=tmp_path / "cursor")
@@ -176,7 +177,8 @@ def test_ack_200_returns_true(monkeypatch):
 
 
 def test_cursor_moves_to_mailbox_when_kernel_on(monkeypatch, tmp_path):
-    # OFF: cursor lives under configs_dir (legacy, byte-identical).
+    # OFF (explicit opt-out): cursor lives under configs_dir (legacy).
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     monkeypatch.setenv("CONFIGS_DIR", str(tmp_path / "configs"))
     off = inbox.default_cursor_path()
     assert off == configs_dir.resolve() / ".mcp_inbox_cursor"

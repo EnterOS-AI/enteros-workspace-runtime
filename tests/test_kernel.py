@@ -46,9 +46,10 @@ def _clean(monkeypatch):
 
 
 def test_enabled_tracks_flag(monkeypatch):
-    assert kernel.enabled() is False
-    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "1")
+    # NATIVE default: enabled with the env unset; "0" is the opt-out.
     assert kernel.enabled() is True
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
+    assert kernel.enabled() is False
 
 
 def test_new_source_types_are_registered_as_routine_self():
@@ -106,7 +107,8 @@ def test_should_inject_fails_open_on_guard_error(monkeypatch):
     assert kernel.should_inject_autonomous_turn() is True
 
 
-def test_install_noop_when_disabled():
+def test_install_noop_when_disabled(monkeypatch):
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     kernel.install()
     assert tl.current() is None
 

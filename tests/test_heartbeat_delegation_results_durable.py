@@ -135,7 +135,7 @@ async def test_kernel_on_queue_is_durable_and_redelivers_after_restart(tmp_path,
 
 def test_kernel_off_queue_is_legacy_tmp_byte_identical(monkeypatch):
     """Kernel-OFF resolution is the legacy /tmp default — byte-identical."""
-    monkeypatch.delenv(mailbox_dir.KERNEL_FLAG_ENV, raising=False)
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     monkeypatch.delenv("DELEGATION_RESULTS_FILE", raising=False)
     assert mailbox_dir.delegation_results_file() == "/tmp/delegation_results.jsonl"
 
