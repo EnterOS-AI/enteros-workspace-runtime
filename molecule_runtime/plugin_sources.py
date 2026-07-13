@@ -53,10 +53,22 @@ Two accepted source forms (any forge)
 Any other scheme (e.g. ``github://``, ``presign://``) is skipped + logged,
 exactly like the shell.
 
-Token source (SSOT): the SAME resolution npm auth uses — ``npm_auth`` is the one
-resolver (``MOLECULE_TEMPLATE_REPO_TOKEN`` → ``GITEA_TOKEN`` → the gitea
-git-http cred: ``GIT_HTTP_PASSWORD``, or ``GIT_HTTP_USERNAME`` when the password
-is the ``x-oauth-basic`` sentinel). No new credential is introduced.
+Token source — PER HOST, N providers (``_host_token_map``). A source may name any
+forge, so the credential layer is keyed by host, not to one forge:
+
+  * ``MOLECULE_GIT_TOKENS`` — JSON ``{"<host>": "<token>", ...}`` (general form);
+  * ``MOLECULE_GIT_TOKEN__<HOST>`` — one var per host, ``.``/``-`` folded to
+    ``_`` (e.g. ``MOLECULE_GIT_TOKEN__GITHUB_COM``);
+  * the gitea read token (SSOT ``npm_auth.gitea_read_token``:
+    ``MOLECULE_TEMPLATE_REPO_TOKEN`` → ``GITEA_TOKEN`` → the gitea git-http cred)
+    seeded for the configured gitea host — the original single-forge credential,
+    kept so nothing regresses.
+
+A token is offered ONLY to the host it is keyed to (git resolves the helper per
+``<scheme>://<host>``), so one forge's credential is never transmitted to
+another. Before this, the map held only the gitea host, so a PRIVATE plugin repo
+on github/gitlab/self-hosted got no token, 401'd, and failed the boot — the
+fetch layer was provider-agnostic while the credential layer was not.
 
 Atomic build-then-swap (hardening win #2 over the shell)
 ========================================================
@@ -97,6 +109,7 @@ template repo) before the shell can be treated as consistent with this module.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -133,6 +146,11 @@ _DEFAULT_GIT_BINARY = "git"
 # OUT of git's argv (no ``ps`` leak) and out of the clone URL — git reads it only
 # when it invokes the helper, which happens only on a 401 challenge.
 _CRED_TOKEN_ENVVAR = "MOLECULE_GIT_CRED_TOKEN"
+
+# Per-host credential env convention for the N-provider case:
+# MOLECULE_GIT_TOKEN__GITHUB_COM=ghp_… (host `.`/`-` folded to `_`). The JSON map
+# MOLECULE_GIT_TOKENS is the general form; this is the flat-env alternative.
+_PER_HOST_TOKEN_PREFIX = "MOLECULE_GIT_TOKEN__"
 
 # Git URL schemes accepted as a full self-contained source (any forge). ``git+``
 # variants are normalized to plain http(s) for the actual clone.
@@ -791,19 +809,75 @@ _resolve_gitea_base = resolve_gitea_base
 
 
 def _host_token_map(env: Mapping[str, str], base_url: str) -> dict[str, str]:
-    """Map ``host -> token`` for the hosts the box holds a credential for.
+    """Map ``host -> token`` for every forge the box holds a credential for.
 
-    Currently the one credential the box carries is the gitea read token (SSOT:
-    ``npm_auth.gitea_read_token``), keyed to the configured gitea host. A full
-    git URL that targets that same host reuses it; any other host has no token
-    here and clones anonymously (or relies on a globally-configured helper, e.g.
-    the github.com helper ``credential_helper.py`` installs).
+    The plugin-source layer is provider-agnostic BY DESIGN (``_PROVIDERS``): a
+    source may name our gitea, github, gitlab, or a customer's self-hosted box.
+    The credential layer must be too, or the abstraction is a lie — a PRIVATE
+    plugin repo on any host other than the configured gitea would get no token,
+    take a 401, and (with GIT_TERMINAL_PROMPT=0) fail the boot. So the map is
+    built from config, not hardcoded to one forge:
+
+      1. ``MOLECULE_GIT_TOKENS`` — a JSON object ``{"<host>": "<token>", ...}``.
+         The general, N-provider form. Hosts are matched on netloc.
+      2. ``MOLECULE_GIT_TOKEN__<HOST>`` — one var per host, with the host's
+         ``.`` and ``-`` folded to ``_`` (e.g. ``MOLECULE_GIT_TOKEN__GITHUB_COM``).
+         For operators who would rather not ship a JSON blob.
+      3. the gitea read token (SSOT ``npm_auth.gitea_read_token``), keyed to the
+         configured gitea host — the existing single-forge credential, kept as a
+         SEED so nothing regresses.
+
+    Later sources do not clobber earlier ones: an explicit per-host entry wins
+    over the inherited gitea default for the same host. Tokens are only ever
+    handed to git through the per-host 401-only credential helper — never in a
+    URL, never on argv (see ``_host_cred_config_args``).
     """
-    token = gitea_read_token(env)
-    if not token:
-        return {}
-    host = urlsplit(base_url).netloc
-    return {host: token} if host else {}
+    tokens: dict[str, str] = {}
+
+    raw_json = (env.get("MOLECULE_GIT_TOKENS") or "").strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except ValueError as exc:
+            # Never fail the boot on a malformed credential blob — a plugin that
+            # needs the token will fail loudly on its own 401.
+            log.warning("[plugins] MOLECULE_GIT_TOKENS is not valid JSON (%s) — ignored", exc)
+            parsed = None
+        if isinstance(parsed, Mapping):
+            for host, token in parsed.items():
+                host = _netloc(str(host))
+                if host and isinstance(token, str) and token:
+                    tokens[host] = token
+        elif parsed is not None:
+            log.warning("[plugins] MOLECULE_GIT_TOKENS must be a JSON object — ignored")
+
+    for key, value in env.items():
+        if not key.startswith(_PER_HOST_TOKEN_PREFIX) or not value:
+            continue
+        suffix = key[len(_PER_HOST_TOKEN_PREFIX):]
+        if not suffix:
+            continue
+        # GITHUB_COM -> github.com. A host with a dash cannot be recovered from
+        # the folded form, so an operator with one should use the JSON map.
+        host = suffix.lower().replace("_", ".")
+        tokens.setdefault(host, value)
+
+    gitea_host = _netloc(base_url)
+    gitea_tok = gitea_read_token(env)
+    if gitea_host and gitea_tok:
+        tokens.setdefault(gitea_host, gitea_tok)
+
+    return tokens
+
+
+def _netloc(url_or_host: str) -> str:
+    """netloc of a URL, or the string itself when already a bare host."""
+    value = (url_or_host or "").strip()
+    if not value:
+        return ""
+    if "//" in value:
+        return urlsplit(value).netloc
+    return value.split("/", 1)[0]
 
 
 def install_declared_plugins(

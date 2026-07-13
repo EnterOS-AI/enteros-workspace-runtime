@@ -179,6 +179,18 @@ jobs:
           # protection 1010 on act_runner's client) can point at the internal
           # forge instead of silently skipping.
           MOLECULE_GITEA_BASE_URL: ${{ vars.MOLECULE_GITEA_API_HOST || 'https://git.moleculesai.app' }}
+          # PROVIDER MATRIX (comma-separated declared-plugin sources, each pinned
+          # to a commit SHA). The fetch + credential layers are provider-agnostic
+          # — a source may name github, gitlab, or a customer's self-hosted forge
+          # — so the live gate must be able to prove that on a forge that is NOT
+          # ours, without a code change. Add one here and it is fetched for real:
+          #   https://github.com/o/r#<sha>,https://gitlab.com/o/r#<sha>
+          # Private repos authenticate through the same per-host token map the
+          # runtime uses (MOLECULE_GIT_TOKENS / MOLECULE_GIT_TOKEN__<HOST>), so
+          # this exercises multi-forge credentials too. Empty = no extra forge
+          # configured; the parametrize then yields no cases and says so.
+          MOLECULE_PLUGIN_E2E_SOURCES: ${{ vars.MOLECULE_PLUGIN_E2E_SOURCES }}
+          MOLECULE_GIT_TOKENS: ${{ secrets.MOLECULE_GIT_TOKENS }}
         run: pytest -v -rs tests/integration/test_plugin_fetch_live_gitea.py
 
   lint:

@@ -1129,3 +1129,86 @@ def test_real_git_fallback_resolves_the_pin_without_sha_in_want(tmp_path, monkey
     assert content is not None, "fallback failed — a restrictive forge would brick the plugin"
     assert (content / "SKILL.md").read_text() == "# pinned"   # the PIN, not the tip
     assert not (content / ".git").exists()
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider CREDENTIALS.
+#
+# The fetch layer is provider-agnostic; the credential layer used to be keyed to
+# the single configured gitea host, so a PRIVATE plugin repo on github / gitlab /
+# a customer's self-hosted forge got no token, took a 401 and (with
+# GIT_TERMINAL_PROMPT=0) failed the boot. The abstraction was a lie one layer
+# down. These pin the N-provider contract — including that a token for one forge
+# is NEVER offered to another.
+# ---------------------------------------------------------------------------
+def test_host_token_map_reads_the_json_map(monkeypatch):
+    tokens = ps._host_token_map(
+        {"MOLECULE_GIT_TOKENS": '{"github.com":"gh","gitlab.com":"gl","git.acme.io":"ac"}'},
+        "https://git.moleculesai.app",
+    )
+    assert tokens == {"github.com": "gh", "gitlab.com": "gl", "git.acme.io": "ac"}
+
+
+def test_host_token_map_reads_per_host_env_vars():
+    tokens = ps._host_token_map(
+        {"MOLECULE_GIT_TOKEN__GITHUB_COM": "gh", "MOLECULE_GIT_TOKEN__GITLAB_COM": "gl"},
+        "https://git.moleculesai.app",
+    )
+    assert tokens == {"github.com": "gh", "gitlab.com": "gl"}
+
+
+def test_host_token_map_keeps_the_gitea_seed_and_lets_explicit_win():
+    env = {
+        "MOLECULE_TEMPLATE_REPO_TOKEN": "gitea-tok",
+        "MOLECULE_GIT_TOKENS": '{"github.com":"gh"}',
+    }
+    tokens = ps._host_token_map(env, "https://git.moleculesai.app")
+    # back-compat: the single gitea credential still lands, keyed to its host...
+    assert tokens["git.moleculesai.app"] == "gitea-tok"
+    # ...alongside the other providers.
+    assert tokens["github.com"] == "gh"
+
+
+def test_host_token_map_survives_a_malformed_json_blob():
+    # A bad credential blob must not kill the boot — a plugin that needs the
+    # token will fail loudly on its own 401 instead.
+    tokens = ps._host_token_map(
+        {"MOLECULE_GIT_TOKENS": "{not json", "MOLECULE_TEMPLATE_REPO_TOKEN": "t"},
+        "https://git.moleculesai.app",
+    )
+    assert tokens == {"git.moleculesai.app": "t"}
+
+
+def test_private_github_plugin_gets_its_own_token(monkeypatch, tmp_path):
+    """A private plugin on a NON-gitea forge authenticates."""
+    calls = _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"S.md": b"x"}))
+    ps.install_declared_plugins(
+        plugins_dir=tmp_path / "p",
+        env={
+            "MOLECULE_DECLARED_PLUGINS": "https://github.com/acme/private-plugin",
+            "MOLECULE_GIT_TOKENS": '{"github.com":"gh-SECRET"}',
+        },
+    )
+    call = calls[0]
+    # The 401-only helper is wired for github.com specifically...
+    assert any(a.startswith("credential.https://github.com") for a in call["cmd"])
+    # ...the token reaches git ONLY via the child env, never argv or the URL.
+    assert call["env"].get(ps._CRED_TOKEN_ENVVAR) == "gh-SECRET"
+    assert not any("gh-SECRET" in a for a in call["cmd"])
+
+
+def test_a_forges_token_is_never_offered_to_another_forge(monkeypatch, tmp_path):
+    """The isolation property. A gitlab plugin must not receive the github token
+    — cross-forge credential leakage would be a real incident."""
+    calls = _patch_git(monkeypatch, lambda url, ref, cmd, env: _make_repo({"S.md": b"x"}))
+    ps.install_declared_plugins(
+        plugins_dir=tmp_path / "p",
+        env={
+            "MOLECULE_DECLARED_PLUGINS": "https://gitlab.com/acme/plugin",
+            "MOLECULE_GIT_TOKENS": '{"github.com":"gh-SECRET"}',
+        },
+    )
+    call = calls[0]
+    assert call["env"].get(ps._CRED_TOKEN_ENVVAR) is None, "github token leaked to gitlab"
+    assert not any("gh-SECRET" in a for a in call["cmd"])
+    assert not any("credential." in a for a in call["cmd"])

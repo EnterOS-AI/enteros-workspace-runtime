@@ -118,6 +118,43 @@ def test_live_a_broken_plugin_does_not_take_the_mgmt_mcp_down(tmp_path):
     )
 
 
+def _extra_provider_sources() -> "list[str]":
+    """Additional LIVE provider sources to exercise, from config — NOT hardcoded.
+
+    The fetch + credential layers are provider-agnostic, so the live gate must be
+    able to prove that on a forge that is not ours without a code change. Set
+    ``MOLECULE_PLUGIN_E2E_SOURCES`` to a comma-separated list of declared-plugin
+    sources, each pinned to a COMMIT SHA — e.g.
+
+        MOLECULE_PLUGIN_E2E_SOURCES=https://github.com/o/r#<sha>,https://gitlab.com/o/r#<sha>
+
+    Each is fetched for real. Private repos authenticate through the same
+    per-host token map the runtime uses (MOLECULE_GIT_TOKENS /
+    MOLECULE_GIT_TOKEN__<HOST>), so this also exercises multi-forge credentials.
+    Empty by default: an unset matrix means "no extra providers configured", not
+    "provider-agnostic is proven".
+    """
+    raw = (os.environ.get("MOLECULE_PLUGIN_E2E_SOURCES") or "").strip()
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git binary not on PATH")
+@pytest.mark.parametrize("source", _extra_provider_sources())
+def test_live_sha_pin_on_any_configured_provider(source, tmp_path):
+    """Fetch a SHA-pinned plugin from a NON-default forge (github/gitlab/self-
+    hosted), proving the fetch is genuinely provider-agnostic and not just
+    Gitea-shaped. Parameterized from config — add a forge without touching code.
+    """
+    report = ps.install_declared_plugins(
+        plugins_dir=tmp_path / "plugins",
+        env={**os.environ, "MOLECULE_DECLARED_PLUGINS": source},
+    )
+    assert report.failed == [], f"SHA-pinned fetch failed on {source}: {report.failed}"
+    assert report.swapped is True
+    installed = list((tmp_path / "plugins").iterdir())
+    assert installed and any(p.iterdir() for p in installed if p.is_dir())
+
+
 @requires_forge
 def test_live_git_really_does_reject_branch_sha(tmp_path):
     """Pins the PREMISE of the fix against the real forge.
