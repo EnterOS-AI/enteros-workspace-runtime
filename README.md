@@ -275,9 +275,9 @@ RUN pip install --no-cache-dir \
     molecules-workspace-runtime==0.4.0
 ```
 
-The version bump in this repo is the gating event; consumers pick up the
-new version via the publish cascade (or by editing the Dockerfile pin
-directly).
+The published runtime tag is the gating event: after successful registry
+publication, the cascade opens exact-pin PRs for consumers. A template can also
+adopt the published version by editing its pin directly.
 
 ## Architecture: why a separate repo
 

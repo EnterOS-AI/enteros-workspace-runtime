@@ -27,4 +27,6 @@ def test_release_guidance_matches_tag_only_staging_flow() -> None:
     assert "staging `runtime_image_pins`" in README
     assert "prod + staging" not in README
     assert "**Loop guard:** the bump commit" not in README
+    assert "The version bump in this repo is the gating event" not in README
     assert "no bump commit or bot-actor guard" in normalized
+    assert "The published runtime tag is the gating event" in normalized
