@@ -21,7 +21,7 @@ name: auto-release
 # build`, so the wheel carries the correct version by construction. The lag is
 # cosmetic.
 #
-# Release → prod chain this kicks off (mapped in the SOP PR body):
+# Release → registry + staging chain this kicks off (mapped in the SOP PR body):
 #   merge to main → THIS workflow re-runs the merge-blocking gates inline and, on
 #   green, pushes tag runtime-v<target> at main HEAD → publish-runtime.yml (existing,
 #   tag-triggered) writes the tag version into pyproject + builds+publishes the wheel
@@ -29,10 +29,11 @@ name: auto-release
 #   PRs on each consumer template → merging a template bump trips that template's
 #   publish-image.yml (on: push main) which pip-installs the pinned wheel into a fresh
 #   image, pushes ECR :latest + :sha-<7>, and auto-promotes the digest into the
-#   control-plane `runtime_image_pins` (prod + staging). Agents boot from the promoted
-#   pinned image — the runtime is baked at image-build, NOT pip-installed at boot — so
-#   the auto-release is only fully "in prod" once the template image rebuilds + the pin
-#   promotes.
+#   control-plane staging runtime_image_pins. Agents boot from the promoted pinned
+#   image — the runtime is baked at image-build, NOT pip-installed at boot — so the
+#   automatic chain reaches staging once the template image rebuilds and its pin
+#   promotes. Production pin promotion remains separate and explicit while the
+#   production freeze is in effect.
 #
 # WHY re-run the gate here instead of `on: workflow_run`: Gitea (1.22.x..1.26.2) has
 # NO `workflow_run` trigger (same limitation that forced publish-image.yml's

@@ -4,6 +4,9 @@ from pathlib import Path
 
 
 README = (Path(__file__).parents[1] / "README.md").read_text()
+AUTO_RELEASE = (
+    Path(__file__).parents[1] / ".gitea/workflows/auto-release.yml"
+).read_text()
 
 
 def test_install_guidance_uses_canonical_private_distribution() -> None:
@@ -30,3 +33,10 @@ def test_release_guidance_matches_tag_only_staging_flow() -> None:
     assert "The version bump in this repo is the gating event" not in README
     assert "no bump commit or bot-actor guard" in normalized
     assert "The published runtime tag is the gating event" in normalized
+
+
+def test_auto_release_narrative_does_not_promise_production_promotion() -> None:
+    assert "prod + staging" not in AUTO_RELEASE
+    assert 'fully "in prod"' not in AUTO_RELEASE
+    assert "staging runtime_image_pins" in AUTO_RELEASE
+    assert "Production pin promotion remains separate and explicit" in AUTO_RELEASE
