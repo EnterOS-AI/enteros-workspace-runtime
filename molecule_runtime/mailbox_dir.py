@@ -48,9 +48,10 @@ Gating (native default — kernel ON)
     (``configs_dir.resolve()``) and every kernel call site behaves exactly as
     the pre-kernel runtime did (static idle_prompt loop, legacy state paths).
 
-Not cached: the flag + one ``mkdir`` are cheap and reading ``os.environ`` live
-keeps tests that monkeypatch ``MOLECULE_MAILBOX_KERNEL`` between cases working
-without a reset hook.
+The flag + env are read live (tests can toggle between cases without a reset
+hook); the base USABILITY probe is cached per raw-base path for the process
+lifetime so every caller agrees on one base — tests use per-test tmp bases
+(unique keys) and the conftest cache-reset hook.
 """
 from __future__ import annotations
 
@@ -480,6 +481,10 @@ def _legacy_pairs(base: Path, legacy: Path) -> list[tuple[Path, Path]]:
                 pairs.append((entry, base / entry.name))
         for name in _LEGACY_MEMORY_BASENAMES:
             pairs.append((legacy / name, base / "memory" / name))
+            # Memory written during a DEGRADED kernel window lands at
+            # <configs>/memory (memory_dir() under the degraded resolve) —
+            # source it too, so fixing the substrate later doesn't shadow it.
+            pairs.append((legacy / "memory" / name, base / "memory" / name))
     # The pre-stop writer historically hardcoded /configs (lib/pre_stop.py),
     # which may differ from configs_dir.resolve() in nonstandard layouts.
     hardcoded_snap = Path("/configs/.agent_snapshot.json")
@@ -533,8 +538,22 @@ def migrate_legacy_state() -> bool:
         migrated: list[str] = []
 
         if marker.exists():
-            # Reconcile: prefer strictly-newer legacy state (flip-flop heal).
+            # Reconcile: prefer strictly-newer legacy state (flip-flop heal) —
+            # RUNTIME-AUTHORED DOTFILES ONLY (cursor family, tombstones,
+            # activity cursor, snapshot, queue). Memory snapshots are EXCLUDED:
+            # their /configs copies are PARAM-RENDERED fresh on every provision
+            # (config-relay O_TRUNCs the bundle before install() in the same
+            # boot), so a newer /configs mtime is provisioner authorship, not
+            # opt-out-window evidence — reconciling them would clobber the
+            # agent's evolved mailbox memory with the template baseline on
+            # every routine reprovision. Cost, documented: memory edits made
+            # during an emergency =0 window stay at the legacy location (the
+            # prompt's kernel-on fallback does NOT read them once a mailbox
+            # copy exists). mtime is only sound where the runtime is the
+            # exclusive writer.
             for src, dst in _legacy_pairs(base, legacy):
+                if dst.parent.name == "memory":
+                    continue
                 try:
                     if not src.is_file():
                         continue

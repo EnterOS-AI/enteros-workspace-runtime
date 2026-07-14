@@ -270,6 +270,8 @@ class TestMcpServerSelfDelegationPropagation:
 
         # Bypass RBAC so we exercise the delegate path specifically.
         with patch.object(mcp, "_tool_permission_check", return_value=None), \
+             patch("molecule_runtime.mcp_tools._tool_permission_check",
+                   return_value=None), \
              patch("molecule_runtime.a2a_tools_delegation.discover_peer",
                    new=AsyncMock()) as p_disc, \
              patch("molecule_runtime.a2a_tools_delegation.send_a2a_message",
@@ -290,6 +292,8 @@ class TestMcpServerSelfDelegationPropagation:
         from molecule_runtime import a2a_mcp_server as mcp
 
         with patch.object(mcp, "_tool_permission_check", return_value=None), \
+             patch("molecule_runtime.mcp_tools._tool_permission_check",
+                   return_value=None), \
              patch("httpx.AsyncClient") as p_client:
             result = await mcp.handle_tool_call(
                 "delegate_task_async",

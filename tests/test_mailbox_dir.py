@@ -180,16 +180,43 @@ def test_migrate_skips_queue_when_env_override_pins_it(_legacy_state, monkeypatc
     assert (base / ".mcp_inbox_cursor").exists()  # the rest still migrates
 
 
-def test_reconcile_prefers_newer_legacy_after_optout_window(_legacy_state):
-    # kernel on → migrate → emergency opt-out window writes legacy → re-enable:
-    # the newer legacy copy must win or the stale mailbox copy shadows it.
+def test_reconcile_prefers_newer_legacy_dotfiles_after_optout_window(_legacy_state):
+    # kernel on → migrate → emergency opt-out window advances the legacy
+    # cursor → re-enable: the newer legacy dotfile must win or the stale
+    # mailbox copy replays the whole opt-out window.
+    legacy, base, queue = _legacy_state
+    assert mailbox_dir.migrate_legacy_state() is True
+    past = time.time() - 3600
+    os.utime(base / ".mcp_inbox_cursor", (past, past))
+    (legacy / ".mcp_inbox_cursor").write_text("77", encoding="utf-8")
+    assert mailbox_dir.migrate_legacy_state() is True  # reconcile carried it
+    assert (base / ".mcp_inbox_cursor").read_text() == "77"
+
+
+def test_reconcile_never_touches_memory_snapshots(_legacy_state):
+    # /configs memory copies are PARAM-RENDERED fresh on every provision — a
+    # newer mtime there is provisioner authorship, not opt-out evidence.
+    # Reconciling them would clobber the agent's evolved mailbox memory with
+    # the template baseline on every routine reprovision (review blocker).
     legacy, base, queue = _legacy_state
     assert mailbox_dir.migrate_legacy_state() is True
     past = time.time() - 3600
     os.utime(base / "memory" / "MEMORY.md", (past, past))
-    (legacy / "MEMORY.md").write_text("newer memory from the opt-out window", encoding="utf-8")
-    assert mailbox_dir.migrate_legacy_state() is True  # reconcile carried it
-    assert (base / "memory" / "MEMORY.md").read_text() == "newer memory from the opt-out window"
+    (legacy / "MEMORY.md").write_text("param-rendered template baseline", encoding="utf-8")
+    mailbox_dir.migrate_legacy_state()
+    assert (base / "memory" / "MEMORY.md").read_text() == "remember the vercel token", (
+        "reconcile must never overwrite evolved mailbox memory with a re-render"
+    )
+
+
+def test_first_boot_migrates_degraded_window_memory(_legacy_state):
+    # Memory written during a DEGRADED kernel window lands at <configs>/memory
+    # — the first-boot pass must source that subdir too.
+    legacy, base, queue = _legacy_state
+    (legacy / "memory").mkdir()
+    (legacy / "memory" / "USER.md").write_text("degraded-window user memory", encoding="utf-8")
+    assert mailbox_dir.migrate_legacy_state() is True
+    assert (base / "memory" / "USER.md").read_text() == "degraded-window user memory"
 
 
 def test_migrate_defers_marker_when_legacy_dir_absent(_legacy_state):
