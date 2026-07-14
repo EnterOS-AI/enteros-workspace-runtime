@@ -1,9 +1,10 @@
 name: auto-release
 
 # CTO standing directive (2026-06-10): a GREEN package-affecting merge to `main`
-# must AUTO-release the runtime and publish to prod. Test, docs, and CI-only
-# merges finish successfully without creating a no-op package version. A manual
-# workflow dispatch deliberately overrides classification and forces a release.
+# must AUTO-release the runtime and publish its wheel to the production package
+# registry. Test, docs, and CI-only merges finish successfully without creating a
+# no-op package version. A manual workflow dispatch deliberately overrides
+# classification and forces a release.
 #
 # TAG-ONLY design (root cause, 2026-06-10): `main` is strictly PR-only — branch
 # protection sets `enable_push: false` + `required_approvals: 2`, so NO identity (not
@@ -30,20 +31,19 @@ name: auto-release
 #   to the Gitea PyPI registry, and its `propagate` job opens `.runtime-version` bump
 #   PRs on each consumer template → merging a template bump trips that template's
 #   publish-image.yml (on: push main) which pip-installs the pinned wheel into a fresh
-#   image, pushes ECR :latest + :sha-<7>, and auto-promotes the digest into the
-#   control-plane staging runtime_image_pins. Agents boot from the promoted pinned
-#   image — the runtime is baked at image-build, NOT pip-installed at boot — so the
-#   automatic chain reaches staging once the template image rebuilds and its pin
-#   promotes. Production pin promotion remains separate and explicit while the
-#   production freeze is in effect.
+#   image, pushes :latest + :sha-<7> to Gitea OCI at registry.moleculesai.app, and
+#   auto-promotes the digest into the control-plane staging runtime_image_pins.
+#   Agents boot from the promoted pinned image — the runtime is baked at image-build,
+#   NOT pip-installed at boot — so the automatic chain reaches staging once the
+#   template image rebuilds and its pin promotes.
+#   Production pin promotion remains separate and explicit while the production
+#   freeze is in effect.
 #
-# WHY re-run the gate here instead of `on: workflow_run`: Gitea (1.22.x..1.26.2) has
-# NO `workflow_run` trigger (same limitation that forced publish-image.yml's
-# promote-pin to be an in-workflow job). So a release workflow cannot subscribe to the
-# `ci` workflow's success. We re-run unit-tests, responsiveness-e2e, and the SDK
-# schema-sync gate inline and only release if all three pass — making "release on
-# green" self-contained and preventing a tag when the packaged contract mirror is
-# stale or cannot be verified.
+# WHY re-run the gate here instead of `on: workflow_run`: current Gitea supports `workflow_run`,
+# but this repository deliberately keeps unit-tests,
+# responsiveness-e2e, and SDK schema-sync inside the release workflow. The tag is
+# therefore decided from one self-contained run against the exact merge commit,
+# without depending on a separate subscriber workflow or its permissions.
 #
 # LOOP SAFETY (structural): this workflow makes NO commit to `main`, and the only
 # write it performs is the TAG push. A tag push does NOT match `on: push:

@@ -241,7 +241,7 @@ def print_missing_env_help(missing: list[str], have_token_file: bool) -> None:
     if not have_token_file:
         print(
             "  MOLECULE_WORKSPACE_TOKEN    — bearer token for this workspace "
-            "(canvas → Tokens tab)",
+            "(Canvas Settings → Workspace Tokens)",
             file=sys.stderr,
         )
         print(

@@ -13,9 +13,9 @@ Why no platform-side Docker-exec equivalent here:
     The handler runs INSIDE the workspace container, which already has
     direct filesystem access to /workspace. mkdir + open + write is
     enough — no archive ceremony, no remote-exec round-trip, no
-    docker socket dependency. Same code path on local Docker and SaaS
-    EC2; the bug behind #2308 (platform's findContainer is nil in
-    SaaS) cannot exist here by construction.
+    docker socket dependency. The same code path runs on local Docker and
+    managed workspaces; the bug behind #2308 (the platform provisioner had no
+    container handle) cannot exist here by construction.
 
 Path safety:
     sanitize_filename strips everything outside [A-Za-z0-9._-], collapses

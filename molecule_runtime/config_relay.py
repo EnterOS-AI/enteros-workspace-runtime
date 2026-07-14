@@ -146,7 +146,7 @@ def validate_bundle_path(raw: str) -> str:
 
     Rejects absolute paths, ``..`` traversal, and any character outside the CP's
     ``^[A-Za-z0-9._/-]+$`` charset. Mirrors the CP's write-side validation so the
-    delivered object and the legacy Secrets-Manager object share ONE unpack path.
+    delivered object and the legacy provisioner bundle share ONE unpack path.
     """
     if not raw or "\x00" in raw:
         raise RelayConfigError(f"invalid bundle path {raw!r}")

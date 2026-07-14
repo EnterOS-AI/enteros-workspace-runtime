@@ -1150,7 +1150,8 @@ async def get_workspace_info(source_workspace_id: str | None = None) -> dict:
                     "hint": body.get(
                         "hint",
                         "Workspace was deleted on the platform. "
-                        "Regenerate workspace + token from the canvas → Tokens tab.",
+                        "Re-create the workspace, then create a token in Canvas "
+                        "Settings → Workspace Tokens.",
                     ),
                 }
             return {"error": "not found"}

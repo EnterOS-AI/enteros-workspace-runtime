@@ -10,11 +10,10 @@ the same convention chat-uploads and inbox attachments already use (see
 
 Durability is a DEPLOYMENT PROPERTY, not a given
 ------------------------------------------------
-``/workspace`` is durable only where it is mounted on a persistent volume — a
-Docker named volume (local / staging) or a dedicated EBS data volume (SaaS
-EC2). On a flavor where ``/workspace`` is merely a directory on the *ephemeral
-root disk* — e.g. a production EC2 workspace with the per-org data volume
-disabled, where ``/workspace`` is NOT in the cp#326 backup/restore set — the
+``/workspace`` is durable only where it is mounted on persistent storage — a
+Docker named volume for local environments or the workspace data volume in a
+managed deployment. On a flavor where ``/workspace`` is merely a directory on
+the *ephemeral root disk* and is outside the cp#326 backup/restore set, the
 kernel's ``mkdir`` still succeeds but the state is silently lost on the next
 instance recreate / auto-heal. :func:`verify_durability` probes for exactly
 this at kernel-on boot and warns LOUD + records an observable status, so a
@@ -133,7 +132,7 @@ def resolve() -> Path:
     Kernel ON  -> ``/workspace/.molecule`` (or ``MOLECULE_MAILBOX_DIR``),
                   created ``0700`` — WHEN that base is actually usable.
                   On a substrate where it cannot be created/written (root:755
-                  named volume — core#4295; an operator host running the
+                  named volume — core#4295; an external host running the
                   standalone ``molecule-mcp`` with no /workspace at all) the
                   kernel DEGRADES to the legacy configs dir instead of
                   scattering failed writes: cursors/tombstones keep their
@@ -174,7 +173,7 @@ def resolve() -> Path:
 # The kernel relocates durable state onto ``/workspace`` on the assumption that
 # ``/workspace`` is durable. That is a DEPLOYMENT + PROVIDER property, not a
 # given, and it holds in TWO provider-agnostic ways:
-#   1. a distinct persistent MOUNT (AWS EBS data volume, Docker named volume) —
+#   1. a distinct persistent MOUNT (block-storage volume, Docker named volume) —
 #      zero-loss across recreate; detected by ``st_dev`` != ``/``;
 #   2. R2 SNAPSHOT/RESTORE (Hetzner/GCP boot disk + the workspace-data contract):
 #      ``/workspace`` is on the ephemeral boot disk (same ``st_dev`` as ``/``)

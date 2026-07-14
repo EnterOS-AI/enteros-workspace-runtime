@@ -344,9 +344,9 @@ class RuntimeInbox:
         self._entries.clear()
 
 
-# Module-level singleton — one inbox per process, shared across all
-# concurrent A2A requests. Matches the "one workspace = one process"
-# topology from reference_workspace_ec2_one_per_workspace_2026_05_19.
+# Module-level singleton — one inbox per process, shared across all concurrent
+# A2A requests. Matches the current isolation boundary: one workspace = one
+# runtime process.
 _INBOX = RuntimeInbox()
 
 

@@ -188,14 +188,13 @@ class SecurityScanConfig:
 
 @dataclass
 class EventLogConfig:
-    """Settings for the workspace event log (workspace/event_log.py).
+    """Settings for the workspace event log (molecule_runtime/event_log.py).
 
-    The event log is an append-and-query buffer for runtime events
-    (turn started, tool invoked, peer message delivered, …) that the
-    canvas Activity tab and platform-side `/activity` endpoint read.
-    Defaults are tuned for a long-running workspace: 1-hour TTL and a
-    10k-entry cap together hold ~1 MB of events in memory at the
-    documented per-event size budget (~100 bytes payload).
+    The event log is an in-process append-and-query buffer. ``main.py``
+    constructs the configured backend and assigns it to the adapter, but no
+    production append/query callers are wired yet. Core's `/activity` endpoint
+    reads its own `activity_logs` database, which drives Canvas Activity, not
+    this buffer. The defaults bound memory for future runtime-local instrumentation.
 
     Example config.yaml snippet::
 
@@ -208,9 +207,9 @@ class EventLogConfig:
 
     backend: str = "memory"
     """``memory`` (default) buffers events in process RAM with the
-    bounds below; ``disabled`` returns a no-op log so the canvas
-    Activity tab is silent. Unknown values fall back to ``memory`` —
-    a typo should not crash boot or silently drop telemetry."""
+    bounds below; ``disabled`` returns a no-op log for this unwired
+    runtime-local seam. It does not silence Canvas Activity. Unknown values
+    fall back to ``memory`` so a typo does not crash boot."""
 
     ttl_seconds: int = 3600
     """How long an event survives before TTL eviction. 1 hour covers
@@ -235,9 +234,9 @@ class ObservabilityConfig:
     vars and hard-coded constants. Adopting this shape unblocks
     per-workspace tuning without a code change.
 
-    The ``event_log`` sub-block is schema-only in this PR (#119 PR-2);
-    consumer wiring (the canvas Activity tab + `/activity` endpoint
-    reading from the configured backend) lands in PR-3.
+    At boot, ``main.py`` creates the configured backend and assigns it to the
+    adapter. Production event producers and consumers are not wired yet; the
+    platform Activity surface remains independent of this in-process backend.
 
     Example config.yaml snippet::
 
@@ -252,7 +251,7 @@ class ObservabilityConfig:
 
     heartbeat_interval_seconds: int = 30
     """Seconds between heartbeats sent to the platform. Default 30 matches
-    ``workspace/heartbeat.py``'s long-standing constant. Lower values
+    ``molecule_runtime/heartbeat.py``'s long-standing constant. Lower values
     reduce platform-side detection latency for crashed workspaces; higher
     values reduce platform write load. Bounds: clamped to [5, 300] at
     parse time — outside that range the workspace either floods the
@@ -260,9 +259,8 @@ class ObservabilityConfig:
 
     log_level: str = "INFO"
     """Python ``logging`` level for the workspace runtime. Accepts the
-    standard names (DEBUG, INFO, WARNING, ERROR, CRITICAL). Today the
-    runtime reads ``LOG_LEVEL`` env; PR-3 of the #119 stack switches to
-    this field with env still honored as an override for ops debugging."""
+    standard names (DEBUG, INFO, WARNING, ERROR, CRITICAL). ``LOG_LEVEL``
+    remains an explicit environment override for operational debugging."""
 
     event_log: EventLogConfig = field(default_factory=EventLogConfig)
     """Event-log backend + retention bounds. See ``EventLogConfig``."""

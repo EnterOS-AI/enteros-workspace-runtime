@@ -1,8 +1,8 @@
 """Desktop-control MCP tools for display-enabled workspaces.
 
-The display session runs on the EC2 host, not inside the runtime
-container. T4 workspaces mount the host at /host and grant sudo inside
-the privileged container, so these tools enter the host namespace with
+The display session runs on the workspace host, not inside the runtime
+container. Display-enabled workspaces mount the host at /host and grant sudo
+inside the privileged container, so these tools enter the host namespace with
 ``chroot /host`` and drive the private Xvfb display on ``:99``.
 """
 

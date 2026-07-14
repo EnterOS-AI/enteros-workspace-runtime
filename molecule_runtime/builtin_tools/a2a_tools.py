@@ -1,7 +1,7 @@
 """A2A communication tools — framework-agnostic delegation and peer discovery.
 
 These are plain async functions that any adapter can wrap in its native tool format.
-The LangChain @tool versions are in tools/delegation.py.
+The LangChain @tool versions are in molecule_runtime/builtin_tools/delegation.py.
 """
 
 import os
@@ -56,7 +56,7 @@ async def delegate_task(workspace_id: str, task: str) -> str:
     #
     # The sibling guards live in:
     #   - workspace-server/internal/handlers/delegation.go (Go API gate)
-    #   - workspace/a2a_tools_delegation.py (MCP path guard)
+    #   - molecule_runtime/a2a_tools_delegation.py (MCP path guard)
     # This module is the framework-agnostic adapter surface used by adapters
     # that don't go through a2a_tools_delegation.py — it needs its own guard.
     if WORKSPACE_ID and workspace_id == WORKSPACE_ID:

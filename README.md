@@ -182,18 +182,22 @@ ID and token returned by each tenant.
 
 The runtime distribution is served by Molecule's Gitea registry. Public PyPI is
 used only for its public dependencies; do not install the retired
-`molecule-ai-workspace-runtime` distribution name.
+`molecule-ai-workspace-runtime` distribution name. Set `RUNTIME_VERSION` to the
+version suffix of a reviewed, published `runtime-v*` tag; every install below is
+exact-pinned so the public dependency index cannot select a higher impostor.
 
 ```bash
+: "${RUNTIME_VERSION:?set RUNTIME_VERSION to a reviewed published version}"
+
 pip install \
   --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
   --extra-index-url https://pypi.org/simple/ \
-  "molecules-workspace-runtime==0.4.0"
+  "molecules-workspace-runtime==${RUNTIME_VERSION}"
 
 # Recommended when installing the external MCP server as an isolated CLI:
 pipx install \
   --pip-args='--index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ --extra-index-url https://pypi.org/simple/' \
-  "molecules-workspace-runtime==0.4.0"
+  "molecules-workspace-runtime==${RUNTIME_VERSION}"
 ```
 
 ## Contributing
@@ -237,8 +241,9 @@ Releases are **automatic on a green merge to `main`** (CTO standing directive,
 1. Land changes via reviewed PR (2 non-author approvals + CI green).
 2. On merge to `main`, `auto-release.yml` re-runs the release-blocking gates
    (`unit-tests`, `responsiveness-e2e`, and the fail-closed SDK schema-sync
-   check) inline. Gitea has no `workflow_run` trigger, so the release workflow
-   re-runs the gates itself rather than subscribing to parallel workflows.
+   check) inline. Current Gitea supports `workflow_run`; this repository keeps
+   the gates inline so the release decision and exact merge commit are checked
+   together instead of depending on a separate subscriber workflow.
 3. On green it computes the next patch from the latest `runtime-v*` tag and
    compares it with the reviewed `[project].version` floor. The higher version
    becomes `runtime-vX.Y.Z` (so an explicit `0.4.0` cutover is not flattened to
@@ -248,11 +253,12 @@ Releases are **automatic on a green merge to `main`** (CTO standing directive,
    Gitea package registry → its `propagate` job opens `.runtime-version` bump PRs
    on each of the four maintained workspace templates. Merging a template bump
    trips that template's `publish-image.yml`, which bakes the pinned wheel into a
-   fresh image, pushes ECR `:latest` + `:sha-<7>`, and auto-promotes the digest
-   into the control-plane staging `runtime_image_pins`. Agents boot from the
-   promoted pinned image (runtime baked at build, not pip-installed at boot).
-   Production pin promotion remains a separate, explicit operation while the
-   production freeze is in effect.
+   fresh image, pushes `:latest` + `:sha-<7>` to the Gitea OCI registry at
+   `registry.moleculesai.app`, and auto-promotes the digest into the control-plane
+   staging `runtime_image_pins`. Agents boot from the promoted pinned image
+   (runtime baked at build, not pip-installed at boot). Production pin promotion
+   remains a separate, explicit operation while the production freeze is in
+   effect.
 
 **Loop safety:** the release bot creates a tag only; there is no bump commit or
 bot-actor guard. The tag push does not match `on: push: branches:[main]`, so
@@ -269,10 +275,11 @@ Molecule Core installs the published wheel separately and does not carry a
 `.runtime-version` template pin.
 
 ```dockerfile
+ARG RUNTIME_VERSION
 RUN pip install --no-cache-dir \
     --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
     --extra-index-url https://pypi.org/simple/ \
-    molecules-workspace-runtime==0.4.0
+    "molecules-workspace-runtime==${RUNTIME_VERSION}"
 ```
 
 The published runtime tag is the gating event: after successful registry

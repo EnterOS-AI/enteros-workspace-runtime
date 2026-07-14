@@ -433,8 +433,8 @@ async def delegate_task_async(
     # from ourselves (#190). Reject before scheduling the background task
     # so no peer_agent echo can be generated. Sibling guards:
     #   - workspace-server/internal/handlers/delegation.go (Go API gate)
-    #   - workspace/a2a_tools_delegation.py (MCP sync + async paths)
-    #   - workspace/builtin_tools/a2a_tools.py (framework-agnostic sync)
+    #   - molecule_runtime/a2a_tools_delegation.py (MCP sync + async paths)
+    #   - molecule_runtime/builtin_tools/a2a_tools.py (framework-agnostic sync)
     if WORKSPACE_ID and workspace_id == WORKSPACE_ID:
         log_event(event_type="delegation", action="delegate", resource=workspace_id,
                   outcome="rejected_self_delegation", trace_id=task_id)

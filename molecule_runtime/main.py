@@ -150,13 +150,11 @@ def resolve_workspace_url(
          appended, since the tunnel/proxy fronts the agent's port.
       2. Fallback: ``http://<HOSTNAME-or-machine-ip>:<port>``.
 
-    Why (1) exists: the fallback advertises the host's own name — on AWS that is
-    the cloud-internal ``ip-<priv-ip>`` (e.g. ``ip-10-10-1-147``), which only
-    resolves inside the workspace's OWN VPC. A tenant in a DIFFERENT cloud (an
-    EC2 workspace under a GCP tenant) gets a DNS SERVFAIL on it and rejects
-    ``/registry/register`` with 400 → the workspace is undialable. A
-    platform-injected reachable URL fixes cross-cloud push delivery while
-    same-cloud workspaces (no env set) keep the intra-VPC fallback.
+    Why (1) exists: the fallback advertises the host's own name, which may resolve
+    only inside that host's private network. A control plane on another network
+    then gets DNS failure and rejects ``/registry/register`` with 400, leaving the
+    workspace undialable. A platform-injected reachable URL fixes cross-network
+    push delivery while same-network workspaces keep the private-host fallback.
 
     Push-mode loopback guard (registration-400 fix): under push delivery the
     platform DIALS this URL, so its write-time SSRF guard (workspace-server
@@ -233,13 +231,13 @@ async def register_with_platform(
 
     internal#688: the original boot-register fired EXACTLY ONCE. If the
     tenant orchestrator (workspace-server) was momentarily down — e.g. a
-    workspace-recreate sweep stopped its EC2, so Cloudflare returned 530 /
+    workspace-recreate sweep stopped its service, so Cloudflare returned 530 /
     tunnel-error 1033 — the one POST failed, a warning was printed, and the
     workspace proceeded with ``workspaces.url`` left empty in the platform
     DB. The workspace heartbeats fine and shows ``online``, but it's
     undialable: schedule ticks throw ``workspace has no URL`` and A2A
-    dispatch can't reach it. The only recovery was a manual
-    ``docker restart molecule-workspace`` per affected EC2.
+    dispatch can't reach it. Before this retry path, recovery required restarting
+    every affected workspace container.
 
     Both failure shapes from the incident are retried here:
       * a transport-level exception (orchestrator unreachable), and
@@ -1063,7 +1061,7 @@ async def main():  # pragma: no cover
                     pass
             raise SystemExit(exit_code)
 
-        # 6b. Restore from pre-stop snapshot if one exists (GH#1391).
+        # 6b. Restore from pre-stop snapshot if one exists (molecule-core#1391).
         # The snapshot is scrubbed before being written, so secrets are
         # already redacted — restore_state must not re-expose them.
         from molecule_runtime.lib.pre_stop import read_snapshot
@@ -1119,7 +1117,7 @@ async def main():  # pragma: no cover
 
     # 7. Wrap in A2A.
     #
-    # Route assembly is in workspace/boot_routes.py so the contract —
+    # Route assembly is in molecule_runtime/boot_routes.py so the contract —
     # card always mounted, JSON-RPC route swaps based on adapter state
     # (DefaultRequestHandler when executor is non-None, not_configured
     # handler returning -32603 otherwise) — is unit-testable with
@@ -1871,10 +1869,11 @@ async def main():  # pragma: no cover
     try:
         await server.serve()
     finally:
-        # 10d. Pre-stop serialization — GH#1391.
+        # 10d. Pre-stop serialization — molecule-core#1391.
         # Capture in-memory state before the container exits so it survives
         # intentional pause and unplanned restart. All content is scrubbed
-        # via lib.snapshot_scrub before being written to the config volume.
+        # via lib.snapshot_scrub before being written to the resolved mailbox
+        # path (the persistent workspace volume when the kernel is enabled).
         try:
             from molecule_runtime.lib.pre_stop import build_snapshot, write_snapshot
             adapter_state = adapter.pre_stop_state() if adapter else {}
@@ -1931,12 +1930,9 @@ async def main():  # pragma: no cover
 def main_sync():  # pragma: no cover
     """Synchronous entry point for the `molecule-runtime` console script.
 
-    Declared in scripts/build_runtime_package.py as the wheel's entry-point
-    target (`molecule-runtime = "molecule_runtime.main:main_sync"`). Removed
-    silently during the pre-monorepo consolidation, which broke every
-    workspace startup against 0.1.16/0.1.17/0.1.18 with `ImportError:
-    cannot import name 'main_sync'`. The .github/workflows/runtime-pin-compat.yml
-    smoke step is the regression gate.
+    Declared directly in pyproject.toml as the wheel's entry-point target
+    (`molecule-runtime = "molecule_runtime.main:main_sync"`). Keep the wrapper
+    stable so installed console scripts can enter the async runtime safely.
     """
     asyncio.run(main())
 

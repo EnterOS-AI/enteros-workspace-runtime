@@ -5,11 +5,12 @@ Single source of truth for every tool the platform exposes to agents
 
 ## Why this exists
 
-Pre-#2240, three places independently declared each tool:
+Before the standalone runtime became the source of truth, three monorepo
+surfaces independently declared each tool:
 
-1. **MCP server** (`workspace/a2a_mcp_server.py`) — the `TOOLS` JSON list
-2. **LangChain `@tool` wrappers** (`workspace/builtin_tools/{delegation,memory}.py`)
-3. **Agent-facing system-prompt docs** (`workspace/executor_helpers.py`)
+1. **MCP server** — the JSON tool list
+2. **Runtime-specific wrappers** — framework-native tool declarations
+3. **Agent-facing system-prompt docs** — names and usage guidance
 
 Adding a tool to one and forgetting the others happened repeatedly. The
 canonical case: `send_message_to_user` was registered in MCP TOOLS but
@@ -32,13 +33,19 @@ ToolSpec(
 )
 ```
 
-Adapters consume specs; no hardcoded names anywhere else:
+The current shared surfaces consume the registry directly:
 
-- **MCP server** builds its `TOOLS` list from `_PLATFORM_TOOL_SPECS` at import time
-- **LangChain `@tool` wrappers** read `name=spec.name` from the registry
-- **Doc generator** (`executor_helpers._render_section()`) produces the
+- **MCP/OpenAI contract and dispatcher** (`molecule_runtime/mcp_tools.py`)
+  derives schemas and dispatch from `TOOLS`.
+- **MCP server** (`molecule_runtime/a2a_mcp_server.py`) re-exports that shared
+  contract rather than declaring a second list.
+- **Doc generator** (`molecule_runtime/executor_helpers.py`) produces the
   system-prompt block from `spec.short` (bullet) + `spec.when_to_use`
-  (heading + paragraph)
+  (heading + paragraph).
+
+Framework-specific wrappers under `molecule_runtime/builtin_tools/` may expose
+a narrower native surface. They delegate implementation to the shared handlers,
+but they are not a second source for the universal MCP schema.
 
 ## CLI subprocess block — special case
 
@@ -57,36 +64,23 @@ doesn't survive positional-arg shell invocation).
 
 ## Tests that catch drift
 
-`workspace/tests/test_platform_tools.py`:
+The active drift gates are:
 
-| Test | What it catches |
+| File | What it catches |
 |---|---|
-| `test_mcp_server_registers_every_registry_tool` | MCP TOOLS list out of sync with registry |
-| `test_mcp_tool_descriptions_match_registry_short` | hand-edited MCP description that drifted |
-| `test_mcp_tool_input_schemas_match_registry` | schema duplicated in server file |
-| `test_a2a_instructions_text_includes_every_a2a_tool` | doc generator missed a tool |
-| `test_old_pre_rename_names_not_present_in_docs` | stale name leaked back in |
-| `test_a2a_mcp_instructions_match_snapshot` | rendered shape (bullet ordering, headings, footers) drifted |
-| `test_a2a_cli_instructions_match_snapshot` | CLI block edited in a way that changes shape |
-| `test_hma_instructions_match_snapshot` | HMA section drifted |
-| `test_cli_keyword_mapping_covers_every_a2a_tool` | tool added to registry without a CLI mapping decision |
-| `test_cli_keyword_substrings_appear_in_cli_block` | CLI keyword in the mapping but missing from the doc block |
-
-The snapshot files at `workspace/tests/snapshots/*.txt` are LF-pinned
-in `.gitattributes` so a Windows contributor with `core.autocrlf=true`
-doesn't get mysterious test failures.
+| `tests/test_mcp_ssot.py` | MCP and OpenAI adapter schemas diverging from the registry |
+| `tests/test_executor_helpers.py` | generated A2A/display guidance missing a registered tool |
+| `tests/test_current_operator_guidance.py` | contributor guidance pointing at retired paths or fixed tool counts |
 
 ## Adding a new tool
 
 1. Append a `ToolSpec(...)` to `TOOLS` in `registry.py`.
-2. Add the LangChain `@tool` wrapper in `workspace/builtin_tools/`
-   (the wrapper body just calls `spec.impl`).
-3. Update `_CLI_A2A_COMMAND_KEYWORDS` in `executor_helpers.py` — set the
+2. Update `_CLI_A2A_COMMAND_KEYWORDS` in `molecule_runtime/executor_helpers.py` — set the
    value to the CLI subcommand keyword, or to `None` if the tool isn't
    exposed via the subprocess interface.
-4. Regenerate snapshots — see the comment block at the top of
-   `workspace/tests/test_platform_tools.py` for the one-liner.
-5. Run `pytest workspace/tests/test_platform_tools.py --no-cov`.
+3. Add or update a framework-specific wrapper only when that framework exposes
+   the capability outside the universal MCP server.
+4. Run `pytest -q tests/test_mcp_ssot.py tests/test_executor_helpers.py`.
 
 ## Renaming a tool
 
@@ -95,7 +89,7 @@ Edit `name` in `registry.py` only. Then:
 1. The MCP TOOLS list rebuilds automatically.
 2. The doc generator regenerates automatically (snapshots will fail
    the diff — regenerate them).
-3. Search `workspace/` for the old literal in case a non-adapter
+3. Search `molecule_runtime/` and `tests/` for the old literal in case a non-adapter
    consumer (tests, plugin code) hardcoded the old name; update those.
 4. Update any `_CLI_A2A_COMMAND_KEYWORDS` key + the literal substring
    in `_A2A_INSTRUCTIONS_CLI` if applicable.

@@ -16,12 +16,10 @@ gaps reported via the canvas:
     ``memory.write`` capability via the existing RBAC permission map so
     read-only roles can't silently rewrite the platform card.
 
-Both originated as a port of molecule-ai-workspace-runtime PR#17
-(``feat(mcp): add update_agent_card + get_runtime_identity tools``).
-The mirror-only PR#17 was closed without merge per
-``reference_runtime_repo_is_mirror_only``; the canonical edit point is
-this monorepo at ``workspace/`` and the wheel mirror is regenerated
-automatically by the publish-runtime workflow.
+Both originated in PR#17 (``feat(mcp): add update_agent_card +
+get_runtime_identity tools``). This standalone repository is now the canonical
+edit point; reviewed package changes release through the repository's Gitea
+workflows.
 
 Imports the auth-header primitive from ``a2a_tools_rbac`` (iter 4a) —
 NOT from ``a2a_tools`` — to avoid a circular import with the

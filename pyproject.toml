@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 # DISTRIBUTION (pip) name. Renamed 2026-06-30 from the legacy
-# `molecule-ai-workspace-runtime` to close a dependency-confusion hole: the
-# legacy dist name is SQUATTED on public PyPI (136 releases incl version-bombs
-# like 0.1.999999), so any resolver that also sees public PyPI (the CLI
-# one-liner's `--extra-index-url`, and the google-adk/hermes/openclaw template
-# image builds) could be silently hijacked by a public publish of a higher
-# version. `molecules-workspace-runtime` is NOT on public PyPI and resolves ONLY
-# from our Gitea registry, so it is confusion-safe. The IMPORT package stays
+# `molecule-ai-workspace-runtime` to close a dependency-confusion hole. At the
+# June 2026 rename, that legacy name had 136 public releases, including anomalous
+# high versions such as 0.1.999999. The legacy project currently returns 404 on
+# PyPI's JSON and simple endpoints as of 2026-07-14; that squatting description
+# is historical, not its present package status. The name remains retired so a
+# future public registration cannot enter resolver candidates. The canonical
+# `molecules-workspace-runtime` name was also absent from public PyPI on that
+# date and resolves from the Gitea registry. The IMPORT package stays
 # `molecule_runtime` (unchanged) — only the pip/dist name changed.
 name = "molecules-workspace-runtime"
 
@@ -83,8 +84,8 @@ test = ["pytest", "pytest-asyncio", "jsonschema>=4.18"]
 molecule-runtime = "molecule_runtime.main:main_sync"
 # External-runtime MCP server — operators running an agent outside the
 # platform's container fleet (Claude Code, hermes, codex, etc.) install
-# this wheel and run `molecule-mcp` locally. Same 8 platform tools as
-# container-bound runtimes get via the auto-spawned MCP.
+# this wheel and run `molecule-mcp` locally. It uses the same registry-backed
+# platform tool contract that container-bound runtimes expose via auto-spawned MCP.
 molecule-mcp = "molecule_runtime.mcp_cli:main"
 
 [tool.ruff]

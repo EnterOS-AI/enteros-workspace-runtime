@@ -12,9 +12,9 @@
 #      remote, etc.). Same regex set as the tenant-proxy CI scanner —
 #      keep them aligned.
 #
-#   2. Internal-paths block (Molecule-AI public repos only). Refuses
+#   2. Internal-paths block (canonical molecule-ai/molecule-core only). Refuses
 #      commits that add `research/`, `marketing/`, etc. to the public
-#      monorepo. Was the original purpose of this hook; lives here so
+#      Core repo. Was the original purpose of this hook; lives here so
 #      every agent commit only pays one hook-install + one git config
 #      surface area, not two.
 #
@@ -128,17 +128,17 @@ if [ -n "$DIFF" ]; then
     fi
 fi
 
-# ─── 2. Internal-paths block (public Molecule-AI repos only) ──────────
+# ─── 2. Internal-paths block (canonical public Core repo only) ───────
 #
-# Despite SHARED_RULES.md, .gitignore, and a CI gate, agents still try
-# to `git add /research/...` from their cwd in `molecule-monorepo`. Each
+# Despite repository guidance, .gitignore, and a CI gate, agents still try
+# to `git add /research/...` from their cwd in `molecule-core`. Each
 # leak attempt costs ~5 cycles (PR opens, CI fails, agent retries with
 # workaround) and pollutes git history with reverts. This gate converts
 # the failure mode from "PR fails" → "commit refused at the agent's
 # local git" — instant feedback with the redirect command in the same
 # error message.
 case "$REMOTE" in
-    *Molecule-AI/molecule-monorepo*|*Molecule-AI/molecule-core*)
+    *git.moleculesai.app/molecule-ai/molecule-core*)
         ;;
     *)
         # Non-target repo (internal, plugins, templates, third-party) — let it through.
@@ -173,27 +173,27 @@ done
 
 {
     echo
-    echo "Refusing commit: internal-flavored paths cannot live in the public monorepo."
+    echo "Refusing commit: internal-flavored paths cannot live in the public Core repo."
     echo
     echo "Offending files:"
     printf "$OFFENDING"
     echo
-    echo "These belong in Molecule-AI/internal. Redirect:"
+    echo "These belong in molecule-ai/internal on Gitea. Redirect:"
     echo
     echo "  mkdir -p ~/repos"
-    echo "  test -d ~/repos/internal || gh repo clone Molecule-AI/internal ~/repos/internal"
+    echo "  test -d ~/repos/internal || git clone https://git.moleculesai.app/molecule-ai/internal.git ~/repos/internal"
     echo "  cd ~/repos/internal"
     echo "  git pull origin main"
     echo "  git checkout -b <my-role>/<topic>-<date>"
     echo "  mkdir -p <area>            # research, marketing, runbooks, etc."
-    echo "  # move your file from the monorepo into <area>/<slug>.md"
+    echo "  # move your file from molecule-core into <area>/<slug>.md"
     echo "  git add <area>/<slug>.md"
     echo "  git commit -m '<area>: add <slug>'"
     echo "  git push -u origin HEAD"
-    echo "  gh pr create --base main --fill"
+    echo "  # Open a PR against main: https://git.moleculesai.app/molecule-ai/internal/pulls"
     echo
     echo "If your file is genuinely public-facing (final blog post, public"
-    echo "tutorial, customer-shippable doc), use one of these monorepo paths"
+    echo "tutorial, customer-shippable doc), use one of these public Core paths"
     echo "instead — these are not blocked:"
     echo "  - docs/blog/<slug>.md"
     echo "  - docs/tutorials/<slug>.md"
@@ -202,7 +202,7 @@ done
     echo
     echo "If you legitimately need a new top-level path that matches a"
     echo "forbidden pattern, edit:"
-    echo "  .github/workflows/block-internal-paths.yml"
+    echo "  .gitea/workflows/block-internal-paths.yml"
     echo "with reviewer signoff and a public-facing justification — do NOT"
     echo "work around the gate by renaming."
     echo

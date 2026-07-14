@@ -1,10 +1,10 @@
-"""Pre-stop serialization for pause/resume — GH#1391.
+"""Pre-stop serialization for pause/resume — molecule-core#1391.
 
 Captures the agent's in-memory state just before the container exits so it
 survives intentional pause and unplanned restart. All content is scrubbed
 with lib.snapshot_scrub before being written to disk so that a snapshot blob
 obtained by an attacker cannot recover API keys, tokens, or arbitrary sandbox
-output (GH#823).
+output (molecule-core#823).
 
 State captured
 --------------

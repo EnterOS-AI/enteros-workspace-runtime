@@ -43,13 +43,12 @@ ORG = "molecule-ai"
 # an auto-bump PR on every release.
 #
 # runtime#83/#91 BUG: this list used to be a HAND-MAINTAINED 4-template subset
-# (claude-code, hermes, openclaw, codex) while the consumer-drift GUARD enforces
-# the full ``check_consumer_runtime_drift.DEFAULT_CONSUMERS`` set (6 templates +
-# molecule-core). The two lists silently diverged: google-adk/crewai also pin
-# .runtime-version and are FAILED by the guard when they drift, but the
-# propagation bot never opened a bump PR for them — so runtime ``main`` went (and
-# stayed) RED on every release that out-paced those pins, with no automation to
-# converge them. A human had to hand-author each bump.
+# (claude-code, hermes, openclaw, codex) while the consumer-drift guard then
+# covered six templates plus molecule-core. The two lists silently diverged:
+# google-adk/crewai were active pin consumers but the propagation bot never
+# opened their bump PRs, so runtime ``main`` stayed red as releases outpaced
+# those pins. Those two templates are now retired and explicitly exempted by the
+# guard; deriving this list still prevents the active sets from diverging again.
 #
 # FIX: derive TEMPLATE_CONSUMERS from the guard's DEFAULT_CONSUMERS so the
 # propagate set can never again be narrower than the set the guard enforces.
@@ -522,4 +521,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

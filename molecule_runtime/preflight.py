@@ -20,7 +20,7 @@ def _validate_runtime_via_adapter(runtime: str) -> tuple[bool, str]:
     the universal-runtime principle (#87).
 
     Discovery uses the same ADAPTER_MODULE env var that production load
-    paths consult (workspace/adapters/__init__.py:get_adapter). The
+    paths consult (molecule_runtime/adapters/__init__.py:get_adapter). The
     adapter's static name() string is the source of truth — config.yaml
     just labels which one the operator expects, and the check warns on
     drift.
