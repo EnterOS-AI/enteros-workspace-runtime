@@ -202,17 +202,35 @@ def build_default_providers(
     prompt_files: Sequence[str] = (),
     workspace_name: str = "this workspace",
     runtime_kind: str = "claude-code",
+    platform_url: str = "",
+    workspace_id: str = "",
+    comms_source=None,
 ) -> list[DigestProvider]:
-    """The official phase-1 provider roster, in tier order. The boot seam calls
-    this, runs the goal-state first-boot migration, then hands the list to a
-    controller. Kept here so the roster + wiring live with the controller."""
+    """The official provider roster, in tier order. The boot seam calls this,
+    runs the goal-state first-boot migration + env bootstrap, then hands the
+    list to a controller. Kept here so the roster + wiring live together.
+
+    PLUGIN SEAM (D5, CTO 2026-07-14): the mail providers (sent-folder +
+    inbound-a2a) depend only on the CommsSummarySource protocol; the binding
+    happens HERE and nowhere else. Today the default binding is the platform
+    mail-summary API (requires platform_url + workspace_id — both absent in
+    unit contexts, in which case the mail providers are simply not assembled);
+    when the communication layer moves behind the plugin boundary, the plugin
+    hands its source in via ``comms_source`` and this function stays the one
+    line that changes.
+    """
     from .providers import (
         GoalStateProvider,
         IdentityCapabilitiesProvider,
         TaskQueueProvider,
     )
+    from .providers.mail import (
+        InboundMailProvider,
+        PlatformMailSummarySource,
+        SentMailProvider,
+    )
 
-    return [
+    providers: list[DigestProvider] = [
         IdentityCapabilitiesProvider(
             config_path=config_path,
             prompt_files=prompt_files,
@@ -220,8 +238,18 @@ def build_default_providers(
             runtime_kind=runtime_kind,
         ),
         TaskQueueProvider(),
-        GoalStateProvider(),
     ]
+    source = comms_source
+    if source is None and platform_url and workspace_id:
+        source = PlatformMailSummarySource(
+            platform_url=platform_url, workspace_id=workspace_id
+        )
+    if source is not None:
+        # Tier order: sent-folder (2) before inbound-a2a (3).
+        providers.append(SentMailProvider(source=source))
+        providers.append(InboundMailProvider(source=source))
+    providers.append(GoalStateProvider())
+    return providers
 
 
 def _sig_of(contributions) -> tuple[tuple[str, str], ...]:

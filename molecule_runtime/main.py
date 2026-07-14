@@ -1556,6 +1556,11 @@ async def main():  # pragma: no cover
                 prompt_files=config.prompt_files,
                 workspace_name=config.name,
                 runtime_kind=config.runtime,
+                # D5 mail providers (sent-folder + inbound-a2a): default
+                # binding = the platform mail-summary API. Comms-plugin
+                # binding replaces this via comms_source later.
+                platform_url=platform_url,
+                workspace_id=workspace_id,
             )
             # goal-state first-boot migration of a legacy config.idle_prompt value
             for _gp in _idle_providers:
