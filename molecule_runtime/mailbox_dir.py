@@ -480,11 +480,13 @@ def _legacy_pairs(base: Path, legacy: Path) -> list[tuple[Path, Path]]:
             if _is_cursor_family(entry.name) or entry.name in _LEGACY_CONFIG_BASENAMES:
                 pairs.append((entry, base / entry.name))
         for name in _LEGACY_MEMORY_BASENAMES:
-            pairs.append((legacy / name, base / "memory" / name))
             # Memory written during a DEGRADED kernel window lands at
             # <configs>/memory (memory_dir() under the degraded resolve) —
-            # source it too, so fixing the substrate later doesn't shadow it.
+            # source it FIRST: under first-boot no-clobber ordering the first
+            # existing source wins, and the degraded-window copy is agent
+            # memory while the root copy may be a param-rendered baseline.
             pairs.append((legacy / "memory" / name, base / "memory" / name))
+            pairs.append((legacy / name, base / "memory" / name))
     # The pre-stop writer historically hardcoded /configs (lib/pre_stop.py),
     # which may differ from configs_dir.resolve() in nonstandard layouts.
     hardcoded_snap = Path("/configs/.agent_snapshot.json")

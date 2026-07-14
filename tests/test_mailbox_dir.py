@@ -294,3 +294,15 @@ def test_delegation_results_falls_back_to_tmp_legacy_when_degraded(monkeypatch, 
         )
     finally:
         locked.chmod(0o700)
+
+
+def test_degraded_window_memory_beats_param_rendered_root_copy(_legacy_state):
+    # Both exist at first boot: <configs>/memory/<name> (agent memory written
+    # during a degraded window) AND <configs>/<name> (param-rendered template
+    # baseline). The agent memory must win under no-clobber ordering.
+    legacy, base, queue = _legacy_state
+    (legacy / "memory").mkdir()
+    (legacy / "memory" / "MEMORY.md").write_text("agent memory from degraded window", encoding="utf-8")
+    # legacy/MEMORY.md (the template baseline) already exists via the fixture
+    assert mailbox_dir.migrate_legacy_state() is True
+    assert (base / "memory" / "MEMORY.md").read_text() == "agent memory from degraded window"
