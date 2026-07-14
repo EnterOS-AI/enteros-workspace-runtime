@@ -304,6 +304,9 @@ class GoalStateProvider:
         e = os.environ if env is None else env
         val = (e.get(IDLE_GOAL_ENV) or "").strip()
         if not val:
+            # NOTE: unsetting the env does NOT clear a previously seeded
+            # env-bootstrap goal — a goal, once set, is durable state; use
+            # goal_clear to retire it.
             return None
         existing = self._read()
         if existing is not None:
@@ -311,7 +314,25 @@ class GoalStateProvider:
                 return None  # unchanged env re-seed — nothing to do
             if _SOURCE_RANK.get(existing.source, 99) > _SOURCE_RANK[SOURCE_ENV_BOOTSTRAP]:
                 return None  # never clobber a higher-ranked (agent-set) goal
+        elif self._last_history_action() == ("clear", "agent"):
+            # The never-clobber-agent principle extends to a deliberate
+            # agent goal_clear: the provision env must not resurrect a goal
+            # the agent explicitly retired. (A provision-side clear —
+            # set_by != "agent" — does not block re-seeding.)
+            return None
         return self.set(val, set_by="env-bootstrap", source=SOURCE_ENV_BOOTSTRAP)
+
+    def _last_history_action(self) -> Optional[tuple]:
+        """(action, set_by) of the last history entry, or None. Read-only,
+        failure-safe: an unreadable/corrupt history means no verdict."""
+        try:
+            lines = self._history_file().read_text(encoding="utf-8").strip().splitlines()
+            if not lines:
+                return None
+            entry = json.loads(lines[-1])
+            return (str(entry.get("action", "")), str(entry.get("set_by", "")))
+        except (OSError, ValueError, TypeError):
+            return None
 
     # ---- digest provider protocol ----------------------------------------
 
