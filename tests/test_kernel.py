@@ -113,9 +113,28 @@ def test_install_noop_when_disabled(monkeypatch):
     assert tl.current() is None
 
 
-def test_install_arms_lease_when_enabled(monkeypatch):
+def test_install_arms_lease_when_enabled(monkeypatch, tmp_path):
+    # Sandboxed paths: install() now runs the real §7.2 migrator, which must
+    # never touch /workspace or ~/.molecule-workspace from a test process.
     monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "1")
+    monkeypatch.setenv(mailbox_dir.MAILBOX_DIR_ENV, str(tmp_path / ".molecule"))
+    monkeypatch.setenv("CONFIGS_DIR", str(tmp_path / "configs"))
     kernel.install()
+    assert tl.current() is not None
+
+
+def test_install_migrates_before_arming_lease(monkeypatch, tmp_path):
+    # Ordering pin (§7.2): install() carries legacy state BEFORE any kernel
+    # machinery arms — the inbox poller/heartbeat read the migrated cursor.
+    legacy = tmp_path / "configs"
+    legacy.mkdir()
+    (legacy / ".mcp_inbox_cursor").write_text("77", encoding="utf-8")
+    base = tmp_path / ".molecule"
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "1")
+    monkeypatch.setenv(mailbox_dir.MAILBOX_DIR_ENV, str(base))
+    monkeypatch.setenv("CONFIGS_DIR", str(legacy))
+    kernel.install()
+    assert (base / ".mcp_inbox_cursor").read_text() == "77"
     assert tl.current() is not None
     kernel.uninstall()
     assert tl.current() is None

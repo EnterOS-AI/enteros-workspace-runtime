@@ -277,3 +277,25 @@ def test_core_list_handler_source_projects_seq():
         "(runtime ack derives max_seq from row['seq'])"
     )
     assert "`seq`" in text, "core List handler SELECT must project the seq column"
+
+
+def test_no_ack_when_cursor_persist_fails(monkeypatch, tmp_path):
+    """Review R1 (core#4295 class): the ack advances the platform's prune
+    floor, so it must NEVER fire when the local cursor could not be durably
+    persisted — otherwise the platform prunes rows a restarted container can
+    no longer re-fetch (permanent message loss). Unwritable cursor parent ⇒
+    save_cursor returns False ⇒ no ack POST."""
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "1")
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    posts: list = []
+    _install_stub_httpx(monkeypatch, [_a2a_row("10", 7)], posts)
+    state = inbox.InboxState(cursor_path=locked / "deep" / "cursor")
+    try:
+        inbox._poll_once(
+            state, "https://platform.test", "ws-1", headers={}, timeout_secs=5.0
+        )
+        ack_posts = [p for p in posts if p[0].endswith("/activity/ack")]
+        assert ack_posts == [], "no durable cursor => no ack (prune-floor safety)"
+    finally:
+        locked.chmod(0o700)

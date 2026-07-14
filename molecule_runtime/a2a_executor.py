@@ -224,8 +224,8 @@ A2A_SOURCE_SELF_HARVESTER = "self-harvester"
 # the 2026-06-29 runaway delegation-result replay incident.
 A2A_SOURCE_SELF_IDLE = "self-idle"
 
-# Mailbox-kernel autonomous self-turn kinds (gated behind MOLECULE_MAILBOX_KERNEL,
-# injected via molecule_runtime.kernel). Each is a ROUTINE SELF-PING — same class
+# Mailbox-kernel autonomous self-turn kinds (native default-ON since 2026-07-13;
+# MOLECULE_MAILBOX_KERNEL=0 opts out; injected via molecule_runtime.kernel). Each is a ROUTINE SELF-PING — same class
 # as cron/idle/harvester — so it drops rather than queues behind an in-flight
 # turn AND its output runs through the UNCHANGED evaluate_autonomous_output
 # replay guard (registration in _ROUTINE_SELF_SOURCE_TYPES below is what wires

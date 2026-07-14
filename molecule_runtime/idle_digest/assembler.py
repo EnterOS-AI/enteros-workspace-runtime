@@ -4,8 +4,9 @@ This is the canonical assembler *implementation* the contract's
 ``ownership.assembler_owner`` names (molecule_runtime). Everything here is a
 pure function of its inputs so it is exhaustively unit-testable without a
 runtime, a lease, or a live tenant (the seam study's rule: build the assembler
-as testable module-level functions). The idle *controller* (a follow-up PR)
-wires these into the boot loop behind ``MOLECULE_MAILBOX_KERNEL``; this module
+as testable module-level functions). The idle *controller*
+(controller.py) wires these into the boot loop — native default-ON since
+2026-07-13 (``MOLECULE_MAILBOX_KERNEL=0`` opts out); this module
 never touches the loop, the network, or the filesystem.
 
 Responsibilities encoded here (all per the design SSOT + contract):

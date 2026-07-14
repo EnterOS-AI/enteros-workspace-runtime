@@ -680,11 +680,12 @@ async def main():  # pragma: no cover
     from molecule_runtime.executor_helpers import ensure_workspace_writable
     ensure_workspace_writable()
 
-    # 0b. Mailbox kernel wiring (MUST-FIX 1/2/5). Gated on MOLECULE_MAILBOX_KERNEL:
-    # when ON this arms the process-global turn lease (so the executor's
-    # tool-activity touches have somewhere to land) and logs the durable base
-    # dir; when OFF it installs nothing and every kernel helper stays a no-op,
-    # so the proven push / hard-gate flow is byte-identical. The runaway-guard
+    # 0b. Mailbox kernel wiring (MUST-FIX 1/2/5). NATIVE default-ON (operator
+    # ruling 2026-07-13): install() runs the ORDERING-CRITICAL §7.2 legacy-state
+    # migration (must precede the inbox poller + heartbeat reads below), arms
+    # the process-global turn lease, and probes durability. Under the
+    # MOLECULE_MAILBOX_KERNEL=0 emergency opt-out it installs nothing and every
+    # kernel helper stays a no-op (legacy flow byte-identical). The runaway-guard
     # should_halt() pre-check (MUST-FIX 2) is kept in the idle loop below AND is
     # centralized in kernel.should_inject_autonomous_turn for any new autonomous
     # injector; active_tasks increment/decrement is preserved throughout.
@@ -1641,9 +1642,17 @@ async def main():  # pragma: no cover
                 "Idle digest: contract-driven digest loop armed (mailbox kernel on)",
                 flush=True,
             )
-        except Exception as _e:  # pragma: no cover — degrade to no idle loop
-            print(f"Idle digest: wiring failed, no idle loop — {_e}", flush=True)
+        except Exception as _e:  # pragma: no cover — degrade to the legacy loop
+            print(
+                f"Idle digest: wiring failed — falling back to the legacy "
+                f"static idle loop — {_e}",
+                flush=True,
+            )
             idle_loop_task = None
+            # A workspace WITH config.idle_prompt had idle behavior before the
+            # kernel; a digest wiring fault must not remove it. The digest task
+            # is None here, so re-enabling the legacy loop cannot double-fire.
+            _idle_digest_enabled = False
 
     # Skipped on misconfigured boots — the self-fire would route to the
     # -32603 handler in a tight loop and consume cycles for no useful work.

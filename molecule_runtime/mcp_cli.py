@@ -134,6 +134,19 @@ def main() -> None:
       current shell environment + platform reachability and exits.
       Closes Ryan's #2934 item 6.
     """
+    # Kernel-native default (task #219): the standalone entrypoint shares the
+    # mailbox-dir resolution with the container runtime, so it must run the
+    # same one-shot legacy-state migration BEFORE its inbox pollers read the
+    # cursor. On operator hosts with no writable /workspace the mailbox base
+    # degrades to the legacy configs dir inside resolve() (mailbox_dir), so
+    # existing operators keep their on-disk state either way.
+    try:
+        from molecule_runtime import mailbox_dir as _mbox_cli
+
+        _mbox_cli.migrate_legacy_state()
+    except Exception:  # noqa: BLE001 — migration must never block the CLI
+        pass
+
     # Subcommand dispatch — must come BEFORE env-var validation so
     # `molecule-mcp doctor` can run on a partially-configured shell
     # and tell the operator what's missing. Argv shapes:

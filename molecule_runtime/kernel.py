@@ -127,9 +127,13 @@ def install() -> None:
         return
     # Legacy-state migration FIRST (design §7.2): the inbox cursor and
     # delegation tombstones must be in place before the inbox poller and
-    # heartbeat read them, or a previously kernel-off workspace replays its
-    # whole inbound backlog / re-harvests delegations on this boot.
-    mailbox_dir.migrate_legacy_state()
+    # heartbeat read them, or a previously kernel-off workspace replays a
+    # bounded inbound backlog window / re-harvests delegations on this boot.
+    # One bounded inline retry: once the pollers start writing kernel state,
+    # a later retry can no longer win (never-clobber), so retrying here —
+    # before any kernel writer runs — is the last cheap chance.
+    if not mailbox_dir.migrate_legacy_state():
+        mailbox_dir.migrate_legacy_state()
 
     from molecule_runtime import turn_lease
 

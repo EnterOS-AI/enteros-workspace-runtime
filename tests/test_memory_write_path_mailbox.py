@@ -210,3 +210,25 @@ def test_consolidation_mirror_noop_when_off(tmp_path, monkeypatch):
     # No exception, no file written when kernel off (explicit opt-out).
     monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     consolidation._mirror_consolidated_to_mailbox("ignored")  # must not raise
+
+
+def test_kernel_on_falls_back_to_configs_when_mailbox_copy_absent(tmp_path, monkeypatch):
+    """Review R3 (core#4295 class): with the kernel ON but NO mailbox memory
+    copy (first boot pre-migration, or an unwritable volume where the migrator
+    could not run), the auto-loaded snapshots must fall back to the legacy
+    /configs copy instead of silently dropping accumulated memory from the
+    prompt. A PRESENT mailbox copy still wins (stale-shadow rule unchanged —
+    pinned by test_stale_configs_never_shadows_fresh_mailbox_memory)."""
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "system-prompt.md").write_text("BASE-ROLE", encoding="utf-8")
+    (configs / "MEMORY.md").write_text("LEGACY-ONLY-MEMORY", encoding="utf-8")
+    base = _enable_kernel(monkeypatch, tmp_path)  # mailbox memory dir stays EMPTY
+
+    out = build_system_prompt(
+        config_path=str(configs), workspace_id="w", loaded_skills=[], peers=[]
+    )
+    assert "LEGACY-ONLY-MEMORY" in out, (
+        "kernel-on with no mailbox copy must not lobotomize the agent — "
+        "the legacy /configs snapshot is the only memory there is"
+    )
