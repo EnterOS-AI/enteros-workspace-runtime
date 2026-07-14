@@ -1564,6 +1564,14 @@ async def main():  # pragma: no cover
                         _gp.migrate_from_config(config.idle_prompt)
                     except Exception:
                         pass
+                    try:
+                        # Provision-time deterministic seed (MOLECULE_IDLE_GOAL
+                        # workspace secret / CP env) — after the one-shot config
+                        # migration, same source-rank rules (never clobbers an
+                        # agent-set goal).
+                        _gp.bootstrap_from_env()
+                    except Exception:
+                        pass
                     break
 
             import json as _idle_json

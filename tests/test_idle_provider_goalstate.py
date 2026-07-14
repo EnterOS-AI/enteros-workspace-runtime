@@ -271,3 +271,104 @@ async def test_official_and_runner_accepts(tmp_path):
     assert p.official is True and p.provider_id == "goal-state"
     res = await ProviderRunner(Policy()).gather([p])
     assert len(res.contributions) == 1 and not res.newly_disabled
+
+
+# ── MOLECULE_IDLE_GOAL env bootstrap (provision-time deterministic seed) ──
+
+
+def _env_provider(tmp_path):
+    from molecule_runtime.idle_digest.providers.goal import GoalStateProvider
+
+    return GoalStateProvider(state_dir=tmp_path / "goal-state")
+
+
+def test_env_bootstrap_seeds_goal(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    doc = p.bootstrap_from_env({g.IDLE_GOAL_ENV: "Keep the e2e pipeline green."})
+    assert doc is not None
+    got = p.get()
+    assert got["goal"] == "Keep the e2e pipeline green."
+    assert got["source"] == g.SOURCE_ENV_BOOTSTRAP
+
+
+def test_env_bootstrap_idempotent_across_boots(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    env = {g.IDLE_GOAL_ENV: "same goal"}
+    assert p.bootstrap_from_env(env) is not None
+    # every-boot re-seed with the same value is a no-op (no history churn)
+    assert p.bootstrap_from_env(env) is None
+
+
+def test_env_bootstrap_never_clobbers_agent_goal(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    p.set("my own objective", set_by="agent", source=g.SOURCE_WORKSPACE_MCP)
+    assert p.bootstrap_from_env({g.IDLE_GOAL_ENV: "provision goal"}) is None
+    assert p.get()["goal"] == "my own objective"
+
+
+def test_env_bootstrap_replaces_fleet_default(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    p.set(g.FLEET_PERSONA_DEFAULT, set_by="provision", source=g.SOURCE_FLEET_DEFAULT)
+    doc = p.bootstrap_from_env({g.IDLE_GOAL_ENV: "specific tenant objective"})
+    assert doc is not None and p.get()["goal"] == "specific tenant objective"
+
+
+def test_env_bootstrap_noop_when_unset(tmp_path):
+    p = _env_provider(tmp_path)
+    assert p.bootstrap_from_env({}) is None
+    assert p.get() is None
+
+
+def test_env_bootstrap_replaces_equal_rank_legacy_migration(tmp_path):
+    # Both config.idle_prompt AND env set: migration runs first (rank 1), the
+    # env seed then replaces it (equal rank, `>` blocks only strictly-higher).
+    # A later "consistency" edit flipping > to >= would invert this contract.
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    p.migrate_from_config("legacy config objective")
+    doc = p.bootstrap_from_env({g.IDLE_GOAL_ENV: "provision env objective"})
+    assert doc is not None
+    assert p.get()["goal"] == "provision env objective"
+    assert p.get()["source"] == g.SOURCE_ENV_BOOTSTRAP
+
+
+def test_env_bootstrap_changed_env_replaces_old_seed(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    assert p.bootstrap_from_env({g.IDLE_GOAL_ENV: "objective v1"}) is not None
+    assert p.bootstrap_from_env({g.IDLE_GOAL_ENV: "objective v2"}) is not None
+    assert p.get()["goal"] == "objective v2"
+
+
+def test_env_bootstrap_does_not_resurrect_agent_clear(tmp_path):
+    # never-clobber-agent extends to a deliberate goal_clear: the provision
+    # env must not resurrect a goal the agent explicitly retired.
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    env = {g.IDLE_GOAL_ENV: "provision objective"}
+    assert p.bootstrap_from_env(env) is not None
+    p.clear(set_by="agent")
+    assert p.bootstrap_from_env(env) is None
+    assert p.get() is None
+
+
+def test_env_bootstrap_reseeds_after_provision_side_clear(tmp_path):
+    # A NON-agent clear (provision/operator housekeeping) does not block.
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    env = {g.IDLE_GOAL_ENV: "provision objective"}
+    assert p.bootstrap_from_env(env) is not None
+    p.clear(set_by="provision")
+    assert p.bootstrap_from_env(env) is not None
