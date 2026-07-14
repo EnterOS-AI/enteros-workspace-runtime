@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 import yaml
 
@@ -54,7 +54,21 @@ FLEET_PERSONA_DEFAULT = (
 SOURCE_WORKSPACE_MCP = "workspace-mcp"
 SOURCE_LEGACY_MIGRATION = "legacy-idle-prompt-migration"
 SOURCE_FLEET_DEFAULT = "fleet-persona-default"
-_SOURCE_RANK = {SOURCE_FLEET_DEFAULT: 0, SOURCE_LEGACY_MIGRATION: 1, SOURCE_WORKSPACE_MCP: 2}
+#: Provision-time bootstrap via the MOLECULE_IDLE_GOAL env var (workspace
+#: secret / CP-injected). Same rank as a legacy config migration: it seeds an
+#: initial objective but may never clobber an agent-set (workspace-mcp) goal.
+SOURCE_ENV_BOOTSTRAP = "env-bootstrap"
+_SOURCE_RANK = {
+    SOURCE_FLEET_DEFAULT: 0,
+    SOURCE_LEGACY_MIGRATION: 1,
+    SOURCE_ENV_BOOTSTRAP: 1,
+    SOURCE_WORKSPACE_MCP: 2,
+}
+
+#: Env var carrying a provision-time initial goal. Deterministic seeding
+#: surface: a tenant/CP/e2e can hand a workspace its starting objective
+#: WITHOUT an org-template import or an LLM tool-call round-trip.
+IDLE_GOAL_ENV = "MOLECULE_IDLE_GOAL"
 
 _SUMMARY_MAX_CHARS = 200
 
@@ -273,6 +287,31 @@ class GoalStateProvider:
         doc = self.set(val, set_by=set_by, source=source)
         self._touch_marker()
         return doc
+
+    def bootstrap_from_env(
+        self, env: Optional[Mapping[str, str]] = None
+    ) -> Optional[GoalDoc]:
+        """Seed the goal from ``MOLECULE_IDLE_GOAL`` (provision-time env).
+
+        The deterministic provision-time surface: a tenant/CP/e2e can hand a
+        workspace its starting objective without an org-template import or an
+        LLM tool-call round-trip. Runs EVERY boot (env is provision state, not
+        a one-shot file): idempotent by same-value check, and it obeys the
+        source-rank rule — an ``env-bootstrap`` goal may replace a
+        fleet-default but NEVER an agent-set (``workspace-mcp``) goal, so an
+        agent that has since chosen its own objective keeps it across restarts.
+        """
+        e = os.environ if env is None else env
+        val = (e.get(IDLE_GOAL_ENV) or "").strip()
+        if not val:
+            return None
+        existing = self._read()
+        if existing is not None:
+            if existing.source == SOURCE_ENV_BOOTSTRAP and existing.goal == val:
+                return None  # unchanged env re-seed — nothing to do
+            if _SOURCE_RANK.get(existing.source, 99) > _SOURCE_RANK[SOURCE_ENV_BOOTSTRAP]:
+                return None  # never clobber a higher-ranked (agent-set) goal
+        return self.set(val, set_by="env-bootstrap", source=SOURCE_ENV_BOOTSTRAP)
 
     # ---- digest provider protocol ----------------------------------------
 

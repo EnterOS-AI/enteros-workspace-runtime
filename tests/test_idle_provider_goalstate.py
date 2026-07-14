@@ -271,3 +271,57 @@ async def test_official_and_runner_accepts(tmp_path):
     assert p.official is True and p.provider_id == "goal-state"
     res = await ProviderRunner(Policy()).gather([p])
     assert len(res.contributions) == 1 and not res.newly_disabled
+
+
+# ── MOLECULE_IDLE_GOAL env bootstrap (provision-time deterministic seed) ──
+
+
+def _env_provider(tmp_path):
+    from molecule_runtime.idle_digest.providers.goal import GoalStateProvider
+
+    return GoalStateProvider(state_dir=tmp_path / "goal-state")
+
+
+def test_env_bootstrap_seeds_goal(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    doc = p.bootstrap_from_env({g.IDLE_GOAL_ENV: "Keep the e2e pipeline green."})
+    assert doc is not None
+    got = p.get()
+    assert got["goal"] == "Keep the e2e pipeline green."
+    assert got["source"] == g.SOURCE_ENV_BOOTSTRAP
+
+
+def test_env_bootstrap_idempotent_across_boots(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    env = {g.IDLE_GOAL_ENV: "same goal"}
+    assert p.bootstrap_from_env(env) is not None
+    # every-boot re-seed with the same value is a no-op (no history churn)
+    assert p.bootstrap_from_env(env) is None
+
+
+def test_env_bootstrap_never_clobbers_agent_goal(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    p.set("my own objective", set_by="agent", source=g.SOURCE_WORKSPACE_MCP)
+    assert p.bootstrap_from_env({g.IDLE_GOAL_ENV: "provision goal"}) is None
+    assert p.get()["goal"] == "my own objective"
+
+
+def test_env_bootstrap_replaces_fleet_default(tmp_path):
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    p.set(g.FLEET_PERSONA_DEFAULT, set_by="provision", source=g.SOURCE_FLEET_DEFAULT)
+    doc = p.bootstrap_from_env({g.IDLE_GOAL_ENV: "specific tenant objective"})
+    assert doc is not None and p.get()["goal"] == "specific tenant objective"
+
+
+def test_env_bootstrap_noop_when_unset(tmp_path):
+    p = _env_provider(tmp_path)
+    assert p.bootstrap_from_env({}) is None
+    assert p.get() is None
