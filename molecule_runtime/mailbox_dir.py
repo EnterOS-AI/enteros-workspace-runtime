@@ -32,21 +32,26 @@ Why not ``$HOME`` or ``/configs``?
     re-provision and (b) the wrong layering — ``/configs`` is *read* for the
     param-rendered system prompt, never the *write* target for evolving memory.
 
-Gating (byte-identical default)
--------------------------------
-``MOLECULE_MAILBOX_KERNEL`` unset / false (DEFAULT)
-    :func:`resolve` returns the LEGACY location (``configs_dir.resolve()``), so
-    every migrated call site behaves EXACTLY as it did before. The proven
-    push / hard-gate flow is unchanged — no new directory, no path move.
+Gating (native default — kernel ON)
+-----------------------------------
+``MOLECULE_MAILBOX_KERNEL`` unset / true (DEFAULT)
+    The mailbox kernel is NATIVE runtime behavior (operator ruling 2026-07-13,
+    task #219): :func:`resolve` returns ``/workspace/.molecule`` (overridable
+    via ``MOLECULE_MAILBOX_DIR``), created ``0700`` so per-file ``0600`` perms
+    are not undermined by a world-readable parent. First kernel-on boot runs
+    :func:`migrate_legacy_state` so pre-existing workspaces carry their inbox
+    cursor / delegation tombstones / queued results over — no inbound replay,
+    no delegation re-harvest (design §7.2).
 
-``MOLECULE_MAILBOX_KERNEL`` true
-    :func:`resolve` returns ``/workspace/.molecule`` (overridable via
-    ``MOLECULE_MAILBOX_DIR``), created ``0700`` so per-file ``0600`` perms are
-    not undermined by a world-readable parent.
+``MOLECULE_MAILBOX_KERNEL`` explicitly false (``0`` / ``false`` / ``no`` / ``off``)
+    Emergency escape hatch: :func:`resolve` returns the LEGACY location
+    (``configs_dir.resolve()``) and every kernel call site behaves exactly as
+    the pre-kernel runtime did (static idle_prompt loop, legacy state paths).
 
-Not cached: the flag + one ``mkdir`` are cheap and reading ``os.environ`` live
-keeps tests that monkeypatch ``MOLECULE_MAILBOX_KERNEL`` between cases working
-without a reset hook.
+The flag + env are read live (tests can toggle between cases without a reset
+hook); the base USABILITY probe is cached per raw-base path for the process
+lifetime so every caller agrees on one base — tests use per-test tmp bases
+(unique keys) and the conftest cache-reset hook.
 """
 from __future__ import annotations
 
@@ -60,9 +65,10 @@ import molecule_runtime.configs_dir as configs_dir
 
 logger = logging.getLogger(__name__)
 
-#: Env flag that turns the mailbox kernel (durable-volume state) on. Default
-#: OFF — when unset the runtime keeps every durable path at its legacy location
-#: so the proven push flow is byte-identical.
+#: Env flag for the mailbox kernel (durable-volume state). Default ON — the
+#: kernel is native runtime behavior. Set explicitly falsy ("0"/"false"/"no"/
+#: "off") as an emergency escape hatch back to the legacy paths + static idle
+#: loop.
 KERNEL_FLAG_ENV = "MOLECULE_MAILBOX_KERNEL"
 
 #: Override for the durable base dir (kernel-on only). Defaults to the durable
@@ -71,42 +77,96 @@ MAILBOX_DIR_ENV = "MOLECULE_MAILBOX_DIR"
 
 _DEFAULT_MAILBOX_DIR = "/workspace/.molecule"
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
 
 
 def kernel_enabled() -> bool:
-    """True iff the mailbox kernel is switched on via ``MOLECULE_MAILBOX_KERNEL``.
+    """True unless ``MOLECULE_MAILBOX_KERNEL`` is set explicitly falsy.
 
-    Read live (not cached) so a test toggling the env var between cases sees
-    the change without a reset hook. This is the SINGLE flag every migrated
-    call site consults; when it returns False the runtime is byte-identical to
-    the pre-migration behavior.
+    The mailbox kernel is NATIVE runtime behavior (default ON, operator ruling
+    2026-07-13); the env var survives only as an emergency opt-out. Read live
+    (not cached) so a test toggling the env var between cases sees the change
+    without a reset hook. This is the SINGLE flag every kernel call site
+    consults; when it returns False the runtime is byte-identical to the
+    pre-kernel behavior (legacy paths, static idle loop).
     """
-    return os.environ.get(KERNEL_FLAG_ENV, "").strip().lower() in _TRUTHY
+    return os.environ.get(KERNEL_FLAG_ENV, "").strip().lower() not in _FALSY
+
+
+def _raw_base() -> Path:
+    """The configured kernel base (env override or default) — NO usability
+    fallback. :func:`verify_durability` probes THIS so an unusable substrate
+    still surfaces as UNWRITABLE even though :func:`resolve` degrades."""
+    return Path(os.environ.get(MAILBOX_DIR_ENV, "").strip() or _DEFAULT_MAILBOX_DIR)
+
+
+#: Per-process usability cache, keyed by the raw base path. Live env reads
+#: keep test toggling working (a different MOLECULE_MAILBOX_DIR is a different
+#: key); within one key the probe result is stable for the process lifetime so
+#: every caller (cursor, queue, memory, digest state) agrees on ONE base.
+_usable_cache: dict[str, bool] = {}
+_degraded_logged: set[str] = set()
+
+
+def _base_usable(base: Path) -> bool:
+    """True iff ``base`` can be created and written (cached per path)."""
+    key = str(base)
+    hit = _usable_cache.get(key)
+    if hit is not None:
+        return hit
+    ok = _is_writable(base)
+    _usable_cache[key] = ok
+    return ok
+
+
+def base_degraded() -> bool:
+    """True when the kernel is ON but the mailbox base is unusable, so
+    :func:`resolve` is returning the LEGACY configs dir instead. Callers with
+    a legacy location that is NOT the configs dir (the /tmp delegation queue)
+    consult this to fall all the way back to their own legacy path."""
+    return kernel_enabled() and not _base_usable(_raw_base())
 
 
 def resolve() -> Path:
     """Return the durable base directory for agent state.
 
     Kernel ON  -> ``/workspace/.molecule`` (or ``MOLECULE_MAILBOX_DIR``),
-                  created ``0700``.
+                  created ``0700`` — WHEN that base is actually usable.
+                  On a substrate where it cannot be created/written (root:755
+                  named volume — core#4295; an operator host running the
+                  standalone ``molecule-mcp`` with no /workspace at all) the
+                  kernel DEGRADES to the legacy configs dir instead of
+                  scattering failed writes: cursors/tombstones keep their
+                  pre-kernel home, nothing is lost, and
+                  :func:`verify_durability` still reports the raw base
+                  UNWRITABLE so the substrate gets fixed.
     Kernel OFF -> ``configs_dir.resolve()`` — the LEGACY location, unchanged.
     """
     if not kernel_enabled():
-        # Byte-identical default: durable state stays exactly where it lived
-        # before the migration.
+        # Byte-identical opt-out: durable state stays exactly where it lived
+        # before the kernel.
         return configs_dir.resolve()
 
-    base = Path(os.environ.get(MAILBOX_DIR_ENV, "").strip() or _DEFAULT_MAILBOX_DIR)
-    try:
-        base.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError:
-        # Best-effort: a read-only or already-existing parent must not crash
-        # boot. Callers that actually write will surface a clear error — and
-        # :func:`verify_durability` turns the *silent* case (writes land on an
-        # ephemeral root disk) into a LOUD, observable warning at kernel-on boot.
-        pass
-    return base
+    base = _raw_base()
+    if _base_usable(base):
+        try:
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError:
+            pass
+        return base
+    legacy = configs_dir.resolve()
+    key = str(base)
+    if key not in _degraded_logged:
+        _degraded_logged.add(key)
+        logger.error(
+            "mailbox: base %s is not writable — DEGRADING durable paths to the "
+            "legacy configs dir (%s). Kernel state stays at its pre-kernel "
+            "home; fix the volume ownership/mount to get durable-volume "
+            "semantics (core#4295).",
+            base,
+            legacy,
+        )
+    return legacy
 
 
 # --- Durability guard --------------------------------------------------------
@@ -292,7 +352,11 @@ def verify_durability() -> str:
         _last_durability_status = DURABILITY_NA
         return _last_durability_status
 
-    base = resolve()
+    # Probe the RAW configured base, not resolve(): when the base is unusable
+    # resolve() degrades to the legacy configs dir (which is usually writable)
+    # and probing THAT would hide exactly the UNWRITABLE condition this guard
+    # exists to surface.
+    base = _raw_base()
     try:
         status = probe_durability(base)
     except Exception:  # pragma: no cover - defensive; probe is already OSError-safe
@@ -332,6 +396,234 @@ def verify_durability() -> str:
             base,
         )
     return _last_durability_status
+
+
+# --- Legacy-state migrator (design §7.2 — replay safety) -------------------
+#
+# The kernel default flipped ON 2026-07-13 (task #219 operator ruling: native
+# ability, not flag-gated). For a workspace that previously ran kernel-OFF,
+# durable state lives at the LEGACY locations: the inbox cursor + delegation
+# tombstones under ``configs_dir.resolve()`` and the delegation-results queue
+# on ``/tmp``. Resolving the mailbox root to ``/workspace/.molecule`` without
+# carrying that state over orphans it: an empty inbox cursor ⇒ FULL INBOUND
+# REPLAY of the historical backlog, missing tombstones ⇒ DELEGATION RE-HARVEST
+# — exactly the 2026-06-29 re-narration incident class. This migrator runs on
+# the first kernel-on boot (marker-gated, idempotent) BEFORE the inbox poller
+# and heartbeat start, copying the legacy files into the mailbox root.
+#
+# Copy — never move: the legacy files stay in place so an emergency
+# ``MOLECULE_MAILBOX_KERNEL=0`` opt-out still finds its state. Never clobber:
+# a file already present at the mailbox root is newer kernel-authored state
+# and always wins. The marker is committed LAST (atomic tmp+rename), so a
+# crash mid-migration re-runs the whole (idempotent) pass next boot.
+
+_MIGRATED_MARKER = ".legacy_state_migrated"
+
+#: Legacy basenames migrated from the configs dir. ``.mcp_inbox_cursor`` also
+#: covers the per-workspace suffixed variants (``.mcp_inbox_cursor_<wsid>``),
+#: matched by prefix below.
+_LEGACY_CONFIG_BASENAMES = (
+    ".mcp_inbox_cursor",
+    ".delegation_tombstones",
+    ".agent_snapshot.json",
+)
+
+#: Legacy memory-snapshot files (kernel-off writers targeted the configs dir;
+#: kernel-on readers ONLY consult ``<mailbox>/memory`` — prompt.py's stale-
+#: shadow rule). Without carrying these over, a workspace's accumulated memory
+#: silently vanishes from the system prompt on the first kernel-on boot. Kept
+#: in lockstep with ``prompt.DEFAULT_MEMORY_SNAPSHOT_FILES`` (duplicated here
+#: to avoid a prompt->mailbox_dir import cycle; the migrator test pins the two
+#: tuples equal).
+_LEGACY_MEMORY_BASENAMES = (
+    "MEMORY.md",
+    "USER.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "SOUL.md",
+)
+
+
+def _copy_0600(src: Path, dst: Path, migrated: list[str]) -> None:
+    """Atomic 0600 copy of ``src`` to ``dst`` unless ``dst`` already exists.
+
+    0600 via os.open (not umask-default write_bytes): the sources include
+    relay-delivered 0600 files; migrated copies must not come out looser.
+    """
+    if not src.is_file() or dst.exists():
+        return
+    tmp = dst.with_name(dst.name + ".migrating")
+    data = src.read_bytes()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(tmp, dst)
+    migrated.append(src.name)
+
+
+def _is_cursor_family(name: str) -> bool:
+    """The prefix-matched cursor files, excluding crash leftovers."""
+    return (
+        name.startswith(".mcp_inbox_cursor")
+        and not name.endswith(".tmp")
+        and not name.endswith(".migrating")
+    )
+
+
+def _legacy_pairs(base: Path, legacy: Path) -> list[tuple[Path, Path]]:
+    """(legacy source, mailbox destination) pairs for every migrated file."""
+    pairs: list[tuple[Path, Path]] = []
+    if legacy.is_dir():
+        for entry in sorted(legacy.iterdir()):
+            if _is_cursor_family(entry.name) or entry.name in _LEGACY_CONFIG_BASENAMES:
+                pairs.append((entry, base / entry.name))
+        for name in _LEGACY_MEMORY_BASENAMES:
+            # Memory written during a DEGRADED kernel window lands at
+            # <configs>/memory (memory_dir() under the degraded resolve) —
+            # source it FIRST: under first-boot no-clobber ordering the first
+            # existing source wins, and the degraded-window copy is agent
+            # memory while the root copy may be a param-rendered baseline.
+            pairs.append((legacy / "memory" / name, base / "memory" / name))
+            pairs.append((legacy / name, base / "memory" / name))
+    # The pre-stop writer historically hardcoded /configs (lib/pre_stop.py),
+    # which may differ from configs_dir.resolve() in nonstandard layouts.
+    hardcoded_snap = Path("/configs/.agent_snapshot.json")
+    if os.path.normpath(str(legacy)) != "/configs":
+        pairs.append((hardcoded_snap, base / ".agent_snapshot.json"))
+    # Legacy /tmp cursors + queue. Skipped when an env override pins the path:
+    # an override is read verbatim in BOTH kernel modes, so the flip does not
+    # move that file and a migrated copy would be dead data.
+    if not os.environ.get("DELEGATION_RESULTS_FILE", "").strip():
+        pairs.append(
+            (Path(_DEFAULT_DELEGATION_RESULTS_FILE), base / "delegation_results.jsonl")
+        )
+    if not os.environ.get("DELEGATION_ACTIVITY_CURSOR_FILE", "").strip():
+        pairs.append(
+            (
+                Path("/tmp/delegation_activity_cursor"),
+                base / ".delegation_activity_cursor",
+            )
+        )
+    return pairs
+
+
+def migrate_legacy_state() -> bool:
+    """Carry legacy kernel-off durable state into the mailbox root.
+
+    First kernel-on boot (marker absent): copy every legacy file that has no
+    mailbox counterpart — copy-not-move, never-clobber, marker committed last
+    (atomic). Later boots (marker present): a light RECONCILE pass — any
+    legacy file strictly NEWER (mtime) than its mailbox counterpart is copied
+    over it. That heals the emergency flip-flop (kernel → =0 → kernel): during
+    the opt-out window the legacy paths were the live writers, so their newer
+    state must win on re-enable or stale mailbox copies silently shadow it.
+
+    Returns True when any pass copied at least one file or committed the
+    marker. Never raises — a migration failure must not crash boot. NOTE the
+    failure mode honestly: boot continues and kernel writers start writing at
+    the base, so a file the kernel touches before the next retry stays owned
+    by the kernel copy (never-clobber) — the retry only heals files the
+    kernel has not yet written.
+    """
+    if not kernel_enabled():
+        return False
+    base = resolve()
+    legacy = configs_dir.resolve()
+    if os.path.normpath(str(base)) == os.path.normpath(str(legacy)):
+        return False  # degraded resolve or MOLECULE_MAILBOX_DIR at the legacy dir
+    marker = base / _MIGRATED_MARKER
+    try:
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (base / "memory").mkdir(parents=True, exist_ok=True, mode=0o700)
+        migrated: list[str] = []
+
+        if marker.exists():
+            # Reconcile: prefer strictly-newer legacy state (flip-flop heal) —
+            # RUNTIME-AUTHORED DOTFILES ONLY (cursor family, tombstones,
+            # activity cursor, snapshot, queue). Memory snapshots are EXCLUDED:
+            # their /configs copies are PARAM-RENDERED fresh on every provision
+            # (config-relay O_TRUNCs the bundle before install() in the same
+            # boot), so a newer /configs mtime is provisioner authorship, not
+            # opt-out-window evidence — reconciling them would clobber the
+            # agent's evolved mailbox memory with the template baseline on
+            # every routine reprovision. Cost, documented: memory edits made
+            # during an emergency =0 window stay at the legacy location (the
+            # prompt's kernel-on fallback does NOT read them once a mailbox
+            # copy exists). mtime is only sound where the runtime is the
+            # exclusive writer.
+            for src, dst in _legacy_pairs(base, legacy):
+                if dst.parent.name == "memory":
+                    continue
+                try:
+                    if not src.is_file():
+                        continue
+                    if dst.exists() and src.stat().st_mtime <= dst.stat().st_mtime:
+                        continue
+                    tmp = dst.with_name(dst.name + ".migrating")
+                    data = src.read_bytes()
+                    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    try:
+                        os.write(fd, data)
+                    finally:
+                        os.close(fd)
+                    os.replace(tmp, dst)
+                    migrated.append(src.name)
+                except OSError:
+                    continue
+            if migrated:
+                logger.warning(
+                    "mailbox reconcile: legacy copies were NEWER than their "
+                    "mailbox counterparts (opt-out window writes?) — carried "
+                    "over: %s",
+                    ", ".join(migrated),
+                )
+            return bool(migrated)
+
+        pairs = _legacy_pairs(base, legacy)
+        # Marker rule keys on the CONFIGS-side sources only: /configs may not
+        # be materialized yet THIS boot (asset-fetcher window; resolve()
+        # re-creates it EMPTY), and burning the marker then would deny later-
+        # arriving configs state its one migration. The /tmp legs (queue,
+        # activity cursor) re-run harmlessly under no-clobber either way.
+        legacy_str = os.path.normpath(str(legacy)) + os.sep
+        configs_had_any = any(
+            src.is_file()
+            for src, _ in pairs
+            if os.path.normpath(str(src)).startswith(legacy_str)
+        )
+        for src, dst in pairs:
+            _copy_0600(src, dst, migrated)
+
+        if not configs_had_any:
+            # Nothing migratable existed — either a genuinely fresh workspace
+            # or /configs not yet materialized THIS boot (asset-fetcher
+            # window; configs_dir.resolve() re-creates the dir EMPTY, so
+            # "absent" reads as "empty" here). Do not burn the one-shot
+            # marker: legacy state appearing on a later boot must still get
+            # its one migration. Re-running this empty pass each boot is a
+            # few stat calls.
+            return False
+
+        tmp_marker = base / (_MIGRATED_MARKER + ".migrating")
+        tmp_marker.write_text(json.dumps({"migrated": migrated}), encoding="utf-8")
+        os.replace(tmp_marker, marker)
+        if migrated:
+            logger.info(
+                "mailbox migrate: carried legacy durable state into %s: %s",
+                base,
+                ", ".join(migrated),
+            )
+        return True
+    except OSError:
+        logger.exception(
+            "mailbox migrate: FAILED to carry legacy state into %s (marker not "
+            "committed; a retry runs next boot, but files the kernel writes in "
+            "the meantime keep their kernel copy — design §7.2 replay risk).",
+            base,
+        )
+        return False
 
 
 def memory_dir() -> Path:
@@ -399,4 +691,12 @@ def delegation_results_file() -> str:
     override = os.environ.get("DELEGATION_RESULTS_FILE", "").strip()
     if override:
         return override
+    if base_degraded():
+        # The mailbox base is unusable, so resolve() is returning the configs
+        # dir — but THIS file's legacy home is /tmp, not configs. Appending to
+        # a possibly-unwritable configs dir would hard-break delegation-result
+        # delivery (heartbeat append raises → self-wake never sent → tombstone
+        # never committed). Fall back to the exact legacy queue instead: the
+        # /tmp path always works and reader + writer resolve it identically.
+        return _DEFAULT_DELEGATION_RESULTS_FILE
     return str(resolve() / "delegation_results.jsonl")

@@ -265,6 +265,18 @@ def build_system_prompt(
         if filename in seen_files:
             continue
         file_path = memory_source / filename
+        if not file_path.exists() and mailbox_dir.kernel_enabled():
+            # Mirror the prompt_files redirect rule in the other direction:
+            # the mailbox copy wins WHEN PRESENT, but when it is absent (first
+            # boot before migration, or an unwritable mailbox volume where the
+            # migrator could not run — core#4295) fall back to the legacy
+            # /configs copy rather than silently dropping accumulated memory
+            # from the prompt. A stale /configs copy still can never SHADOW a
+            # fresh mailbox copy — this branch only fires when there is no
+            # mailbox copy at all.
+            legacy_copy = Path(config_path) / filename
+            if legacy_copy.exists():
+                file_path = legacy_copy
         if file_path.exists():
             content = file_path.read_text().strip()
             if content:

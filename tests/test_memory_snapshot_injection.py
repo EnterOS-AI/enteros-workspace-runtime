@@ -27,7 +27,10 @@ def _cfg(**files):
     return d
 
 
-def test_build_system_prompt_loads_present_snapshot_files():
+def test_build_system_prompt_loads_present_snapshot_files(monkeypatch):
+    # Legacy (kernel opt-out) contract: snapshots load from config_path. The
+    # kernel-on read path is pinned in test_memory_write_path_mailbox.py.
+    monkeypatch.setenv("MOLECULE_MAILBOX_KERNEL", "0")
     d = _cfg(**{
         "system-prompt.md": "BASE",
         "CLAUDE.md": "DURABLE-CLAUDE: commit as jerry@jrsautocustoms.com",

@@ -108,7 +108,8 @@ def test_probe_durability_mapping(monkeypatch, tmp_path, writable, on_root, expe
 
 # --- verify_durability -------------------------------------------------------
 
-def test_verify_is_noop_when_kernel_off(caplog):
+def test_verify_is_noop_when_kernel_off(caplog, monkeypatch):
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     with caplog.at_level(logging.INFO, logger="molecule_runtime.mailbox_dir"):
         assert mailbox_dir.verify_durability() == mailbox_dir.DURABILITY_NA
     assert mailbox_dir.last_durability_status() == mailbox_dir.DURABILITY_NA

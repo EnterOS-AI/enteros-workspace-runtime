@@ -52,4 +52,41 @@ def _reset_a2a_client_workspace_id_cache():
     except ImportError:
         pass
 
+
+@pytest.fixture(autouse=True)
+def _sandbox_mailbox_base(monkeypatch, tmp_path_factory):
+    """Kernel-native default (task #219): kernel-on code paths now WRITE real
+    durable state (harvest tombstones, cursors, the delegation queue) through
+    ``mailbox_dir.resolve()``. Without a sandbox that lands in a REAL shared
+    location — on hosts without a writable /workspace the resolver degrades to
+    the configs home fallback (``~/.molecule-workspace``) — and one test's
+    tombstones suppress another test's self-wake: cross-test AND cross-run
+    flakes (bit CI on 5e21cd0, reproduced by both reviewers). Give every test
+    a fresh base; tests that pin their own MOLECULE_MAILBOX_DIR / CONFIGS_DIR
+    simply override this. The usability cache is reset per test so a prior
+    test's probe result can never leak across bases.
+    """
+    base = tmp_path_factory.mktemp("mbox-sandbox")
+    monkeypatch.setenv("MOLECULE_MAILBOX_DIR", str(base / ".molecule"))
+    monkeypatch.setenv("CONFIGS_DIR", str(base / "configs"))
+    try:
+        import molecule_runtime.mailbox_dir as _mbx
+
+        _mbx._usable_cache.clear()
+        _mbx._degraded_logged.clear()
+    except ImportError:
+        pass
+    # The per-test CONFIGS_DIR sandbox invalidates the process-wide RBAC
+    # config cache: the first test to trigger _load_workspace_config() under
+    # an EMPTY sandbox would otherwise cache None → fail-secure read-only
+    # roles poison every later RBAC check in the process (bit the
+    # self-delegation-guard tests, order-dependently).
+    try:
+        from molecule_runtime.builtin_tools import audit as _audit
+
+        _audit._load_workspace_config.cache_clear()
+    except (ImportError, AttributeError):
+        pass
+    yield
+
 # Rest of the conftest.py is the stub setup from the original

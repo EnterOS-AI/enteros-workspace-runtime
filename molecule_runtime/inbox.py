@@ -237,27 +237,37 @@ class InboxState:
             self._cursors_loaded[workspace_id] = True
             return cursor
 
-    def save_cursor(self, activity_id: str, workspace_id: str = "") -> None:
+    def save_cursor(self, activity_id: str, workspace_id: str = "") -> bool:
         """Persist the cursor. Best-effort — log + continue on failure.
 
         Loss of the cursor on a write failure means an extra page of
         backlog after restart, never a stuck poller. Silent-fail
         would mask a permission misconfiguration on the operator's
         configs dir; warn loudly so they can fix it.
+
+        Returns True iff the cursor is DURABLY persisted to disk. The ack
+        POST keys off this: acking advances the platform's prune floor, so
+        claiming durable consumption while the persist failed (unwritable
+        mailbox volume — core#4295) would let the platform prune rows the
+        next boot can no longer re-fetch — permanent message loss. In-memory
+        update alone is NOT durable. ``path is None`` (pathless test state)
+        is likewise not durable.
         """
         path = self._path_for(workspace_id)
         with self._lock:
             self._cursors[workspace_id] = activity_id
             self._cursors_loaded[workspace_id] = True
         if path is None:
-            return
+            return False
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(activity_id)
             tmp.replace(path)
+            return True
         except OSError as exc:
             logger.warning("inbox: failed to persist cursor to %s: %s", path, exc)
+            return False
 
     def reset_cursor(self, workspace_id: str = "") -> None:
         """Forget the cursor. Used after a 410 from the activity API."""
@@ -904,8 +914,9 @@ def _poll_once(
     if batch_fetcher is not None:
         _drain_uploads(batch_fetcher)
 
+    cursor_persisted = False
     if last_id is not None:
-        state.save_cursor(last_id, cursor_key)
+        cursor_persisted = state.save_cursor(last_id, cursor_key)
 
     # MUST-FIX 3 (acked delivery): after persisting the local cursor, tell the
     # platform how far we've durably consumed so it can prune acked rows early.
@@ -916,7 +927,13 @@ def _poll_once(
     # per row (distinct from the ``id`` used as the since_id cursor); we ack the
     # MAX seq seen this batch. A 404 (endpoint not deployed / platform-before-
     # runtime ordering) is a SOFT failure — we degrade to today's behavior.
-    if mailbox_dir.kernel_enabled():
+    # GATED on the cursor having durably persisted: the ack advances the
+    # platform's prune floor, so acking rows whose local cursor could not be
+    # written (unwritable mailbox volume — core#4295) would let the platform
+    # prune messages a restarted container can never re-fetch — permanent
+    # loss. No durable cursor => no ack; the platform's time floors still
+    # bound retention exactly as pre-kernel.
+    if mailbox_dir.kernel_enabled() and cursor_persisted:
         max_seq = 0
         for r in rows:
             if not isinstance(r, dict):

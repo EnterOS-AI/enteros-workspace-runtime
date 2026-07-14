@@ -133,7 +133,7 @@ async def test_status_flip_completed_then_failed_harvested_once_each(tmp_path):
 async def test_kernel_off_has_no_tombstone_file(tmp_path, monkeypatch):
     """Kernel OFF: _already_harvested is a no-op, no durable tombstone file is
     written — byte-identical to the pre-migration harvester."""
-    monkeypatch.delenv(mailbox_dir.KERNEL_FLAG_ENV, raising=False)
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     hb = HeartbeatLoop("http://p", _WS)
     hb_mod.register_awaited_delegation("d3")
     posts: list = []
@@ -182,7 +182,7 @@ async def test_injector_fires_kernel_off_even_when_breaker_open(monkeypatch):
     """Kernel OFF: the pre-injection kernel gate is skipped entirely, so the
     harvester fires EXACTLY as before (byte-identical) even if should_halt
     would be True — the legacy end-of-turn guard still governs the OUTPUT."""
-    monkeypatch.delenv(mailbox_dir.KERNEL_FLAG_ENV, raising=False)
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
     monkeypatch.setattr(guard, "should_halt", lambda: True)
     hb = HeartbeatLoop("http://p", _WS)
     hb_mod.register_awaited_delegation("doff")
