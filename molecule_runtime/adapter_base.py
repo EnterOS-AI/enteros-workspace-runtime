@@ -173,7 +173,7 @@ class RuntimeCapabilities:
     architecture principle these flags encode.
     """
     # Heartbeat — adapter sends its own keep-alive signal to the platform's
-    # broadcaster instead of relying on workspace/heartbeat.py's 30s loop.
+    # broadcaster instead of relying on molecule_runtime/heartbeat.py's loop.
     # Set True when the SDK already maintains a long-lived session that
     # produces natural progress events (e.g. claude-code streaming).
     provides_native_heartbeat: bool = False
@@ -325,9 +325,9 @@ class BaseAdapter(ABC):
 
         Adapters MAY call ``self.event_log.append(kind=..., payload=...)``
         to record runtime-internal events (tool dispatch, skill load,
-        executor errors, peer-handoff). Readers query the buffer via
-        the platform's ``/workspaces/:id/activity`` endpoint with a
-        cursor — see ``event_log.py`` for the protocol.
+        executor errors, peer-handoff), though maintained adapters do not yet.
+        The buffer is not exposed through Core's `/activity` endpoint; see
+        ``event_log.py`` for the current in-process-only contract.
 
         Default: shared ``DisabledEventLog`` no-op, so adapters that
         never set this still link cleanly. ``main.py`` overrides at boot

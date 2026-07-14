@@ -63,7 +63,8 @@ async def tool_commit_memory(
         )
 
     # Scope enforcement: only root workspaces (tier 0) can write GLOBAL memory.
-    # This prevents tenant workspaces from poisoning org-wide memory (GH#1610).
+    # This prevents tenant workspaces from poisoning org-wide memory
+    # (molecule-core#1610).
     if scope == "GLOBAL" and not _is_root_workspace():
         return (
             "Error: RBAC — only root workspaces (tier 0) can write to GLOBAL scope. "
@@ -79,7 +80,7 @@ async def tool_commit_memory(
                     "content": content,
                     "scope": scope,
                     # Embed source workspace so the platform can namespace-isolate
-                    # and audit cross-workspace writes (GH#1610 fix).
+                    # and audit cross-workspace writes (molecule-core#1610 fix).
                     "workspace_id": src,
                 },
                 headers=_auth_headers_for_heartbeat(src),

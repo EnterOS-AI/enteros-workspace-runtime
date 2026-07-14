@@ -5,13 +5,8 @@ memory, broadcast, introspection) is defined ONCE in TOOLS below.
 Adapters consume these specs to register the tool in their native
 runtime format:
 
-  - a2a_mcp_server.py iterates `TOOLS` to build the MCP TOOLS list +
-    dispatches calls to spec.impl. No tool name or description is
-    hardcoded there.
-
-  - builtin_tools/{delegation,memory}.py define decorated tool
-    wrappers using `name=` from the spec; the wrapper body just
-    calls spec.impl.
+  - mcp_tools.py derives the shared MCP/OpenAI schema lists and dispatches
+    calls to spec.impl. a2a_mcp_server.py re-exports that shared list.
 
   - executor_helpers.get_a2a_instructions(mcp=True) /
     get_hma_instructions() GENERATE the system-prompt doc string from
@@ -26,16 +21,16 @@ runtime format:
     from JSON-schema specs without losing the readable invocation
     syntax. Its tool-coverage alignment with the registry is enforced
     by the `_CLI_A2A_COMMAND_KEYWORDS` mapping in executor_helpers.py
-    and the alignment tests in test_platform_tools.py — adding a new
+    and the alignment tests in tests/test_executor_helpers.py — adding a new
     a2a tool here will fail those tests until the mapping is updated.
 
 Adding a new tool: append a ToolSpec to `TOOLS` below, then update
 `_CLI_A2A_COMMAND_KEYWORDS` in executor_helpers.py (set the value to
 the CLI subcommand keyword, or to `None` if the tool isn't exposed via
 the CLI subprocess interface). The structural alignment tests in
-workspace/tests/test_platform_tools.py fail otherwise.
+tests/test_executor_helpers.py and tests/test_mcp_ssot.py fail otherwise.
 
-Renaming a tool: change `name` here. Search workspace/ for the old
+Renaming a tool: change `name` here. Search molecule_runtime/ and tests/ for the old
 literal in case any non-adapter consumer (tests, plugin code) hard-coded
 it; update those manually. The grep is the audit, the test is the gate.
 
@@ -673,7 +668,7 @@ _DESKTOP_OPEN_URL = ToolSpec(
 # ---------------------------------------------------------------------------
 # Inbox — inbound delivery for the standalone molecule-mcp path.
 #
-# These tools observe a poller-fed in-memory queue (see workspace/inbox.py).
+# These tools observe a poller-fed in-memory queue (see molecule_runtime/inbox.py).
 # They are universally registered so docs + adapters stay aligned, but
 # they only return real data in the standalone molecule-mcp runtime;
 # in-container runtimes return an informational "not enabled" message

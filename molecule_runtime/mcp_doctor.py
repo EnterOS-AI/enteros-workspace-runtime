@@ -365,8 +365,8 @@ def check_token_auth() -> Verdict:
         _fail(
             label,
             "401 Unauthorized — token rejected",
-            "tokens are shown only once at workspace-create time; "
-            "re-create the workspace OR rotate via canvas Tokens tab.",
+            "token plaintext is shown only once when created; "
+            "create a replacement in Canvas Settings → Workspace Tokens.",
         )
         return "fail"
     if status == 404:

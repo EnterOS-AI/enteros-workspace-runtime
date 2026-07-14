@@ -178,7 +178,7 @@ def _safe_ts(value) -> str:
 # naming (`-`, `_`, `.`, `/`, `+`, `:`, `@`, parens, space). Anything
 # else collapses to a space and adjacent whitespace is squeezed.
 # Mirrors the TypeScript sanitiser shipped in the channel plugin
-# (Molecule-AI/molecule-mcp-claude-channel#25).
+# (molecule-ai/molecule-mcp-claude-channel#25).
 _NAME_SAFE_RE = _re.compile(r"[^A-Za-z0-9 _.\-/+:@()]")
 _NAME_MAX_CHARS = 64
 
@@ -640,7 +640,7 @@ def _build_channel_notification(msg: dict) -> dict:
     # pass. See _format_channel_content for the rationale + tradeoff on
     # coupling display to behaviour. Mirrors the change shipped for the
     # external channel-plugin path
-    # (Molecule-AI/molecule-mcp-claude-channel#24); the universal MCP
+    # (molecule-ai/molecule-mcp-claude-channel#24); the universal MCP
     # path is the same display surface for in-workspace agents.
     content = _format_channel_content(
         text=_append_attachment_manifest(msg.get("text", ""), msg_attachments),

@@ -18,10 +18,9 @@ The bundled ``pre-commit-checks.sh`` runs:
    copying ``_authToken`` into ``package.json``, an agent persisting
    its own ``GITHUB_TOKEN`` to a config file, etc.).
 
-2. **Internal-paths block** — ``Molecule-AI/molecule-monorepo`` and
-   ``Molecule-AI/molecule-core`` only. Refuses commits that add
-   ``research/``, ``marketing/``, etc. to the public monorepo with a
-   redirect to ``Molecule-AI/internal``.
+2. **Internal-paths block** — canonical Gitea ``molecule-ai/molecule-core``
+   checkouts only. Refuses commits that add ``research/``, ``marketing/``,
+   etc. to the public repository with a redirect to ``molecule-ai/internal``.
 
 Both gates skip during rebase / cherry-pick / merge / revert (they
 replay existing commits and blocking would force interactive history
@@ -110,7 +109,7 @@ def install_pre_commit_hook() -> None:
     if existing and Path(existing).resolve() != _HOOKS_DIR.resolve():
         log.warning(
             "precommit_hook: git core.hooksPath already set to %s — leaving it alone. "
-            "Internal-paths gate will NOT fire on commits in the public monorepo. "
+            "Internal-paths gate will NOT fire on commits in the public Core repo. "
             "If this is intentional, point that hooks dir at %s/%s as well.",
             existing, _HOOKS_DIR, _HOOK_SCRIPT_NAME,
         )

@@ -24,15 +24,15 @@ from urllib.parse import urlsplit
 
 # SSOT for the set of repos that pin/install the runtime and MUST stay current
 # with the latest published runtime-v<semver> tag. Every workspace template whose
-# Dockerfile installs ``molecule-ai-workspace-runtime==${RUNTIME_VERSION}`` (where
+# Dockerfile installs ``molecules-workspace-runtime==${RUNTIME_VERSION}`` (where
 # RUNTIME_VERSION is read from its ``.runtime-version`` file) belongs here, plus
 # molecule-core (installs the wheel; carries no .runtime-version pin but must not
 # vendor the source). This list was previously only a hand-maintained subset of
-# templates the runtime#91 propagation bot bumps + molecule-core, which created a
-# SILENT BLIND SPOT: google-adk/crewai also pin .runtime-version and build images
-# from it, but were omitted here, so the guard stayed green while those pins
-# drifted (16-26 releases behind). The ``reconcile_org_consumers`` check below now
-# makes any future omission LOUD.
+# templates the runtime#91 propagation bot bumped + molecule-core. At the time,
+# google-adk/crewai were active pin consumers but were omitted, so the guard stayed
+# green while those pins drifted (16-26 releases behind). They are now retired and
+# explicitly exempted below; ``reconcile_org_consumers`` still makes any future
+# unclassified template LOUD.
 DEFAULT_CONSUMERS = (
     "molecule-ai-workspace-template-claude-code",
     "molecule-ai-workspace-template-hermes",
@@ -723,4 +723,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

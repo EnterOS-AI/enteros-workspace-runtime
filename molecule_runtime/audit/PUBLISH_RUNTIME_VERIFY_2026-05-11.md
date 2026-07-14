@@ -1,12 +1,17 @@
 # Publish-runtime pipeline verification — 2026-05-11
 
-Marker file for the canonical end-to-end pipeline verification after
+> **Historical record.** This marker documents the retired monorepo/PyPI
+> pipeline as it existed on 2026-05-11. It does not trigger the current
+> standalone runtime release workflow and must not be used as an operator
+> runbook. Current release behavior is documented in the repository README.
+
+Marker file for the then-current end-to-end pipeline verification after
 `publish-runtime-bot` provisioning (internal#327) + stale-tag drift
 resolution (`runtime-v0.1.131` deleted from main).
 
-## Purpose
+## Historical purpose
 
-Triggers `workspace/**` path filter on `publish-runtime-autobump.yml`,
+Triggered the retired `workspace/**` path filter on `publish-runtime-autobump.yml`,
 exercising the full pipeline:
 
 1. `publish-runtime-autobump / bump-and-tag` reads PyPI version, computes

@@ -119,7 +119,7 @@ def _runtime_metadata_payload() -> dict:
     to its own defaults when fields are missing.
 
     See project memory `project_runtime_native_pluggable.md` and
-    workspace/adapter_base.py:RuntimeCapabilities.
+    molecule_runtime/adapter_base.py:RuntimeCapabilities.
     """
     try:
         from molecule_runtime.adapters import get_adapter

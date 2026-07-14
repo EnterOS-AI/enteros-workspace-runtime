@@ -105,7 +105,7 @@ def _check_runtime_wedge() -> str | None:
     are upgraded to FAIL when the flag is set, so a wedge that was
     triggered inside a still-running execute() (timeout branch) or
     inside a non-import exception (PASS-on-other-error branch) gets
-    surfaced instead of silently shipping a broken image to GHCR.
+    surfaced instead of silently shipping a broken image to Gitea OCI.
 
     Lazy import: the runtime may be installed without runtime_wedge in
     a corrupt-rolling-deploy state, in which case "no wedge info"
@@ -115,9 +115,8 @@ def _check_runtime_wedge() -> str | None:
     Catch is narrowed to import errors only — a signature change
     (`is_wedged` removed/renamed, `wedge_reason` returning the wrong
     type) must NOT silently degrade to "no wedge info." The runtime's
-    structural snapshot test (workspace/tests/test_runtime_wedge_signature.py,
-    task #169) carries the API-drift load: any rename surfaces there
-    as a snapshot mismatch instead of letting the smoke gate go blind.
+    direct import is deliberately strict: any rename surfaces here instead of
+    letting the smoke gate silently go blind.
     """
     try:
         from molecule_runtime.runtime_wedge import is_wedged, wedge_reason

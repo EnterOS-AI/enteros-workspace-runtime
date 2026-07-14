@@ -1591,7 +1591,7 @@ def new_response_message(
     Adapter executors should use this instead of ``a2a.helpers.new_text_message``
     (which omits ``task_id`` / ``context_id``) so the platform's a2a proxy can
     reliably correlate the response to the originating task. Mirrors the shape
-    used by ``workspace/a2a_executor.py``'s own response construction so all
+    used by ``molecule_runtime/a2a_executor.py``'s response construction so all
     runtime paths produce the same Message envelope.
 
     Args:

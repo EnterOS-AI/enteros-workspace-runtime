@@ -12,7 +12,7 @@ Prior behaviour wrote the marker AFTER the prompt completed successfully. If
 the prompt crashed mid-execution (e.g. ProcessError from a stale Claude
 session), the marker was never written; every subsequent container boot
 replayed the same failing prompt, cascading into "every message crashes until
-an operator intervenes." See GitHub issue #71.
+an operator intervenes." See molecule-ai-workspace-runtime#71.
 
 Fix (2026-04-12): write the marker BEFORE firing the prompt. If the prompt
 fails, operators re-send it manually via chat — cheap and available — instead

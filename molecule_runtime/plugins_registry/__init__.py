@@ -2,7 +2,7 @@
 
 Resolution order for ``(plugin_name, runtime)``:
 
-  1. Platform registry  → ``workspace/plugins_registry/<plugin>/<runtime>.py``
+  1. Platform registry  → ``molecule_runtime/plugins_registry/<plugin>/<runtime>.py``
   2. Plugin-shipped     → ``<plugin_root>/adapters/<runtime>.py``
   3. MCP-shaped default → :class:`MCPServerAdaptor`
   4. Skill-shaped default → :class:`AgentskillsAdaptor`
@@ -10,7 +10,7 @@ Resolution order for ``(plugin_name, runtime)``:
 
 Path #1 wins so the platform can override or hot-fix a third-party adaptor
 without forking the upstream plugin repo. Path #2 is the SDK contract: a
-single GitHub repo ships its own adaptors and is installable on day one.
+single source repository ships its own adaptors and is installable on day one.
 Path #5 is the escape hatch — power users can still bring unsupported
 plugins onto a workspace, they just don't get tools wired up.
 

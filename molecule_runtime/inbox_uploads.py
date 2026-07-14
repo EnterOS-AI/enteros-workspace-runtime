@@ -108,11 +108,11 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^a-zA-Z0-9._\-]")
 def sanitize_filename(name: str) -> str:
     """Reduce a user-supplied filename to a safe form.
 
-    Mirrors ``internal_chat_uploads.sanitize_filename`` and the Go
-    handler's ``SanitizeFilename`` — three-way parity is pinned by
-    ``workspace-server/internal/handlers/sanitize_filename_test.go`` and
-    ``workspace/tests/test_internal_chat_uploads.py`` so the URI shape
-    is identical regardless of which path handles the upload.
+    Mirrors ``internal_chat_uploads.sanitize_filename`` and the Go handler's
+    ``SanitizeFilename``. Runtime two-way parity is pinned by
+    ``tests/test_current_operator_guidance.py``; Core keeps the same fixtures
+    in ``workspace-server/internal/handlers/sanitize_filename_test.go`` so the
+    URI shape remains identical across upload paths.
     """
     base = os.path.basename(name)
     base = base.replace(" ", "_")

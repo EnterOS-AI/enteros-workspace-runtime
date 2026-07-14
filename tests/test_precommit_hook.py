@@ -13,7 +13,10 @@ Two paths covered:
    actual #2090 incident vector) so the most important regression case
    is locked.
 
-2. **Clean commit through** — verifies the hook is a no-op for benign
+2. **Canonical Gitea internal-path guard** — refuses internal-only paths in
+   molecule-core and prints a recovery path that does not use suspended GitHub.
+
+3. **Clean commit through** — verifies the hook is a no-op for benign
    content, confirming we haven't shipped a check that fails open or
    blocks every commit.
 
@@ -119,6 +122,38 @@ def test_clean_commit_passes_through(repo: Path) -> None:
         env={"GIT_AUTHOR_NAME": "test-agent", "GIT_COMMITTER_NAME": "test-agent"},
     )
     assert result.returncode == 0, f"clean commit refused: {result.stderr}"
+
+
+@pytest.mark.skipif(_BASH is None, reason="bash not on PATH")
+def test_internal_paths_gate_targets_canonical_gitea_remote(repo: Path) -> None:
+    """The public-repo gate and its recovery instructions must be Gitea-native."""
+    _run(
+        [
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "https://git.moleculesai.app/molecule-ai/molecule-core.git",
+        ],
+        cwd=repo,
+    ).check_returncode()
+    research = repo / "research" / "private.md"
+    research.parent.mkdir()
+    research.write_text("internal research\n")
+    _run(["git", "add", "research/private.md"], cwd=repo).check_returncode()
+
+    result = _run(
+        ["git", "commit", "-m", "docs: internal draft", "--no-gpg-sign"],
+        cwd=repo,
+        env={"GIT_AUTHOR_NAME": "test-agent", "GIT_COMMITTER_NAME": "test-agent"},
+    )
+
+    assert result.returncode != 0, "canonical Gitea molecule-core commit should be refused"
+    assert "research/private.md" in result.stderr
+    assert "https://git.moleculesai.app/molecule-ai/internal.git" in result.stderr
+    assert "github.com" not in result.stderr
+    assert "gh repo" not in result.stderr
+    assert ".github/workflows" not in result.stderr
 
 
 @pytest.mark.skipif(_BASH is None, reason="bash not on PATH")

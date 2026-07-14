@@ -17,7 +17,7 @@ to a shared registry.
 This module lives in molecule-runtime (NOT in any adapter / template
 repo) because:
 
-  1. workspace/heartbeat.py reads it on every heartbeat — cross-cutting
+  1. molecule_runtime/heartbeat.py reads it on every heartbeat — cross-cutting
      concern, runtime owns it.
   2. Multiple adapter executors can mark themselves wedged with their
      own reason; the runtime aggregates one flag for the platform.
@@ -41,12 +41,8 @@ in place — adapters do not change anything in molecule-runtime.
 Minimum integration (~6 LOC inside the executor):
 
     # Import path:
-    #   - In a TEMPLATE repo (the common case for new adapters), the
-    #     runtime is installed via PyPI as `molecule-ai-workspace-runtime`,
-    #     so the import is `from molecule_runtime.runtime_wedge import …`.
-    #   - In molecule-core itself (when editing this repo's own
-    #     workspace/ tree), the module is at the top level — import as
-    #     `from runtime_wedge import …`.
+    # The runtime is installed from the Gitea package registry as
+    # `molecules-workspace-runtime`; adapters use its stable import package:
     from molecule_runtime.runtime_wedge import mark_wedged, clear_wedge
 
     async def execute(self, ctx, queue):

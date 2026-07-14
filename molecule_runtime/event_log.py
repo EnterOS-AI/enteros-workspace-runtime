@@ -1,15 +1,11 @@
-"""Workspace event log — append-and-query buffer for runtime events.
+"""Workspace event log — in-process append-and-query buffer.
 
-Hermes-style declarative observability primitive. Adapter and platform
-code emit semantic events (turn started, tool invoked, peer message
-delivered) and external readers — the canvas Activity tab, A2A peers,
-and the platform's `/workspaces/:id/activity` endpoint — query them
-with a cursor.
-
-Today's PR ships the in-memory backend only. Redis backend lands in
-the follow-up that wires platform-side fan-out (#119 PR-3 follow-up).
-The Protocol shape lets a future backend swap in without touching the
-emitting sites.
+This module implements an in-memory backend and a disabled no-op backend.
+``main.py`` constructs one and assigns it to the active adapter, but maintained
+adapters do not append events and no production reader queries the buffer yet.
+It does not feed Core's `/activity` endpoint or Canvas Activity; those surfaces
+read Core's independent ``activity_logs`` database. The Protocol leaves a
+runtime-local instrumentation seam without claiming platform integration.
 
 Eviction is the load-bearing invariant: the workspace runtime is
 long-lived, so an unbounded list would leak memory. Every append
@@ -51,7 +47,7 @@ class Event:
     kind: str
     """Short tag categorising the event: ``turn.started``, ``tool.invoked``,
     ``peer.message.delivered``, etc. Convention is dotted snake_case so
-    the canvas can group by prefix without a parser."""
+    a future runtime-local consumer can group by prefix without a parser."""
 
     payload: dict = field(default_factory=dict)
     """Arbitrary JSON-serialisable dict. Keep small — the in-memory
@@ -64,9 +60,8 @@ class Event:
 
         Wrapping ``dataclasses.asdict`` rather than relying on the
         consumer to call it themselves means the wire format stays
-        owned by this module — a rename of ``kind`` to ``type`` (or
-        whatever the canvas eventually settles on) flips here, not in
-        every reader.
+        owned by this module — a future rename of ``kind`` to ``type`` flips
+        here, not in every runtime-local reader.
         """
         return asdict(self)
 
@@ -74,10 +69,9 @@ class Event:
 class EventLogBackend(Protocol):
     """Backend Protocol — the swap point for memory ↔ redis ↔ disabled.
 
-    Implementations must be safe to call from multiple threads. The
-    workspace runtime appends from the heartbeat thread, the agent's
-    main loop, and any A2A executor concurrently; readers run on the
-    HTTP server thread. A backend that needs locking owns it.
+    Implementations must be safe to call from multiple threads so future
+    runtime-local producers and readers can use the backend from heartbeat,
+    main-loop, A2A, or HTTP threads. A backend that needs locking owns it.
     """
 
     def append(self, kind: str, payload: Optional[dict] = None) -> Event:
@@ -200,8 +194,8 @@ class DisabledEventLog:
     Append returns a synthetic event so callers that want the id
     don't crash; query always returns empty. The synthetic event is
     NOT cached anywhere — the contract for ``backend: disabled`` is
-    that no state is retained. Operators who pick this backend opt
-    out of the canvas Activity tab and the `/activity` endpoint.
+    that no runtime-local state is retained. Selecting it does not affect
+    Canvas Activity or Core's `/activity` endpoint, which use ``activity_logs``.
     """
 
     def __init__(self) -> None:

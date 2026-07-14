@@ -156,7 +156,8 @@ def platform_register(platform_url: str, workspace_id: str, token: str) -> None:
             print(
                 f"molecule-mcp: register rejected with HTTP {resp.status_code} — "
                 f"the token in MOLECULE_WORKSPACE_TOKEN is invalid for workspace "
-                f"{workspace_id}. Regenerate from the canvas → Tokens tab.",
+                f"{workspace_id}. Create a replacement in Canvas Settings → "
+                "Workspace Tokens.",
                 file=sys.stderr,
             )
             sys.exit(3)
@@ -262,8 +263,8 @@ def log_heartbeat_auth_failure(count: int, workspace_id: str, status_code: int) 
     if count < HEARTBEAT_AUTH_LOUD_THRESHOLD:
         logger.warning(
             "molecule-mcp: heartbeat HTTP %d (auth failure %d/%d) — "
-            "token may be revoked. Will retry; if persistent, regenerate "
-            "from canvas → Tokens.",
+            "token may be revoked. Will retry; if persistent, create a "
+            "replacement in Canvas Settings → Workspace Tokens.",
             status_code, count, HEARTBEAT_AUTH_LOUD_THRESHOLD,
         )
         return
@@ -275,9 +276,10 @@ def log_heartbeat_auth_failure(count: int, workspace_id: str, status_code: int) 
             "molecule-mcp: %d consecutive heartbeat auth failures (HTTP %d) — "
             "the token in MOLECULE_WORKSPACE_TOKEN has been REVOKED, likely "
             "because workspace %s was deleted server-side. The MCP server is "
-            "still running but every platform call will fail. Regenerate the "
-            "workspace + token from the canvas (Tokens tab), update your MCP "
-            "config, and restart your runtime.",
+            "still running but every platform call will fail. Re-create the "
+            "workspace if it was deleted, create a replacement token in Canvas "
+            "Settings → Workspace Tokens, update your MCP config, and restart "
+            "your runtime.",
             count, status_code, workspace_id,
         )
 

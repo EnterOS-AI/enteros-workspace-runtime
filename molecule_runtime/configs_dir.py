@@ -3,9 +3,8 @@
 The runtime persists per-workspace state to a single directory:
 ``.auth_token`` (platform_auth), ``.platform_inbound_secret``
 (platform_inbound_auth), ``.mcp_inbox_cursor`` (inbox). Inside a
-workspace EC2 container that directory is ``/configs`` — a tmpfs/EBS
-mount owned by the agent user, populated by the provisioner before
-runtime boot.
+managed workspace container that directory is ``/configs`` — a
+provisioner-populated mount owned by the agent user before runtime boot.
 
 Outside a container — operators running ``molecule-mcp`` on a laptop
 for the external-runtime path — ``/configs`` doesn't exist (or, if it
@@ -42,7 +41,7 @@ volume via :func:`molecule_runtime.mailbox_dir.resolve`. When the kernel is off,
 ``mailbox_dir.resolve()`` returns THIS directory, so nothing moves and the
 proven flow is byte-identical.
 
-Issue: Molecule-AI/molecule-core#2458.
+Issue: molecule-ai/molecule-core#2458.
 """
 from __future__ import annotations
 

@@ -293,6 +293,25 @@ def test_env_bootstrap_seeds_goal(tmp_path):
     assert got["source"] == g.SOURCE_ENV_BOOTSTRAP
 
 
+@pytest.mark.asyncio
+async def test_env_bootstrap_goal_is_due_before_default_cadence_elapses(tmp_path):
+    """The fire-loop interval and the goal's repeat cadence are independent.
+
+    A provisioned goal keeps the contract's one-hour repeat cadence, but its
+    first contribution is due immediately because it has never been included.
+    """
+    from molecule_runtime.idle_digest.contract import AgeBand
+    from molecule_runtime.idle_digest.providers import goal as g
+
+    p = _env_provider(tmp_path)
+    doc = p.bootstrap_from_env({g.IDLE_GOAL_ENV: "Keep the e2e pipeline green."})
+
+    assert doc is not None
+    assert doc.cadence_seconds == g.CADENCE_DEFAULT_SECONDS == 3600
+    [contribution] = await p.contribute()
+    assert contribution.age_band is AgeBand.DUE
+
+
 def test_env_bootstrap_idempotent_across_boots(tmp_path):
     from molecule_runtime.idle_digest.providers import goal as g
 
