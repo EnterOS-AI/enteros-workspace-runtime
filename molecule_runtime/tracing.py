@@ -49,6 +49,7 @@ log = logging.getLogger(__name__)
 _MAX_INFLIGHT = 64
 _executor: "ThreadPoolExecutor | None" = None
 _inflight = 0
+_dropped = 0  # cumulative traces dropped under backpressure (observability)
 _submit_lock = threading.Lock()
 
 
@@ -56,11 +57,20 @@ def _submit_offloop(fn: Callable, *args: Any) -> None:
     """Run ``fn(*args)`` on the background trace worker. Non-blocking; drops the
     work (never blocks the turn, never grows unbounded) when the worker is
     saturated by a stalled backend. Fully fail-open."""
-    global _executor, _inflight
+    global _executor, _inflight, _dropped
     try:
         with _submit_lock:
             if _inflight >= _MAX_INFLIGHT:
-                return  # backpressure: drop this trace, keep the turn moving
+                # Backpressure: drop this trace, keep the turn moving. Log the
+                # first drop and then periodically so a persistently hung
+                # backend is visible without flooding the log.
+                _dropped += 1
+                if _dropped == 1 or _dropped % _MAX_INFLIGHT == 0:
+                    log.warning(
+                        "agent-trace worker saturated (backend slow/hung); "
+                        "dropped %d trace(s) so far", _dropped,
+                    )
+                return
             if _executor is None:
                 _executor = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="agent-trace"
@@ -78,7 +88,16 @@ def _submit_offloop(fn: Callable, *args: Any) -> None:
                 with _submit_lock:
                     _inflight -= 1
 
-        _executor.submit(_run)
+        try:
+            _executor.submit(_run)
+        except Exception:
+            # submit() failed (e.g. interpreter shutdown) so _run — and its
+            # decrement — will never execute. Release the slot we reserved here,
+            # otherwise a transient failure permanently shrinks capacity until
+            # _inflight pins at _MAX_INFLIGHT and every future trace is dropped.
+            with _submit_lock:
+                _inflight -= 1
+            raise
     except Exception:  # pragma: no cover - never let trace scheduling break a turn
         pass
 
@@ -249,7 +268,19 @@ def build_agent_trace(
     if steps:
         norm = []
         for st in steps:
-            item = {k: st[k] for k in _STEP_KEYS if st.get(k) is not None}
+            # The SSOT schema types every step field as a string ("Producers
+            # serialize input/result to strings so the shape is uniform across
+            # runtimes"). The tool_calls fallback in _emit passes raw dict args
+            # as `input`, so coerce non-str values here — otherwise the emitted
+            # record violates its own contract.
+            item = {}
+            for k in _STEP_KEYS:
+                v = st.get(k)
+                if v is None:
+                    continue
+                s = v if isinstance(v, str) else str(v)
+                if s:
+                    item[k] = s
             if item:
                 norm.append(item)
         if norm:
@@ -265,6 +296,7 @@ def _emit(
     tool_uses: list,
     tool_calls: "list | None" = None,
     steps: "list | None" = None,
+    session_id: str = "",
 ) -> None:
     lf = _langfuse()
     if lf is None:
@@ -272,18 +304,20 @@ def _emit(
     try:
         # Ordered per-turn steps (SSOT contract AgentTrace.steps): prefer the
         # runtime's ordered thinking+tool steps, else synthesize from the flat
-        # tool_calls list. Computed ONCE and shared by the canonical record and
-        # the span loop below.
+        # tool_calls list. Fed to build_agent_trace, which normalizes + string-
+        # coerces them into the canonical record; the span loop below then wires
+        # THAT canonical shape (not this raw list) so what the conformance test
+        # validates is exactly what reaches the backend.
         ordered = steps if steps else [
             {"kind": "tool_call", "name": tc.get("name"),
              "input": tc.get("input"), "result": tc.get("output")}
             for tc in (tool_calls or [])
         ]
         # Canonical SSOT record (conforms to the vendored agent-trace schema).
-        # The Langfuse trace/generation/span calls below are ITS backend mapping,
-        # so what the conformance test validates is what the producer emits.
+        # The Langfuse trace/generation/span calls below are ITS backend mapping.
         at = build_agent_trace(
             workspace_id, model, user_input, output, tool_uses, ordered,
+            session_id=session_id,
         )
         system_prompt = _system_prompts.get(workspace_id, "")
         components = _system_components.get(workspace_id, [])
@@ -292,6 +326,7 @@ def _emit(
         trace = lf.trace(
             name=at.get("name", "agent-turn"),
             tags=[wsid] if wsid else [],
+            session_id=at.get("session_id") or None,
             input=at.get("input", ""),
             output=at.get("output", ""),
             metadata={"agent": agent, "workspace_id": wsid, "tool_uses": at.get("tool_uses", [])},
@@ -316,9 +351,12 @@ def _emit(
             output=output,
             metadata={"tool_uses": tool_uses, "prompt_component_labels": [c.get("label") for c in components]},
         )
-        # Emit each ordered step as an observation IN SEQUENCE so the trace
+        # Emit each canonical step as an observation IN SEQUENCE so the trace
         # shows HOW the agent decided — thinking blocks + tool calls interleaved.
-        for st in ordered:
+        # Iterate at["steps"] (the normalized, string-coerced, schema-conformant
+        # record) — NOT the raw `ordered` list — so the wire matches exactly what
+        # the conformance test validates.
+        for st in at.get("steps", []):
             try:
                 if st.get("kind") == "thinking":
                     trace.span(name="thinking", input=None, output=st.get("text"),
@@ -382,6 +420,18 @@ class TracingExecutor(_AgentExecutor):  # type: ignore[misc]
             user_input = extract_message_text(context.message) or ""
         except Exception:
             pass
+        # A2A conversation id, so multiple turns group into one Traces-tab
+        # session (SSOT AgentTrace.session_id). a2a-sdk exposes it as
+        # ``context_id``; older shapes use ``contextId``. Best-effort.
+        session_id = ""
+        try:
+            session_id = str(
+                getattr(context, "context_id", None)
+                or getattr(context, "contextId", None)
+                or ""
+            )
+        except Exception:
+            pass
         try:
             return await self._inner.execute(context, cap)
         finally:
@@ -398,7 +448,7 @@ class TracingExecutor(_AgentExecutor):  # type: ignore[misc]
                 # flush cannot stall the executor / A2A delivery / heartbeats.
                 _submit_offloop(
                     _emit, self._wsid, self._model, user_input, output,
-                    tool_uses, tool_calls, steps,
+                    tool_uses, tool_calls, steps, session_id,
                 )
             except Exception as e:  # pragma: no cover
                 log.warning("langfuse post-turn trace failed: %s", e)

@@ -187,12 +187,16 @@ def test_decomposed_prompt_and_tool_spans(monkeypatch):
         "base_platform_identity", "role_prompt_files", "a2a_instructions",
     ]
 
-    # One span per tool call, with name + input + output.
+    # One span per tool call, with name + input + output. Spans are wired from
+    # the canonical (string-coerced) at["steps"], NOT the raw tool_calls, so the
+    # dict args reach the backend serialized — matching the SSOT schema, which
+    # types step.input as a string.
     assert len(calls["span"]) == 2, calls["span"]
     names = [s["name"] for s in calls["span"]]
     assert names == ["tool:list_peers", "tool:delegate_task"]
     assert calls["span"][0]["output"] == "3 peers"
-    assert calls["span"][1]["input"] == {"task": "x"}
+    assert calls["span"][1]["input"] == "{'task': 'x'}"
+    assert isinstance(calls["span"][1]["input"], str)
 
 
 def test_ordered_steps_thinking_and_tools(monkeypatch):
@@ -354,3 +358,59 @@ def test_vendored_golden_example_conforms():
     schema = _vendored("agent-trace.schema.json")
     jsonschema.Draft202012Validator.check_schema(schema)
     jsonschema.validate(_vendored("agent-trace.contract.json"), schema)
+
+
+def test_tool_calls_fallback_dict_input_is_coerced_and_conformant():
+    """Regression (#252 review, findings b+c): the tool_calls fallback path
+    passes raw dict `input` args. build_agent_trace MUST serialize them to
+    strings so the emitted record validates against the SSOT schema (which
+    types step.input as a string) — previously the dict leaked through and
+    the 'conformance' was hollow because the wire diverged from the record."""
+    import jsonschema
+
+    schema = _vendored("agent-trace.schema.json")
+    trace = tracing.build_agent_trace(
+        workspace_id="ws-1",
+        model="m",
+        user_input="hi",
+        output="ok",
+        tool_uses=["delegate_task"],
+        # kind of step the tool_calls fallback synthesizes: dict input, no str.
+        steps=[{"kind": "tool_call", "name": "delegate_task",
+                "input": {"task": "x", "n": 3}, "result": "queued"}],
+    )
+    jsonschema.validate(trace, schema)  # would raise if input stayed a dict
+    step = trace["steps"][0]
+    assert isinstance(step["input"], str) and "task" in step["input"]
+    assert step["result"] == "queued"
+
+
+def test_submit_offloop_releases_slot_when_submit_raises(monkeypatch):
+    """Regression (#252 review, finding a): if executor.submit() raises after
+    the in-flight slot is reserved, the slot MUST be released — otherwise a
+    transient failure permanently shrinks capacity until every trace is
+    dropped. The turn is never affected (fully fail-open)."""
+    class _BoomExecutor:
+        def submit(self, *a, **k):
+            raise RuntimeError("interpreter shutting down")
+
+    monkeypatch.setattr(tracing, "_executor", _BoomExecutor())
+    tracing._inflight = 0
+    tracing._submit_offloop(lambda: None)  # must not raise
+    assert tracing._inflight == 0, "in-flight slot leaked on submit failure"
+
+
+def test_session_id_flows_to_trace(monkeypatch):
+    """The a2a conversation id (context_id) is captured and set as the trace
+    session_id so multiple turns group into one Traces-tab session."""
+    calls = _install_fake_langfuse(monkeypatch)
+
+    class _CtxSess(_Ctx):
+        def __init__(self, text, context_id):
+            super().__init__(text)
+            self.context_id = context_id
+
+    wrapped = tracing.wrap_executor(_Inner(), "ws-1", "m")
+    asyncio.run(wrapped.execute(_CtxSess("hi", "conv-abc"), _Queue()))
+    assert tracing._drain(), "off-loop trace worker did not finish"
+    assert calls["trace"][0]["session_id"] == "conv-abc"
