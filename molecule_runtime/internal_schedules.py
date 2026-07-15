@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,7 +36,44 @@ from molecule_runtime.schedule_store import ScheduleError, ScheduleStore
 # per-plugin, not importable from the runtime process).
 GRID_FILENAME = "schedules.yaml"
 HEALTH_FILENAME = "schedule-health.json"
+POKES_FILENAME = "schedule-pokes.json"
+HISTORY_FILENAME = "schedule-history.json"
 STATE_DIR_ENV = "MOLECULE_TRIGGER_STATE_DIR"
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _enqueue_poke(state_dir: Path, name: str) -> None:
+    """Add a schedule name to the poke set the daemon consumes next tick.
+
+    Read-modify-write of a single JSON set. The daemon is the only clearer; a
+    RunNow landing in the same ~poll-interval window the daemon clears is a rare,
+    user-retriable loss, acceptable for a fire-now signal.
+    """
+    path = state_dir / POKES_FILENAME
+    current: set[str] = set()
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                current = {str(n) for n in raw}
+        except (ValueError, OSError):
+            current = set()
+    current.add(name)
+    _atomic_write_json(path, sorted(current))
 
 
 class ScheduleStoreUnconfigured(RuntimeError):
@@ -140,6 +178,48 @@ def make_handlers(
             return JSONResponse({"error": f"no such schedule: {name!r}"}, status_code=404)
         return JSONResponse({"deleted": name})
 
+    async def run_now(request: Request) -> JSONResponse:
+        if _unauthorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        state_dir = _dir_or_503()
+        if isinstance(state_dir, JSONResponse):
+            return state_dir
+        name = request.path_params["name"]
+        store = ScheduleStore(state_dir / GRID_FILENAME)
+        try:
+            existing = store.get(name)
+        except ScheduleError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        if existing is None:
+            return JSONResponse({"error": f"no such schedule: {name!r}"}, status_code=404)
+        if not existing.get("enabled", True):
+            return JSONResponse(
+                {"error": f"schedule is disabled: {name!r}"}, status_code=409
+            )
+        _enqueue_poke(state_dir, name)
+        # Accepted, not fired: the daemon consumes the poke on its next tick.
+        return JSONResponse({"poked": name}, status_code=202)
+
+    async def schedule_history(request: Request) -> JSONResponse:
+        if _unauthorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        state_dir = _dir_or_503()
+        if isinstance(state_dir, JSONResponse):
+            return state_dir
+        path = state_dir / HISTORY_FILENAME
+        if not path.is_file():
+            return JSONResponse({"history": []})
+        try:
+            log = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as exc:
+            return JSONResponse({"error": f"unreadable history: {exc}"}, status_code=500)
+        if not isinstance(log, list):
+            log = []
+        name = request.path_params.get("name")
+        if name is not None:
+            log = [row for row in log if isinstance(row, dict) and row.get("name") == name]
+        return JSONResponse({"history": log})
+
     async def schedule_health(request: Request) -> JSONResponse:
         if _unauthorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -167,6 +247,8 @@ def make_handlers(
         "create": create_schedule,
         "update": update_schedule,
         "delete": delete_schedule,
+        "run": run_now,
+        "history": schedule_history,
         "health": schedule_health,
     }
 
@@ -176,18 +258,28 @@ def add_schedule_routes(app, state_dir_factory: Callable[[], Path] = default_sta
     handlers = make_handlers(state_dir_factory)
     app.add_route("/internal/schedules", handlers["list"], methods=["GET"])
     app.add_route("/internal/schedules", handlers["create"], methods=["POST"])
+    # Fixed segments before the /{name} matcher so they are not shadowed.
     app.add_route("/internal/schedules/health", handlers["health"], methods=["GET"])
+    app.add_route("/internal/schedules/history", handlers["history"], methods=["GET"])
     app.add_route(
         "/internal/schedules/{name}", handlers["update"], methods=["PATCH"]
     )
     app.add_route(
         "/internal/schedules/{name}", handlers["delete"], methods=["DELETE"]
     )
+    app.add_route(
+        "/internal/schedules/{name}/run", handlers["run"], methods=["POST"]
+    )
+    app.add_route(
+        "/internal/schedules/{name}/history", handlers["history"], methods=["GET"]
+    )
 
 
 __all__ = [
     "GRID_FILENAME",
     "HEALTH_FILENAME",
+    "POKES_FILENAME",
+    "HISTORY_FILENAME",
     "STATE_DIR_ENV",
     "ScheduleStoreUnconfigured",
     "add_schedule_routes",

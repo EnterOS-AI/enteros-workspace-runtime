@@ -16,7 +16,12 @@ from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
 from molecule_runtime import internal_schedules
-from molecule_runtime.internal_schedules import HEALTH_FILENAME, add_schedule_routes
+from molecule_runtime.internal_schedules import (
+    HEALTH_FILENAME,
+    HISTORY_FILENAME,
+    POKES_FILENAME,
+    add_schedule_routes,
+)
 
 SECRET = "test-secret"
 AUTH = {"Authorization": f"Bearer {SECRET}"}
@@ -38,6 +43,53 @@ def test_unauthorized_on_every_route(client: TestClient) -> None:
     assert client.patch("/internal/schedules/x", json={}).status_code == 401
     assert client.delete("/internal/schedules/x").status_code == 401
     assert client.get("/internal/schedules/health").status_code == 401
+    assert client.post("/internal/schedules/x/run").status_code == 401
+    assert client.get("/internal/schedules/history").status_code == 401
+
+
+def test_run_now_enqueues_a_poke_the_daemon_will_consume(client: TestClient) -> None:
+    state_dir: Path = client._state_dir  # type: ignore[attr-defined]
+    client.post(
+        "/internal/schedules",
+        headers=AUTH,
+        json={"name": "sweep", "cron": "0 0 * * *", "prompt": "go"},
+    )
+    resp = client.post("/internal/schedules/sweep/run", headers=AUTH)
+    assert resp.status_code == 202
+    assert resp.json() == {"poked": "sweep"}
+    pokes = json.loads((state_dir / POKES_FILENAME).read_text())
+    assert pokes == ["sweep"]
+
+
+def test_run_now_unknown_is_404(client: TestClient) -> None:
+    assert client.post("/internal/schedules/ghost/run", headers=AUTH).status_code == 404
+
+
+def test_run_now_disabled_is_409(client: TestClient) -> None:
+    client.post(
+        "/internal/schedules",
+        headers=AUTH,
+        json={"name": "off", "cron": "0 0 * * *", "prompt": "p", "enabled": False},
+    )
+    assert client.post("/internal/schedules/off/run", headers=AUTH).status_code == 409
+
+
+def test_history_reads_daemon_log_filtered_by_name(client: TestClient) -> None:
+    state_dir: Path = client._state_dir  # type: ignore[attr-defined]
+    (state_dir / HISTORY_FILENAME).write_text(
+        json.dumps([
+            {"name": "a", "status": "fired", "poked": True},
+            {"name": "b", "status": "fired", "poked": False},
+        ]),
+        encoding="utf-8",
+    )
+    assert len(client.get("/internal/schedules/history", headers=AUTH).json()["history"]) == 2
+    only_a = client.get("/internal/schedules/a/history", headers=AUTH).json()["history"]
+    assert [r["name"] for r in only_a] == ["a"]
+
+
+def test_history_before_any_run_is_empty(client: TestClient) -> None:
+    assert client.get("/internal/schedules/history", headers=AUTH).json() == {"history": []}
 
 
 def test_crud_lifecycle(client: TestClient) -> None:
