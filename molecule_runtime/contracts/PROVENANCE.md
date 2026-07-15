@@ -169,3 +169,33 @@ Re-vendoring:
     curl -fsS -A "curl/8.4.0" \
       "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/schedule/fixtures.json" \
       -o "molecule_runtime/contracts/schedule.fixtures.json"
+
+## agent-trace.schema.json, agent-trace.contract.json
+
+Source: molecule-ai-sdk `contracts/workspace-comms/agent-trace.{schema,contract}.json`
+— the `AgentTrace` contract, SSOT for the per-turn agent trace this runtime
+PRODUCES (`molecule_runtime/tracing.py`) and molecule-core's `/traces` proxy
+reads back. Vendor-neutral trace DATA + the load-bearing tagging convention
+(`tags=[workspace_id]`); Langfuse is the current concrete sink, unnamed by the
+shape.
+
+Why vendored: `tests/test_tracing.py` asserts `tracing.build_agent_trace(...)`
+— the canonical record the producer assembles before mapping it onto the
+Langfuse backend — validates against `$` (the vendored schema), and that the
+golden `agent-trace.contract.json` example validates too. This closes the drift
+loop: the producer's emitted shape cannot diverge from the SDK contract without
+failing the test, and the vendored copy cannot diverge from sdk main without
+failing `check-schemas-in-sync.sh`.
+
+Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
+Source path:          contracts/workspace-comms/agent-trace.{schema,contract}.json
+Source commit:        `65ad524b6faeb8b45575a0dea715881730dfbd7e` (ai-sdk#65 — AgentTrace SSOT trace shape, SDK-first)
+Vendored at sdk HEAD: `65ad524b6faeb8b45575a0dea715881730dfbd7e` (main)
+
+Re-vendoring (schema + golden instance):
+
+    for f in schema contract; do
+      curl -fsS -A "curl/8.4.0" \
+        "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/workspace-comms/agent-trace.$f.json" \
+        -o "molecule_runtime/contracts/agent-trace.$f.json"
+    done

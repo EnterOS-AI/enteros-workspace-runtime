@@ -967,6 +967,16 @@ async def main():  # pragma: no cover
         await adapter.setup(adapter_config)
         executor = await adapter.create_executor(adapter_config)
 
+        # SSOT trace wrap: the single funnel every adapter's executor passes
+        # through — wrapping here means ALL runtimes inherit Langfuse tracing
+        # from one place. No-op when Langfuse is unset. Fail-open.
+        try:
+            from molecule_runtime import tracing as _tracing
+
+            executor = _tracing.wrap_executor(executor, workspace_id, adapter_config.model)
+        except Exception:
+            pass
+
         # 6.0 loaded_mcp_tools producer (core#3082) — INIT-TIME enumeration.
         # Right after the executor is built (MCP servers are wired into the
         # runtime's native config by setup()), enumerate the connected MCP

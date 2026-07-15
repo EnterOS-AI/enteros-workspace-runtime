@@ -1,0 +1,15 @@
+{
+  "workspace_id": "0b8f2c4a-1d3e-4f56-9a7b-2c8d4e6f1a90",
+  "name": "agent-turn",
+  "input": "In one sentence, who are you?",
+  "output": "I'm the organization's Org Concierge — the platform orchestrator that routes and delegates work across the team.",
+  "system_prompt": "You are a Molecule AI platform workspace agent...\n## Orchestrator-only — you NEVER do the work yourself\n...",
+  "model": "anthropic/claude-opus-4-8",
+  "tool_uses": ["list_peers", "delegate_task"],
+  "session_id": "3f9c1b7a-2e4d-6058-a1c3-e5f70b9d2a46",
+  "steps": [
+    { "kind": "thinking", "text": "The user is asking who I am; I should introduce myself as the org concierge and check whether I have peers to route to." },
+    { "kind": "tool_call", "name": "list_peers", "input": "{}", "result": "[]" },
+    { "kind": "thinking", "text": "No peers exist yet, so I'll explain my role and offer to help create a team." }
+  ]
+}

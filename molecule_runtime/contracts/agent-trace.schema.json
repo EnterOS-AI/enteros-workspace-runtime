@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-comms/agent-trace.schema.json",
+  "title": "Workspace-Comms Agent-Turn-Trace Contract",
+  "description": "SSOT JSON-Schema (draft 2020-12) for one AGENT TURN TRACE — the observability record a workspace runtime produces per turn and the platform's GET /workspaces/:id/traces proxy reads back for the canvas Traces tab. VENDOR-NEUTRAL: this describes the trace DATA + the tagging convention, not any backend (Langfuse is the current concrete sink; the shape does not name it). SSOT-first: both agent surfaces (molecule_runtime container agents and molecule_external_workspace BYO-compute agents) emit this shape, and molecule-core's reader filters by `workspace_id`, so the three cannot drift. THE TAGGING CONVENTION IS LOAD-BEARING: every producer MUST tag/label the trace with `workspace_id` because the platform reader's ONLY filter is `tags=<workspace_id>`; an untagged trace is invisible to the canvas. Field requiredness: only `workspace_id` is statically required (an untagged trace is unroutable); the rest are best-effort so a producer that cannot capture, say, the system prompt still emits a routable trace.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["workspace_id"],
+  "properties": {
+    "workspace_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The producing workspace's id (self). The trace MUST carry this as a backend tag/label: molecule-core traces.go filters Langfuse by `tags=<workspace_id>`, so this is the sole routing key from producer to the canvas Traces tab."
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-facing trace name. Conventionally 'agent-turn'. Optional; producers should set it for a readable Traces tab."
+    },
+    "input": {
+      "type": "string",
+      "description": "The user/inbound message text that drove this turn — the turn's input."
+    },
+    "output": {
+      "type": "string",
+      "description": "The agent's reply text for this turn — the turn's output."
+    },
+    "system_prompt": {
+      "type": "string",
+      "description": "The CONSOLIDATED system prompt sent to the LLM this turn (base platform identity + role/prompt-files + injected instructions). This is the 'what we actually send to the LLM' view the Traces tab surfaces on the generation."
+    },
+    "model": {
+      "type": "string",
+      "description": "The model id the turn ran against (e.g. anthropic/claude-opus-4-8)."
+    },
+    "tool_uses": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered tool names the agent invoked during the turn. Empty for turns that used no tools."
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Opaque per-conversation session id, when the runtime tracks one, so multiple turns group into one Traces-tab session."
+    },
+    "steps": {
+      "type": "array",
+      "description": "Ordered per-turn steps — the model's reasoning + tool decisions IN SEQUENCE, so the trace shows HOW the agent decided, not just the final answer. CAPABILITY-GATED per runtime: each runtime fills what its CLI/SDK surfaces. A `thinking` step carries the reasoning `text`; a `tool_call` step carries the tool `name` + `input` (args) + `result` (output) — a runtime whose CLI hides tool results (e.g. claude-code's Agent SDK, which executes tools inside the CLI and never returns the result block to the runtime) emits `tool_call` steps with `result` absent. Producers serialize `input`/`result` to strings so the shape is uniform across runtimes; the trace backend may render them richer.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Step kind: 'thinking' (a reasoning block) or 'tool_call' (a tool invocation)."
+          },
+          "text": {
+            "type": "string",
+            "description": "Reasoning text — present on a 'thinking' step."
+          },
+          "name": {
+            "type": "string",
+            "description": "Tool name — present on a 'tool_call' step."
+          },
+          "input": {
+            "type": "string",
+            "description": "Serialized tool input/args — present on a 'tool_call' step when the runtime exposes it."
+          },
+          "result": {
+            "type": "string",
+            "description": "Serialized tool result/output — present on a 'tool_call' step ONLY when the runtime surfaces it (absent for CLI runtimes that hide tool results)."
+          }
+        }
+      }
+    }
+  }
+}

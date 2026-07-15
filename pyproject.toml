@@ -53,6 +53,10 @@ dependencies = [
     "opentelemetry-api>=1.24.0",
     "opentelemetry-sdk>=1.24.0",
     "opentelemetry-exporter-otlp-proto-http>=1.24.0",
+    # Langfuse trace producer (molecule_runtime/tracing.py). v2 SDK: the
+    # low-level trace()/generation()/span() API, which ingests into the
+    # Langfuse v3 server. Fail-open — absent config makes it a no-op.
+    "langfuse>=2.60,<3",
 ]
 
 [project.optional-dependencies]

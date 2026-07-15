@@ -335,4 +335,53 @@ If a delegation fails:
 4. Never silently drop a failed task
 """)
 
-    return "\n".join(parts)
+    prompt = "\n".join(parts)
+
+    # SSOT trace producer: record the consolidated prompt + its labeled
+    # constituent pieces so a turn's Langfuse generation shows WHAT consolidated
+    # into the system payload. Self-contained (re-references sources; no coupling
+    # to the parts assembly above). Fail-open.
+    _components = []
+
+    def _c(_l, _t):
+        if _t and str(_t).strip():
+            _components.append({"label": _l, "text": str(_t)})
+
+    _c("base_platform_identity", BASE_PLATFORM_PROMPT)
+    if platform_guardrail:
+        _c("orchestrator_guardrail", ORCHESTRATOR_ONLY_GUARDRAIL)
+    _c("platform_instructions", platform_instructions)
+    try:
+        _role = []
+        for _f in (prompt_files or ["system-prompt.md"]):
+            _fp = Path(config_path) / _f
+            if _fp.exists():
+                _role.append(_fp.read_text().strip())
+        _c("role_prompt_files", "\n".join(_role))
+    except Exception:
+        pass
+    _c("plugin_rules", "\n".join(plugin_rules or []))
+    _c("plugin_guidelines", "\n".join(plugin_prompts or []))
+    try:
+        _c("skills", ", ".join(_s.metadata.name for _s in (loaded_skills or [])))
+    except Exception:
+        pass
+    try:
+        _c("a2a_instructions", get_a2a_instructions(mcp=a2a_mcp))
+    except Exception:
+        pass
+    try:
+        _c("hma_instructions", get_hma_instructions())
+    except Exception:
+        pass
+    try:
+        _c("peers", build_peer_section(peers))
+    except Exception:
+        pass
+    try:
+        from molecule_runtime import tracing as _tracing
+
+        _tracing.record_system_prompt(workspace_id, prompt, _components)
+    except Exception:
+        pass
+    return prompt

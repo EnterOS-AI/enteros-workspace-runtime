@@ -36,6 +36,8 @@ declare -A MAP=(
   [molecule_runtime/contracts/cron.fixtures.json]="contracts/cron/fixtures.json"
   [molecule_runtime/contracts/schedule.schema.json]="contracts/schedule/schedule.schema.json"
   [molecule_runtime/contracts/schedule.fixtures.json]="contracts/schedule/fixtures.json"
+  [molecule_runtime/contracts/agent-trace.schema.json]="contracts/workspace-comms/agent-trace.schema.json"
+  [molecule_runtime/contracts/agent-trace.contract.json]="contracts/workspace-comms/agent-trace.contract.json"
   [contracts/mcp-plugin-delivery.contract.json]="contracts/mcp/mcp-plugin-delivery.contract.json"
 )
 
