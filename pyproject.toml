@@ -36,8 +36,8 @@ dependencies = [
     # multipart/form-data parser — required for Starlette's Request.form() on
     # /internal/chat/uploads/ingest. Without it, Starlette raises AssertionError
     # when parsing multipart bodies, which the chat-upload handler surfaces as
-    # an opaque 400. Mirrors the canonical pin from the monorepo workspace
-    # requirements; >=0.0.27 avoids CVE-2024-53981 (DoS via malformed boundary).
+    # an opaque 400. The >=0.0.27 floor avoids CVE-2024-53981 (DoS via a
+    # malformed multipart boundary).
     "python-multipart>=0.0.27",
     "pyyaml>=6.0",
     # Backs the ADVISORY plugin-manifest SSOT validation (molecule-core#3383,

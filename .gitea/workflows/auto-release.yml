@@ -7,8 +7,8 @@ name: auto-release
 # classification and forces a release.
 #
 # TAG-ONLY design (root cause, 2026-06-10): `main` is strictly PR-only — branch
-# protection sets `enable_push: false` + `required_approvals: 2`, so NO identity (not
-# even the release bot) may push a commit directly to `main`. The previous design
+# protection disables direct pushes and requires non-author review, so NO identity
+# (not even the release bot) may push a commit directly to `main`. The previous design
 # committed a `pyproject.toml` version bump to `main` via the contents API; that PUT
 # is a direct push to a protected branch and FAILED every run (~17s). So this
 # workflow now does NOT touch `main` at all: on a green merge it only CUTS THE TAG
@@ -36,8 +36,8 @@ name: auto-release
 #   Agents boot from the promoted pinned image — the runtime is baked at image-build,
 #   NOT pip-installed at boot — so the automatic chain reaches staging once the
 #   template image rebuilds and its pin promotes.
-#   Production pin promotion remains separate and explicit while the production
-#   freeze is in effect.
+#   Production pin promotion remains separate and explicit; it requires its own
+#   reviewed control-plane change.
 #
 # WHY re-run the gate here instead of `on: workflow_run`: current Gitea supports `workflow_run`,
 # but this repository deliberately keeps unit-tests,
@@ -85,9 +85,9 @@ jobs:
           AFTER_SHA: ${{ github.sha }}
         run: python3 .gitea/scripts/classify_runtime_release.py
 
-  # Re-run the release-blocking gates inline so we release ONLY on green.
-  # Gitea has no workflow_run trigger, so the tag job cannot depend on the
-  # independent CI/schema-sync workflows that a main push starts in parallel.
+  # Re-run the release-blocking gates inline so we release ONLY on green. Although
+  # current Gitea supports workflow_run, keeping these gates in this workflow binds
+  # the release decision to the exact merge commit without cross-workflow coupling.
   unit-tests:
     name: Gate — unit-tests
     needs: classify

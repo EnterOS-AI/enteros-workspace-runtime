@@ -145,6 +145,7 @@ def test_actions_comments_match_current_gitea_capabilities() -> None:
 
     for stale in (
         "Gitea has no `workflow_run`",
+        "Gitea has no workflow_run",
         "NO `workflow_run`",
         "1.22.x..1.26.2",
         "until Gitea is upgraded",
@@ -155,6 +156,12 @@ def test_actions_comments_match_current_gitea_capabilities() -> None:
     assert "supports `workflow_run`" in " ".join(auto_release.split())
     assert "deliberate repo-local copy" in secret_scan
     assert "collaborative-owner access" in secret_scan
+
+
+def test_package_comments_do_not_point_at_retired_monorepo_pin_sources() -> None:
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+
+    assert "canonical pin from the monorepo workspace" not in pyproject
 
 
 def test_bundled_internal_path_hook_uses_current_repo_guidance() -> None:

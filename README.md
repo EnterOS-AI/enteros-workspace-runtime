@@ -206,22 +206,19 @@ This repo is the editable source. Open PRs directly here.
 
 ### Branch protection contract
 
-- 2 non-author approvals required (typically `core-qa` + `core-devops` persona tokens)
-- All CI contexts must pass: `ci / unit-tests`, `ci / lint`, `ci / build`,
-  `ci / smoke-install`, `Secret scan / Scan diff for credential-shaped strings`
+- Required non-author approvals must be satisfied on the exact PR head.
+- All required status contexts must pass on that same head; do not rely on stale
+  approvals or results from an earlier revision.
 - No admin-bypass; no force-push to `main`
-- Use the per-agent persona-token pattern (see
-  [`feedback_per_agent_gitea_identity_default`](https://git.moleculesai.app/molecule-ai/molecule-core/)
-  in the ops handbook) — not the founder PAT for CI
+- Use a designated per-agent persona token, not the founder PAT, for CI and
+  repository automation.
 
 ### Local development
 
 ```bash
 # Run the unit tests
 python -m venv .venv && source .venv/bin/activate
-pip install \
-  --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
-  -e . pytest pytest-asyncio
+pip install -e ".[test]"
 pytest -q
 ```
 
@@ -238,7 +235,8 @@ molecule-mcp --help
 Releases are **automatic on a green merge to `main`** (CTO standing directive,
 2026-06-10) — no manual tag or approval gate:
 
-1. Land changes via reviewed PR (2 non-author approvals + CI green).
+1. Land changes via a reviewed PR with required non-author approvals and
+   required status contexts green on the exact head.
 2. On merge to `main`, `auto-release.yml` re-runs the release-blocking gates
    (`unit-tests`, `responsiveness-e2e`, and the fail-closed SDK schema-sync
    check) inline. Current Gitea supports `workflow_run`; this repository keeps
@@ -257,8 +255,8 @@ Releases are **automatic on a green merge to `main`** (CTO standing directive,
    `registry.moleculesai.app`, and auto-promotes the digest into the control-plane
    staging `runtime_image_pins`. Agents boot from the promoted pinned image
    (runtime baked at build, not pip-installed at boot). Production pin promotion
-   remains a separate, explicit operation while the production freeze is in
-   effect.
+   remains separate and explicit; it requires its own reviewed control-plane
+   change.
 
 **Loop safety:** the release bot creates a tag only; there is no bump commit or
 bot-actor guard. The tag push does not match `on: push: branches:[main]`, so
@@ -288,7 +286,7 @@ adopt the published version by editing its pin directly.
 
 ## Architecture: why a separate repo
 
-The runtime needs to ship as a PyPI artifact (so the four maintained workspace
+The runtime needs to ship as a wheel and sdist (so the four maintained workspace
 template images can `pip install` it AND so operators can run `molecule-mcp`
 outside our container fleet) while still evolving fast.
 
