@@ -283,6 +283,31 @@ class DaemonSupervisor:
             self._threads[spec.key] = thread
             thread.start()
 
+    def supervise(self, new_specs: "Iterable[DaemonSpec]") -> list[DaemonSpec]:
+        """Add daemons to a RUNNING supervisor and start monitors for them.
+
+        The hot-install counterpart to ``start()``: when a ``kind: trigger`` (or
+        channel) plugin is installed AFTER boot, its daemon must come up without
+        restarting the whole workspace (the daemon lifecycle otherwise only runs
+        at boot). Appends specs whose ``key`` is not already supervised, then
+        calls ``start()`` — which is idempotent per key, so it spawns a monitor
+        for each newly-added daemon and leaves existing ones untouched. Returns
+        the specs actually added (empty when every key was already supervised, so
+        the caller can treat a no-op reload as such). A stopped supervisor adds
+        nothing — daemons are shutting down."""
+        if self._stop.is_set():
+            return []
+        with self._lock:
+            existing = {s.key for s in self.specs}
+            added = [
+                s for s in new_specs
+                if s.key not in existing and s.key not in self._threads
+            ]
+            self.specs.extend(added)
+        if added:
+            self.start()
+        return added
+
     # -- per-daemon monitor loop ------------------------------------------
     def _monitor(self, spec: DaemonSpec) -> None:
         key = spec.key
