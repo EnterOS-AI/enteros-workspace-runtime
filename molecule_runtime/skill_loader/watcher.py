@@ -133,7 +133,7 @@ class SkillsWatcher:
             old = self._hashes.get(rel_path, "")
             new = new_hashes.get(rel_path, "")
             if old != new:
-                # rel_path is like "web_search/SKILL.md" or "web_search/tools/foo.py"
+                # rel_path is like "web_search/SKILL.md" or "web_search/scripts/foo.py"
                 skill_name = rel_path.split("/")[0]
                 if skill_name in self.skill_names:
                     changed.setdefault(skill_name, []).append(rel_path)

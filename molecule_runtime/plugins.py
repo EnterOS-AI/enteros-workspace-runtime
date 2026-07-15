@@ -4,7 +4,7 @@ Plugins provide skills, rules, and prompt fragments to agent workspaces.
 Each plugin is a directory containing:
   - plugin.yaml    — manifest (name, kind, version, contributions, skills, rules)
   - rules/*.md     — always-on guidelines injected into every prompt
-  - skills/        — skill directories with SKILL.md + tools/*.py
+  - skills/        — skill directories with SKILL.md + optional scripts/*.py
   - *.md           — prompt fragments (excluding README, CHANGELOG, etc.)
 
 Loading priority:
