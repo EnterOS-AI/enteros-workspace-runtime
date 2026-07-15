@@ -53,6 +53,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
