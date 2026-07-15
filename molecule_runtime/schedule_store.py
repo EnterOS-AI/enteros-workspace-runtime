@@ -148,6 +148,10 @@ class ScheduleStore:
     # --- write --------------------------------------------------------------
     def create(self, entry: Any) -> dict[str, Any]:
         norm = validate_entry(entry)
+        # A schedule created through this store (the API) is user-owned. Stamping
+        # source='runtime' is what lets reconcile-on-boot seeding (upsert_template)
+        # tell it apart from a template-seeded entry and never clobber it.
+        norm["source"] = "runtime"
         entries = self.load()
         if any(e["name"] == norm["name"] for e in entries):
             raise ScheduleError(f"schedule already exists: {norm['name']!r}")
@@ -155,6 +159,8 @@ class ScheduleStore:
             raise ScheduleError(f"too many schedules: {MAX_ENTRIES} max")
         entries.append(norm)
         self._write(entries)
+        # Explicit (re)create clears any prior tombstone for this name.
+        self._remove_tombstone(norm["name"])
         return norm
 
     def update(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -169,6 +175,11 @@ class ScheduleStore:
                 if value is not None:
                     merged[key] = value
             norm = validate_entry(merged)
+            # A user edit takes ownership: a previously template-seeded entry the
+            # user changes becomes source='runtime' so the next reconcile-on-boot
+            # seeding preserves the edit instead of reverting it to the template
+            # definition (the entry's prior source in `merged` is overridden here).
+            norm["source"] = "runtime"
             entries[index] = norm
             self._write(entries)
             return norm
@@ -180,6 +191,12 @@ class ScheduleStore:
         if len(remaining) == len(entries):
             return False
         self._write(remaining)
+        # Tombstone the name so reconcile-on-boot seeding does not resurrect a
+        # template schedule the user deliberately deleted (it would otherwise be
+        # re-added, and re-fire, on every restart). Harmless for purely-user
+        # schedules — no template ships their name. A later create() of the same
+        # name clears the tombstone (the user explicitly wants it back).
+        self._add_tombstone(name)
         return True
 
     def replace_all(self, entries: Iterable[Any]) -> list[dict[str, Any]]:
@@ -200,14 +217,21 @@ class ScheduleStore:
         when it shares a name with a template entry.
 
         Additive-only: a template entry that was *removed* from the delivered file
-        is NOT pruned here (mirrors the old core additive-upsert seeding). Returns
-        the merged grid; a validation failure on any delivered entry leaves the
-        prior grid intact (``replace_all`` is atomic).
+        is NOT pruned here (mirrors the old core additive-upsert seeding). A
+        template entry the user *deleted* is tombstoned (see :meth:`delete`) and is
+        NOT re-seeded. Returns the merged grid; a validation failure on any
+        delivered entry — including the combined grid exceeding ``MAX_ENTRIES`` —
+        raises :class:`ScheduleError` and leaves the prior grid intact
+        (``replace_all`` is atomic). Callers that must not fail boot handle that.
         """
+        tombstoned = self._load_tombstones()
         by_name: dict[str, dict[str, Any]] = {e["name"]: e for e in self.load()}
         for raw in template_entries:
             norm = validate_entry(raw)
             norm["source"] = "template"
+            if norm["name"] in tombstoned:
+                # The user deleted this template schedule — do not resurrect it.
+                continue
             existing = by_name.get(norm["name"])
             if existing is None or existing.get("source") == "template":
                 # New template entry, or refresh of a template-owned one.
@@ -237,10 +261,17 @@ class ScheduleStore:
         if self.path.suffix in (".yaml", ".yml"):
             try:
                 import yaml  # type: ignore
-
-                return yaml.safe_load(text)
             except ImportError:
-                pass
+                yaml = None  # type: ignore
+            if yaml is not None:
+                try:
+                    return yaml.safe_load(text)
+                except yaml.YAMLError as exc:
+                    # Re-raise as ValueError so load()'s `except (ValueError,
+                    # OSError)` wraps it into ScheduleError — a malformed grid is
+                    # a contract violation, not an escape hatch past callers'
+                    # (ScheduleError, OSError) handling (e.g. the boot seeder).
+                    raise ValueError(f"invalid YAML: {exc}") from exc
         return json.loads(text)
 
     def _dump(self, payload: Any, handle: Any) -> None:
@@ -253,6 +284,51 @@ class ScheduleStore:
             except ImportError:
                 pass
         json.dump(payload, handle, indent=2, sort_keys=False)
+
+    # --- tombstones (user-deleted template schedules) -----------------------
+    # A small JSON set of names beside the grid. Only reconcile-on-boot seeding
+    # consults it; ordinary CRUD ignores it. Kept separate from the grid so a
+    # tombstone write never touches the definition file the daemon reads.
+    def _tombstones_path(self) -> Path:
+        return self.path.parent / "schedule-tombstones.json"
+
+    def _load_tombstones(self) -> set[str]:
+        path = self._tombstones_path()
+        if not path.is_file():
+            return set()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return set()  # a corrupt tombstone file must never break seeding
+        names = raw.get("deleted", []) if isinstance(raw, dict) else raw
+        return {n for n in names if isinstance(n, str)} if isinstance(names, list) else set()
+
+    def _write_tombstones(self, names: set[str]) -> None:
+        path = self._tombstones_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"deleted": sorted(names)}, handle, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _add_tombstone(self, name: str) -> None:
+        names = self._load_tombstones()
+        if name not in names:
+            names.add(name)
+            self._write_tombstones(names)
+
+    def _remove_tombstone(self, name: str) -> None:
+        names = self._load_tombstones()
+        if name in names:
+            names.discard(name)
+            self._write_tombstones(names)
 
 
 def utcnow() -> _dt.datetime:

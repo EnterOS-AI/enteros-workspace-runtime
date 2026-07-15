@@ -701,8 +701,11 @@ def test_main_boot_daemon_wiring_is_fail_open():
     the discovery call sits inside a try/except close above it in main()."""
     src = inspect.getsource(m.main)
     idx = src.index("discover_daemon_specs")
-    # a try: within the preceding few lines guards the discovery call
-    assert "try:" in src[max(0, idx - 400):idx]
+    # a try: within the preceding few lines guards the discovery call. Window
+    # widened: the shared load_plugins() scan (reused by the schedule seeder to
+    # avoid a double manifest scan) now sits between the try: and discovery,
+    # itself inside the same fail-open try.
+    assert "try:" in src[max(0, idx - 800):idx]
     # and its except announces non-fatality instead of re-raising into boot.
     # Window widened for the G2 trigger-plugin native-scheduler signal AND the
     # P4b reconcile-on-boot schedule seed, both of which sit between discovery

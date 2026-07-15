@@ -210,3 +210,71 @@ def test_upsert_template_bad_entry_leaves_grid_intact(tmp_path: Path) -> None:
     with pytest.raises(ScheduleError):
         store.upsert_template([{"name": "bad", "cron": "not a cron", "prompt": "p"}])
     assert [e["name"] for e in store.list()] == ["keep"]  # atomic: prior grid intact
+
+
+# ---------------------------------------------------------------------------
+# source-stamping (finding #1) — API create/update take ownership
+# ---------------------------------------------------------------------------
+
+
+def test_create_stamps_source_runtime(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    created = store.create({"name": "u", "cron": "0 * * * *", "prompt": "p"})
+    assert created["source"] == "runtime"
+
+
+def test_editing_a_template_schedule_survives_reseed(tmp_path: Path) -> None:
+    # This is the finding #1 regression: a user edit via update() must not be
+    # reverted by the next reconcile-on-boot seeding.
+    store = _store(tmp_path)
+    store.upsert_template([{"name": "nightly", "cron": "0 3 * * *", "prompt": "seed"}])
+    assert store.get("nightly")["source"] == "template"
+
+    # User edits the template-seeded schedule -> it takes ownership.
+    edited = store.update("nightly", {"cron": "0 6 * * *"})
+    assert edited["source"] == "runtime"
+
+    # Re-provision ships the original template definition again.
+    store.upsert_template([{"name": "nightly", "cron": "0 3 * * *", "prompt": "seed"}])
+    got = store.get("nightly")
+    assert got["cron"] == "0 6 * * *"  # user edit preserved, NOT reverted
+    assert got["source"] == "runtime"
+
+
+# ---------------------------------------------------------------------------
+# tombstones (finding #2) — user-deleted template schedules stay deleted
+# ---------------------------------------------------------------------------
+
+
+def test_deleted_template_schedule_is_not_resurrected(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.upsert_template([{"name": "nightly", "cron": "0 3 * * *", "prompt": "seed"}])
+    assert store.delete("nightly") is True
+
+    # Re-provision must NOT bring the deleted template schedule back.
+    store.upsert_template([{"name": "nightly", "cron": "0 3 * * *", "prompt": "seed"}])
+    assert store.get("nightly") is None
+    assert [e["name"] for e in store.list()] == []
+
+
+def test_recreating_a_deleted_name_clears_its_tombstone(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.upsert_template([{"name": "nightly", "cron": "0 3 * * *", "prompt": "seed"}])
+    store.delete("nightly")
+    # User explicitly recreates it -> tombstone cleared, future reseeds allowed.
+    store.create({"name": "nightly", "cron": "0 9 * * *", "prompt": "mine"})
+    store.upsert_template([{"name": "nightly", "cron": "0 3 * * *", "prompt": "seed"}])
+    got = store.get("nightly")
+    assert got is not None and got["source"] == "runtime" and got["cron"] == "0 9 * * *"
+
+
+# ---------------------------------------------------------------------------
+# malformed YAML (finding #3) — parsed into ScheduleError, not a raw YAMLError
+# ---------------------------------------------------------------------------
+
+
+def test_load_wraps_malformed_yaml_as_schedule_error(tmp_path: Path) -> None:
+    path = tmp_path / "schedules.yaml"
+    path.write_text("schedules:\n  - name: x\n   bad: indent\n", encoding="utf-8")
+    with pytest.raises(ScheduleError):
+        ScheduleStore(path).load()

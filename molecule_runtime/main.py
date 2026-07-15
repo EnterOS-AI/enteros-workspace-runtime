@@ -1849,10 +1849,14 @@ async def main():  # pragma: no cover
     try:
         from molecule_runtime import plugin_daemons
         from molecule_runtime.channel_events import ChannelEventSocketManager
+        from molecule_runtime.plugins import load_plugins
 
-        daemon_specs = plugin_daemons.discover_daemon_specs(
+        # One installed-plugin scan shared by daemon discovery and the schedule
+        # seeder below — avoids parsing every plugin manifest from disk twice.
+        _loaded_plugins = load_plugins(
             workspace_plugins_dir=os.path.join(config_path, "plugins"),
         )
+        daemon_specs = plugin_daemons.discover_daemon_specs(loaded=_loaded_plugins)
         # G2: a trigger plugin means this workspace schedules natively, so the
         # platform's central scheduler must defer (NativeSchedulerCheck). Signal
         # it once at boot; the heartbeat reads the flag and advertises the
@@ -1867,9 +1871,7 @@ async def main():  # pragma: no cover
             try:
                 from molecule_runtime import schedule_seed
 
-                seeded = schedule_seed.seed_schedules_from_plugins(
-                    workspace_plugins_dir=os.path.join(config_path, "plugins"),
-                )
+                seeded = schedule_seed.seed_schedules_from_plugins(loaded=_loaded_plugins)
                 if seeded:
                     print(f"Schedule seed: reconciled {seeded} template grid(s)", flush=True)
             except Exception as e:  # noqa: BLE001 — seeding must never block boot

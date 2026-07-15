@@ -148,20 +148,24 @@ def _entry_problem(entry: object) -> str | None:
 def discover_daemon_specs(
     workspace_plugins_dir: str | None = None,
     shared_plugins_dir: str | None = None,
+    loaded=None,
 ) -> list[DaemonSpec]:
     """Collect daemon specs from every installed plugin's manifest.
 
     Reuses :func:`plugins.load_plugins` (the canonical installed-plugin scan)
     so priority/dedup/SSOT-enforcement semantics are identical to skills,
-    rules, and MCP contributions — no parallel discovery convention.
+    rules, and MCP contributions — no parallel discovery convention. Pass a
+    pre-loaded ``LoadedPlugins`` (``loaded=``) to reuse a single boot-time scan
+    across callers (e.g. the schedule seeder) instead of re-scanning disk.
     """
-    from molecule_runtime.plugins import load_plugins
+    if loaded is None:
+        from molecule_runtime.plugins import load_plugins
 
-    loaded = load_plugins(
-        workspace_plugins_dir=workspace_plugins_dir,
-        shared_plugins_dir=shared_plugins_dir
-        or os.environ.get("PLUGINS_DIR", "/plugins"),
-    )
+        loaded = load_plugins(
+            workspace_plugins_dir=workspace_plugins_dir,
+            shared_plugins_dir=shared_plugins_dir
+            or os.environ.get("PLUGINS_DIR", "/plugins"),
+        )
     specs: list[DaemonSpec] = []
     channel_identity_paths: dict[str, str] = {}
     daemon_keys: set[str] = set()

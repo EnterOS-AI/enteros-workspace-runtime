@@ -29,19 +29,23 @@ from molecule_runtime.trigger_state import resolve_grid_path
 def trigger_plugin_schedule_files(
     workspace_plugins_dir: str | None = None,
     shared_plugins_dir: str | None = None,
+    loaded=None,
 ) -> list[Path]:
     """Paths to the ``schedules.yaml`` each installed ``kind: trigger`` plugin ships.
 
     Reuses the canonical installed-plugin scan (``plugins.load_plugins``) so
     priority/dedup/SSOT semantics match every other plugin surface. Returns only
-    files that exist, in discovery order.
+    files that exist, in discovery order. Pass a pre-loaded ``LoadedPlugins``
+    (``loaded=``) to reuse the boot-time scan ``discover_daemon_specs`` already
+    ran, instead of re-scanning every plugin manifest from disk.
     """
-    from molecule_runtime.plugins import load_plugins
+    if loaded is None:
+        from molecule_runtime.plugins import load_plugins
 
-    loaded = load_plugins(
-        workspace_plugins_dir=workspace_plugins_dir,
-        shared_plugins_dir=shared_plugins_dir or os.environ.get("PLUGINS_DIR", "/plugins"),
-    )
+        loaded = load_plugins(
+            workspace_plugins_dir=workspace_plugins_dir,
+            shared_plugins_dir=shared_plugins_dir or os.environ.get("PLUGINS_DIR", "/plugins"),
+        )
     files: list[Path] = []
     for plugin in loaded.plugins:
         if plugin.manifest.kind != "trigger":
@@ -57,16 +61,20 @@ def seed_schedules_from_plugins(
     workspace_plugins_dir: str | None = None,
     shared_plugins_dir: str | None = None,
     grid_path: Path | None = None,
+    loaded=None,
 ) -> int:
     """Reconcile every trigger plugin's template grid into the live volume grid.
 
-    Additive upsert per source (source='runtime' edits preserved). Returns the
-    number of template files successfully applied. Never raises — a malformed or
-    unreadable template grid is logged and skipped so boot proceeds.
+    Additive upsert per source (source='runtime' edits preserved, user-deleted
+    template schedules stay deleted). Returns the number of template files
+    successfully applied. Never raises — a malformed/unreadable template grid, or
+    a merged grid that would exceed the ``MAX_ENTRIES`` cap, is logged and skipped
+    so boot proceeds. Pass ``loaded`` to reuse the boot-time plugin scan.
     """
     sources = trigger_plugin_schedule_files(
         workspace_plugins_dir=workspace_plugins_dir,
         shared_plugins_dir=shared_plugins_dir,
+        loaded=loaded,
     )
     if not sources:
         return 0
@@ -78,6 +86,17 @@ def seed_schedules_from_plugins(
             delivered = ScheduleStore(src).load()  # validates the template grid
             target.upsert_template(delivered)
             applied += 1
-        except (ScheduleError, OSError) as exc:
-            print(f"schedule seed: skipped {src} (non-fatal): {exc}", flush=True)
+        except ScheduleError as exc:
+            # ScheduleError includes the MAX_ENTRIES overflow (the merged grid
+            # would exceed the cap) and a malformed/invalid template grid. Both
+            # mean the plugin's template schedules did NOT land — call it out
+            # distinctly rather than as a generic "skipped file" so an operator
+            # can see the grid is at capacity vs. the file being bad.
+            print(
+                f"schedule seed: template schedules from {src} NOT applied "
+                f"(grid unchanged): {exc}",
+                flush=True,
+            )
+        except OSError as exc:
+            print(f"schedule seed: skipped {src} (unreadable, non-fatal): {exc}", flush=True)
     return applied

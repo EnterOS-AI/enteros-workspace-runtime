@@ -98,3 +98,43 @@ def test_seed_is_fail_soft_on_bad_template(tmp_path: Path, monkeypatch) -> None:
     # Must not raise; bad source skipped, applied count 0, grid left empty.
     assert schedule_seed.seed_schedules_from_plugins(grid_path=grid_path) == 0
     assert ScheduleStore(grid_path).list() == []
+
+
+def test_seed_is_fail_soft_on_malformed_yaml(tmp_path: Path, monkeypatch) -> None:
+    # finding #3: a YAML *syntax* error must not escape the fail-soft loop.
+    grid_path = tmp_path / "schedules.yaml"
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("schedules:\n  - name: x\n   cron: bad indent\n")
+    monkeypatch.setattr(schedule_seed, "trigger_plugin_schedule_files", lambda **kw: [bad])
+    assert schedule_seed.seed_schedules_from_plugins(grid_path=grid_path) == 0
+    assert ScheduleStore(grid_path).list() == []
+
+
+def test_seed_is_fail_soft_on_max_entries_overflow(tmp_path: Path, monkeypatch) -> None:
+    # finding #4: a merged grid over MAX_ENTRIES must be skipped, not raised.
+    from molecule_runtime.schedule_store import MAX_ENTRIES
+
+    grid_path = tmp_path / "schedules.yaml"
+    existing = ScheduleStore(grid_path)
+    for i in range(MAX_ENTRIES):
+        existing.create({"name": f"u-{i}", "cron": "0 * * * *", "prompt": "p"})
+
+    src = tmp_path / "src.yaml"
+    src.write_text("schedules:\n  - name: over\n    cron: '0 3 * * *'\n    prompt: p\n")
+    monkeypatch.setattr(schedule_seed, "trigger_plugin_schedule_files", lambda **kw: [src])
+
+    # Does not raise; overflow file not applied; prior grid intact.
+    assert schedule_seed.seed_schedules_from_plugins(grid_path=grid_path) == 0
+    assert len(ScheduleStore(grid_path).list()) == MAX_ENTRIES
+    assert ScheduleStore(grid_path).get("over") is None
+
+
+def test_trigger_plugin_schedule_files_accepts_preloaded(tmp_path: Path) -> None:
+    # finding #6: reuse a pre-loaded scan instead of re-scanning disk.
+    from molecule_runtime.plugins import load_plugins
+
+    plugins = tmp_path / "plugins"
+    _write_trigger_plugin(plugins, "scheduler", GRID_YAML)
+    loaded = load_plugins(workspace_plugins_dir=str(plugins), shared_plugins_dir=str(tmp_path / "empty"))
+    found = schedule_seed.trigger_plugin_schedule_files(loaded=loaded)
+    assert [p.parent.name for p in found] == ["scheduler"]
