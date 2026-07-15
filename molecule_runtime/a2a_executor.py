@@ -305,6 +305,33 @@ def _is_routine_self_message(context: RequestContext, text: str) -> bool:
     return any(t.startswith(p) for p in _ROUTINE_SELF_MESSAGE_PREFIXES)
 
 
+def _tooltrace_to_trace_shapes(tool_trace: list[dict]) -> tuple[list, list, list]:
+    """Map the astream ``tool_trace`` onto the SSOT AgentTrace capture shapes
+    read by ``molecule_runtime.tracing.TracingExecutor``.
+
+    Each ``tool_trace`` entry is ``{tool, input, output_preview}`` (see the
+    on_tool_start / on_tool_end handlers in ``_core_execute``). Returns
+    ``(tool_uses, tool_calls, steps)``:
+      * ``tool_uses``  — ordered tool-name list (AgentTrace.tool_uses)
+      * ``tool_calls`` — ``{name, input, output}`` (the _emit tool_calls fallback)
+      * ``steps``      — ordered ``tool_call`` steps (AgentTrace.steps)
+    No ``thinking`` steps on the native path: ``_extract_chunk_text`` filters
+    reasoning blocks out of the stream, so a turn's steps are its tool calls.
+    """
+    tool_uses = [e.get("tool", "") for e in tool_trace]
+    tool_calls = [
+        {"name": e.get("tool", ""), "input": e.get("input", ""),
+         "output": e.get("output_preview", "")}
+        for e in tool_trace
+    ]
+    steps = [
+        {"kind": "tool_call", "name": e.get("tool", ""),
+         "input": e.get("input", ""), "result": e.get("output_preview", "")}
+        for e in tool_trace
+    ]
+    return tool_uses, tool_calls, steps
+
+
 class RuntimeA2AExecutor(AgentExecutor):
     """Bridges runtime agent to A2A event model with SSE streaming support.
 
@@ -325,6 +352,13 @@ class RuntimeA2AExecutor(AgentExecutor):
         # block) so a long-running executor doesn't grow this
         # unboundedly.
         self._last_input_tokens: dict[str, int] = {}
+        # Per-turn trace capture read by molecule_runtime.tracing.TracingExecutor
+        # (getattr on the wrapped inner). Populated from the astream tool_trace at
+        # turn completion so the Langfuse trace shows the ordered tool calls; reset
+        # each turn so a tool-less turn doesn't inherit the prior turn's steps.
+        self._last_tool_uses: list = []
+        self._last_tool_calls: list = []
+        self._last_steps: list = []
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Execute a task from an A2A request with SSE streaming.
@@ -348,6 +382,11 @@ class RuntimeA2AExecutor(AgentExecutor):
           2. TaskArtifactUpdateEvent chunks           — token-by-token via astream_events
           3. Message(final_text)                      — terminal event
         """
+        # Reset per-turn trace capture (see __init__) so a turn that makes no
+        # tool calls reports empty rather than inheriting the prior turn's steps.
+        self._last_tool_uses = []
+        self._last_tool_calls = []
+        self._last_steps = []
         user_input = _extract_plain_message_text(context)
         # Classify ROUTINE SELF-PING (idle self-wake / cron tick / delegation
         # harvester) up front, from the ORIGINAL message — before the
@@ -1054,6 +1093,12 @@ class RuntimeA2AExecutor(AgentExecutor):
                         # accept the assignment. See #1787 + commit dcbcf19
                         # for the original test-mock motivation.
                         logger.debug("metadata attach skipped (non-Message return from new_text_message)")
+                # Stash the ordered tool calls for the Langfuse tracer
+                # (molecule_runtime.tracing reads these off the wrapped inner).
+                if tool_trace:
+                    (self._last_tool_uses,
+                     self._last_tool_calls,
+                     self._last_steps) = _tooltrace_to_trace_shapes(tool_trace)
                 # A2A v1 (a2a-sdk ≥ 1.0): once Task is enqueued (above, PR #2558),
                 # the executor is in task mode and raw Message enqueues are
                 # rejected with InvalidAgentResponseError("Received Message
