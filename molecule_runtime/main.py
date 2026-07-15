@@ -1334,6 +1334,10 @@ async def main():  # pragma: no cover
         _internal_file_read,
         methods=["GET"],
     )
+    # /internal/schedules* — the runtime schedule API (Option A). Backed by the
+    # volume grid a kind:trigger scheduler plugin fires from; same forward-auth.
+    from molecule_runtime.internal_schedules import add_schedule_routes as _add_schedule_routes
+    _add_schedule_routes(starlette_app)
 
     built_app = make_trace_middleware(starlette_app)
 
