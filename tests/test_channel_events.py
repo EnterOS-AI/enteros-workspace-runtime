@@ -688,3 +688,45 @@ async def test_bind_failure_removes_capability_then_starts_daemon_supervisor():
     )
     assert event_transport.cleared is True
     assert supervisor.started is True
+
+
+@pytest.mark.asyncio
+async def test_add_specs_binds_new_lane_and_leaves_running_lanes_untouched():
+    """Hot-install (scheduler-as-trigger-plugin): a plugin installed AFTER
+    start() gets its private socket bound by add_specs() WITHOUT re-binding or
+    disturbing the already-serving lanes."""
+    async def endpoint(request: Request) -> JSONResponse:
+        body = await request.json()
+        return JSONResponse({"jsonrpc": "2.0", "id": body["id"], "result": {"parts": []}})
+
+    app = Starlette(routes=[Route("/", endpoint, methods=["POST"])])
+    first = DaemonSpec(name="bridge", plugin="lark-channel-molecule", kind="channel",
+                       command=["x"])
+    manager = ChannelEventSocketManager(app, [first], startup_timeout_seconds=3)
+    try:
+        assert await manager.start() is True
+        first_sock = first.env[CHANNEL_A2A_SOCKET_ENV]
+        first_tok = first.env[CHANNEL_A2A_TOKEN_ENV]
+        assert stat.S_ISSOCK(os.stat(first_sock).st_mode)
+
+        # Hot-add a second plugin's lane.
+        second = DaemonSpec(name="bridge2", plugin="slack-channel-molecule",
+                            kind="channel", command=["x"])
+        added = await manager.add_specs([second])
+
+        assert added == ["slack-channel-molecule"]
+        # The new lane is bound + secured with its OWN socket/token.
+        second_sock = second.env[CHANNEL_A2A_SOCKET_ENV]
+        assert second_sock != first_sock
+        assert stat.S_IMODE(os.stat(second_sock).st_mode) == 0o600
+        assert stat.S_ISSOCK(os.stat(second_sock).st_mode)
+        # The already-serving lane is untouched (same socket + token, still up).
+        assert first.env[CHANNEL_A2A_SOCKET_ENV] == first_sock
+        assert first.env[CHANNEL_A2A_TOKEN_ENV] == first_tok
+        assert stat.S_ISSOCK(os.stat(first_sock).st_mode)
+
+        # Re-adding an already-bound spec is a no-op (no re-bind).
+        assert await manager.add_specs([second]) == []
+        assert second.env[CHANNEL_A2A_SOCKET_ENV] == second_sock
+    finally:
+        await manager.stop()

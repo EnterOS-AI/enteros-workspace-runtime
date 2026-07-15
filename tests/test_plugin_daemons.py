@@ -678,36 +678,47 @@ def test_main_boot_wires_daemon_supervisor():
     tests), same spirit as test_main_privileged_plugin_failure's 'if main.py
     drifts, these tests catch the drift'."""
     src = inspect.getsource(m.main)
-    # discovery wired at boot
-    assert "discover_daemon_specs" in src
-    # spawn gated on the server bind (never blocks boot)
-    assert "start_supervisor_when_bound" in src
-    # PR-2 local binding wraps the SAME built A2A app and is handed to the
-    # post-bind starter before any daemon process can observe its socket env.
-    assert "ChannelEventSocketManager" in src
-    assert "event_transport=channel_event_transport" in src
-    # supervisor shutdown wired
-    assert "plugin_daemon_supervisor.stop()" in src
-    assert "await channel_event_transport.stop()" in src
-    # stop lives in the shutdown path (the `finally:` of server.serve())
+    # The daemon lifecycle moved into the DaemonRuntime holder so it can be
+    # ESTABLISHED at boot AND EXTENDED on a post-boot plugin install
+    # (hot-start via /internal/daemons/reload) without a restart. main() wires
+    # the holder; the holder owns discovery/spawn/sockets. Pin BOTH halves.
+    #
+    # main() side: construct the holder, mount the reload route, and schedule
+    # ensure_daemons as a background task (never blocks boot — its bind gate
+    # only clears once server.serve() below starts listening).
+    assert "DaemonRuntime(" in src
+    assert "add_daemon_routes(" in src
+    assert "ensure_daemons()" in src
+    # shutdown wired in the `finally:` of server.serve()
     finally_block = src.split("await server.serve()", 1)[1]
-    assert "await plugin_daemon_task" in finally_block
-    assert "plugin_daemon_supervisor.stop()" in finally_block
-    assert "await channel_event_transport.stop()" in finally_block
+    assert "daemon_boot_task" in finally_block
+    assert "await daemon_runtime.stop()" in finally_block
+
+    # holder side: it actually does discovery + spawn + the private A2A sockets,
+    # gates spawn on the uvicorn bind, and supports the hot-add path.
+    import molecule_runtime.daemon_runtime as _dr
+
+    holder_src = inspect.getsource(_dr)
+    assert "discover_daemon_specs" in holder_src
+    assert "DaemonSupervisor" in holder_src
+    assert "ChannelEventSocketManager" in holder_src
+    assert "wait_until_server_bound" in holder_src
+    assert "add_specs" in holder_src          # warm hot-add path
+    assert "supervise(" in holder_src
 
 
 def test_main_boot_daemon_wiring_is_fail_open():
-    """Daemon discovery/spawn failures must be logged, never fatal to boot —
-    the discovery call sits inside a try/except close above it in main()."""
+    """The daemon holder setup at boot must be logged, never fatal — the
+    DaemonRuntime construction + route mount + task schedule sit inside a
+    try/except whose handler announces non-fatality instead of re-raising."""
     src = inspect.getsource(m.main)
-    idx = src.index("discover_daemon_specs")
-    # a try: within the preceding few lines guards the discovery call. Window
-    # widened: the shared load_plugins() scan (reused by the schedule seeder to
-    # avoid a double manifest scan) now sits between the try: and discovery,
-    # itself inside the same fail-open try.
-    assert "try:" in src[max(0, idx - 800):idx]
-    # and its except announces non-fatality instead of re-raising into boot.
-    # Window widened for the G2 trigger-plugin native-scheduler signal AND the
-    # P4b reconcile-on-boot schedule seed, both of which sit between discovery
-    # and the except (each itself fail-soft; still inside the same outer try).
-    assert "non-fatal" in src[idx:idx + 2200]
+    idx = src.index("DaemonRuntime(")
+    # a try: guards the holder setup
+    assert "try:" in src[max(0, idx - 500):idx]
+    # and its except announces non-fatality instead of re-raising into boot
+    assert "non-fatal" in src[idx:idx + 600]
+    # the holder's own internal steps (grid seed, socket bind) are fail-soft too
+    import molecule_runtime.daemon_runtime as _dr
+
+    holder_src = inspect.getsource(_dr)
+    assert "non-fatal" in holder_src or "must never break a reload" in holder_src

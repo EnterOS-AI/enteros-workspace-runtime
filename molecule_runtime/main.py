@@ -1853,57 +1853,31 @@ async def main():  # pragma: no cover
     # task entirely. PR-2 binds this SAME built A2A app on a private Unix
     # socket per plugin identity; the post-bind starter waits for those local
     # listeners and only then publishes the path + spawns the daemons.
-    plugin_daemon_supervisor = None
-    plugin_daemon_task = None
-    channel_event_transport = None
+    # Plugin-declared daemons (issue #215) + post-boot hot-install
+    # (scheduler-as-trigger-plugin, per-workspace delivery). The lifecycle lives
+    # in a DaemonRuntime holder so it can be ESTABLISHED at boot AND EXTENDED
+    # when a trigger/channel plugin is installed after boot — via
+    # POST /internal/daemons/reload — WITHOUT a workspace restart (the daemon
+    # supervisor + private sockets otherwise only come up at boot). The holder's
+    # ensure_daemons() does the same work the inline block used to (load plugins,
+    # discover specs, set/clear NATIVE_SCHEDULER_ENV + seed the grid for a
+    # trigger, cold-start the supervisor + channel-event sockets once uvicorn
+    # binds). It is scheduled as a BACKGROUND task — never awaited here — because
+    # its bind gate only clears once `server.serve()` (below) starts listening;
+    # awaiting inline would deadlock. Fail-open for the agent: setup failures are
+    # logged, never fatal, and a zero-daemon workspace is a no-op.
+    daemon_runtime = None
+    daemon_boot_task = None
     try:
-        from molecule_runtime import plugin_daemons
-        from molecule_runtime.channel_events import ChannelEventSocketManager
-        from molecule_runtime.plugins import load_plugins
+        from molecule_runtime.daemon_runtime import DaemonRuntime, add_daemon_routes
 
-        # One installed-plugin scan shared by daemon discovery and the schedule
-        # seeder below — avoids parsing every plugin manifest from disk twice.
-        _loaded_plugins = load_plugins(
-            workspace_plugins_dir=os.path.join(config_path, "plugins"),
+        daemon_runtime = DaemonRuntime(
+            built_app, config_path, server, log_level=uvicorn_log_level,
         )
-        daemon_specs = plugin_daemons.discover_daemon_specs(loaded=_loaded_plugins)
-        # G2: a trigger plugin means this workspace schedules natively, so the
-        # platform's central scheduler must defer (NativeSchedulerCheck). Signal
-        # it once at boot; the heartbeat reads the flag and advertises the
-        # `scheduler` capability. Set-or-clear so a plugin uninstall is reflected.
-        if plugin_daemons.has_trigger_daemon(daemon_specs):
-            os.environ[plugin_daemons.NATIVE_SCHEDULER_ENV] = "1"
-            # Reconcile the template-delivered schedules.yaml into the
-            # volume-authoritative grid BEFORE the daemon reads it (P4b: core no
-            # longer seeds workspace_schedules — the runtime seeds its own grid).
-            # Additive upsert; user (source='runtime') edits survive re-provision.
-            # Fail-soft: never blocks boot.
-            try:
-                from molecule_runtime import schedule_seed
-
-                seeded = schedule_seed.seed_schedules_from_plugins(loaded=_loaded_plugins)
-                if seeded:
-                    print(f"Schedule seed: reconciled {seeded} template grid(s)", flush=True)
-            except Exception as e:  # noqa: BLE001 — seeding must never block boot
-                print(f"Schedule seed: failed (non-fatal): {e}", flush=True)
-        else:
-            os.environ.pop(plugin_daemons.NATIVE_SCHEDULER_ENV, None)
-        if daemon_specs:
-            plugin_daemon_supervisor = plugin_daemons.DaemonSupervisor(daemon_specs)
-            channel_event_transport = ChannelEventSocketManager(
-                built_app,
-                daemon_specs,
-                log_level=uvicorn_log_level,
-            )
-            plugin_daemon_task = asyncio.create_task(
-                plugin_daemons.start_supervisor_when_bound(
-                    server,
-                    plugin_daemon_supervisor,
-                    event_transport=channel_event_transport,
-                )
-            )
+        add_daemon_routes(starlette_app, daemon_runtime)
+        daemon_boot_task = asyncio.create_task(daemon_runtime.ensure_daemons())
     except Exception as e:  # noqa: BLE001 — daemons must never block boot
-        print(f"Plugin daemons: discovery failed (non-fatal): {e}", flush=True)
+        print(f"Plugin daemons: setup failed (non-fatal): {e}", flush=True)
 
     try:
         await server.serve()
@@ -1937,34 +1911,28 @@ async def main():  # pragma: no cover
         # bind-wait (e.g. shutdown during a stalled startup).
         if poll_delivery_task and not poll_delivery_task.done():
             poll_delivery_task.cancel()
-        # Cancel the daemon-supervisor starter if it never got past the
-        # bind-wait, then terminate any spawned plugin daemons (issue #215 —
-        # the workspace owns its channel processes; they die with it).
-        if plugin_daemon_task:
-            if not plugin_daemon_task.done():
-                plugin_daemon_task.cancel()
-            # The starter may be inside ChannelEventSocketManager.start().
-            # Await its cancellation so its bind rollback finishes before the
-            # supervisor/socket cleanup below touches the same state.
+        # Cancel the daemon boot task if it never got past the bind-wait, then
+        # terminate any spawned plugin daemons + their sockets (issue #215 — the
+        # workspace owns its channel/trigger processes; they die with it). The
+        # DaemonRuntime holder owns both the supervisor and the socket transport
+        # (established at boot or hot-added post-boot), so one stop() reaps
+        # whatever was armed. Await the boot task first so a cold-start still
+        # inside ChannelEventSocketManager.start() finishes its bind rollback
+        # before stop() touches the same state.
+        if daemon_boot_task:
+            if not daemon_boot_task.done():
+                daemon_boot_task.cancel()
             try:
-                await plugin_daemon_task
+                await daemon_boot_task
             except asyncio.CancelledError:
                 pass
             except Exception as daemon_start_err:  # noqa: BLE001
                 print(f"Warning: plugin daemon starter failed: {daemon_start_err}")
-        if plugin_daemon_supervisor is not None:
+        if daemon_runtime is not None:
             try:
-                plugin_daemon_supervisor.stop()
+                await daemon_runtime.stop()
             except Exception as daemon_stop_err:  # noqa: BLE001
                 print(f"Warning: plugin daemon stop failed: {daemon_stop_err}")
-        if channel_event_transport is not None:
-            try:
-                await channel_event_transport.stop()
-            except Exception as channel_event_stop_err:  # noqa: BLE001
-                print(
-                    "Warning: channel event socket stop failed: "
-                    f"{channel_event_stop_err}"
-                )
 
 def main_sync():  # pragma: no cover
     """Synchronous entry point for the `molecule-runtime` console script.

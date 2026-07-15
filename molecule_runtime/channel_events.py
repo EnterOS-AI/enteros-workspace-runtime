@@ -466,6 +466,93 @@ class ChannelEventSocketManager:
             self._cleanup_paths()
             raise
 
+    async def add_specs(self, new_specs: Iterable[Any]) -> list[str]:
+        """Bind private A2A lanes for daemons installed AFTER ``start()``.
+
+        The hot-install counterpart to :meth:`start`: a ``kind: trigger`` (or
+        channel) plugin installed post-boot needs its private socket bound
+        WITHOUT tearing down the lanes already serving live daemons. Registers
+        the new specs, then binds ONLY plugin identities not already served,
+        waits for those, secures them, and injects their (and only their) lane
+        env. Idempotent: a spec whose ``key`` is already present, or whose
+        identity is already bound, is skipped. Returns the plugin identities
+        newly bound (empty on a pure no-op). Must run on the serving event loop.
+        """
+        existing_keys = {s.key for s in self.specs}
+        added_specs = [s for s in new_specs if s.key not in existing_keys]
+        # Manifest env is untrusted for the reserved lane keys — scrub the
+        # freshly-added specs before we (re)inject authoritative values, exactly
+        # as start() does wholesale up front.
+        reserved = (
+            CHANNEL_API_VERSION_ENV, CHANNEL_A2A_SOCKET_ENV,
+            CHANNEL_A2A_TOKEN_ENV, CHANNEL_PLUGIN_ID_ENV,
+            TRIGGER_API_VERSION_ENV, TRIGGER_A2A_SOCKET_ENV,
+            TRIGGER_A2A_TOKEN_ENV, TRIGGER_PLUGIN_ID_ENV,
+        )
+        for spec in added_specs:
+            for var in reserved:
+                spec.env.pop(var, None)
+        self.specs.extend(added_specs)
+
+        # Recompute lane identities across ALL specs (rebuilds self._kinds), then
+        # bind only those not already served by a live socket.
+        all_ids = self._plugin_ids()
+        new_ids = [pid for pid in all_ids if pid not in self._servers]
+        if not new_ids:
+            # Added specs were non-lane daemons, or their identity is already
+            # bound (a second daemon of an existing plugin). Still (re)inject so
+            # any added lane spec picks up the existing socket/token.
+            self._inject_daemon_env()
+            return []
+
+        socket_dir = self._prepare_socket_dir()
+        newly_bound: list[str] = []
+        try:
+            for plugin_id in new_ids:
+                token = secrets.token_urlsafe(32)
+                path = socket_dir / _socket_name(plugin_id)
+                self._prepare_socket_path(path)
+                wrapped_app = RuntimeStampedChannelProvenance(
+                    self.app, plugin_id, token,
+                    stamp=_STAMP_BY_KIND[self._kinds.get(plugin_id, "channel")],
+                )
+                config = uvicorn.Config(
+                    wrapped_app,
+                    uds=str(path),
+                    log_level=self.log_level,
+                    access_log=False,
+                    lifespan="off",
+                )
+                server = _LocalUvicornServer(config)
+                self._servers[plugin_id] = server
+                self._paths[plugin_id] = path
+                self._tokens[plugin_id] = token
+                self._tasks[plugin_id] = asyncio.create_task(
+                    server.serve(), name=f"channel-a2a:{plugin_id}"
+                )
+                newly_bound.append(plugin_id)
+
+            await self._wait_until_bound()
+            for plugin_id in newly_bound:
+                _secure_socket(self._paths[plugin_id])
+            self._inject_daemon_env()
+            self._started = True
+            logger.info(
+                "channel events: hot-added %d private A2A socket(s): %s",
+                len(newly_bound), ", ".join(sorted(newly_bound)),
+            )
+            return newly_bound
+        except BaseException:
+            # Roll back ONLY the lanes we were adding — never disturb the
+            # already-serving daemons. Clear their reserved env, stop their
+            # half-bound servers, and drop their paths/tokens.
+            for spec in added_specs:
+                for var in reserved:
+                    spec.env.pop(var, None)
+            for plugin_id in newly_bound:
+                await self._shutdown_one(plugin_id)
+            raise
+
     async def stop(self) -> None:
         """Stop local listeners and remove their filesystem capabilities."""
         await self._shutdown_servers()
@@ -633,6 +720,32 @@ class ChannelEventSocketManager:
                 await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._servers.clear()
         self._tasks.clear()
+
+    async def _shutdown_one(self, plugin_id: str) -> None:
+        """Stop and forget ONE lane's server/task/path/token, leaving every
+        other live lane untouched. Used to roll back a failed hot-add
+        (:meth:`add_specs`) without disturbing the daemons already serving."""
+        server = self._servers.pop(plugin_id, None)
+        task = self._tasks.pop(plugin_id, None)
+        if server is not None:
+            server.should_exit = True
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+            except asyncio.TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self._tokens.pop(plugin_id, None)
+        path = self._paths.pop(plugin_id, None)
+        if path is not None:
+            try:
+                info = os.lstat(path)
+                if stat.S_ISSOCK(info.st_mode) and (
+                    not hasattr(os, "getuid") or info.st_uid == os.getuid()
+                ):
+                    path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _cleanup_paths(self) -> None:
         for path in self._paths.values():
