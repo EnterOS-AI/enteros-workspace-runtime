@@ -38,6 +38,24 @@ CHANNEL_PLUGIN_ID_ENV = "MOLECULE_CHANNEL_PLUGIN_ID"
 CHANNEL_CAPABILITY_HEADER = "x-molecule-channel-capability"
 """HTTP header carrying the ephemeral local capability."""
 
+# --- trigger lane (kind: trigger) --------------------------------------------
+# A trigger plugin (scheduler is the first type) gets the SAME private local-A2A
+# socket mechanism as a channel, but its provenance is stamped as an autonomous
+# self-turn (source_type in an allow-list) rather than an external channel
+# source. Distinct env-var names so a channel and a trigger daemon in the same
+# workspace get their own capabilities and neither can read the other's.
+TRIGGER_A2A_SOCKET_ENV = "MOLECULE_TRIGGER_A2A_SOCKET"
+"""Runtime-created private Unix socket for a trigger plugin's local A2A self-turn."""
+
+TRIGGER_A2A_TOKEN_ENV = "MOLECULE_TRIGGER_A2A_TOKEN"
+"""Ephemeral per-plugin capability for the trigger's private Unix socket."""
+
+TRIGGER_PLUGIN_ID_ENV = "MOLECULE_TRIGGER_PLUGIN_ID"
+"""Runtime-owned trigger-plugin identity used for trusted provenance stamping."""
+
+TRIGGER_API_VERSION_ENV = "MOLECULE_TRIGGER_API_VERSION"
+"""Runtime-injected trigger contract version (shares CHANNEL_API_VERSION)."""
+
 
 class ChannelCapabilityUnavailable(RuntimeError):
     """The host did not provide a complete, supported channel capability."""

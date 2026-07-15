@@ -128,9 +128,19 @@ def _runtime_metadata_payload() -> dict:
         adapter_cls = get_adapter("")
         adapter = adapter_cls()
         caps = adapter.capabilities()
+        caps_dict = caps.to_dict()
+        # G2 (scheduler-as-trigger-plugin): a loaded trigger plugin makes native
+        # scheduling a RUNTIME-level fact independent of the adapter — like
+        # channel_dispatch. Advertise it so the platform scheduler defers
+        # (NativeSchedulerCheck) and never double-fires. The boot seam sets the
+        # flag from actual daemon discovery.
+        import os as _os
+        from molecule_runtime.plugin_daemons import NATIVE_SCHEDULER_ENV
+        if _os.environ.get(NATIVE_SCHEDULER_ENV) == "1":
+            caps_dict["scheduler"] = True
         # Typed against the SSOT contract sub-shape (molecule-contracts
         # HeartbeatRuntimeMetadata) for drift-prevention; same plain dict on the wire.
-        meta: HeartbeatRuntimeMetadata = {"capabilities": caps.to_dict()}
+        meta: HeartbeatRuntimeMetadata = {"capabilities": caps_dict}
         idle = adapter.idle_timeout_override()
         # Only include the override when it's a positive integer. None /
         # zero / negative falls through to the platform's global default
