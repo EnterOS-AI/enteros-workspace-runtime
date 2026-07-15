@@ -704,6 +704,7 @@ def test_main_boot_daemon_wiring_is_fail_open():
     # a try: within the preceding few lines guards the discovery call
     assert "try:" in src[max(0, idx - 400):idx]
     # and its except announces non-fatality instead of re-raising into boot.
-    # Window widened for the G2 trigger-plugin native-scheduler signal that now
-    # sits between discovery and the except (still inside the same try).
-    assert "non-fatal" in src[idx:idx + 1400]
+    # Window widened for the G2 trigger-plugin native-scheduler signal AND the
+    # P4b reconcile-on-boot schedule seed, both of which sit between discovery
+    # and the except (each itself fail-soft; still inside the same outer try).
+    assert "non-fatal" in src[idx:idx + 2200]

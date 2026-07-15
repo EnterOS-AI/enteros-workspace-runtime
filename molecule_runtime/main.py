@@ -1859,6 +1859,21 @@ async def main():  # pragma: no cover
         # `scheduler` capability. Set-or-clear so a plugin uninstall is reflected.
         if plugin_daemons.has_trigger_daemon(daemon_specs):
             os.environ[plugin_daemons.NATIVE_SCHEDULER_ENV] = "1"
+            # Reconcile the template-delivered schedules.yaml into the
+            # volume-authoritative grid BEFORE the daemon reads it (P4b: core no
+            # longer seeds workspace_schedules — the runtime seeds its own grid).
+            # Additive upsert; user (source='runtime') edits survive re-provision.
+            # Fail-soft: never blocks boot.
+            try:
+                from molecule_runtime import schedule_seed
+
+                seeded = schedule_seed.seed_schedules_from_plugins(
+                    workspace_plugins_dir=os.path.join(config_path, "plugins"),
+                )
+                if seeded:
+                    print(f"Schedule seed: reconciled {seeded} template grid(s)", flush=True)
+            except Exception as e:  # noqa: BLE001 — seeding must never block boot
+                print(f"Schedule seed: failed (non-fatal): {e}", flush=True)
         else:
             os.environ.pop(plugin_daemons.NATIVE_SCHEDULER_ENV, None)
         if daemon_specs:

@@ -155,3 +155,58 @@ def test_replace_all_is_atomic_and_validated(tmp_path: Path) -> None:
     store.replace_all([{"name": "a", "cron": "0 * * * *", "prompt": "p"},
                        {"name": "b", "cron": "0 9 * * *", "prompt": "q"}])
     assert sorted(e["name"] for e in store.list()) == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# upsert_template — additive, edit-preserving reconcile-on-boot seeding
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_template_seeds_empty_grid_stamping_source(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.upsert_template([
+        {"name": "a", "cron": "0 * * * *", "prompt": "p"},
+        {"name": "b", "cron": "0 9 * * *", "prompt": "q"},
+    ])
+    got = {e["name"]: e for e in store.list()}
+    assert set(got) == {"a", "b"}
+    assert got["a"]["source"] == "template" and got["b"]["source"] == "template"
+
+
+def test_upsert_template_preserves_runtime_edits(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    # A user-created (source='runtime') entry, plus a template-owned one.
+    store.create({"name": "user", "cron": "0 * * * *", "prompt": "mine", "source": "runtime"})
+    store.upsert_template([{"name": "tmpl", "cron": "0 9 * * *", "prompt": "seed"}])
+
+    # Re-provision: template ships a DIFFERENT prompt for both names, incl. one
+    # that collides with the user's own entry name.
+    store.upsert_template([
+        {"name": "tmpl", "cron": "0 9 * * *", "prompt": "seed-v2"},
+        {"name": "user", "cron": "0 0 * * *", "prompt": "TEMPLATE-CLOBBER"},
+    ])
+    got = {e["name"]: e for e in store.list()}
+    # user entry is source='runtime' → PRESERVED untouched (not clobbered)
+    assert got["user"]["prompt"] == "mine"
+    assert got["user"]["cron"] == "0 * * * *"
+    assert got["user"]["source"] == "runtime"
+    # template-owned entry → refreshed to the new definition
+    assert got["tmpl"]["prompt"] == "seed-v2"
+    assert got["tmpl"]["source"] == "template"
+
+
+def test_upsert_template_is_additive_not_pruning(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.upsert_template([{"name": "a", "cron": "0 * * * *", "prompt": "p"},
+                           {"name": "b", "cron": "0 9 * * *", "prompt": "q"}])
+    # A later delivery drops "b" — additive semantics keep the prior "b".
+    store.upsert_template([{"name": "a", "cron": "0 * * * *", "prompt": "p"}])
+    assert sorted(e["name"] for e in store.list()) == ["a", "b"]
+
+
+def test_upsert_template_bad_entry_leaves_grid_intact(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.upsert_template([{"name": "keep", "cron": "0 * * * *", "prompt": "p"}])
+    with pytest.raises(ScheduleError):
+        store.upsert_template([{"name": "bad", "cron": "not a cron", "prompt": "p"}])
+    assert [e["name"] for e in store.list()] == ["keep"]  # atomic: prior grid intact

@@ -24,6 +24,11 @@ STATE_DIR_ENV = "MOLECULE_TRIGGER_STATE_DIR"
 # Subdirectory of the persisted config volume the grid + state live under.
 TRIGGER_STATE_SUBDIR = "schedules"
 
+# The grid file the API writes and both the daemon and the boot seeder read.
+# Defined here (import-light) so the seeder can resolve it without importing the
+# schedule API (starlette). internal_schedules re-exports this for back-compat.
+GRID_FILENAME = "schedules.yaml"
+
 
 def resolve_trigger_state_dir() -> Path:
     """Return the workspace's trigger state dir on the persisted volume.
@@ -41,4 +46,15 @@ def resolve_trigger_state_dir() -> Path:
     return resolve_configs_dir() / TRIGGER_STATE_SUBDIR
 
 
-__all__ = ["STATE_DIR_ENV", "TRIGGER_STATE_SUBDIR", "resolve_trigger_state_dir"]
+def resolve_grid_path() -> Path:
+    """Full path to the schedule grid file both the API and daemon use."""
+    return resolve_trigger_state_dir() / GRID_FILENAME
+
+
+__all__ = [
+    "STATE_DIR_ENV",
+    "TRIGGER_STATE_SUBDIR",
+    "GRID_FILENAME",
+    "resolve_trigger_state_dir",
+    "resolve_grid_path",
+]

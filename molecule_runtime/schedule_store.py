@@ -188,6 +188,33 @@ class ScheduleStore:
         self._write(normalized)
         return normalized
 
+    def upsert_template(self, template_entries: Iterable[Any]) -> list[dict[str, Any]]:
+        """Additive template seeding that preserves user edits (reconcile-on-boot).
+
+        The runtime seeds its own grid from the template-delivered ``schedules.yaml``
+        on boot, replacing core's old ``workspace_schedules`` seeding (P4). RFC
+        invariant: a template re-provision must never clobber a user's own edits.
+        So each delivered entry is upserted keyed on ``name`` and stamped
+        ``source='template'``; any *live* entry whose source is not ``'template'``
+        (a runtime/API-created or untagged user entry) is preserved untouched, even
+        when it shares a name with a template entry.
+
+        Additive-only: a template entry that was *removed* from the delivered file
+        is NOT pruned here (mirrors the old core additive-upsert seeding). Returns
+        the merged grid; a validation failure on any delivered entry leaves the
+        prior grid intact (``replace_all`` is atomic).
+        """
+        by_name: dict[str, dict[str, Any]] = {e["name"]: e for e in self.load()}
+        for raw in template_entries:
+            norm = validate_entry(raw)
+            norm["source"] = "template"
+            existing = by_name.get(norm["name"])
+            if existing is None or existing.get("source") == "template":
+                # New template entry, or refresh of a template-owned one.
+                by_name[norm["name"]] = norm
+            # else: a runtime/user-owned entry with this name — preserve it.
+        return self.replace_all(list(by_name.values()))
+
     # --- internals ----------------------------------------------------------
     def _write(self, entries: list[dict[str, Any]]) -> None:
         payload = {"schedules": entries}

@@ -29,13 +29,17 @@ from starlette.responses import JSONResponse
 
 from molecule_runtime.platform_inbound_auth import get_inbound_secret, inbound_authorized
 from molecule_runtime.schedule_store import ScheduleError, ScheduleStore
-from molecule_runtime.trigger_state import STATE_DIR_ENV, resolve_trigger_state_dir
+from molecule_runtime.trigger_state import (
+    GRID_FILENAME,
+    STATE_DIR_ENV,
+    resolve_trigger_state_dir,
+)
 
-# Filenames mirror the trigger-plugin daemon (SDK templates/trigger/scheduler.py).
-# The daemon writes the health file; the API reads it. Kept in sync by the
-# schedule contract's convention, not a shared import (the daemon is vendored
-# per-plugin, not importable from the runtime process).
-GRID_FILENAME = "schedules.yaml"
+# GRID_FILENAME is the SSOT in trigger_state (import-light) and re-exported here
+# for back-compat. HEALTH/POKES filenames mirror the trigger-plugin daemon (SDK
+# templates/trigger/scheduler.py): the daemon writes the health file, the API
+# reads it — kept in sync by the schedule contract's convention, not a shared
+# import (the daemon is vendored per-plugin, not importable from the runtime).
 HEALTH_FILENAME = "schedule-health.json"
 POKES_FILENAME = "schedule-pokes.json"
 HISTORY_FILENAME = "schedule-history.json"
