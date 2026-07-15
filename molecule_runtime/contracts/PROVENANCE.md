@@ -126,3 +126,24 @@ Re-vendoring:
     curl -fsS -A "curl/8.4.0" \
       "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/credentials/credentials.contract.json" \
       -o "molecule_runtime/contracts/credentials.contract.json"
+
+## cron.fixtures.json
+
+Source: molecule-ai-sdk `contracts/cron/fixtures.json` (the `cron` contract's
+executable behavioural SSOT — a list of `{expr, tz, after, expect}` rows).
+Generated from `github.com/robfig/cron/v3` v3.0.1 (`NewParser(Minute|Hour|Dom|
+Month|Dow)`), the shipping Go scheduler, so the contract cannot silently change
+the fire time every existing schedule depends on.
+
+Why vendored: `tests/test_cronspec_contract.py` asserts
+`molecule_runtime.cronspec.compute_next_run` reproduces every row exactly — the
+Python end of the cross-language equivalence gate with core
+`internal/cronspec/cronspec_conformance_test.go` (which asserts the same
+fixtures against robfig). A drift here is a real fire-time bug. Drift-gated
+byte-identical to sdk main via `check-schemas-in-sync.sh`.
+
+Re-vendoring:
+
+    curl -fsS -A "curl/8.4.0" \
+      "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/cron/fixtures.json" \
+      -o "molecule_runtime/contracts/cron.fixtures.json"
