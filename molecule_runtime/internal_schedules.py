@@ -29,6 +29,7 @@ from starlette.responses import JSONResponse
 
 from molecule_runtime.platform_inbound_auth import get_inbound_secret, inbound_authorized
 from molecule_runtime.schedule_store import ScheduleError, ScheduleStore
+from molecule_runtime.trigger_state import STATE_DIR_ENV, resolve_trigger_state_dir
 
 # Filenames mirror the trigger-plugin daemon (SDK templates/trigger/scheduler.py).
 # The daemon writes the health file; the API reads it. Kept in sync by the
@@ -38,7 +39,8 @@ GRID_FILENAME = "schedules.yaml"
 HEALTH_FILENAME = "schedule-health.json"
 POKES_FILENAME = "schedule-pokes.json"
 HISTORY_FILENAME = "schedule-history.json"
-STATE_DIR_ENV = "MOLECULE_TRIGGER_STATE_DIR"
+# STATE_DIR_ENV is re-exported from trigger_state (the shared resolver) so the
+# API and the injected daemon agree on one location.
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
@@ -81,10 +83,8 @@ class ScheduleStoreUnconfigured(RuntimeError):
 
 
 def default_state_dir() -> Path:
-    configured = os.environ.get(STATE_DIR_ENV, "").strip()
-    if not configured:
-        raise ScheduleStoreUnconfigured(f"{STATE_DIR_ENV} is not set")
-    return Path(configured)
+    """The trigger state dir on the persisted volume (shared with the daemon)."""
+    return resolve_trigger_state_dir()
 
 
 def _unauthorized(request: Request) -> bool:

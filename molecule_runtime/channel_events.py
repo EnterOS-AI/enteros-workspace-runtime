@@ -603,6 +603,15 @@ class ChannelEventSocketManager:
                 spec.env[TRIGGER_A2A_SOCKET_ENV] = str(path)
                 spec.env[TRIGGER_A2A_TOKEN_ENV] = token
                 spec.env[TRIGGER_PLUGIN_ID_ENV] = plugin_id
+                # Point the daemon at the SAME durable state dir the runtime
+                # schedule API resolves, so the API writes the grid this daemon
+                # reads and reads the health/history it writes.
+                from molecule_runtime.trigger_state import (
+                    STATE_DIR_ENV as _TRIGGER_STATE_DIR_ENV,
+                    resolve_trigger_state_dir,
+                )
+
+                spec.env[_TRIGGER_STATE_DIR_ENV] = str(resolve_trigger_state_dir())
             else:
                 spec.env[CHANNEL_API_VERSION_ENV] = CHANNEL_API_VERSION
                 spec.env[CHANNEL_A2A_SOCKET_ENV] = str(path)
