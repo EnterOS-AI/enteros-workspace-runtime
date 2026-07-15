@@ -53,6 +53,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ class DaemonSpec:
     name: str
     command: list[str]  # full argv ([command, *args] from the manifest entry)
     plugin: str = ""  # owning plugin name (log context; PR-2 identity anchor)
-    kind: str = ""  # owning manifest kind; only "channel" gets local A2A
+    kind: str = ""  # owning manifest kind; "channel" + "trigger" get a local A2A lane
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
 
@@ -172,7 +173,7 @@ def discover_daemon_specs(
         # identity for generic daemons, whose supervisor keys predate this API.
         daemon_owner = str(
             plugin.manifest.name
-            if plugin.manifest.kind == "channel"
+            if plugin.manifest.kind in ("channel", "trigger")
             else plugin.name
         ).strip()
         plugin_specs = daemon_specs_from_manifest(
@@ -200,6 +201,27 @@ def discover_daemon_specs(
             len(specs), ", ".join(s.key for s in specs),
         )
     return specs
+
+
+# Boot-time signal: set to "1" by the boot seam when a trigger plugin is
+# present, read by the heartbeat to advertise the ``scheduler`` capability
+# (G2). A process-lifetime fact — plugins don't change mid-run — so a single
+# env flag is authoritative and avoids re-scanning on every heartbeat.
+NATIVE_SCHEDULER_ENV = "MOLECULE_RUNTIME_NATIVE_SCHEDULER"
+
+
+def has_trigger_daemon(specs: "Iterable[DaemonSpec]") -> bool:
+    """True iff any discovered daemon spec is a ``kind: trigger`` daemon.
+
+    A present trigger plugin means this workspace schedules natively, so the
+    platform's central scheduler must DEFER for it (G2 of the scheduler-as-
+    trigger-plugin refactor) — otherwise both would fire and the agent would be
+    double-triggered. The runtime advertises this via the ``scheduler``
+    capability in its heartbeat; the platform reads it in NativeSchedulerCheck.
+    """
+    return any(
+        str(getattr(s, "kind", "") or "").strip() == "trigger" for s in specs
+    )
 
 
 class DaemonSupervisor:
@@ -334,13 +356,20 @@ class DaemonSupervisor:
             CHANNEL_A2A_TOKEN_ENV,
             CHANNEL_API_VERSION_ENV,
             CHANNEL_PLUGIN_ID_ENV,
+            TRIGGER_A2A_SOCKET_ENV,
+            TRIGGER_A2A_TOKEN_ENV,
+            TRIGGER_API_VERSION_ENV,
+            TRIGGER_PLUGIN_ID_ENV,
         )
 
         child_env = dict(os.environ)
-        child_env.pop(CHANNEL_API_VERSION_ENV, None)
-        child_env.pop(CHANNEL_A2A_SOCKET_ENV, None)
-        child_env.pop(CHANNEL_A2A_TOKEN_ENV, None)
-        child_env.pop(CHANNEL_PLUGIN_ID_ENV, None)
+        for reserved in (
+            CHANNEL_API_VERSION_ENV, CHANNEL_A2A_SOCKET_ENV,
+            CHANNEL_A2A_TOKEN_ENV, CHANNEL_PLUGIN_ID_ENV,
+            TRIGGER_API_VERSION_ENV, TRIGGER_A2A_SOCKET_ENV,
+            TRIGGER_A2A_TOKEN_ENV, TRIGGER_PLUGIN_ID_ENV,
+        ):
+            child_env.pop(reserved, None)
         child_env.update(spec.env)
         try:
             proc = subprocess.Popen(

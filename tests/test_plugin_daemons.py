@@ -703,5 +703,7 @@ def test_main_boot_daemon_wiring_is_fail_open():
     idx = src.index("discover_daemon_specs")
     # a try: within the preceding few lines guards the discovery call
     assert "try:" in src[max(0, idx - 400):idx]
-    # and its except announces non-fatality instead of re-raising into boot
-    assert "non-fatal" in src[idx:idx + 900]
+    # and its except announces non-fatality instead of re-raising into boot.
+    # Window widened for the G2 trigger-plugin native-scheduler signal that now
+    # sits between discovery and the except (still inside the same try).
+    assert "non-fatal" in src[idx:idx + 1400]

@@ -1,0 +1,26 @@
+{
+  "valid": [
+    {
+      "desc": "minimal entry: name + cron + prompt, defaults for the rest",
+      "entry": {"name": "daily-standup", "cron": "0 9 * * 1-5", "prompt": "prep the standup"}
+    },
+    {
+      "desc": "full entry with timezone, enabled, source",
+      "entry": {"name": "hourly-sweep", "cron": "0 * * * *", "timezone": "America/New_York", "prompt": "sweep", "enabled": false, "source": "runtime"}
+    },
+    {
+      "desc": "multi-value cron within the length cap is accepted",
+      "entry": {"name": "quarter-hourly", "cron": "0,15,30,45 9-17 * * 1-5", "prompt": "p"}
+    }
+  ],
+  "invalid": [
+    {"desc": "missing cron", "reason": "cron required", "entry": {"name": "n", "prompt": "p"}},
+    {"desc": "missing prompt", "reason": "prompt required", "entry": {"name": "n", "cron": "0 * * * *"}},
+    {"desc": "empty name", "reason": "name min length", "entry": {"name": "", "cron": "0 * * * *", "prompt": "p"}},
+    {"desc": "name not a slug", "reason": "name pattern", "entry": {"name": "Bad Name", "cron": "0 * * * *", "prompt": "p"}},
+    {"desc": "cron over 128 chars", "reason": "cron max length", "entry": {"name": "n", "cron": "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0", "prompt": "p"}},
+    {"desc": "unknown field", "reason": "additionalProperties false", "entry": {"name": "n", "cron": "0 * * * *", "prompt": "p", "webhook_url": "http://x"}},
+    {"desc": "bad source enum", "reason": "source enum", "entry": {"name": "n", "cron": "0 * * * *", "prompt": "p", "source": "somewhere"}},
+    {"desc": "enabled wrong type", "reason": "enabled boolean", "entry": {"name": "n", "cron": "0 * * * *", "prompt": "p", "enabled": "yes"}}
+  ]
+}

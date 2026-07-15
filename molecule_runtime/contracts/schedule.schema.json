@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/contracts/schedule/schedule.schema.json",
+  "title": "Molecule schedule-grid contract",
+  "description": "Schema for the volume-authoritative schedule grid a kind:trigger scheduler plugin owns under Option A. One entry per scheduled self-turn. The engine-state bookkeeping (last_run_at, run_count, ...) is NOT part of the grid: the daemon owns it in a separate state file on the same volume.",
+  "type": "object",
+  "required": ["contract", "version", "entry", "caps"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "contract": {"const": "schedule"},
+    "version": {"type": "string", "pattern": "^schedule/v[0-9]+$"},
+    "summary": {"type": "string"},
+    "entry": {
+      "type": "object",
+      "description": "Field-level description of one schedule entry (informational; the executable schema is $defs/scheduleEntry).",
+      "required": ["name", "cron", "prompt"],
+      "properties": {
+        "name": {"type": "string"},
+        "cron": {"type": "string"},
+        "timezone": {"type": "string"},
+        "prompt": {"type": "string"},
+        "enabled": {"type": "string"},
+        "source": {"type": "string"}
+      }
+    },
+    "caps": {
+      "type": "object",
+      "required": ["max_entries", "max_cron_len", "max_prompt_bytes"],
+      "properties": {
+        "max_entries": {"const": 100},
+        "max_cron_len": {"const": 128},
+        "max_prompt_bytes": {"const": 16384}
+      }
+    },
+    "fixtures": {
+      "type": "object",
+      "properties": {
+        "file": {"type": "string"},
+        "role": {"type": "string"}
+      }
+    }
+  },
+  "$defs": {
+    "scheduleEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "cron", "prompt"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Unique, stable identifier and state key.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "cron": {
+          "type": "string",
+          "description": "5-field cron in the Molecule cron contract grammar.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "timezone": {
+          "type": "string",
+          "description": "IANA timezone the cron is evaluated in. Defaults to UTC when absent.",
+          "minLength": 1
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Instruction delivered to the agent as the self-scheduler turn.",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Disarm without deleting. Defaults to true when absent."
+        },
+        "source": {
+          "type": "string",
+          "description": "Provenance, informational only: template (org/import seeded) or runtime (Canvas/API created).",
+          "enum": ["template", "runtime"]
+        }
+      }
+    },
+    "scheduleGrid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schedules"],
+      "properties": {
+        "schedules": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {"$ref": "#/$defs/scheduleEntry"}
+        }
+      }
+    }
+  }
+}

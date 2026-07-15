@@ -34,6 +34,8 @@ declare -A MAP=(
   [molecule_runtime/contracts/workspace-data.contract.json]="contracts/workspace-data/workspace-data.contract.json"
   [molecule_runtime/contracts/credentials.contract.json]="contracts/credentials/credentials.contract.json"
   [molecule_runtime/contracts/cron.fixtures.json]="contracts/cron/fixtures.json"
+  [molecule_runtime/contracts/schedule.schema.json]="contracts/schedule/schedule.schema.json"
+  [molecule_runtime/contracts/schedule.fixtures.json]="contracts/schedule/fixtures.json"
   [contracts/mcp-plugin-delivery.contract.json]="contracts/mcp/mcp-plugin-delivery.contract.json"
 )
 

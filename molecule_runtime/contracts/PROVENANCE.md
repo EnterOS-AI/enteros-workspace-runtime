@@ -147,3 +147,25 @@ Re-vendoring:
     curl -fsS -A "curl/8.4.0" \
       "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/cron/fixtures.json" \
       -o "molecule_runtime/contracts/cron.fixtures.json"
+
+## schedule.schema.json, schedule.fixtures.json
+
+Source: molecule-ai-sdk `contracts/schedule/{schedule.schema.json, fixtures.json}`
+— the `schedule` contract, SSOT for the volume-authoritative schedule grid a
+`kind: trigger` scheduler plugin owns under Option A. Definition-only entries
+(name, cron, timezone, prompt, enabled, source); engine bookkeeping is
+daemon-owned in a separate state file, not in the grid.
+
+Why vendored: `molecule_runtime/schedule_store.py` validates every write against
+`$defs/scheduleEntry` / `$defs/scheduleGrid` and `tests/test_schedule_store.py`
+asserts the fixtures' valid/invalid partition holds. Drift-gated byte-identical
+to sdk main via `check-schemas-in-sync.sh`.
+
+Re-vendoring:
+
+    curl -fsS -A "curl/8.4.0" \
+      "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/schedule/schedule.schema.json" \
+      -o "molecule_runtime/contracts/schedule.schema.json"
+    curl -fsS -A "curl/8.4.0" \
+      "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/schedule/fixtures.json" \
+      -o "molecule_runtime/contracts/schedule.fixtures.json"

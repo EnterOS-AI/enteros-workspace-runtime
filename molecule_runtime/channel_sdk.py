@@ -36,15 +36,45 @@ CHANNEL_PLUGIN_ID_ENV = "MOLECULE_CHANNEL_PLUGIN_ID"
 """Runtime-owned plugin identity used for trusted provenance stamping."""
 
 CHANNEL_CAPABILITY_HEADER = "x-molecule-channel-capability"
-"""HTTP header carrying the ephemeral local capability."""
+"""HTTP header carrying the ephemeral local capability (shared by both lanes)."""
+
+# --- trigger lane (kind: trigger) --------------------------------------------
+# A trigger plugin (scheduler is the first type) gets the SAME private local-A2A
+# socket mechanism as a channel, but its provenance is stamped as an autonomous
+# self-turn (``source_type`` in an allow-list) rather than an external channel
+# source. Distinct env-var names so a channel and a trigger daemon in the same
+# workspace get their own capabilities and neither can read the other's. The
+# host validates the same capability header and shares CHANNEL_API_VERSION.
+TRIGGER_A2A_SOCKET_ENV = "MOLECULE_TRIGGER_A2A_SOCKET"
+"""Runtime-created private Unix socket for a trigger plugin's local A2A self-turn."""
+
+TRIGGER_A2A_TOKEN_ENV = "MOLECULE_TRIGGER_A2A_TOKEN"
+"""Ephemeral per-plugin capability for the trigger's private Unix socket."""
+
+TRIGGER_PLUGIN_ID_ENV = "MOLECULE_TRIGGER_PLUGIN_ID"
+"""Runtime-owned trigger-plugin identity used for trusted provenance stamping."""
+
+TRIGGER_API_VERSION_ENV = "MOLECULE_TRIGGER_API_VERSION"
+"""Runtime-injected trigger contract version (shares CHANNEL_API_VERSION)."""
+
+TRIGGER_DEFAULT_SOURCE_TYPE = "self-scheduler"
+"""Autonomous self-turn ``source_type`` a scheduler trigger requests by default.
+
+The host re-validates this against its own allow-list and stamps the runtime-owned
+``source`` provenance; a client cannot widen the grant by asserting another value.
+"""
 
 
 class ChannelCapabilityUnavailable(RuntimeError):
-    """The host did not provide a complete, supported channel capability."""
+    """The host did not provide a complete, supported local-A2A capability.
+
+    Raised by both the channel and trigger clients: capability absence is
+    known-safe (the request never crossed the boundary), so the caller may skip.
+    """
 
 
 class ChannelProtocolError(RuntimeError):
-    """A complete channel response was a valid JSON-RPC error or bad result."""
+    """A complete local-A2A response was a valid JSON-RPC error or bad result."""
 
 
 class ChannelDeliveryUnknown(RuntimeError):
@@ -183,28 +213,6 @@ async def send_channel_message(
     :class:`ChannelDeliveryUnknown`; callers must not replay that provider event
     because the agent may already have accepted it.
     """
-    env = os.environ if environ is None else environ
-    resolved_version = (api_version or env.get(CHANNEL_API_VERSION_ENV, "")).strip()
-    if not resolved_version:
-        raise ChannelCapabilityUnavailable(
-            f"{CHANNEL_API_VERSION_ENV} is absent; this host cannot run channel plugins"
-        )
-    if resolved_version != CHANNEL_API_VERSION:
-        raise ChannelCapabilityUnavailable(
-            "unsupported channel API version "
-            f"{resolved_version!r}; plugin requires {CHANNEL_API_VERSION!r}"
-        )
-
-    resolved_path = os.fspath(socket_path) if socket_path is not None else ""
-    resolved_path = resolved_path.strip() or env.get(CHANNEL_A2A_SOCKET_ENV, "").strip()
-    if not resolved_path:
-        raise ChannelCapabilityUnavailable(f"{CHANNEL_A2A_SOCKET_ENV} is absent")
-    resolved_token = (capability_token or "").strip() or env.get(
-        CHANNEL_A2A_TOKEN_ENV, ""
-    ).strip()
-    if not resolved_token:
-        raise ChannelCapabilityUnavailable(f"{CHANNEL_A2A_TOKEN_ENV} is absent")
-
     request = build_channel_message_send_request(
         text,
         metadata=metadata,
@@ -212,11 +220,150 @@ async def send_channel_message(
         message_id=message_id,
         attachments=attachments,
     )
+    return await _post_local_a2a(
+        request,
+        lane="channel",
+        socket_env=CHANNEL_A2A_SOCKET_ENV,
+        token_env=CHANNEL_A2A_TOKEN_ENV,
+        version_env=CHANNEL_API_VERSION_ENV,
+        socket_path=socket_path,
+        capability_token=capability_token,
+        api_version=api_version,
+        timeout_seconds=timeout_seconds,
+        environ=environ,
+    )
+
+
+def build_trigger_message_send_request(
+    text: str,
+    *,
+    source_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the A2A ``message/send`` request for an autonomous trigger self-turn.
+
+    Unlike a channel turn, a trigger turn carries a ``source_type`` (a routine
+    self-ping class the host allow-lists — ``self-scheduler`` by default) instead
+    of an external ``source``.  The runtime-owned ``source`` provenance is stamped
+    host-side after capability verification, so any client-supplied ``source`` is
+    stripped here and the host re-validates ``source_type`` against its allow-list.
+    """
+    if not isinstance(text, str):
+        raise TypeError("trigger message text must be a string")
+
+    resolved_request_id = request_id or str(uuid.uuid4())
+    resolved_message_id = message_id or resolved_request_id
+    clean_metadata = dict(metadata or {})
+    clean_metadata.pop("source", None)
+    clean_metadata["source_type"] = (
+        source_type or clean_metadata.get("source_type") or TRIGGER_DEFAULT_SOURCE_TYPE
+    )
+
+    return {
+        "jsonrpc": "2.0",
+        "id": resolved_request_id,
+        "method": "message/send",
+        "params": {
+            "message": {
+                "kind": "message",
+                "role": "user",
+                "messageId": resolved_message_id,
+                "parts": [{"kind": "text", "text": text}],
+            },
+            "metadata": clean_metadata,
+        },
+    }
+
+
+async def send_trigger_message(
+    text: str,
+    *,
+    source_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    message_id: str | None = None,
+    socket_path: str | PathLike[str] | None = None,
+    capability_token: str | None = None,
+    api_version: str | None = None,
+    timeout_seconds: float = 600.0,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Fire one autonomous self-turn through the runtime's authenticated host.
+
+    Same delivery contract as :func:`send_channel_message`: capability absence is
+    known-safe (:class:`ChannelCapabilityUnavailable`); once the request crosses
+    the boundary any failure raises :class:`ChannelDeliveryUnknown` and must not
+    be replayed.  A trigger daemon should therefore treat an unknown outcome as
+    "possibly fired" and advance its schedule state rather than retry.
+    """
+    request = build_trigger_message_send_request(
+        text,
+        source_type=source_type,
+        metadata=metadata,
+        request_id=request_id,
+        message_id=message_id,
+    )
+    return await _post_local_a2a(
+        request,
+        lane="trigger",
+        socket_env=TRIGGER_A2A_SOCKET_ENV,
+        token_env=TRIGGER_A2A_TOKEN_ENV,
+        version_env=TRIGGER_API_VERSION_ENV,
+        socket_path=socket_path,
+        capability_token=capability_token,
+        api_version=api_version,
+        timeout_seconds=timeout_seconds,
+        environ=environ,
+    )
+
+
+async def _post_local_a2a(
+    request: dict[str, Any],
+    *,
+    lane: str,
+    socket_env: str,
+    token_env: str,
+    version_env: str,
+    socket_path: str | PathLike[str] | None,
+    capability_token: str | None,
+    api_version: str | None,
+    timeout_seconds: float,
+    environ: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """Resolve the per-lane capability and POST one request over the Unix socket.
+
+    Shared transport for both the channel and trigger clients; ``lane`` only
+    labels the human-readable error text.  Capability absence raises
+    :class:`ChannelCapabilityUnavailable` before any send; once a send is
+    attempted, every failure raises :class:`ChannelDeliveryUnknown`.
+    """
+    env = os.environ if environ is None else environ
+    resolved_version = (api_version or env.get(version_env, "")).strip()
+    if not resolved_version:
+        raise ChannelCapabilityUnavailable(
+            f"{version_env} is absent; this host cannot run {lane} plugins"
+        )
+    if resolved_version != CHANNEL_API_VERSION:
+        raise ChannelCapabilityUnavailable(
+            f"unsupported {lane} API version "
+            f"{resolved_version!r}; plugin requires {CHANNEL_API_VERSION!r}"
+        )
+
+    resolved_path = os.fspath(socket_path) if socket_path is not None else ""
+    resolved_path = resolved_path.strip() or env.get(socket_env, "").strip()
+    if not resolved_path:
+        raise ChannelCapabilityUnavailable(f"{socket_env} is absent")
+    resolved_token = (capability_token or "").strip() or env.get(token_env, "").strip()
+    if not resolved_token:
+        raise ChannelCapabilityUnavailable(f"{token_env} is absent")
+
     try:
         import httpx
     except ImportError as error:  # pragma: no cover - packaging guard
         raise ChannelCapabilityUnavailable(
-            "channel client requires httpx; install molecule-ai-sdk[channel]"
+            f"{lane} client requires httpx; install molecule-ai-sdk[channel]"
         ) from error
 
     transport = httpx.AsyncHTTPTransport(uds=resolved_path)
@@ -238,7 +385,7 @@ async def send_channel_message(
     except Exception as error:
         if send_attempted:
             raise ChannelDeliveryUnknown(
-                "local channel delivery outcome is unknown; this turn must not be replayed"
+                f"local {lane} delivery outcome is unknown; this turn must not be replayed"
             ) from error
         raise
 
@@ -246,7 +393,7 @@ async def send_channel_message(
         payload = response.json()
     except ValueError as error:
         raise ChannelDeliveryUnknown(
-            "local channel response was invalid after send; this turn must not be replayed"
+            f"local {lane} response was invalid after send; this turn must not be replayed"
         ) from error
     if not (
         isinstance(payload, dict)
@@ -254,7 +401,7 @@ async def send_channel_message(
         and ("result" in payload or "error" in payload)
     ):
         raise ChannelDeliveryUnknown(
-            "local channel response was malformed after send; this turn must not be replayed"
+            f"local {lane} response was malformed after send; this turn must not be replayed"
         )
     return payload
 
@@ -266,11 +413,18 @@ __all__ = [
     "CHANNEL_API_VERSION_ENV",
     "CHANNEL_CAPABILITY_HEADER",
     "CHANNEL_PLUGIN_ID_ENV",
+    "TRIGGER_A2A_SOCKET_ENV",
+    "TRIGGER_A2A_TOKEN_ENV",
+    "TRIGGER_API_VERSION_ENV",
+    "TRIGGER_DEFAULT_SOURCE_TYPE",
+    "TRIGGER_PLUGIN_ID_ENV",
     "ChannelCapabilityUnavailable",
     "ChannelDeliveryUnknown",
     "ChannelMessageSender",
     "ChannelProtocolError",
     "build_channel_message_send_request",
+    "build_trigger_message_send_request",
     "channel_message_response_text",
     "send_channel_message",
+    "send_trigger_message",
 ]

@@ -1334,6 +1334,10 @@ async def main():  # pragma: no cover
         _internal_file_read,
         methods=["GET"],
     )
+    # /internal/schedules* — the runtime schedule API (Option A). Backed by the
+    # volume grid a kind:trigger scheduler plugin fires from; same forward-auth.
+    from molecule_runtime.internal_schedules import add_schedule_routes as _add_schedule_routes
+    _add_schedule_routes(starlette_app)
 
     built_app = make_trace_middleware(starlette_app)
 
@@ -1849,6 +1853,14 @@ async def main():  # pragma: no cover
         daemon_specs = plugin_daemons.discover_daemon_specs(
             workspace_plugins_dir=os.path.join(config_path, "plugins"),
         )
+        # G2: a trigger plugin means this workspace schedules natively, so the
+        # platform's central scheduler must defer (NativeSchedulerCheck). Signal
+        # it once at boot; the heartbeat reads the flag and advertises the
+        # `scheduler` capability. Set-or-clear so a plugin uninstall is reflected.
+        if plugin_daemons.has_trigger_daemon(daemon_specs):
+            os.environ[plugin_daemons.NATIVE_SCHEDULER_ENV] = "1"
+        else:
+            os.environ.pop(plugin_daemons.NATIVE_SCHEDULER_ENV, None)
         if daemon_specs:
             plugin_daemon_supervisor = plugin_daemons.DaemonSupervisor(daemon_specs)
             channel_event_transport = ChannelEventSocketManager(

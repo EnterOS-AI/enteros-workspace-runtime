@@ -46,6 +46,10 @@ from molecule_runtime.channel_sdk import (
     CHANNEL_API_VERSION_ENV,
     CHANNEL_CAPABILITY_HEADER,
     CHANNEL_PLUGIN_ID_ENV,
+    TRIGGER_A2A_SOCKET_ENV,
+    TRIGGER_A2A_TOKEN_ENV,
+    TRIGGER_API_VERSION_ENV,
+    TRIGGER_PLUGIN_ID_ENV,
     ChannelCapabilityUnavailable,
     ChannelDeliveryUnknown,
     ChannelMessageSender,
@@ -93,6 +97,21 @@ MAX_A2A_REQUEST_BYTES = 16 << 20
 
 _SOCKET_PATH_MAX_BYTES = 100  # conservative across Linux (108) and macOS (104)
 _SOURCE_KEY = "source"
+_SOURCE_TYPE_KEY = "source_type"
+
+# The kinds that receive a private local-A2A lane. `channel` bridges an external
+# comms surface (source = plugin id); `trigger` fires autonomous self-turns
+# (source_type in the allow-list below). Both share the socket + capability
+# mechanism; they differ only in how provenance is stamped and which env vars
+# carry the capability.
+_LANE_KINDS = ("channel", "trigger")
+
+# The ONLY source_type values a trigger plugin may cause. A scheduler is the
+# first (today only) trigger type. This allow-list is the security boundary: it
+# stops a trigger plugin forging a user turn, a channel turn, or any self-turn
+# class it was not granted. Widen it deliberately when a new trigger type ships.
+TRIGGER_ALLOWED_SOURCE_TYPES = frozenset({"self-scheduler"})
+TRIGGER_DEFAULT_SOURCE_TYPE = "self-scheduler"
 
 
 class RuntimeStampedChannelProvenance:
@@ -105,6 +124,7 @@ class RuntimeStampedChannelProvenance:
         capability_token: str,
         *,
         max_request_bytes: int = MAX_A2A_REQUEST_BYTES,
+        stamp: "Any | None" = None,
     ) -> None:
         identity = plugin_id.strip()
         if not identity:
@@ -118,6 +138,10 @@ class RuntimeStampedChannelProvenance:
             raise ValueError("channel event binding requires a non-empty capability token")
         self._capability_token = token.encode("utf-8")
         self.max_request_bytes = max_request_bytes
+        # Per-lane provenance stamp (channel by default; a trigger lane passes
+        # _stamp_trigger_source). Defaulted here rather than in the signature so
+        # the module-level function need not exist at class-definition time.
+        self._stamp = stamp if stamp is not None else _stamp_source
 
     async def __call__(self, scope, receive, send) -> None:
         if not (
@@ -181,7 +205,7 @@ class RuntimeStampedChannelProvenance:
             return
 
         request_id = payload.get("id") if isinstance(payload, dict) else None
-        problem = _stamp_source(payload, self.plugin_id)
+        problem = self._stamp(payload, self.plugin_id)
         if problem:
             await _jsonrpc_error(
                 send,
@@ -253,6 +277,68 @@ def _stamp_source(payload: object, plugin_id: str) -> str | None:
     return None
 
 
+def _stamp_trigger_source(payload: object, plugin_id: str) -> str | None:
+    """Stamp a trigger plugin's local A2A envelope as an autonomous self-turn.
+
+    Unlike a channel (which represents an external party), a trigger fires the
+    agent itself, so the turn is stamped ``source_type`` (the routine-self-ping
+    classification the executor + autonomous-loop guard key on) — NOT an
+    external ``source``. The trigger plugin controls only the prompt text; the
+    runtime forces the identity:
+
+      * Any daemon-supplied ``source`` / ``source_type`` at the message level is
+        stripped (no message-level forging of provenance).
+      * ``params.metadata.source_type`` must be in the allow-list; a value
+        outside it is rejected, and an absent value defaults to the granted
+        type. A trigger can therefore never impersonate a user turn, a channel,
+        or an un-granted self-turn class.
+      * ``params.metadata.source`` is set to the plugin id for audit provenance.
+    """
+    if not isinstance(payload, dict):
+        return "local trigger A2A requests must be a JSON object"
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return "local trigger A2A request must contain object params"
+
+    message = params.get("message")
+    if isinstance(message, dict):
+        message_metadata = message.get("metadata")
+        if message_metadata is not None and not isinstance(message_metadata, dict):
+            return "params.message.metadata must be an object"
+        if isinstance(message_metadata, dict):
+            # strip forgeable provenance — the runtime owns the turn's identity
+            message_metadata.pop(_SOURCE_KEY, None)
+            message_metadata.pop(_SOURCE_TYPE_KEY, None)
+
+    metadata = params.get("metadata")
+    if metadata is None:
+        metadata = {}
+        params["metadata"] = metadata
+    if not isinstance(metadata, dict):
+        return "params.metadata must be an object"
+
+    requested = metadata.get(_SOURCE_TYPE_KEY)
+    if requested is not None and requested not in TRIGGER_ALLOWED_SOURCE_TYPES:
+        return (
+            f"source_type {requested!r} is not permitted for a trigger plugin "
+            f"(allowed: {sorted(TRIGGER_ALLOWED_SOURCE_TYPES)})"
+        )
+    metadata[_SOURCE_TYPE_KEY] = (
+        requested if requested in TRIGGER_ALLOWED_SOURCE_TYPES else TRIGGER_DEFAULT_SOURCE_TYPE
+    )
+    metadata[_SOURCE_KEY] = plugin_id
+    return None
+
+
+# Provenance stamper per lane kind. The socket/auth/body machinery in
+# RuntimeStampedChannelProvenance is identical across kinds; only the stamp
+# differs.
+_STAMP_BY_KIND = {
+    "channel": _stamp_source,
+    "trigger": _stamp_trigger_source,
+}
+
+
 async def _jsonrpc_error(
     send,
     *,
@@ -317,6 +403,7 @@ class ChannelEventSocketManager:
         self._tasks: dict[str, asyncio.Task] = {}
         self._paths: dict[str, Path] = {}
         self._tokens: dict[str, str] = {}
+        self._kinds: dict[str, str] = {}  # plugin_id -> lane kind (channel|trigger)
         self._started = False
 
     async def start(self) -> bool:
@@ -338,7 +425,8 @@ class ChannelEventSocketManager:
                 path = socket_dir / _socket_name(plugin_id)
                 self._prepare_socket_path(path)
                 wrapped_app = RuntimeStampedChannelProvenance(
-                    self.app, plugin_id, token
+                    self.app, plugin_id, token,
+                    stamp=_STAMP_BY_KIND[self._kinds.get(plugin_id, "channel")],
                 )
                 config = uvicorn.Config(
                     wrapped_app,
@@ -363,12 +451,12 @@ class ChannelEventSocketManager:
             self._inject_daemon_env()
             self._started = True
             logger.info(
-                "channel events: %d private A2A socket(s) ready for %d channel daemon(s)",
+                "channel events: %d private A2A socket(s) ready for %d lane daemon(s) "
+                "(%d channel, %d trigger)",
                 len(self._paths),
-                sum(
-                    str(getattr(spec, "kind", "") or "").strip() == "channel"
-                    for spec in self.specs
-                ),
+                len(self._paths),
+                sum(1 for k in self._kinds.values() if k == "channel"),
+                sum(1 for k in self._kinds.values() if k == "trigger"),
             )
             return True
         except BaseException:
@@ -387,18 +475,24 @@ class ChannelEventSocketManager:
         self._started = False
 
     def clear_daemon_env(self) -> None:
-        """Remove reserved capability variables after a bind failure."""
+        """Remove reserved capability variables (both lanes) after a bind failure."""
+        reserved = (
+            CHANNEL_API_VERSION_ENV, CHANNEL_A2A_SOCKET_ENV,
+            CHANNEL_A2A_TOKEN_ENV, CHANNEL_PLUGIN_ID_ENV,
+            TRIGGER_API_VERSION_ENV, TRIGGER_A2A_SOCKET_ENV,
+            TRIGGER_A2A_TOKEN_ENV, TRIGGER_PLUGIN_ID_ENV,
+        )
         for spec in self.specs:
-            spec.env.pop(CHANNEL_API_VERSION_ENV, None)
-            spec.env.pop(CHANNEL_A2A_SOCKET_ENV, None)
-            spec.env.pop(CHANNEL_A2A_TOKEN_ENV, None)
-            spec.env.pop(CHANNEL_PLUGIN_ID_ENV, None)
+            for var in reserved:
+                spec.env.pop(var, None)
 
     def _plugin_ids(self) -> list[str]:
         identities: list[str] = []
         seen: set[str] = set()
+        self._kinds = {}
         for spec in self.specs:
-            if str(getattr(spec, "kind", "") or "").strip() != "channel":
+            kind = str(getattr(spec, "kind", "") or "").strip()
+            if kind not in _LANE_KINDS:
                 continue
             identity = str(getattr(spec, "plugin", "") or "").strip()
             if not identity:
@@ -411,6 +505,7 @@ class ChannelEventSocketManager:
             if identity not in seen:
                 identities.append(identity)
                 seen.add(identity)
+                self._kinds[identity] = kind
         return identities
 
     def _prepare_socket_dir(self) -> Path:
@@ -492,18 +587,36 @@ class ChannelEventSocketManager:
 
     def _inject_daemon_env(self) -> None:
         for spec in self.specs:
-            if str(getattr(spec, "kind", "") or "").strip() != "channel":
+            kind = str(getattr(spec, "kind", "") or "").strip()
+            if kind not in _LANE_KINDS:
                 continue
             plugin_id = str(getattr(spec, "plugin", "") or "").strip()
             path = self._paths.get(plugin_id)
             token = self._tokens.get(plugin_id)
             if path is None or token is None:
                 continue
-            # Reserved runtime values overwrite manifest env claims.
-            spec.env[CHANNEL_API_VERSION_ENV] = CHANNEL_API_VERSION
-            spec.env[CHANNEL_A2A_SOCKET_ENV] = str(path)
-            spec.env[CHANNEL_A2A_TOKEN_ENV] = token
-            spec.env[CHANNEL_PLUGIN_ID_ENV] = plugin_id
+            # Reserved runtime values overwrite manifest env claims. Each lane
+            # kind gets its own env-var names so a channel and a trigger daemon
+            # never see each other's socket/token.
+            if kind == "trigger":
+                spec.env[TRIGGER_API_VERSION_ENV] = CHANNEL_API_VERSION
+                spec.env[TRIGGER_A2A_SOCKET_ENV] = str(path)
+                spec.env[TRIGGER_A2A_TOKEN_ENV] = token
+                spec.env[TRIGGER_PLUGIN_ID_ENV] = plugin_id
+                # Point the daemon at the SAME durable state dir the runtime
+                # schedule API resolves, so the API writes the grid this daemon
+                # reads and reads the health/history it writes.
+                from molecule_runtime.trigger_state import (
+                    STATE_DIR_ENV as _TRIGGER_STATE_DIR_ENV,
+                    resolve_trigger_state_dir,
+                )
+
+                spec.env[_TRIGGER_STATE_DIR_ENV] = str(resolve_trigger_state_dir())
+            else:
+                spec.env[CHANNEL_API_VERSION_ENV] = CHANNEL_API_VERSION
+                spec.env[CHANNEL_A2A_SOCKET_ENV] = str(path)
+                spec.env[CHANNEL_A2A_TOKEN_ENV] = token
+                spec.env[CHANNEL_PLUGIN_ID_ENV] = plugin_id
 
     async def _shutdown_servers(self) -> None:
         for server in self._servers.values():
