@@ -500,3 +500,26 @@ def test_recorded_components_cover_all_real_sections(tmp_path):
     labels = [c["label"] for c in comps]
     for lbl in ("memory_snapshots", "skills", "delegation_failures"):
         assert lbl in labels, f"missing component label {lbl}; got {labels}"
+
+
+def test_memory_snapshot_named_in_prompt_files_labeled_memory_not_role(tmp_path):
+    """A MEMORY.md/USER.md listed directly in prompt_files must be traced under
+    'memory_snapshots', not 'role_prompt_files' — otherwise /traces misattributes
+    durable memory to the role prompt. (Regression: PR #313 follow-up.)"""
+    from molecule_runtime import prompt as rt_prompt
+
+    (tmp_path / "system-prompt.md").write_text("You are the Org Concierge.")
+    (tmp_path / "MEMORY.md").write_text("- MEM_NAMED_SENTINEL: prefer lean increments.")
+    full = rt_prompt.build_system_prompt(
+        config_path=str(tmp_path), workspace_id="ws-memnamed",
+        loaded_skills=[], peers=[],
+        prompt_files=["system-prompt.md", "MEMORY.md"],  # MEMORY.md NAMED here
+    )
+    comps = tracing._system_components.get("ws-memnamed", [])
+    mem_text = "\n".join(c["text"] for c in comps if c["label"] == "memory_snapshots")
+    role_text = "\n".join(c["text"] for c in comps if c["label"] == "role_prompt_files")
+    assert "MEM_NAMED_SENTINEL" in full, "fixture wrong"
+    assert "MEM_NAMED_SENTINEL" in mem_text, "named MEMORY.md not traced under memory_snapshots"
+    assert "MEM_NAMED_SENTINEL" not in role_text, "named MEMORY.md mislabeled as role_prompt_files"
+    # role file is still its own labeled component
+    assert "Org Concierge" in role_text
