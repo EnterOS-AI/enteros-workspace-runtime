@@ -180,7 +180,32 @@ def build_system_prompt(
     # runtime or template. The shared "you are a Molecule AI platform workspace"
     # frame; the prompt_files below layer the specific role on top of it, never
     # replace it. Single-sourced as BASE_PLATFORM_PROMPT.
-    parts.append(BASE_PLATFORM_PROMPT)
+    # ── Single-derivation prompt assembly (SSOT) ─────────────────────────────
+    # Each labeled segment is appended to ``parts`` (the flattened system prompt
+    # the LLM receives) AND recorded as a Langfuse trace component in ONE place,
+    # via ``_seg``. This makes the decomposed ``generation.input`` view provably
+    # COMPLETE and drift-proof: it can never omit — or diverge from — content
+    # that is in the real prompt. (Previously a SECOND, deliberately
+    # "self-contained" re-derivation at the end of this function re-read the
+    # sources independently and silently dropped the capabilities preamble, the
+    # MEMORY.md/USER.md snapshots, the delegation-failures block, and full skill
+    # instructions, so the traced prompt misrepresented what the model saw.)
+    _components: list[dict] = []
+
+    def _seg(_label, *_texts):
+        # Extend ``parts`` with the EXACT same strings the old inline appends
+        # produced (so the flattened prompt stays byte-identical) and record
+        # them as one labeled component. Fail-open — recording must never break
+        # prompt construction.
+        parts.extend(_texts)
+        try:
+            _joined = "\n".join(_texts).strip()
+            if _joined:
+                _components.append({"label": _label, "text": _joined})
+        except Exception:
+            pass
+
+    _seg("base_platform_identity", BASE_PLATFORM_PROMPT)
 
     # Orchestrator-only guardrail — platform/concierge agents ONLY. Injected
     # high (right after the base identity, ahead of platform instructions and
@@ -189,13 +214,12 @@ def build_system_prompt(
     # still gagged from self-executing. Normal worker workspaces pass
     # platform_guardrail=False and keep doing real work — never gag them.
     if platform_guardrail:
-        parts.append(ORCHESTRATOR_ONLY_GUARDRAIL)
+        _seg("orchestrator_guardrail", ORCHESTRATOR_ONLY_GUARDRAIL)
 
     # Platform instructions (global → team → workspace scope) go next so
     # they take highest precedence among the operational instructions.
     if platform_instructions:
-        parts.append("# Platform Instructions\n")
-        parts.append(platform_instructions)
+        _seg("platform_instructions", "# Platform Instructions\n", platform_instructions)
 
     # Platform Capabilities preamble (#2332): tight inventory of every
     # native tool agents have access to, generated from the registry.
@@ -206,7 +230,7 @@ def build_system_prompt(
     # sections are the manual ("here's when and how").
     capabilities = get_capabilities_preamble(mcp=a2a_mcp)
     if capabilities:
-        parts.append(capabilities)
+        _seg("platform_capabilities", capabilities)
 
     # Load prompt files in order
     files_to_load = list(prompt_files or [])
@@ -224,6 +248,7 @@ def build_system_prompt(
     # /configs copy") holds no matter WHERE a memory-snapshot file is referenced.
     memory_source = mailbox_dir.memory_dir() if mailbox_dir.kernel_enabled() else Path(config_path)
 
+    _role_parts = []
     for filename in files_to_load:
         # MUST-FIX (RC #203, SSOT): a memory-snapshot file NAMED in prompt_files
         # must resolve to its DURABLE mailbox copy when the kernel is on and that
@@ -241,9 +266,14 @@ def build_system_prompt(
         if file_path.exists():
             content = file_path.read_text().strip()
             if content:
-                parts.append(content)
+                _role_parts.append(content)
         else:
             print(f"Warning: prompt file not found: {file_path}")
+    # Trace the role component from the ACTUALLY-loaded content (honoring the
+    # mailbox redirect above) — not a second independent re-read of config_path,
+    # which could show Langfuse a prompt the model never received.
+    if _role_parts:
+        _seg("role_prompt_files", *_role_parts)
 
     # Hermes-style memory snapshot files: load automatically when present.
     # These stay as thin markdown files so the runtime does not need a new
@@ -261,6 +291,7 @@ def build_system_prompt(
     # SSOT holds whether or not the file is named in prompt_files.
     # Kernel OFF => read from config_path exactly as before (byte-identical).
     # ``memory_source`` was resolved above (shared with the prompt_files loop).
+    _mem_parts = []
     for filename in DEFAULT_MEMORY_SNAPSHOT_FILES:
         if filename in seen_files:
             continue
@@ -280,31 +311,39 @@ def build_system_prompt(
         if file_path.exists():
             content = file_path.read_text().strip()
             if content:
-                parts.append(content)
+                _mem_parts.append(content)
+    # Durable memory snapshots (MEMORY.md/USER.md) are part of what the model
+    # sees — trace them so Langfuse does not misleadingly omit accumulated memory.
+    if _mem_parts:
+        _seg("memory_snapshots", *_mem_parts)
 
     # Inject plugin rules (always-on guidelines from ECC, Superpowers, etc.)
     if plugin_rules:
-        parts.append("\n## Platform Rules\n")
+        _rule_parts = ["\n## Platform Rules\n"]
         for rule in plugin_rules:
-            parts.append(rule)
-            parts.append("")
+            _rule_parts.append(rule)
+            _rule_parts.append("")
+        _seg("plugin_rules", *_rule_parts)
 
     # Inject plugin prompt fragments
     if plugin_prompts:
-        parts.append("\n## Platform Guidelines\n")
+        _guideline_parts = ["\n## Platform Guidelines\n"]
         for fragment in plugin_prompts:
-            parts.append(fragment)
-            parts.append("")
+            _guideline_parts.append(fragment)
+            _guideline_parts.append("")
+        _seg("plugin_guidelines", *_guideline_parts)
 
-    # Add skill instructions
+    # Add skill instructions — trace the FULL section (names + descriptions +
+    # instructions), the same text the model receives, not a names-only summary.
     if loaded_skills:
-        parts.append("\n## Your Skills\n")
+        _skill_parts = ["\n## Your Skills\n"]
         for skill in loaded_skills:
-            parts.append(f"### {skill.metadata.name}")
+            _skill_parts.append(f"### {skill.metadata.name}")
             if skill.metadata.description:
-                parts.append(skill.metadata.description)
-            parts.append(skill.instructions)
-            parts.append("")
+                _skill_parts.append(skill.metadata.description)
+            _skill_parts.append(skill.instructions)
+            _skill_parts.append("")
+        _seg("skills", *_skill_parts)
 
     # Platform tool instructions: A2A (inter-agent communication) and HMA
     # (persistent memory). These document how to call delegate_task,
@@ -317,16 +356,16 @@ def build_system_prompt(
     # codex). a2a_mcp=False: CLI subprocess variant (custom
     # runtimes that don't speak MCP). Default True matches the
     # MCP-capable majority; CLI-only adapters override at the call site.
-    parts.append(get_a2a_instructions(mcp=a2a_mcp))
-    parts.append(get_hma_instructions())
+    _seg("a2a_instructions", get_a2a_instructions(mcp=a2a_mcp))
+    _seg("hma_instructions", get_hma_instructions())
 
     # Add peer capabilities with a single shared renderer.
     peer_section = build_peer_section(peers)
     if peer_section:
-        parts.append(peer_section)
+        _seg("peers", peer_section)
 
     # Add delegation failure handling
-    parts.append("""
+    _seg("delegation_failures", """
 ## Handling delegation failures
 If a delegation fails:
 1. Check if the task is blocking — if not, continue other work
@@ -337,47 +376,10 @@ If a delegation fails:
 
     prompt = "\n".join(parts)
 
-    # SSOT trace producer: record the consolidated prompt + its labeled
-    # constituent pieces so a turn's Langfuse generation shows WHAT consolidated
-    # into the system payload. Self-contained (re-references sources; no coupling
-    # to the parts assembly above). Fail-open.
-    _components = []
-
-    def _c(_l, _t):
-        if _t and str(_t).strip():
-            _components.append({"label": _l, "text": str(_t)})
-
-    _c("base_platform_identity", BASE_PLATFORM_PROMPT)
-    if platform_guardrail:
-        _c("orchestrator_guardrail", ORCHESTRATOR_ONLY_GUARDRAIL)
-    _c("platform_instructions", platform_instructions)
-    try:
-        _role = []
-        for _f in (prompt_files or ["system-prompt.md"]):
-            _fp = Path(config_path) / _f
-            if _fp.exists():
-                _role.append(_fp.read_text().strip())
-        _c("role_prompt_files", "\n".join(_role))
-    except Exception:
-        pass
-    _c("plugin_rules", "\n".join(plugin_rules or []))
-    _c("plugin_guidelines", "\n".join(plugin_prompts or []))
-    try:
-        _c("skills", ", ".join(_s.metadata.name for _s in (loaded_skills or [])))
-    except Exception:
-        pass
-    try:
-        _c("a2a_instructions", get_a2a_instructions(mcp=a2a_mcp))
-    except Exception:
-        pass
-    try:
-        _c("hma_instructions", get_hma_instructions())
-    except Exception:
-        pass
-    try:
-        _c("peers", build_peer_section(peers))
-    except Exception:
-        pass
+    # SSOT trace producer: record the consolidated prompt + its COMPLETE labeled
+    # decomposition (``_components``, built inline above from the SAME segments
+    # appended to ``parts`` — a single source of truth, so the traced view can
+    # never drift from or drop content in the real prompt). Fail-open.
     try:
         from molecule_runtime import tracing as _tracing
 
