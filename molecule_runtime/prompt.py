@@ -248,7 +248,25 @@ def build_system_prompt(
     # /configs copy") holds no matter WHERE a memory-snapshot file is referenced.
     memory_source = mailbox_dir.memory_dir() if mailbox_dir.kernel_enabled() else Path(config_path)
 
-    _role_parts = []
+    # Trace each loaded prompt file under its TRUE category: a memory-snapshot
+    # file (MEMORY.md/USER.md) NAMED in prompt_files is durable memory and must
+    # be labeled ``memory_snapshots``, not ``role_prompt_files`` — otherwise an
+    # operator auditing injected memory in /traces would misattribute it to the
+    # role prompt. We flush contiguous same-category RUNS (not per-file), so the
+    # common case (all role files, or role files then memory files) stays a
+    # single component per category, while any interleaving is still labeled
+    # correctly. Every content string is still appended to ``parts`` in file
+    # order, so the flattened prompt is byte-identical.
+    _run_parts: list = []
+    _run_label = None
+
+    def _flush_run():
+        nonlocal _run_parts, _run_label
+        if _run_parts:
+            _seg(_run_label, *_run_parts)
+            _run_parts = []
+            _run_label = None
+
     for filename in files_to_load:
         # MUST-FIX (RC #203, SSOT): a memory-snapshot file NAMED in prompt_files
         # must resolve to its DURABLE mailbox copy when the kernel is on and that
@@ -258,22 +276,23 @@ def build_system_prompt(
         # and only when a mailbox copy is present; every other prompt file keeps
         # its /configs source. Kernel OFF => memory_source IS config_path, so
         # this is byte-identical.
+        is_mem = filename in DEFAULT_MEMORY_SNAPSHOT_FILES
         file_path = Path(config_path) / filename
-        if filename in DEFAULT_MEMORY_SNAPSHOT_FILES:
+        if is_mem:
             mailbox_copy = memory_source / filename
             if mailbox_copy.exists():
                 file_path = mailbox_copy
         if file_path.exists():
             content = file_path.read_text().strip()
             if content:
-                _role_parts.append(content)
+                label = "memory_snapshots" if is_mem else "role_prompt_files"
+                if _run_parts and label != _run_label:
+                    _flush_run()
+                _run_label = label
+                _run_parts.append(content)
         else:
             print(f"Warning: prompt file not found: {file_path}")
-    # Trace the role component from the ACTUALLY-loaded content (honoring the
-    # mailbox redirect above) — not a second independent re-read of config_path,
-    # which could show Langfuse a prompt the model never received.
-    if _role_parts:
-        _seg("role_prompt_files", *_role_parts)
+    _flush_run()
 
     # Hermes-style memory snapshot files: load automatically when present.
     # These stay as thin markdown files so the runtime does not need a new
