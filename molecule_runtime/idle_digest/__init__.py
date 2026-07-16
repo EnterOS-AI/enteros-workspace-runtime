@@ -53,6 +53,12 @@ from .contract import (
     Urgency,
 )
 from .provider import DigestProvider, GatherResult, ProviderRunner
+from .plugin_loader import (
+    DigestProviderContext,
+    digest_provider_plugins_enabled,
+    load_digest_provider_plugins,
+    native_plugin_names_from_env,
+)
 
 __all__ = [
     "CONTRACT_SCHEMA_VERSION",
@@ -64,8 +70,12 @@ __all__ = [
     "Contribution",
     "ContributionError",
     "DigestProvider",
+    "DigestProviderContext",
     "FIRED",
     "IdleDigestController",
+    "digest_provider_plugins_enabled",
+    "load_digest_provider_plugins",
+    "native_plugin_names_from_env",
     "SKIPPED",
     "SLEEP",
     "UNCHANGED",

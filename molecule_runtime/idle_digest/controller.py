@@ -205,6 +205,7 @@ def build_default_providers(
     platform_url: str = "",
     workspace_id: str = "",
     comms_source=None,
+    loaded_plugins=None,
 ) -> list[DigestProvider]:
     """The official provider roster, in tier order. The boot seam calls this,
     runs the goal-state first-boot migration + env bootstrap, then hands the
@@ -218,6 +219,15 @@ def build_default_providers(
     when the communication layer moves behind the plugin boundary, the plugin
     hands its source in via ``comms_source`` and this function stays the one
     line that changes.
+
+    PLUGIN DISCOVERY (D1, RFC molecule-core#4413): when
+    ``MOLECULE_DIGEST_PROVIDER_PLUGINS`` is enabled, providers contributed by
+    installed plugins (plugin-manifest ``contributes.digestProviders``) are
+    discovered and appended. Flag-off (default) is byte-identical to the
+    hardcoded roster below. The assembler sorts by contribution tier, so
+    append order does not affect render order. ``loaded_plugins`` is the
+    already-scanned :class:`~molecule_runtime.plugins.LoadedPlugins`; when the
+    caller does not have it, discovery lazily re-scans.
     """
     from .providers import (
         GoalStateProvider,
@@ -249,6 +259,41 @@ def build_default_providers(
         providers.append(SentMailProvider(source=source))
         providers.append(InboundMailProvider(source=source))
     providers.append(GoalStateProvider())
+
+    # D1: append plugin-contributed providers (flag-gated; default off = byte-identical).
+    from .plugin_loader import digest_provider_plugins_enabled
+
+    if digest_provider_plugins_enabled():
+        try:
+            from .plugin_loader import (
+                DigestProviderContext,
+                load_digest_provider_plugins,
+                native_plugin_names_from_env,
+            )
+
+            plugins = loaded_plugins
+            if plugins is None:
+                from ..plugins import load_plugins
+
+                plugins = load_plugins()
+            ctx = DigestProviderContext(
+                config_path=config_path,
+                prompt_files=tuple(prompt_files),
+                workspace_name=workspace_name,
+                runtime_kind=runtime_kind,
+                comms_source=source,
+                platform_url=platform_url,
+                workspace_id=workspace_id,
+            )
+            providers.extend(
+                load_digest_provider_plugins(
+                    plugins, ctx, native_plugin_names=native_plugin_names_from_env()
+                )
+            )
+        except Exception as exc:  # discovery must never break the baked roster
+            logger.warning(
+                "digest-provider: plugin discovery failed, using baked roster only: %s", exc
+            )
     return providers
 
 
