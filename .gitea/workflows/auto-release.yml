@@ -211,6 +211,23 @@ jobs:
           echo "RELEASE_BOT_TOKEN=$RUNTIME_BOT_TOKEN" >> "$GITHUB_ENV"
           echo "RUNTIME_BOT_TOKEN loaded from Infisical /shared/runtime-bot (non-empty, len=${#RUNTIME_BOT_TOKEN})"
 
+          # LIVENESS (fail-closed): a NON-EMPTY token is not proof of a VALID one.
+          # A deactivated/rotated release bot yields a stale-but-present secret that
+          # passes the emptiness check above yet 401s on the first authenticated API
+          # call — surfacing as an opaque "list tags failed HTTP 401" deep inside
+          # auto_release_runtime.py, with the release chain stalling silently (root
+          # cause of the freeze at runtime-v0.4.6; issue #311). Probe the EXACT
+          # capability the release needs — list tags on this repo — and fail HERE,
+          # loudly, with a remediation pointer, if the token cannot authenticate.
+          PROBE=$(curl -s -o /dev/null -w '%{http_code}' \
+            "$GITEA_URL/api/v1/repos/${GITHUB_REPOSITORY}/tags?limit=1" \
+            -H "Authorization: token $RUNTIME_BOT_TOKEN")
+          if [ "$PROBE" != "200" ]; then
+            echo "::error::RUNTIME_BOT_TOKEN failed its liveness probe (GET /repos/${GITHUB_REPOSITORY}/tags -> HTTP $PROBE). The token is present but does NOT authenticate — the release bot is likely deactivated, or the token was rotated/revoked. Refresh RUNTIME_BOT_TOKEN at Infisical /shared/runtime-bot (prod) with a valid write:repository token for molecule-runtime-release-bot. See issue #311." >&2
+            exit 1
+          fi
+          echo "RUNTIME_BOT_TOKEN liveness probe OK (list-tags HTTP 200)"
+
       - name: Compute next version + cut tag at gated commit
         env:
           # molecule-runtime-release-bot identity with write on this repo, now
