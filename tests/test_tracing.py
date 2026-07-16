@@ -414,3 +414,89 @@ def test_session_id_flows_to_trace(monkeypatch):
     asyncio.run(wrapped.execute(_CtxSess("hi", "conv-abc"), _Queue()))
     assert tracing._drain(), "off-loop trace worker did not finish"
     assert calls["trace"][0]["session_id"] == "conv-abc"
+
+
+# --- Prompt-consolidation COMPLETENESS (regression: runtime tracing gap) -----
+#
+# build_system_prompt previously recorded the Langfuse decomposition via a
+# SECOND, self-contained re-derivation that silently OMITTED the capabilities
+# preamble, MEMORY.md/USER.md snapshots, the delegation-failures block, and full
+# skill instructions (it recorded skill NAMES only). The traced generation.input
+# therefore misrepresented the prompt the model actually received. These tests
+# pin the property that the recorded components are COMPLETE (cover the real
+# prompt) and FAITHFUL (never contain content that isn't in the prompt). They
+# FAIL against the old parallel-derivation code — the negative control.
+
+def _write_cfg(tmp_path):
+    (tmp_path / "system-prompt.md").write_text(
+        "You are the Org Concierge. Ground decisions in live platform state."
+    )
+    (tmp_path / "MEMORY.md").write_text("- MEMORY_SENTINEL: prefer the leanest increment.")
+    (tmp_path / "USER.md").write_text("# User\nUSER_SENTINEL: founder is CTO.")
+    return str(tmp_path)
+
+
+def _build_full_prompt(config_path, workspace_id="ws-complete"):
+    from molecule_runtime import prompt as rt_prompt
+    from molecule_runtime.skill_loader.loader import LoadedSkill, SkillMetadata
+
+    def sk(name):
+        return LoadedSkill(
+            metadata=SkillMetadata(id=name, name=name, description=name + " skill"),
+            instructions=f"SKILL_INSTRUCTIONS_SENTINEL for {name}.",
+        )
+
+    return rt_prompt.build_system_prompt(
+        config_path=config_path,
+        workspace_id=workspace_id,
+        loaded_skills=[sk("git-ops"), sk("web-research")],
+        peers=[{"name": "ops-agent", "workspace_id": "ws-ops", "status": "idle"}],
+        prompt_files=["system-prompt.md"],
+        plugin_rules=["PLUGIN_RULE_SENTINEL: never push to main."],
+        plugin_prompts=["PLUGIN_GUIDELINE_SENTINEL: lean increments."],
+        platform_instructions="PLATFORM_INSTRUCTIONS_SENTINEL: 5 workspaces.",
+        a2a_mcp=True,
+        platform_guardrail=True,
+    )
+
+
+def test_recorded_components_are_faithful_no_fabrication(tmp_path):
+    cfg = _write_cfg(tmp_path)
+    full = _build_full_prompt(cfg, "ws-faithful")
+    comps = tracing._system_components.get("ws-faithful", [])
+    assert comps, "no components recorded"
+    # Every recorded component's text must be present verbatim in the prompt the
+    # model actually received — Langfuse must never show content the LLM didn't see.
+    for c in comps:
+        assert c["text"] in full, f"component {c['label']!r} not a substring of the real prompt"
+
+
+def test_recorded_components_cover_all_real_sections(tmp_path):
+    cfg = _write_cfg(tmp_path)
+    full = _build_full_prompt(cfg, "ws-complete")
+    comps = tracing._system_components.get("ws-complete", [])
+    joined = "\n".join(c["text"] for c in comps)
+
+    # Each of these sentinels is in the real prompt; the decomposition must carry
+    # it too. The four memory/skill/delegation/plugin sentinels are exactly what
+    # the old parallel derivation dropped (memory snapshots, full skill
+    # instructions) or never labeled (delegation block).
+    for sentinel in (
+        "MEMORY_SENTINEL",
+        "USER_SENTINEL",
+        "SKILL_INSTRUCTIONS_SENTINEL",
+        "PLATFORM_INSTRUCTIONS_SENTINEL",
+        "PLUGIN_RULE_SENTINEL",
+        "PLUGIN_GUIDELINE_SENTINEL",
+    ):
+        assert sentinel in full, f"test fixture wrong: {sentinel} not in prompt"
+        assert sentinel in joined, (
+            f"{sentinel} is in the real prompt but MISSING from the traced "
+            f"decomposition — Langfuse would misrepresent the consolidation"
+        )
+    # The delegation-failures block is unconditional; it must be labeled too.
+    assert "Handling delegation failures" in joined
+    # New complete label set includes the sections the old code dropped.
+    labels = [c["label"] for c in comps]
+    for lbl in ("memory_snapshots", "skills", "delegation_failures"):
+        assert lbl in labels, f"missing component label {lbl}; got {labels}"
