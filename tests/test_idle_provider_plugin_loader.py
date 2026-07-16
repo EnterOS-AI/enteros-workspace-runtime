@@ -20,7 +20,9 @@ from molecule_runtime.idle_digest import (
     build_default_providers,
     digest_provider_plugins_enabled,
     load_digest_provider_plugins,
+    native_plugin_names,
     native_plugin_names_from_env,
+    native_plugin_names_from_registry,
 )
 from molecule_runtime.idle_digest.plugin_loader import FLAG_ENV, NATIVE_NAMES_ENV
 from molecule_runtime.idle_digest.providers.mail import MailSummary, SentMailProvider
@@ -305,3 +307,64 @@ def test_build_default_providers_flag_on_appends(tmp_path, monkeypatch):
     ids = [p.provider_id for p in providers]
     assert "vendor-notes" in ids
     assert len(providers) == _baseline_len() + 1
+
+
+# --- native allow-list sourced from the vendored registry (D-trust) ---------
+
+
+def test_native_plugin_names_from_registry_are_install_names(monkeypatch):
+    """The registry-sourced native set is derived from each entry's SOURCE (the
+    on-disk install name), NOT its `name` field. The four digest plugin repos
+    must be present (the trust gate governs digest providers), and the scheduler
+    resolves to its REPO name `molecule-ai-plugin-scheduler` — proving we key on
+    the source, since its registry `name` is the different `molecule-scheduler`."""
+    monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
+    names = native_plugin_names_from_registry()
+    for repo in (
+        "molecule-ai-plugin-digest-mail",
+        "molecule-ai-plugin-digest-identity",
+        "molecule-ai-plugin-digest-task-queue",
+        "molecule-ai-plugin-digest-goal",
+    ):
+        assert repo in names, f"{repo} missing from registry native set: {sorted(names)}"
+    # The scheduler is present under its INSTALL name (the repo), never the
+    # registry `name` field — the whole reason we parse the source.
+    assert "molecule-ai-plugin-scheduler" in names
+    assert "molecule-scheduler" not in names
+
+
+def test_native_plugin_names_unions_registry_and_env(monkeypatch):
+    """native_plugin_names() = vendored registry (SSOT) UNION the env escape-hatch.
+    The env can only EXTEND the trusted set, never remove a registry entry."""
+    monkeypatch.setenv(NATIVE_NAMES_ENV, "self-host-private-plugin, another")
+    combined = native_plugin_names()
+    reg = native_plugin_names_from_registry()
+    assert reg <= combined  # registry entries always trusted
+    assert "self-host-private-plugin" in combined  # env extends
+    assert "another" in combined
+
+
+def test_trust_gate_uses_registry_source_endtoend(tmp_path, monkeypatch):
+    """End-to-end with the REAL vendored registry (no injected set, no env): a
+    plugin installed under a registry repo name loads its official/reserved
+    provider, while the identical provider from a non-registry plugin is refused."""
+    monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
+    ctx = DigestProviderContext(comms_source=FakeSource())
+
+    native = _make_plugin(
+        tmp_path, "molecule-ai-plugin-digest-mail", MAIL_SHIM,
+        [{"provider_id": "sent-folder", "entrypoint": "prov:get_provider"}],
+    )
+    got = load_digest_provider_plugins(
+        _loaded(native), ctx, native_plugin_names=native_plugin_names()
+    )
+    assert [p.provider_id for p in got] == ["sent-folder"]
+
+    impostor = _make_plugin(
+        tmp_path, "totally-not-a-native-plugin", MAIL_SHIM,
+        [{"provider_id": "sent-folder", "entrypoint": "prov:get_provider"}],
+    )
+    refused = load_digest_provider_plugins(
+        _loaded(impostor), ctx, native_plugin_names=native_plugin_names()
+    )
+    assert refused == [], "a non-registry plugin must not load a reserved provider"

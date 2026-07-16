@@ -268,7 +268,7 @@ def build_default_providers(
             from .plugin_loader import (
                 DigestProviderContext,
                 load_digest_provider_plugins,
-                native_plugin_names_from_env,
+                native_plugin_names,
             )
 
             plugins = loaded_plugins
@@ -287,7 +287,7 @@ def build_default_providers(
             )
             providers.extend(
                 load_digest_provider_plugins(
-                    plugins, ctx, native_plugin_names=native_plugin_names_from_env()
+                    plugins, ctx, native_plugin_names=native_plugin_names()
                 )
             )
         except Exception as exc:  # discovery must never break the baked roster

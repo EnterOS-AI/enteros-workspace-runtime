@@ -39,7 +39,7 @@
     },
     "kind": {
       "type": "string",
-      "description": "Optional v1 plugin kind discriminator from plugin.yaml (e.g. `env-mutator` for the Go env-mutator class — gh-identity). Absent for skill/hook-class plugins. Open string (not enum) so new kinds are additive."
+      "description": "Optional v1 plugin kind discriminator from plugin.yaml (e.g. `env-mutator` for the Go env-mutator class — gh-identity; `trigger` for a scheduler-style subprocess daemon — molecule-scheduler; `mcp-server` for an mcpServers-shaped plugin — molecule-platform; `digest-provider` for an in-process idle-digest DigestProvider — see `contributes.digestProviders`, RFC molecule-core#4413). Absent for skill/hook-class plugins. Open string (not enum) so new kinds are additive."
     },
     "entrypoint": {
       "type": "string",
@@ -107,7 +107,7 @@
     "contributes": {
       "type": "object",
       "additionalProperties": true,
-      "description": "The contribution surface. KNOWN keys (skills/hooks/rules/mcpServers/commands v1; daemons per runtime#216) below are validated by shape. UNKNOWN keys (future contribution points such as `themes`, `tabs`, `canvasElements`) are explicitly TOLERATED via additionalProperties:true — adding a new contribution point MUST NOT fail validation against this schema (forward-compat). `daemons` itself landed exactly this way: the runtime shipped it as an additive point tolerated by this open object, and this schema now captures its shape descriptively.",
+      "description": "The contribution surface. KNOWN keys (skills/hooks/rules/mcpServers/commands v1; daemons per runtime#216; digestProviders per molecule-core#4413) below are validated by shape. UNKNOWN keys (future contribution points such as `themes`, `tabs`, `canvasElements`) are explicitly TOLERATED via additionalProperties:true — adding a new contribution point MUST NOT fail validation against this schema (forward-compat). `daemons` itself landed exactly this way: the runtime shipped it as an additive point tolerated by this open object, and this schema now captures its shape descriptively.",
       "properties": {
         "skills": {
           "type": "array",
@@ -148,6 +148,22 @@
           ],
           "examples": [
             [ { "name": "lark-bridge", "command": "bash", "args": ["daemon-bootstrap.sh"] } ]
+          ]
+        },
+        "digestProviders": {
+          "description": "In-process idle-digest provider contributions (ADDITIVE contribution point, RFC molecule-core#4413 digest-providers-as-native-plugins). Each entry names a DigestProvider (idle-prompt/v1 contract) the workspace runtime imports IN-PROCESS and whose `contribute()` the idle-digest assembler awaits in the runtime event loop — unlike `daemons` (a spawned subprocess) or `mcpServers` (out-of-process config-file wiring), a digest provider is live Python loaded into the runtime, which is why `kind: digest-provider` plugins are delivered native-only (native-plugins registry) and their trust is gated at LOAD time. VALIDATION SEMANTICS — deliberately UNCONSTRAINED here, mirroring the runtime and the idle-prompt failurePolicy: a malformed entry (or a non-list value) is SKIPPED with a warning at provider discovery (skip-and-degrade), never a manifest-validation failure, so a typo cannot brick the plugin at the (future fail-closed) install gate — schema-constraining this property would CHANGE runtime semantics rather than capture them, exactly as for `daemons`. TRUST — `official` and the reserved band/id are NOT taken from the manifest at face value: the idle-prompt assembler derives them (reserved_provider_ids + pinned_reserved_to=identity-capabilities; urgency_grant=operator-approved-manifest), and its check_reserved_id DISABLES a third-party provider that claims a reserved provider_id. `$defs/digestProviderContribution` documents the canonical WELL-FORMED entry emitters should produce and codegen consumers should use.",
+          "anyOf": [
+            {
+              "type": "array",
+              "items": { "$ref": "#/$defs/digestProviderContribution" },
+              "description": "The canonical, well-formed form — what emitters MUST produce. Kept as a live ref so the shape stays discoverable and $defs/digestProviderContribution is never orphaned."
+            },
+            {
+              "description": "Anything else — tolerated by design: the runtime skips non-conforming values/entries at provider discovery with a warning instead of failing manifest validation. This branch makes the anyOf always-satisfiable, which IS the contract."
+            }
+          ],
+          "examples": [
+            [ { "provider_id": "org-roster-digest", "entrypoint": "molecule_platform_digest.roster:OrgRosterDigestProvider", "base_tier": 5, "summary": "Open workspaces and pending provisions across the org." } ]
           ]
         }
       }
@@ -236,6 +252,40 @@
         "cwd": {
           "type": "string",
           "description": "Optional working directory, resolved against the plugin dir when relative (default: the plugin dir itself). The runtime never validates `cwd` — a non-string value is str()-coerced rather than rejected; a string path is the canonical form."
+        }
+      }
+    },
+    "digestProviderContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["provider_id", "entrypoint"],
+      "description": "A single contributed in-process idle-digest provider (idle-prompt/v1 DigestProvider). The workspace runtime imports `entrypoint` as a DigestProvider and the idle-digest assembler awaits its `contribute()` each idle tick, applying the idle-prompt trust/failure policy. First real consumers: the platform digest legos being extracted from the runtime's hardcoded roster (goal-state, task-queue, identity-capabilities, sent-folder, inbound-a2a) into native plugins per RFC molecule-core#4413.",
+      "properties": {
+        "provider_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "The digest provider id the idle-prompt assembler keys trust + render tier on (idle-prompt providerDecl.provider_id), and which MUST equal the loaded DigestProvider's `provider_id`. Reserved official ids (identity-capabilities, task-queue, sent-folder, inbound-a2a, delegation-results, scheduler, goal-state) survive the assembler's check_reserved_id ONLY when the loaded class is official=True AND delivered through the native-plugins registry; a third-party plugin claiming a reserved id is disabled (never rendered)."
+        },
+        "entrypoint": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "In-process import target the runtime loads as a DigestProvider, `module:ClassName` (e.g. `molecule_digest_goal.provider:GoalStateProvider`), resolved against the installed plugin dir. IN-PROCESS load (contribute() awaited in the runtime idle loop) is what distinguishes a digest provider from a subprocess `daemon` or an out-of-process `mcpServer`, and is why it is delivered as native-only code."
+        },
+        "base_tier": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional REQUESTED base render rank (idle-prompt providerDecl.base_tier; lower renders earlier within the base band). Advisory only: the assembler applies the idle-prompt trustPolicy — a third-party provider is placed at third_party_default_tier and cannot self-grant band=pinned or urgency (urgency_grant=operator-approved-manifest)."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional human-readable one-line summary of the section this provider renders (idle-prompt providerDecl.summary)."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional human-readable description of the contribution."
         }
       }
     },

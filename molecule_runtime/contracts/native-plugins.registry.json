@@ -1,0 +1,48 @@
+{
+  "$comment": "NATIVE plugins registry. SSOT for the set of platform-delivered first-party plugins and HOW each is installed. 'Native' = delivered/managed by the platform itself (as opposed to marketplace/third-party plugins a user opts into via contracts/catalog). This registry is NOT about authorship ('official') — every entry is first-party, but the load-bearing field is `install`: not all native plugins are installed everywhere (the scheduler is default-on-every-workspace; the management MCP is concierge-only). Core reads the generated molcontracts bindings and declares each plugin per its `install` policy, replacing the previously-hardcoded per-plugin Go source constants (scheduler_plugin.go SchedulerPluginSource, platform_agent.go conciergePlatformMCPSource) with this single declarative SSOT. Delivery mechanism is unchanged: name+source flow through workspace_declared_plugins -> MOLECULE_DECLARED_PLUGINS boot-install/reconcile. Mirrors contracts/adapter/official-runtimes.registry.json (the analogous SSOT for native runtimes). schema_version is const-pinned so a breaking shape change surfaces as a visible MAJOR bump.",
+  "schema_version": "1",
+  "plugins": {
+    "molecule-scheduler": {
+      "name": "molecule-scheduler",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0",
+      "kind": "trigger",
+      "install": "default",
+      "description": "Per-workspace cron scheduler (scheduler-as-trigger-plugin RFC). Runs the trigger daemon that fires self-scheduler turns from the workspace's schedule grid. Installed on every workspace so any workspace can schedule."
+    },
+    "molecule-ai-plugin-molecule-platform-mcp": {
+      "name": "molecule-ai-plugin-molecule-platform-mcp",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main",
+      "kind": "mcp",
+      "install": "concierge",
+      "description": "Management/concierge MCP — the org-admin tool surface (create_workspace, ...). Privileged: declared ONLY on the org-root kind=platform concierge workspace, never on ordinary workspaces."
+    },
+    "molecule-ai-plugin-digest-identity": {
+      "name": "molecule-ai-plugin-digest-identity",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.1.0",
+      "kind": "digest-provider",
+      "install": "default",
+      "description": "Native idle-digest identity-capabilities provider (tier 0, the pinned second-person header). Delivered to every workspace (RFC molecule-core#4413)."
+    },
+    "molecule-ai-plugin-digest-task-queue": {
+      "name": "molecule-ai-plugin-digest-task-queue",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-task-queue#v0.1.0",
+      "kind": "digest-provider",
+      "install": "default",
+      "description": "Native idle-digest task-queue provider (tier 1). The task-queue store stays runtime-owned; this plugin renders only the digest section."
+    },
+    "molecule-ai-plugin-digest-mail": {
+      "name": "molecule-ai-plugin-digest-mail",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0",
+      "kind": "digest-provider",
+      "install": "default",
+      "description": "Native idle-digest comms providers: sent-folder (tier 2) + inbound-a2a (tier 3). The comms source is bound by the runtime."
+    },
+    "molecule-ai-plugin-digest-goal": {
+      "name": "molecule-ai-plugin-digest-goal",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-goal#v0.1.0",
+      "kind": "digest-provider",
+      "install": "default",
+      "description": "Native idle-digest goal-state provider (tier 7), cadence-banded so a static goal keeps re-firing under the delta gate."
+    }
+  }
+}

@@ -57,7 +57,9 @@ from .plugin_loader import (
     DigestProviderContext,
     digest_provider_plugins_enabled,
     load_digest_provider_plugins,
+    native_plugin_names,
     native_plugin_names_from_env,
+    native_plugin_names_from_registry,
 )
 
 __all__ = [
@@ -75,7 +77,9 @@ __all__ = [
     "IdleDigestController",
     "digest_provider_plugins_enabled",
     "load_digest_provider_plugins",
+    "native_plugin_names",
     "native_plugin_names_from_env",
+    "native_plugin_names_from_registry",
     "SKIPPED",
     "SLEEP",
     "UNCHANGED",

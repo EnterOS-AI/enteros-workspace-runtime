@@ -36,6 +36,7 @@ Design invariants (mirrors ``plugin_daemons`` + the idle-prompt failurePolicy):
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -49,6 +50,12 @@ logger = logging.getLogger(__name__)
 
 FLAG_ENV = "MOLECULE_DIGEST_PROVIDER_PLUGINS"
 NATIVE_NAMES_ENV = "MOLECULE_NATIVE_PLUGIN_NAMES"
+
+# The vendored native-plugins registry (SSOT mirror of molecule-ai-sdk
+# contracts/plugin/native-plugins.registry.json — see contracts/PROVENANCE.md +
+# the check-schemas-in-sync.sh drift gate). It is the SSOT for which plugins are
+# NATIVE (platform-delivered first-party), and thus the trust source below.
+NATIVE_REGISTRY_RESOURCE = "contracts/native-plugins.registry.json"
 
 
 @dataclass(frozen=True)
@@ -77,14 +84,74 @@ def digest_provider_plugins_enabled() -> bool:
 
 
 def native_plugin_names_from_env() -> frozenset[str]:
-    """Interim source of the native (registry-delivered) plugin allow-list.
+    """Operator escape-hatch for the native allow-list (``MOLECULE_NATIVE_PLUGIN_NAMES``).
 
-    Fail-safe default: EMPTY — with no configured native set, no provider that
-    asserts ``official``/reserved may load. D2 replaces this with the vendored
-    native-plugins registry as the SSOT.
+    No longer the primary source (that is the vendored registry below); it can
+    only EXTEND the trusted set — for a self-host private native plugin, or to
+    control the set in a test. Fail-safe default: EMPTY.
     """
     raw = os.environ.get(NATIVE_NAMES_ENV, "")
     return frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+def native_plugin_names_from_registry() -> frozenset[str]:
+    """Native allow-list from the vendored native-plugins registry (the SSOT).
+
+    The trust gate matches a *loaded* plugin's install-dir basename
+    (``LoadedPlugin.name``) against this set. That basename is the plugin
+    SOURCE's on-disk name (repo segment / subpath tail), which is NOT always the
+    registry entry's ``name`` field — e.g. the scheduler's registry name is
+    ``molecule-scheduler`` but it installs from repo ``molecule-ai-plugin-scheduler``.
+    So each native name is derived by parsing the registry entry's ``source``
+    with the runtime's OWN source parser (``parse_declared_plugins``), the exact
+    logic that names an installed plugin's directory — guaranteeing the set
+    matches what ``load_plugins`` calls a plugin.
+
+    Fail-safe EMPTY on any read/parse error: a registry we cannot read trusts
+    nothing, so no ``official``/reserved provider loads (same fail-safe direction
+    as the env fallback). Read offline from the wheel via ``importlib.resources``.
+    """
+    try:
+        from importlib import resources
+
+        raw = (
+            resources.files("molecule_runtime")
+            .joinpath(NATIVE_REGISTRY_RESOURCE)
+            .read_text(encoding="utf-8")
+        )
+        plugins = json.loads(raw).get("plugins", {})
+        sources = [
+            (entry or {}).get("source", "")
+            for entry in plugins.values()
+            if isinstance(entry, dict)
+        ]
+    except Exception as exc:  # noqa: BLE001 — an unreadable registry trusts nothing
+        logger.warning(
+            "digest-provider: could not read vendored native-plugins registry "
+            "(%s); native trust set is EMPTY (no official/reserved provider will load)",
+            exc,
+        )
+        return frozenset()
+
+    try:
+        from ..plugin_sources import parse_declared_plugins
+
+        joined = ",".join(s for s in sources if isinstance(s, str) and s.strip())
+        return frozenset(p.name for p in parse_declared_plugins(joined) if p.name)
+    except Exception as exc:  # noqa: BLE001 — parse failure must not crash the digest
+        logger.warning("digest-provider: could not parse native-plugins registry sources: %s", exc)
+        return frozenset()
+
+
+def native_plugin_names() -> frozenset[str]:
+    """The effective native allow-list for the load-time trust gate.
+
+    The vendored registry is the SSOT source; ``MOLECULE_NATIVE_PLUGIN_NAMES``
+    only EXTENDS it (operator escape-hatch, same operator trust). Union, never
+    subtraction — the env can add a self-host native plugin but can never
+    un-trust a registry one.
+    """
+    return native_plugin_names_from_registry() | native_plugin_names_from_env()
 
 
 def _entry_problem(entry: object) -> Optional[str]:

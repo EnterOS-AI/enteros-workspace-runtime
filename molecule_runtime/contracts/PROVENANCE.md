@@ -199,3 +199,30 @@ Re-vendoring (schema + golden instance):
         "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/workspace-comms/agent-trace.$f.json" \
         -o "molecule_runtime/contracts/agent-trace.$f.json"
     done
+
+## native-plugins.registry.json
+
+Source: molecule-ai-sdk `contracts/plugin/native-plugins.registry.json` — the
+SSOT for the set of platform-delivered first-party ("native") plugins and how
+each installs (`install: default | concierge`). Core reads its generated
+molcontracts binding to declare each plugin (molecule-core#4413); the runtime
+reads the same registry to know which plugins are NATIVE.
+
+Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
+Source path:          contracts/plugin/native-plugins.registry.json
+Source commit:        `0093d6e5d00c79c9c6a85f25b0201164185261f7` (sdk#108 — native plugins registry SSOT)
+Vendored at sdk HEAD: `68f89520e508d6581fa522ac62b0074bd888dd96` (main)
+
+Why vendored: `molecule_runtime/idle_digest/plugin_loader.py` sources the
+D1 load-time TRUST allow-list (which plugin names may load an `official`/reserved
+digest provider in-process) from this registry's plugin names, offline via
+`importlib.resources` — replacing the interim `MOLECULE_NATIVE_PLUGIN_NAMES` env
+knob. The registry is the SSOT for "which plugins are native"; a non-native
+plugin shipping an official/reserved provider is refused at load. Drift-gated
+byte-identical to sdk main via `check-schemas-in-sync.sh`.
+
+Re-vendoring:
+
+    curl -fsS -A "curl/8.4.0" \
+      "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin/native-plugins.registry.json" \
+      -o "molecule_runtime/contracts/native-plugins.registry.json"
