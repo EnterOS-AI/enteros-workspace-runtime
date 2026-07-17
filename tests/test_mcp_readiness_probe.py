@@ -261,9 +261,11 @@ def test_probe_returns_none_on_unspawnable_command(tmp_path, monkeypatch):
 class TestProberPublishing:
     def setup_method(self):
         pai.set_loaded_mcp_tools(None)
+        pai.set_mcp_tools_ready(None)  # EV2: reset the readiness holder too
 
     def teardown_method(self):
         pai.set_loaded_mcp_tools(None)
+        pai.set_mcp_tools_ready(None)
 
     def test_run_once_publishes_loaded_tools_on_success(self):
         pr = probe.MCPReadinessProber(probe=lambda _t: [PROVISION_ID, "mcp__molecule-platform__list_workspaces"])
@@ -277,6 +279,53 @@ class TestProberPublishing:
         pr = probe.MCPReadinessProber(probe=lambda _t: None)
         assert pr.run_once() is None
         assert pai.loaded_mcp_tools() == [PROVISION_ID]
+
+    # ── EV2 mcp_tools_ready ─────────────────────────────────────────────────
+
+    def test_mcp_tools_ready_absent_before_any_probe(self):
+        # Tri-state initial: unknown (None), distinct from False. Nothing probed
+        # yet, so the heartbeat OMITS the field.
+        assert pai.mcp_tools_ready() is None
+        assert pai.first_ready_at() is None
+
+    def test_run_once_sets_mcp_tools_ready_true_on_first_success(self):
+        # EV2 POSITIVE half: the FIRST successful tools/list flips the readiness
+        # signal True (turn-independent) and stamps first_ready_at.
+        assert pai.mcp_tools_ready() is None  # absent before
+        pr = probe.MCPReadinessProber(probe=lambda _t: [PROVISION_ID])
+        pr.run_once()
+        assert pai.mcp_tools_ready() is True  # True after first list
+        first = pai.first_ready_at()
+        assert isinstance(first, str) and first.endswith("Z")
+
+    def test_mcp_tools_ready_true_even_without_provision_workspace(self):
+        # Turn-independent readiness is about the tools/list SUCCEEDING, not about
+        # which tools it returned — so a management MCP that lists tools but not
+        # provision_workspace still reports mcp_tools_ready=True (the online-flip
+        # trigger), while loaded_mcp_tools truthfully lacks provision_workspace.
+        pr = probe.MCPReadinessProber(probe=lambda _t: ["mcp__molecule-platform__list_workspaces"])
+        pr.run_once()
+        assert pai.mcp_tools_ready() is True
+        assert probe.management_provision_ready(pai.loaded_mcp_tools()) is False
+
+    def test_first_ready_at_stable_across_reprobes(self):
+        # first_ready_at is stamped ONCE and never moves, so the reported
+        # provisioning->ready latency stays stable across subsequent beats.
+        pr = probe.MCPReadinessProber(probe=lambda _t: [PROVISION_ID])
+        pr.run_once()
+        stamped = pai.first_ready_at()
+        assert stamped is not None
+        pr.run_once()  # a later successful probe
+        assert pai.first_ready_at() == stamped
+        assert pai.mcp_tools_ready() is True
+
+    def test_mcp_tools_ready_absent_on_probe_miss(self):
+        # A probe that never succeeds leaves the readiness signal unknown (None),
+        # so the heartbeat keeps OMITTING it — the row holds provisioning.
+        pr = probe.MCPReadinessProber(probe=lambda _t: None)
+        pr.run_once()
+        assert pai.mcp_tools_ready() is None
+        assert pai.first_ready_at() is None
 
     def test_run_once_publishes_truthful_absent_list(self):
         # Genuinely-missing provision_workspace is reported (not hidden), so the

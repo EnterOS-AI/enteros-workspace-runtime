@@ -10,11 +10,14 @@ from molecule_runtime.platform_agent_identity import (
     MCPSERVER_PATH,
     PLATFORM_AGENT_IMAGE_ENV,
     ensure_management_mcp_in_settings,
+    first_ready_at,
     identity_gate_payload,
     loaded_mcp_tools,
     mcp_server_present,
+    mcp_tools_ready,
     on_platform_agent_image,
     set_loaded_mcp_tools,
+    set_mcp_tools_ready,
 )
 
 
@@ -122,10 +125,15 @@ class TestMCPServerPresent:
             "molecule_runtime.platform_agent_identity.mcp_server_present",
             lambda: True,
         )
+        set_mcp_tools_ready(None)  # EV2: unknown/not-yet-probed
         payload = identity_gate_payload()
         assert payload["mcp_server_present"] is True
         # loaded_mcp_tools omitted until a live turn reports a tool list.
         assert "loaded_mcp_tools" not in payload
+        # EV2: mcp_tools_ready + first_ready_at OMITTED before the first probe
+        # success — absence reads as "unknown" (distinct from False).
+        assert "mcp_tools_ready" not in payload
+        assert "first_ready_at" not in payload
         # cp#3164: the box-level diagnostic ships in the payload.
         assert set(payload["platform_mcp_diag"]) == {
             "on_platform_agent_image",
@@ -156,6 +164,39 @@ class TestMCPServerPresent:
             assert payload["mcp_launch_failure"] == "mcp-server: exit=1 ETARGET"
         finally:
             lp.record_launch_failure(None)
+
+    def test_identity_gate_payload_emits_mcp_tools_ready_when_probed(self, monkeypatch):
+        # EV2 POSITIVE half: once the MCPReadinessProber has succeeded
+        # (mcp_tools_ready=True), the heartbeat body carries mcp_tools_ready +
+        # first_ready_at — the SDK-owned event core flips provisioning->online on.
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.mcp_server_present",
+            lambda: True,
+        )
+        try:
+            set_mcp_tools_ready(True)
+            payload = identity_gate_payload()
+            assert payload["mcp_tools_ready"] is True
+            assert payload["first_ready_at"] == first_ready_at()
+            assert payload["first_ready_at"].endswith("Z")
+        finally:
+            set_mcp_tools_ready(None)
+
+    def test_identity_gate_payload_emits_false_without_first_ready_at(self, monkeypatch):
+        # Tri-state: an explicit probed-not-ready (False) is emitted, but with NO
+        # first_ready_at (never stamped on False) — false != true, and the latency
+        # marker only exists once the tools actually loaded.
+        monkeypatch.setattr(
+            "molecule_runtime.platform_agent_identity.mcp_server_present",
+            lambda: True,
+        )
+        try:
+            set_mcp_tools_ready(False)
+            payload = identity_gate_payload()
+            assert payload["mcp_tools_ready"] is False
+            assert "first_ready_at" not in payload
+        finally:
+            set_mcp_tools_ready(None)
 
 
 @pytest.fixture

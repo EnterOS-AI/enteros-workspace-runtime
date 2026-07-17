@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import threading
+from datetime import datetime, timezone
 
 # Legacy in-container path to the platform MCP server binary baked into the
 # platform-agent image.
@@ -434,6 +435,55 @@ def loaded_mcp_tools():
         return None if _loaded_mcp_tools is None else list(_loaded_mcp_tools)
 
 
+# ── EV2 mcp_tools_ready readiness signal (SDK workspace-comms EV2) ───────────
+# The POSITIVE half of the tools-loaded heartbeat signal — runtime#273 landed the
+# NEGATIVE half (mcp_launch_failure). The MCPReadinessProber sets this True on the
+# FIRST successful ``tools/list`` — turn-INDEPENDENT (no synthetic warmup turn, and
+# independent of the per-turn loaded_mcp_tools capture), so it fires for
+# codex/hermes too. Core flips a concierge provisioning->online on the first beat
+# carrying True. Tri-state (absent != False): None = unknown / prober has not yet
+# succeeded, False = probed-not-ready, True = tools loaded. STICKY: once True it
+# stays True and ``first_ready_at`` is stamped exactly once (stable latency
+# observability across subsequent beats). Absent (None) is the initial state, so
+# the heartbeat OMITS both fields until the first success.
+_mcp_tools_ready_lock = threading.Lock()
+_mcp_tools_ready = None  # type: bool | None
+_first_ready_at = None  # type: str | None
+
+
+def set_mcp_tools_ready(ready) -> None:
+    """Record the EV2 tools-loaded readiness signal.
+
+    Called by the MCPReadinessProber on a successful ``tools/list`` (ready=True).
+    On the FIRST True, ``first_ready_at`` is stamped (RFC3339) and never
+    overwritten thereafter, so the reported provisioning->ready latency is stable
+    across beats. Passing False records probed-not-ready without stamping a
+    timestamp. Passing None clears both (resets to the initial unknown state —
+    used for test isolation, mirroring ``set_loaded_mcp_tools(None)``).
+    """
+    global _mcp_tools_ready, _first_ready_at
+    with _mcp_tools_ready_lock:
+        if ready is None:
+            _mcp_tools_ready = None
+            _first_ready_at = None
+            return
+        _mcp_tools_ready = bool(ready)
+        if ready and _first_ready_at is None:
+            _first_ready_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def mcp_tools_ready():
+    """The EV2 readiness flag: None (unknown / not yet probed), True, or False."""
+    with _mcp_tools_ready_lock:
+        return _mcp_tools_ready
+
+
+def first_ready_at():
+    """RFC3339 timestamp of the first ``tools/list`` success, or None if never."""
+    with _mcp_tools_ready_lock:
+        return _first_ready_at
+
+
 def management_mcp_diagnostic() -> dict:
     """Box-level diagnostic of WHY the management MCP is (or isn't) available.
 
@@ -495,6 +545,16 @@ def identity_gate_payload() -> dict:
     tools = loaded_mcp_tools()
     if tools is not None:
         payload["loaded_mcp_tools"] = tools
+    # EV2: the POSITIVE readiness event. Included ONLY once the MCPReadinessProber
+    # has observed a tools/list result (mcp_tools_ready is not None), so a beat
+    # before the first probe success OMITS both fields — absence reads as "unknown"
+    # (distinct from False), matching the SDK tri-state contract.
+    ready = mcp_tools_ready()
+    if ready is not None:
+        payload["mcp_tools_ready"] = ready
+        first_at = first_ready_at()
+        if first_at is not None:
+            payload["first_ready_at"] = first_at
     payload["platform_mcp_diag"] = management_mcp_diagnostic()
     try:
         from molecule_runtime.loaded_mcp_tools_probe import launch_failure_reason

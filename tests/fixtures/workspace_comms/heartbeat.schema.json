@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-comms/heartbeat.schema.json",
   "title": "Workspace-Comms /registry/heartbeat Contract",
-  "description": "SSOT JSON-Schema (draft 2020-12) for POST /registry/heartbeat — the periodic workspace->platform liveness + telemetry beat. Promoted from workspace-comms/registry-contract.md, DERIVED FROM THE WIRE AUTHORITY: molecule-core workspace-server/internal/models/workspace.go (`HeartbeatPayload` + `RuntimeMetadata`) and internal/handlers/registry.go (the Heartbeat handler's gin.H response). The instance models BOTH directions: `request` = HeartbeatPayload, `response` = the heartbeat ack. Requiredness mirrors the Go binding tags (only `workspace_id` is `binding:\"required\"`; everything else is optional — value fields default to their Go zero value, pointer/`,omitempty` fields are genuinely absentable). Two nullable tri-states are load-bearing and intentionally modeled as boolean (absent != false): `mcp_server_present` (nil=allow / false=fail-closed / true=ok) and the OMITTED-vs-empty distinction on `loaded_mcp_tools` (registry-contract.md divergence #5). The agent_card sub-shape (backfill-only) is the minimal shared one (see agent-card.schema.json), inlined under $defs/agentCard for offline validation.",
+  "description": "SSOT JSON-Schema (draft 2020-12) for POST /registry/heartbeat — the periodic workspace->platform liveness + telemetry beat. Promoted from workspace-comms/registry-contract.md, DERIVED FROM THE WIRE AUTHORITY: molecule-core workspace-server/internal/models/workspace.go (`HeartbeatPayload` + `RuntimeMetadata`) and internal/handlers/registry.go (the Heartbeat handler's gin.H response). The instance models BOTH directions: `request` = HeartbeatPayload, `response` = the heartbeat ack. Requiredness mirrors the Go binding tags (only `workspace_id` is `binding:\"required\"`; everything else is optional — value fields default to their Go zero value, pointer/`,omitempty` fields are genuinely absentable). Three nullable tri-states are load-bearing and intentionally modeled as boolean (absent != false): `mcp_server_present` (nil=allow / false=fail-closed / true=ok), `mcp_tools_ready` (EV2: nil=unknown/not-yet-probed / false=probed-not-ready / true=tools-loaded, the online-flip trigger) and the OMITTED-vs-empty distinction on `loaded_mcp_tools` (registry-contract.md divergence #5). The agent_card sub-shape (backfill-only) is the minimal shared one (see agent-card.schema.json), inlined under $defs/agentCard for offline validation.",
   "type": "object",
   "additionalProperties": false,
   "required": ["request", "response"],
@@ -66,6 +66,14 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Optional (`,omitempty`). Namespaced MCP tool ids the runtime reports as actually loaded, each of the form `mcp__<server>__<tool>`. For kind=platform, core cross-checks this against the required `mcp__molecule-platform__provision_workspace` (#3082). OMITTED is NOT the same as `[]`: on a beat with mcp_server_present=true and this field absent/nil the #3082 gate fails loud (degraded). Per registry-contract.md divergence #5."
+        },
+        "mcp_tools_ready": {
+          "type": "boolean",
+          "description": "EV2 (RFC molecule-core EV2): the POSITIVE readiness half of the tools-loaded heartbeat signal (runtime#273 landed the negative half, `launch_failure`). Set true by the runtime's MCPReadinessProber on the FIRST successful `tools/list` — turn-independent, so it fires for codex/hermes without a synthetic turn. Core flips a concierge provisioning->online on the first beat carrying true, retiring the wall-clock `fireConciergeWarmup` nudge (the 180s grace is kept as the flap absorber). Optional (`,omitempty`; *bool). TRI-STATE: ABSENT/nil = unknown (probe has not yet succeeded — distinct from false), false = probed-not-ready, true = tools loaded. Absent on every beat until the first probe success."
+        },
+        "first_ready_at": {
+          "type": "string",
+          "description": "EV2: RFC3339 timestamp of the FIRST `tools/list` success that set mcp_tools_ready=true. Optional (`,omitempty`), observability/latency only (provisioning->ready wall-clock); consumers MUST NOT gate on it. Absent until the first probe success, then stable across subsequent beats."
         }
       }
     },

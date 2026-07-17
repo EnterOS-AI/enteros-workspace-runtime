@@ -86,6 +86,7 @@ from molecule_runtime.platform_agent_identity import (
     SETTINGS_PATH,
     resolve_mcp_launch_env,
     set_loaded_mcp_tools,
+    set_mcp_tools_ready,
 )
 
 # Share the platform-agent identity logger namespace so a stuck-readiness
@@ -485,10 +486,16 @@ class MCPReadinessProber:
             return None
         if result is not None:
             set_loaded_mcp_tools(result)
+            # EV2: publish the POSITIVE readiness event on the FIRST successful
+            # tools/list. Turn-independent, so core can flip provisioning->online
+            # without the retired fireConciergeWarmup synthetic turn. set_mcp_tools_ready
+            # is sticky-once for the first_ready_at stamp, so re-publishing on later
+            # probes is harmless.
+            set_mcp_tools_ready(True)
             self._succeeded_once = True
             logger.info(
                 "mcp readiness prober: published %d management tool(s); "
-                "provision_workspace_loaded=%s",
+                "provision_workspace_loaded=%s mcp_tools_ready=True",
                 len(result), management_provision_ready(result),
             )
         return result
