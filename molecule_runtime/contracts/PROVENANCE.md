@@ -210,8 +210,15 @@ reads the same registry to know which plugins are NATIVE.
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin/native-plugins.registry.json
-Source commit:        `0093d6e5d00c79c9c6a85f25b0201164185261f7` (sdk#108 — native plugins registry SSOT)
-Vendored at sdk HEAD: `68f89520e508d6581fa522ac62b0074bd888dd96` (main)
+Source commit:        `40d58387951f74084a3f2c420a81a988ccf67c87` (sdk d3/registry-digest-v0.2.0 — bump digest plugins #v0.1.0 → #v0.2.0, D3 source-move)
+Vendored at sdk HEAD: `40d58387951f74084a3f2c420a81a988ccf67c87` (branch d3/registry-digest-v0.2.0, PENDING MERGE)
+
+GATED (D3 source-move): the SDK bump above is a HELD draft and not yet on
+sdk `main`. Re-vendored byte-for-byte from that branch (content sha256
+`bffb835fd9c4afc9390db8c24dbace453ec3cab148f571a945596bce8585a4e3`). When
+the SDK bump merges, reconcile the two SHAs above to the sdk `main` merge
+commit; the file content is unchanged so `check-schemas-in-sync.sh` goes
+green against sdk main the moment the SDK bump lands.
 
 Why vendored: `molecule_runtime/idle_digest/plugin_loader.py` sources the
 D1 load-time TRUST allow-list (which plugin names may load an `official`/reserved

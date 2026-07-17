@@ -18,28 +18,28 @@
     },
     "molecule-ai-plugin-digest-identity": {
       "name": "molecule-ai-plugin-digest-identity",
-      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.1.0",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.2.0",
       "kind": "digest-provider",
       "install": "default",
       "description": "Native idle-digest identity-capabilities provider (tier 0, the pinned second-person header). Delivered to every workspace (RFC molecule-core#4413)."
     },
     "molecule-ai-plugin-digest-task-queue": {
       "name": "molecule-ai-plugin-digest-task-queue",
-      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-task-queue#v0.1.0",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-task-queue#v0.2.0",
       "kind": "digest-provider",
       "install": "default",
       "description": "Native idle-digest task-queue provider (tier 1). The task-queue store stays runtime-owned; this plugin renders only the digest section."
     },
     "molecule-ai-plugin-digest-mail": {
       "name": "molecule-ai-plugin-digest-mail",
-      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.2.0",
       "kind": "digest-provider",
       "install": "default",
       "description": "Native idle-digest comms providers: sent-folder (tier 2) + inbound-a2a (tier 3). The comms source is bound by the runtime."
     },
     "molecule-ai-plugin-digest-goal": {
       "name": "molecule-ai-plugin-digest-goal",
-      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-goal#v0.1.0",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-goal#v0.2.0",
       "kind": "digest-provider",
       "install": "default",
       "description": "Native idle-digest goal-state provider (tier 7), cadence-banded so a static goal keeps re-firing under the delta gate."
