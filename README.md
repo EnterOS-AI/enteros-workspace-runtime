@@ -29,12 +29,19 @@ This package provides the core machinery every Molecule AI workspace container n
   process serve N workspaces concurrently (introduced in the multi-WS PR
   series, finalised in 0.2.0)
 
-## Channel plugin local A2A transport
+## Plugin local A2A transport (channel + trigger lanes)
 
-A plugin whose `plugin.yaml` declares `kind: channel` can declare a
-workspace-owned daemon with `contributes.daemons`. At boot the runtime
-discovers and supervises every declared daemon, but injects the local channel
-capability only into daemons owned by `kind: channel` plugins:
+A plugin whose `plugin.yaml` declares `kind: channel` or `kind: trigger` can
+declare a workspace-owned daemon with `contributes.daemons`. At boot the
+runtime discovers and supervises every declared daemon, but binds a private
+local A2A socket only for daemons owned by those two lane kinds (`_LANE_KINDS`
+in `molecule_runtime/channel_events.py`); other supervised daemons never
+inherit or receive the reserved lane environment. Both lanes share the same
+socket + ephemeral-capability mechanism and the same request-body ceiling as
+the public A2A proxy; they differ only in how provenance is stamped and which
+environment variables carry the capability.
+
+A `kind: channel` daemon receives:
 
 - `MOLECULE_CHANNEL_API_VERSION` — the SDK/host contract version. Version `1`
   is required by the current client.
@@ -45,6 +52,43 @@ capability only into daemons owned by `kind: channel` plugins:
   that plugin's socket. The helper sends it in the local-only capability header.
 - `MOLECULE_CHANNEL_PLUGIN_ID` — the installed plugin identity the runtime
   stamps as channel provenance.
+
+A `kind: trigger` daemon receives its own, distinct set —
+`MOLECULE_TRIGGER_API_VERSION`, `MOLECULE_TRIGGER_A2A_SOCKET`,
+`MOLECULE_TRIGGER_A2A_TOKEN`, `MOLECULE_TRIGGER_PLUGIN_ID` — plus
+`MOLECULE_TRIGGER_STATE_DIR`, the durable schedule-state directory it shares
+with the runtime schedule API. The names are distinct per lane so a channel
+daemon and a trigger daemon in the same workspace never see each other's
+socket or token.
+
+The two lanes stamp provenance differently:
+
+- **Channel** — the injected turn represents an external party. The runtime
+  overwrites `params.metadata.source` with the plugin identity (details
+  below).
+- **Trigger** — the injected turn is the agent's own autonomous self-turn,
+  stamped with a `source_type` classification rather than an external
+  `source` (`_stamp_trigger_source`):
+  - `params.metadata.source_type` must be in the runtime allow-list
+    (`TRIGGER_ALLOWED_SOURCE_TYPES`, today `{"self-scheduler"}`); a value
+    outside it is rejected, and an absent value defaults to the granted type.
+    This allow-list is the security boundary: a trigger daemon cannot make
+    its turn pass as a user-directed turn (the stamped `source_type` marks it
+    a routine self-ping), cannot claim a channel source, and cannot use any
+    self-turn class it was not granted.
+  - Any daemon-supplied `source` / `source_type` at the message level is
+    stripped, and `params.metadata.source` is set to the plugin id for audit
+    provenance.
+  - Turns stamped `self-scheduler` are routine self-pings: they drop rather
+    than queue behind an in-flight turn, and their output is governed by the
+    autonomous-loop replay guard (`molecule_runtime/autonomous_loop_guard.py`).
+
+See [docs/trigger-daemons.md](docs/trigger-daemons.md) for the full
+`kind: trigger` daemon reference — supervision + hot-start, the schedule grid
+and state directory, the `/internal/schedules` API, poke semantics, and the
+health-file contract. The rest of this section documents the channel lane's
+client contract; the trigger client (`send_trigger_message`) shares the same
+transport and delivery semantics.
 
 The socket does **not** define a second event envelope. Provider plugins import
 the provider-neutral client from `molecule-ai-sdk`; they do not import the
@@ -102,10 +146,11 @@ principals. The socket directory is mode 0700 and each socket is mode 0600
 before the daemon starts. Paths and tokens are ephemeral per-boot capabilities
 and must not be persisted.
 
-If the socket bind fails, the runtime removes all four reserved capability
-variables and still starts the daemon. `send_channel_message` raises
+If the socket bind fails, the runtime removes the reserved capability
+variables for both lanes and still starts the daemon. `send_channel_message`
+(and the trigger lane's `send_trigger_message`) raise
 `ChannelCapabilityUnavailable` when the version, socket, or token is absent or
-unsupported, which means this host cannot run the channel plugin. Once a local
+unsupported, which means this host cannot run the plugin. Once a local
 send is attempted, a connection, timeout, or HTTP failure raises
 `ChannelDeliveryUnknown`; the same external event must **not** be replayed
 because the agent may already have accepted the turn.
