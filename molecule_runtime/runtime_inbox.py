@@ -339,6 +339,20 @@ class RuntimeInbox:
         """Return the entry without creating one. None if absent."""
         return self._entries.get(context_id)
 
+    def any_turn_in_flight(self) -> bool:
+        """True iff SOME context currently has a turn executing.
+
+        The single source of truth for "is this workspace busy?" — reads the
+        same ``turn_in_flight`` flag the A2A executor sets True at the start of
+        a turn (inside the get_or_create lock) and clears False in its finally.
+        Iterates a snapshot of the entries dict so a concurrent get_or_create
+        can't raise "dictionary changed size during iteration"; the read is
+        lock-free by design (a stale-by-one-beat answer is acceptable for a
+        liveness signal and avoids awaiting an asyncio lock from the sync
+        heartbeat thread).
+        """
+        return any(e.turn_in_flight for e in list(self._entries.values()))
+
     def reset_for_tests(self) -> None:
         """Test-only: clear all entries. Production code never calls this."""
         self._entries.clear()
@@ -353,3 +367,13 @@ _INBOX = RuntimeInbox()
 def get_inbox() -> RuntimeInbox:
     """Return the process-wide inbox singleton."""
     return _INBOX
+
+
+def any_turn_in_flight() -> bool:
+    """Process-wide busy signal: True while any context has a turn executing.
+
+    Thin accessor over the inbox singleton so callers (e.g. the heartbeat
+    sender's ``is_busy`` field) don't reach into module internals. Sourced
+    from the live ``turn_in_flight`` state — no duplicate turn-tracking.
+    """
+    return _INBOX.any_turn_in_flight()

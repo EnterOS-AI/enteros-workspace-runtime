@@ -28,7 +28,11 @@
         },
         "active_tasks": {
           "type": "integer",
-          "description": "Number of tasks the runtime currently has in flight (drives the scheduler spare-capacity / queue-drain decision)."
+          "description": "DEPRECATED (RFC molecule-core#4402): superseded by is_busy. Number of in-flight tasks; at max_concurrent_tasks=1 (every maintained runtime) this only ever holds 0 or 1 and self-decrements in a finally that strands stuck-high on a crashed turn. Still emitted during the B1-B4 migration; consumers cut over to is_busy."
+        },
+        "is_busy": {
+          "type": "boolean",
+          "description": "Self-healing successor to active_tasks (RFC molecule-core#4402): true while the runtime is executing a turn (including its tool calls), false when idle. Sourced from the runtime's turn-in-flight state. The platform reads it through a heartbeat-freshness TTL so a crashed agent's stale true decays to false on its own — no phantom-busy sweep needed. Optional during the migration window: absent from older images, in which case the platform derives it from active_tasks>0."
         },
         "uptime_seconds": {
           "type": "integer",

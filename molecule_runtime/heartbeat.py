@@ -493,6 +493,25 @@ class HeartbeatLoop:
             self._task = asyncio.create_task(self._loop())
             self._task.add_done_callback(self._on_done)
 
+    def _is_busy(self) -> bool:
+        """Live busy signal for the heartbeat body (RFC molecule-core#4402 B2).
+
+        Sourced from the A2A inbox's ``turn_in_flight`` state via the single
+        ``runtime_inbox.any_turn_in_flight()`` accessor — no duplicated
+        turn-tracking. True while a turn (incl. its tool calls) is executing,
+        False when idle. Imported lazily + defensively so a heartbeat can never
+        be lost to an inbox import/lookup hiccup (best-effort telemetry): on any
+        failure we report not-busy, and core's COALESCE(is_busy, active_tasks>0)
+        honor-branch still has active_tasks as the fallback.
+        """
+        try:
+            from molecule_runtime.runtime_inbox import any_turn_in_flight
+
+            return any_turn_in_flight()
+        except Exception:  # noqa: BLE001 — busy telemetry is best-effort
+            logger.debug("heartbeat: is_busy probe failed; reporting not-busy")
+            return False
+
     def _send_heartbeat(self, client: httpx.Client) -> None:
         """Send one alive-signal heartbeat POST (sync). Runs on the dedicated
         OS thread. Mirrors the original async POST: same /registry/heartbeat
@@ -513,6 +532,10 @@ class HeartbeatLoop:
             "error_rate": self.error_rate,
             "sample_error": self.sample_error,
             "active_tasks": self.active_tasks,
+            # RFC molecule-core#4402 B2: dual-write is_busy alongside active_tasks
+            # (active_tasks kept for the migration window per §5). Sourced from the
+            # live turn_in_flight state; activates core's COALESCE honor-branch.
+            "is_busy": self._is_busy(),
             "current_task": self.current_task,
             "uptime_seconds": int(time.time() - self.start_time),
             **identity_gate_payload(),
@@ -555,6 +578,8 @@ class HeartbeatLoop:
                 "error_rate": self.error_rate,
                 "sample_error": self.sample_error,
                 "active_tasks": self.active_tasks,
+                # RFC molecule-core#4402 B2: dual-write is_busy (see primary body).
+                "is_busy": self._is_busy(),
                 "current_task": self.current_task,
                 "uptime_seconds": int(time.time() - self.start_time),
                 **identity_gate_payload(),

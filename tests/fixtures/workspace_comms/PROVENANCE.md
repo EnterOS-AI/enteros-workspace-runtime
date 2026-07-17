@@ -9,7 +9,7 @@ be rewritten here):
 
     molecule-ai-sdk/contracts/workspace-comms/{register,heartbeat,a2a-envelope,agent-card}.schema.json
 
-Source commit: `d7c95119e9977d7c14bd37419c6472ea2929cfc7` (last commit touching the workspace-comms schemas in molecule-ai-sdk)
+Source commit: `6347fa76308ab37121ab265473da78e5e14fe64d` (last commit touching the workspace-comms schemas in molecule-ai-sdk — added is_busy to heartbeat.schema.json per RFC molecule-core#4402)
 Source repo:   https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:   contracts/workspace-comms/
 
