@@ -215,6 +215,41 @@ async def test_ensure_warm_add_supervises_only_new(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ensure_seeds_workspace_config_after_plugin_grids(tmp_path, monkeypatch):
+    """RFC P3 seam wiring: BOTH cold boot and the warm reload run workspace-config
+    seeding, AFTER the plugin-grid seeding, against the resolved volume grid."""
+    from molecule_runtime import schedule_seed, trigger_state
+    from molecule_runtime.schedule_store import ScheduleStore
+
+    trig = DaemonSpec(name="scheduler", plugin="molecule-scheduler", kind="trigger",
+                      command=["python", "scheduler.py"])
+    _patch_holder(monkeypatch, [[trig], [trig]])
+    grid_path = tmp_path / "trigger" / "schedules.yaml"
+    monkeypatch.setattr(trigger_state, "resolve_grid_path", lambda: grid_path)
+
+    calls = []
+    monkeypatch.setattr(
+        schedule_seed, "seed_schedules_from_plugins",
+        lambda **kw: calls.append(("plugins",)) or 0,
+    )
+    monkeypatch.setattr(
+        schedule_seed, "seed_schedules_from_workspace_config",
+        lambda configs_dir, store: calls.append(("config", configs_dir, store)) or 0,
+    )
+    from molecule_runtime.daemon_runtime import DaemonRuntime
+
+    holder = DaemonRuntime(app=object(), config_path=str(tmp_path), server=None)
+    await holder.ensure_daemons()   # cold boot
+    await holder.ensure_daemons()   # warm /internal/daemons/reload path
+
+    assert [c[0] for c in calls] == ["plugins", "config", "plugins", "config"]
+    _, configs_dir, store = calls[1]
+    assert configs_dir == str(tmp_path)          # the delivered /configs dir
+    assert isinstance(store, ScheduleStore)
+    assert store.path == grid_path               # the daemon-read volume grid
+
+
+@pytest.mark.asyncio
 async def test_ensure_warm_noop_when_nothing_new(tmp_path, monkeypatch):
     a = DaemonSpec(name="a", plugin="chan", kind="channel", command=["python", "-c", "1"])
     _patch_holder(monkeypatch, [[a], [a]])

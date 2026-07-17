@@ -87,6 +87,28 @@ class DaemonRuntime:
                     logger.info("Schedule seed: reconciled %d template grid(s)", seeded)
             except Exception as e:  # noqa: BLE001 — seeding must never break a reload
                 logger.warning("Schedule seed failed (non-fatal): %s", e)
+            # RFC §8A P3 seam (runtime leg): core also delivers template/org
+            # schedules INSIDE the provisioned config.yaml (top-level
+            # `schedules:`). Seed them AFTER the plugin grids, still before the
+            # trigger daemon reads the grid — on cold boot and on the warm
+            # /internal/daemons/reload path alike. Inert until core ships the
+            # key: pre-seam configs simply lack it (clean no-op).
+            try:
+                from molecule_runtime import schedule_seed
+                from molecule_runtime.schedule_store import ScheduleStore
+                from molecule_runtime.trigger_state import resolve_grid_path
+
+                seeded_cfg = schedule_seed.seed_schedules_from_workspace_config(
+                    self.config_path, ScheduleStore(resolve_grid_path())
+                )
+                if seeded_cfg:
+                    logger.info(
+                        "Schedule seed: %d workspace-config schedule(s)", seeded_cfg
+                    )
+            except Exception as e:  # noqa: BLE001 — seeding must never break a reload
+                logger.warning(
+                    "Workspace-config schedule seed failed (non-fatal): %s", e
+                )
         else:
             os.environ.pop(plugin_daemons.NATIVE_SCHEDULER_ENV, None)
 
