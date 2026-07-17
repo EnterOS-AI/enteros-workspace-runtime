@@ -3,20 +3,28 @@
 Proves the loader discovers `contributes.digestProviders` off installed plugins,
 imports each provider IN-PROCESS, applies the LOAD-TIME trust gate (only native
 plugins may load official/reserved providers), and degrades safely (every
-malformed/broken case is skipped, never raised). The parity test proves a mail
-provider loaded via a plugin renders byte-identically to the hardcoded one.
+malformed/broken case is skipped, never raised). The parity tests prove each
+provider loaded via its native plugin renders byte-identically to the hardcoded
+one — the pre-D3 cutover gate (RFC §8: byte-identical digest output PER
+provider before the baked roster is deleted).
 
 Hermetic: writes fixture plugin modules under tmp_path; no network/mailbox.
 """
 from __future__ import annotations
 
+import dataclasses
 import textwrap
 from pathlib import Path
 
 import pytest
 
 from molecule_runtime.idle_digest import (
+    AgeBand,
+    Band,
+    Contribution,
     DigestProviderContext,
+    PreviewItem,
+    Urgency,
     build_default_providers,
     digest_provider_plugins_enabled,
     load_digest_provider_plugins,
@@ -25,7 +33,10 @@ from molecule_runtime.idle_digest import (
     native_plugin_names_from_registry,
 )
 from molecule_runtime.idle_digest.plugin_loader import FLAG_ENV, NATIVE_NAMES_ENV
+from molecule_runtime.idle_digest.providers.goal import GoalStateProvider
+from molecule_runtime.idle_digest.providers.identity import IdentityCapabilitiesProvider
 from molecule_runtime.idle_digest.providers.mail import MailSummary, SentMailProvider
+from molecule_runtime.idle_digest.providers.task_queue import TaskQueueProvider
 from molecule_runtime.plugins import LoadedPlugins, Plugin, PluginManifest
 
 
@@ -39,6 +50,44 @@ MAIL_SHIM = textwrap.dedent(
 
     def get_provider(context):
         return SentMailProvider(source=context.comms_source)
+    """
+)
+
+# The other three native shims: exactly what the D2 plugin repos ship in prov.py
+# (molecule-ai-plugin-digest-task-queue / -identity / -goal @v0.1.0). The
+# task-queue/goal shims ignore the context (their stores resolve via
+# mailbox_dir); the identity shim forwards the persona/naming context fields.
+TASK_QUEUE_SHIM = textwrap.dedent(
+    """
+    from molecule_runtime.idle_digest.providers.task_queue import TaskQueueProvider
+
+    def get_provider(context):
+        return TaskQueueProvider()
+    """
+)
+
+IDENTITY_SHIM = textwrap.dedent(
+    """
+    from molecule_runtime.idle_digest.providers.identity import (
+        IdentityCapabilitiesProvider,
+    )
+
+    def get_provider(context):
+        return IdentityCapabilitiesProvider(
+            config_path=context.config_path,
+            prompt_files=context.prompt_files,
+            workspace_name=context.workspace_name,
+            runtime_kind=context.runtime_kind,
+        )
+    """
+)
+
+GOAL_SHIM = textwrap.dedent(
+    """
+    from molecule_runtime.idle_digest.providers.goal import GoalStateProvider
+
+    def get_provider(context):
+        return GoalStateProvider()
     """
 )
 
@@ -221,6 +270,166 @@ async def test_parity_mail_provider_via_plugin(tmp_path):
     via_plugin = await loaded[0].contribute()
     baked = await SentMailProvider(source=FakeSource()).contribute()
     assert via_plugin == baked
+
+
+# --- per-provider parity goldens (pre-D3 cutover gate, RFC §8) ---------------
+# One golden per remaining native provider: build the baked provider exactly as
+# build_default_providers does, load the same provider through the plugin-loader
+# path (the D2 shim), and assert the Contribution envelopes are byte-identical —
+# every field, list order included (frozen-dataclass ==; the sensitivity control
+# below proves == fails on any single-field change). Each golden first pins the
+# expected envelope shape so it can never pass vacuously on [] == [].
+
+
+def _load_one_native(tmp_path, repo: str, shim: str, provider_id: str, ctx):
+    """Load exactly one provider the way the runtime does: through the manifest
+    entry + trust gate + entrypoint import, from a plugin named as its repo."""
+    plugin = _make_plugin(
+        tmp_path, repo, shim,
+        [{"provider_id": provider_id, "entrypoint": "prov:get_provider"}],
+    )
+    loaded = load_digest_provider_plugins(
+        _loaded(plugin), ctx, native_plugin_names=frozenset({repo})
+    )
+    assert [p.provider_id for p in loaded] == [provider_id]
+    return loaded[0]
+
+
+@pytest.mark.asyncio
+async def test_parity_task_queue_provider_via_plugin(tmp_path):
+    """task-queue: baked TaskQueueProvider() vs the plugin-loaded one, over a
+    fixed synthetic ledger exercising BOTH envelopes (E1 urgent + E2 base)."""
+    from molecule_runtime import mailbox_dir
+
+    # Seed the runtime-owned store at the path BOTH constructions resolve
+    # (the conftest mailbox sandbox makes it per-test); fixed clock + fixed ids.
+    store = (
+        mailbox_dir.resolve() / "idle-prompt" / "providers" / "task-queue" / "state.sqlite"
+    )
+    writer = TaskQueueProvider(db_path=store, now_fn=lambda: 1_000_000.0)
+    writer.add_task("current build", status="current", task_id="task-cur")
+    writer.add_task(
+        "fix the deploy", origin="user", status="queued",
+        next_action="rerun the gate", task_id="task-user",
+    )
+    writer.add_task("resume nightly audit", origin="lifecycle", status="blocked", task_id="task-life")
+    writer.upsert_awaiting_user("req-1", "need the API key")
+
+    via_plugin = await _load_one_native(
+        tmp_path, "molecule-ai-plugin-digest-task-queue", TASK_QUEUE_SHIM,
+        "task-queue", DigestProviderContext(),
+    ).contribute()
+    baked = await TaskQueueProvider().contribute()  # as build_default_providers builds it
+
+    # non-vacuous: the fixture must render the full two-envelope shape
+    assert [c.band for c in baked] == [Band.URGENT, Band.BASE]
+    assert "fix the deploy (next: rerun the gate)" in baked[0].summary
+    assert "current: current build" in baked[1].summary
+    assert "1 awaiting user" in baked[1].summary
+    assert via_plugin == baked
+
+
+@pytest.mark.asyncio
+async def test_parity_identity_provider_via_plugin(tmp_path, monkeypatch):
+    """identity-capabilities: baked vs plugin-loaded, persona read through the
+    REAL reader off a fixture file; the tool inventory + platform check module
+    seams are patched to fixed values (identically visible to both sides)."""
+    (tmp_path / "persona.md").write_text(
+        "Fleet infrastructure engineer for the molecule-ai org.\n"
+        "Keep CI, deploys, and fleet infra healthy.\n",
+        encoding="utf-8",
+    )
+    tools = [
+        "mcp__molecule__task_list",
+        "mcp__molecule__delegate_task",
+        "mcp__molecule-platform__create_workspace",
+        "mcp__gitea__list_prs",
+    ]
+    monkeypatch.setattr(
+        "molecule_runtime.platform_agent_identity.loaded_mcp_tools", lambda: list(tools)
+    )
+    monkeypatch.setattr(
+        "molecule_runtime.loaded_mcp_tools_probe._is_platform_agent", lambda: True
+    )
+
+    ctx = DigestProviderContext(
+        config_path=str(tmp_path),
+        prompt_files=("persona.md",),
+        workspace_name="core-devops",
+        runtime_kind="claude-code",
+    )
+    via_plugin = await _load_one_native(
+        tmp_path, "molecule-ai-plugin-digest-identity", IDENTITY_SHIM,
+        "identity-capabilities", ctx,
+    ).contribute()
+    baked = await IdentityCapabilitiesProvider(  # as build_default_providers builds it
+        config_path=str(tmp_path),
+        prompt_files=("persona.md",),
+        workspace_name="core-devops",
+        runtime_kind="claude-code",
+    ).contribute()
+
+    # non-vacuous: persona + all three tool groups actually rendered
+    assert len(baked) == 1
+    assert baked[0].summary.startswith("You are core-devops — Fleet infrastructure engineer")
+    assert "Your responsibility: Keep CI, deploys" in baked[0].summary
+    assert "workspace MCP (2)" in baked[0].summary
+    assert "platform MCP (1)" in baked[0].summary
+    assert "from plugins: gitea" in baked[0].summary
+    assert via_plugin == baked
+
+
+@pytest.mark.asyncio
+async def test_parity_goal_state_provider_via_plugin(tmp_path):
+    """goal-state: baked GoalStateProvider() vs the plugin-loaded one, over a
+    fixed goal.yaml (never surfaced -> cadence band 'due' on both sides)."""
+    from molecule_runtime import mailbox_dir
+
+    state_dir = mailbox_dir.resolve() / "idle-prompt" / "providers" / "goal-state"
+    writer = GoalStateProvider(state_dir=state_dir, now_fn=lambda: 1_000_000.0)
+    writer.set("Work the labeled-ready backlog, smallest first.", cadence_seconds=1800)
+
+    via_plugin = await _load_one_native(
+        tmp_path, "molecule-ai-plugin-digest-goal", GOAL_SHIM,
+        "goal-state", DigestProviderContext(),
+    ).contribute()
+    baked = await GoalStateProvider().contribute()  # as build_default_providers builds it
+
+    # non-vacuous: the seeded goal must render, due (never surfaced)
+    assert len(baked) == 1
+    assert "Work the labeled-ready backlog, smallest first." in baked[0].summary
+    assert baked[0].age_band is AgeBand.DUE
+    assert via_plugin == baked
+
+
+@pytest.mark.asyncio
+async def test_parity_comparison_sensitive_to_every_field(tmp_path):
+    """NEGATIVE CONTROL for the parity goldens: prove the == the goldens rely on
+    fails on a one-step mutation of ANY Contribution field, over a REAL rendered
+    envelope. Exhaustive by construction — a new envelope field without a mutant
+    here fails the coverage assert, so the control can never silently thin."""
+    writer = GoalStateProvider(state_dir=tmp_path / "goal", now_fn=lambda: 1_000_000.0)
+    writer.set("Work the labeled-ready backlog, smallest first.")
+    [c] = await writer.contribute()
+
+    mutants = {
+        "provider_id": c.provider_id + "x",
+        "band": Band.URGENT,
+        "tier": c.tier + 1,
+        "urgency": Urgency.URGENT,
+        "count": c.count + 1,
+        "summary": c.summary + "\x00",  # one extra byte
+        "age_band": AgeBand.JUST_INCLUDED,
+        "item_ids": c.item_ids + ("extra",),
+        "pull": None,
+        "rearm_signals": ("extra",),
+        "preview_items": (PreviewItem(item_id="x", status="open", summary="p"),),
+    }
+    assert set(mutants) == {f.name for f in dataclasses.fields(Contribution)}
+    for fname, value in mutants.items():
+        assert value != getattr(c, fname), f"mutant for {fname!r} is a no-op"
+        mutated = dataclasses.replace(c, **{fname: value})
+        assert [mutated] != [c], f"parity comparison is blind to field {fname!r}"
 
 
 # --- skip-not-reject semantics ---------------------------------------------
