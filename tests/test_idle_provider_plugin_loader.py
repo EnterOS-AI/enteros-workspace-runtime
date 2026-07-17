@@ -518,6 +518,90 @@ def test_build_default_providers_flag_on_appends(tmp_path, monkeypatch):
     assert len(providers) == _baseline_len() + 1
 
 
+# --- gate-probed evidence lines (stdout — staging e2e sub-step 10e) ----------
+# The workspace runtime process never configures Python logging (only mcp_cli
+# does — a different entrypoint), so logger.info is dropped by the unconfigured
+# root logger and can NEVER reach docker logs; the e2e gate's grep can only see
+# print()ed stdout. These tests assert on capsys .out ON PURPOSE, never caplog:
+# a caplog assertion passes against the broken logger.info code — the exact
+# vacuity that blinded the first armed 10e run (gate run 527665).
+
+
+def test_loaded_evidence_line_reaches_stdout(tmp_path, capsys):
+    """SUCCESS path: loading a provider from a native plugin must print the
+    evidence line the e2e gate greps — substring "from plugin <name>
+    (native=True)" — to STDOUT. RED against the pre-fix logger.info code
+    (negative control run recorded in the PR)."""
+    plugin = _make_plugin(
+        tmp_path, "molecule-ai-plugin-digest-mail", MAIL_SHIM,
+        [{"provider_id": "sent-folder", "entrypoint": "prov:get_provider"}],
+    )
+    ctx = DigestProviderContext(comms_source=FakeSource())
+    got = load_digest_provider_plugins(
+        _loaded(plugin), ctx,
+        native_plugin_names=frozenset({"molecule-ai-plugin-digest-mail"}),
+    )
+    assert [p.provider_id for p in got] == ["sent-folder"]  # the load really happened
+    out = capsys.readouterr().out
+    # the exact substring the gate greps (molecule-core test_staging_full_saas.sh)
+    assert "from plugin molecule-ai-plugin-digest-mail (native=True)" in out
+    assert "digest-provider: loaded 'sent-folder'" in out
+
+
+def test_refused_plugin_prints_no_native_true_on_stdout(tmp_path, monkeypatch, capsys):
+    """REFUSAL path: the trust-gate refusal stays on logging (stderr via the
+    lastResort handler in the workspace process) — stdout must contain NO
+    "(native=True)", so the gate's grep can never false-positive on a refused
+    plugin. The scan-complete line must not print either: a refused
+    contribution was FOUND, not nothing."""
+    monkeypatch.setenv(FLAG_ENV, "1")  # as in the armed gate run
+    plugin = _make_plugin(
+        tmp_path, "rogue-plugin", ROGUE_OFFICIAL,
+        [{"provider_id": "goal-state", "entrypoint": "prov:RogueProvider"}],
+    )
+    got = load_digest_provider_plugins(
+        _loaded(plugin), DigestProviderContext(), native_plugin_names=frozenset()
+    )
+    assert got == []  # refused by the trust gate
+    out = capsys.readouterr().out
+    assert "(native=True)" not in out
+    assert "scan complete" not in out
+
+
+def _plugin_with_no_contributions(name: str) -> Plugin:
+    return Plugin(name=name, path=".", manifest=PluginManifest(name=name, contributes={}))
+
+
+def test_scan_complete_line_when_flag_on_and_zero_contributions(monkeypatch, capsys):
+    """'Ran and found nothing' must be distinguishable from 'never invoked'
+    (in run 527665 they were not): flag on + zero digestProviders contributions
+    across the installed plugins -> one scan-complete evidence line on stdout."""
+    monkeypatch.setenv(FLAG_ENV, "1")
+    plugins = [
+        _plugin_with_no_contributions("plugin-a"),
+        _plugin_with_no_contributions("plugin-b"),
+    ]
+    got = load_digest_provider_plugins(
+        _loaded(*plugins), DigestProviderContext(), native_plugin_names=frozenset()
+    )
+    assert got == []
+    assert (
+        "digest-provider: scan complete — no digestProviders contributions "
+        "among 2 installed plugin(s)"
+    ) in capsys.readouterr().out
+
+
+def test_scan_complete_line_absent_when_flag_off(monkeypatch, capsys):
+    monkeypatch.delenv(FLAG_ENV, raising=False)
+    got = load_digest_provider_plugins(
+        _loaded(_plugin_with_no_contributions("plugin-a")),
+        DigestProviderContext(),
+        native_plugin_names=frozenset(),
+    )
+    assert got == []
+    assert "scan complete" not in capsys.readouterr().out
+
+
 # --- native allow-list sourced from the vendored registry (D-trust) ---------
 
 

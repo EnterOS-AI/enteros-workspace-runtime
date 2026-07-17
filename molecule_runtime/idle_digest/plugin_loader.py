@@ -256,28 +256,46 @@ def load_digest_provider_plugins(
     except Exception as exc:  # noqa: BLE001 — a broken LoadedPlugins must not crash boot
         logger.warning("digest-provider: cannot read plugins list: %s", exc)
         return out
+    contributions_seen = 0
     for plugin in plugins:
         try:
-            _collect_from_plugin(plugin, context, native_plugin_names, reserved_ids, out)
+            contributions_seen += _collect_from_plugin(
+                plugin, context, native_plugin_names, reserved_ids, out
+            )
         except Exception as exc:  # noqa: BLE001 — defense in depth; never raise per plugin
             logger.warning(
                 "digest-provider: unexpected error loading from %s: %s",
                 getattr(plugin, "name", "?"), exc,
             )
+    if contributions_seen == 0 and digest_provider_plugins_enabled():
+        # GATE-PROBED EVIDENCE (stdout via print, same reason as the loaded
+        # line): makes "the loader ran and found nothing" distinguishable in
+        # docker logs from "the loader was never invoked". Refused/malformed
+        # contributions do NOT count as nothing — their warnings are the
+        # evidence for those paths.
+        print(
+            f"digest-provider: scan complete — no digestProviders contributions "
+            f"among {len(plugins)} installed plugin(s)",
+            flush=True,
+        )
     return out
 
 
-def _collect_from_plugin(plugin, context, native_plugin_names, reserved_ids, out) -> None:
+def _collect_from_plugin(plugin, context, native_plugin_names, reserved_ids, out) -> int:
     """Load every well-formed, trust-passing provider a single plugin contributes,
-    appending to ``out``. Extracted so the top-level loop can guard each plugin."""
+    appending to ``out``. Extracted so the top-level loop can guard each plugin.
+
+    Returns the number of ``digestProviders`` contributions the plugin DECLARED
+    (whether or not they loaded), so the caller can tell a scan that found
+    nothing from one that refused/skipped what it found."""
     name = getattr(plugin, "name", "") or ""
     contributes = getattr(getattr(plugin, "manifest", None), "contributes", None) or {}
     entries = contributes.get("digestProviders")
     if entries is None:
-        return
+        return 0
     if not isinstance(entries, list):
         logger.warning("digest-provider: %s contributes.digestProviders is not a list — skipped", name)
-        return
+        return 1  # a (malformed) contribution surface was declared — not "nothing found"
     plugin_root = Path(getattr(plugin, "path", "") or ".")
     is_native = name in native_plugin_names
     for entry in entries:
@@ -312,8 +330,17 @@ def _collect_from_plugin(plugin, context, native_plugin_names, reserved_ids, out
                     name, actual_id,
                 )
                 continue
-            logger.info("digest-provider: loaded %r from plugin %s (native=%s)", actual_id, name, is_native)
+            # GATE-PROBED EVIDENCE — the staging e2e (sub-step 10e) greps docker
+            # logs for "from plugin <name> (native=True)". It must go to stdout
+            # via print(), not logging: the workspace process never configures
+            # Python logging, so logger.info is dropped by the unconfigured root
+            # logger and could never reach docker logs.
+            print(
+                f"digest-provider: loaded {actual_id!r} from plugin {name} (native={is_native})",
+                flush=True,
+            )
             out.append(provider)
         except Exception as exc:  # noqa: BLE001 — one bad entry must not skip its siblings
             logger.warning("digest-provider: %s error on an entry, skipping it: %s", name, exc)
             continue
+    return len(entries)
