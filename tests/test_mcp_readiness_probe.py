@@ -288,24 +288,30 @@ class TestProberPublishing:
         assert pai.mcp_tools_ready() is None
         assert pai.first_ready_at() is None
 
-    def test_run_once_sets_mcp_tools_ready_true_on_first_success(self):
-        # EV2 POSITIVE half: the FIRST successful tools/list flips the readiness
-        # signal True (turn-independent) and stamps first_ready_at.
+    def test_run_once_sets_mcp_tools_ready_true_on_first_provision_ready_success(self):
+        # EV2 POSITIVE half (CORRECTED contract): the readiness signal flips True
+        # only when a successful tools/list carries the REQUIRED provision_workspace
+        # verb — turn-independent — and stamps first_ready_at. mcp_tools_ready MEANS
+        # "provision-ready", NOT merely "some tools/list succeeded" (the fix for the
+        # #4449/#320 regression where core flipped a provision-less concierge online).
         assert pai.mcp_tools_ready() is None  # absent before
         pr = probe.MCPReadinessProber(probe=lambda _t: [PROVISION_ID])
         pr.run_once()
-        assert pai.mcp_tools_ready() is True  # True after first list
+        assert pai.mcp_tools_ready() is True  # True after first provision-ready list
         first = pai.first_ready_at()
         assert isinstance(first, str) and first.endswith("Z")
 
-    def test_mcp_tools_ready_true_even_without_provision_workspace(self):
-        # Turn-independent readiness is about the tools/list SUCCEEDING, not about
-        # which tools it returned — so a management MCP that lists tools but not
-        # provision_workspace still reports mcp_tools_ready=True (the online-flip
-        # trigger), while loaded_mcp_tools truthfully lacks provision_workspace.
+    def test_mcp_tools_ready_FALSE_without_provision_workspace(self):
+        # CORRECTED contract (was test_mcp_tools_ready_true_even_without_provision_
+        # workspace, which encoded the BUG): a management MCP whose tools/list
+        # SUCCEEDS but does NOT expose provision_workspace is NOT online-ready. The
+        # probe records mcp_tools_ready=False (tri-state "probed-not-ready"), never
+        # True — so core neither flips such a concierge online (defect #1) nor treats
+        # it as the reliable degrade signal. loaded_mcp_tools stays truthful (absent).
         pr = probe.MCPReadinessProber(probe=lambda _t: ["mcp__molecule-platform__list_workspaces"])
         pr.run_once()
-        assert pai.mcp_tools_ready() is True
+        assert pai.mcp_tools_ready() is False
+        assert pai.first_ready_at() is None  # never stamped without provision-ready
         assert probe.management_provision_ready(pai.loaded_mcp_tools()) is False
 
     def test_first_ready_at_stable_across_reprobes(self):
@@ -329,11 +335,45 @@ class TestProberPublishing:
 
     def test_run_once_publishes_truthful_absent_list(self):
         # Genuinely-missing provision_workspace is reported (not hidden), so the
-        # gate can degrade — this is NOT a false-empty.
+        # gate can degrade — this is NOT a false-empty. And mcp_tools_ready is
+        # recorded False (probed-not-ready), never True.
         pr = probe.MCPReadinessProber(probe=lambda _t: ["mcp__molecule-platform__list_workspaces"])
         pr.run_once()
         assert pai.loaded_mcp_tools() == ["mcp__molecule-platform__list_workspaces"]
         assert probe.management_provision_ready(pai.loaded_mcp_tools()) is False
+        assert pai.mcp_tools_ready() is False
+
+    def test_run_retries_while_provision_absent_then_stops_on_provision_ready(self):
+        # CORRECTED loop-stop contract: "success" now means provision-READY, not
+        # merely a tools/list that returned SOME tool. A management MCP that lists
+        # tools but not provision_workspace is NOT ready — the prober must KEEP
+        # retrying (so a post-boot plugin reconcile that later delivers
+        # provision_workspace is still captured) and only STOP once provision-ready.
+        calls = {"n": 0}
+        ready = threading.Event()
+
+        def _probe(_t):
+            calls["n"] += 1
+            # First two probes: MCP up but provision_workspace ABSENT -> not ready.
+            if calls["n"] < 3:
+                return ["mcp__molecule-platform__list_workspaces"]
+            # Third: plugin reconcile has delivered provision_workspace.
+            ready.set()
+            return [PROVISION_ID]
+
+        pr = probe.MCPReadinessProber(retry_interval=0.01, interval=0.01, probe=_probe)
+        pr.start()
+        assert ready.wait(5.0), "prober never reached provision-ready"
+        # It kept retrying through the provision-absent probes (>=3 calls) and, once
+        # provision-ready, published True and stopped re-probing.
+        threading.Event().wait(0.2)
+        assert calls["n"] == 3, (
+            "prober did not stop after reaching provision-ready (or stopped early on "
+            "a provision-ABSENT tools/list)"
+        )
+        assert pai.mcp_tools_ready() is True
+        assert probe.management_provision_ready(pai.loaded_mcp_tools()) is True
+        pr.stop()
 
     def test_run_once_swallows_probe_exception(self):
         def _boom(_t):

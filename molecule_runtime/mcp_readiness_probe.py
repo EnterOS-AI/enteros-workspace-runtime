@@ -485,19 +485,38 @@ class MCPReadinessProber:
             logger.exception("mcp readiness prober: probe raised")
             return None
         if result is not None:
+            # Always DUAL-WRITE the truthful loaded-tools list (even when it lacks
+            # provision_workspace — reported so the core gate degrades correctly).
             set_loaded_mcp_tools(result)
-            # EV2: publish the POSITIVE readiness event on the FIRST successful
-            # tools/list. Turn-independent, so core can flip provisioning->online
-            # without the retired fireConciergeWarmup synthetic turn. set_mcp_tools_ready
-            # is sticky-once for the first_ready_at stamp, so re-publishing on later
-            # probes is harmless.
-            set_mcp_tools_ready(True)
-            self._succeeded_once = True
-            logger.info(
-                "mcp readiness prober: published %d management tool(s); "
-                "provision_workspace_loaded=%s mcp_tools_ready=True",
-                len(result), management_provision_ready(result),
-            )
+            # EV2 (fix for #4449/#320 regression): mcp_tools_ready MUST MEAN "the
+            # REQUIRED provision_workspace verb is ready", NOT merely "some tools/list
+            # succeeded". Only a provision-ready result flips the signal True — the
+            # turn-independent online-flip trigger AND the reliable degrade signal
+            # core keys on. A successful tools/list that is MISSING provision_workspace
+            # is recorded False (tri-state "probed-not-ready"), never True: core must
+            # neither flip such a concierge online (the #3082 hang) nor trust it as
+            # ready. set_mcp_tools_ready keeps first_ready_at sticky-once, so
+            # re-publishing True on later probes is harmless.
+            if management_provision_ready(result):
+                set_mcp_tools_ready(True)
+                self._succeeded_once = True
+                logger.info(
+                    "mcp readiness prober: published %d management tool(s); "
+                    "provision_workspace_loaded=True mcp_tools_ready=True",
+                    len(result),
+                )
+            else:
+                # Server is up and enumerable but the required verb is ABSENT. Record
+                # probed-not-ready and KEEP retrying — a post-boot plugin reconcile may
+                # still deliver provision_workspace (capture-first). Do NOT set
+                # _succeeded_once, so the retry loop does not stop on a not-ready list.
+                set_mcp_tools_ready(False)
+                logger.warning(
+                    "mcp readiness prober: tools/list returned %d tool(s) but "
+                    "provision_workspace ABSENT — mcp_tools_ready=False (not online-ready); "
+                    "will keep retrying",
+                    len(result),
+                )
         return result
 
     def _run(self) -> None:
