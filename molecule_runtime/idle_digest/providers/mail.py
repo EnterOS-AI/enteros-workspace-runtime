@@ -31,61 +31,45 @@ import json
 import time
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Optional, Protocol
+from typing import Optional
 
 from ..contract import AgeBand, Band, Contribution, PullInstruction, Urgency
 
+# D3 mail-plugin seam precursor: the stable comms contract now lives in
+# ``molecule_runtime.idle_digest.comms`` so the mail plugin (which owns the
+# provider render source at v0.2.0) can import it from a path that survives the
+# eventual delete of this module's render half. Imported + re-exported here so
+# every existing importer of ``providers.mail`` (controller.build_default_providers,
+# tests/test_idle_provider_mail.py, tests/test_idle_provider_plugin_loader.py)
+# and ``PlatformMailSummarySource`` below stay byte-behaviour-identical.
+from ..comms import (  # noqa: F401  (re-exported for backwards-compatible import path)
+    DEFAULT_OVERDUE_AFTER_SECONDS,
+    CommsSummarySource,
+    CommsSummaryUnavailable,
+    MailSummary,
+)
 
-class CommsSummaryUnavailable(RuntimeError):
-    """The comms source could not produce a summary THIS tick.
-
-    Providers let this propagate: the ProviderRunner catches it, marks the
-    section FAILED, and the assembler excludes failed sections from the delta
-    hash SYMMETRICALLY (contract failed_sections_excluded_from_hash) — a
-    transient outage neither fires the digest nor suppresses it, and the
-    degraded marker renders. Returning an empty summary instead would conflate
-    "comms down" with "no mail" and fire spuriously on the blip + recovery.
-    """
-
+__all__ = [
+    "CommsSummaryUnavailable",
+    "CommsSummarySource",
+    "MailSummary",
+    "DEFAULT_OVERDUE_AFTER_SECONDS",
+    "PlatformMailSummarySource",
+    "InboundMailProvider",
+    "SentMailProvider",
+    "INBOUND_PROVIDER_ID",
+    "INBOUND_TIER",
+    "SENT_PROVIDER_ID",
+    "SENT_TIER",
+]
 
 INBOUND_PROVIDER_ID = "inbound-a2a"
 INBOUND_TIER = 3  # contract providers[3].base_tier
 SENT_PROVIDER_ID = "sent-folder"
 SENT_TIER = 2  # contract providers[2].base_tier
 
-#: Default no-reply age (seconds) beyond which a sent delegation is flagged
-#: "target agent may have an issue" (matches the server default and the
-#: delegations hard-deadline default).
-DEFAULT_OVERDUE_AFTER_SECONDS = 21600
-
 #: How many overdue targets the summary names inline (detail via pull).
 _OVERDUE_NAMES_CAP = 3
-
-
-@dataclass
-class MailSummary:
-    """The tenant mail-summary API response, typed."""
-
-    received_unread: int = 0
-    replies_unread: int = 0
-    sent_awaiting_reply: int = 0
-    overdue: tuple = ()  # of dict: delegation_id, target_workspace_id, age_seconds
-    overdue_after_seconds: int = DEFAULT_OVERDUE_AFTER_SECONDS
-
-
-class CommsSummarySource(Protocol):
-    """The comms abstraction the mail providers depend on.
-
-    THE plugin seam: today the one implementation reads the platform
-    mail-summary API; a future communication-layer plugin provides its own
-    implementation and is bound in ``build_default_providers`` — nothing else
-    changes. ``fetch()`` returns a summary, or raises
-    :class:`CommsSummaryUnavailable` when the source cannot answer THIS tick —
-    never an empty summary for an outage (failed-exclusion symmetry).
-    """
-
-    async def fetch(self) -> MailSummary:  # pragma: no cover - protocol
-        ...
 
 
 @dataclass
