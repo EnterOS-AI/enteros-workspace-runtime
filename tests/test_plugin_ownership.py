@@ -27,6 +27,22 @@ def _context(plugin_root: Path, configs: Path) -> InstallContext:
     )
 
 
+@pytest.fixture(autouse=True)
+def _memory_in_configs_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route plugin memory to the plugin's ``configs_dir`` for these tests.
+
+    These ownership tests model memory (and owned files) under ``configs_dir``:
+    the ``_context()`` append closure writes ``configs/<file>`` and the
+    assertions read it. With the mailbox kernel ON (the default) memory instead
+    lands in the durable mailbox memory dir, so the writer and
+    ``_runtime_memory_path`` would disagree and ownership would never be
+    recorded. Pin the kernel OFF so both resolve to ``configs/<file>``. The
+    kernel-ON mailbox memory path is covered explicitly by
+    ``test_mailbox_memory_path_is_owned_and_removed``, which re-enables it.
+    """
+    monkeypatch.setenv("MOLECULE_MAILBOX_KERNEL", "0")
+
+
 @pytest.mark.asyncio
 async def test_uninstall_preserves_preexisting_skill_directory(tmp_path: Path) -> None:
     plugin = tmp_path / "plugin"
@@ -290,3 +306,68 @@ async def test_privileged_setup_failure_persists_partial_ownership(
     assert list((configs / ".molecule" / "plugin-ownership").glob("*.json"))
     await adaptor.uninstall(ctx)
     assert not (configs / "skills" / "owned").exists()
+
+
+@pytest.mark.asyncio
+async def test_uninstall_preserves_symlinked_owned_path_target(tmp_path: Path) -> None:
+    """An owned file swapped for an in-root symlink must not let uninstall delete
+    the symlink's target.
+
+    The victim shares the recorded content, so the SHA-match guard alone would
+    pass if the recorded path were resolved through the symlink — the no-follow
+    _owned_path rejects the symlinked recorded leaf and preserves the replacement.
+    """
+    shared = "shared-content\n"
+    plugin = tmp_path / "plugin"
+    (plugin / "skills" / "s1").mkdir(parents=True)
+    (plugin / "skills" / "s1" / "SKILL.md").write_text(shared)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    adaptor = AgentskillsAdaptor("demo", "claude-code")
+    ctx = _context(plugin, configs)
+    await adaptor.install(ctx)
+
+    installed = configs / "skills" / "s1" / "SKILL.md"
+    assert installed.read_text() == shared
+    victim = configs / "victim.md"
+    victim.write_text(shared)
+    installed.unlink()
+    installed.symlink_to(victim)
+
+    await adaptor.uninstall(ctx)
+
+    assert victim.exists(), "uninstall followed the symlink and deleted its target"
+    assert victim.read_text() == shared
+    assert installed.is_symlink(), "the symlink replacement was not preserved"
+
+
+@pytest.mark.asyncio
+async def test_update_does_not_write_through_symlinked_owned_path(tmp_path: Path) -> None:
+    """A reinstall/update must not copy a new plugin file THROUGH a symlink that
+    has replaced an owned destination.
+
+    The victim shares the previously-installed content, so the previous-digest
+    guard would pass if the destination symlink were followed — the no-follow
+    guard preserves the symlinked destination instead of overwriting its target.
+    """
+    plugin = tmp_path / "plugin"
+    skill = plugin / "skills" / "s1"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("v1\n")
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    adaptor = AgentskillsAdaptor("demo", "claude-code")
+    ctx = _context(plugin, configs)
+    await adaptor.install(ctx)
+
+    installed = configs / "skills" / "s1" / "SKILL.md"
+    victim = configs / "victim.md"
+    victim.write_text("v1\n")
+    installed.unlink()
+    installed.symlink_to(victim)
+
+    (skill / "SKILL.md").write_text("v2\n")
+    await adaptor.install(ctx)
+
+    assert victim.read_text() == "v1\n", "update wrote through the symlink onto the victim"
+    assert installed.is_symlink(), "the symlink replacement was not preserved"

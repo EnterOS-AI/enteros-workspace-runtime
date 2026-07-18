@@ -342,12 +342,47 @@ def _owned_path(ctx: InstallContext, relative: str) -> Path | None:
     if not isinstance(relative, str) or not relative:
         return None
     root = ctx.configs_dir.resolve()
-    path = (ctx.configs_dir / relative).resolve()
+    raw = ctx.configs_dir / relative
+    if raw.name in ("", ".", ".."):
+        return None
+    # Resolve the PARENT (following directory symlinks) and containment-check it,
+    # but never follow the final component. If the recorded owned path has since
+    # been replaced by a symlink, we must treat it as the symlink it is rather
+    # than resolving to — and then mutating/deleting — its target, which the
+    # plugin never owned. Callers get None and preserve the replacement.
     try:
-        path.relative_to(root)
+        parent = raw.parent.resolve()
+    except OSError:
+        return None
+    try:
+        parent.relative_to(root)
     except ValueError:
         return None
-    return path
+    leaf = parent / raw.name
+    if leaf.is_symlink():
+        return None
+    return leaf
+
+
+def _has_symlink_component(path: Path, root: Path) -> bool:
+    """True if ``path`` — or any path component below ``root`` — is a symlink.
+
+    Walks from ``root`` down to ``path`` with per-component ``lstat`` (no-follow),
+    so a symlink swapped in at any level, including the leaf, is detected without
+    ever following it. Keeps an install/update from writing *through* a symlinked
+    destination onto a target the plugin never owned. A ``path`` outside ``root``
+    is treated as unsafe.
+    """
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
 
 
 def _memory_marker(plugin_name: str) -> str:
@@ -896,6 +931,12 @@ def _sync_owned_files(
     for source, target in candidates:
         relative = target.relative_to(ctx.configs_dir).as_posix()
         candidate_relatives.add(relative)
+        if _has_symlink_component(target, ctx.configs_dir):
+            # The destination (or a parent component) is a symlink. exists()/
+            # is_file()/copy2() would all follow it and overwrite a target the
+            # plugin never owned; preserve the replacement instead.
+            result.warnings.append(f"preserved symlinked path: {relative}")
+            continue
         if target.exists():
             previous_digest = previous_scope.get(relative)
             if (
