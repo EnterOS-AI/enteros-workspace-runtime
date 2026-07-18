@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +89,51 @@ PRIVILEGED_ENV_KEYS: tuple[str, ...] = (
 # The runtime is always inside that tenant trust boundary; an operator-launched
 # management MCP is a separate process and must receive its capability directly.
 TENANT_FORBIDDEN_ENV_KEYS: tuple[str, ...] = ("CP_PROMOTE_PROD_API_TOKEN",)
+
+
+def tenant_safe_child_env(
+    env: Mapping[str, str], *, boundary: str
+) -> dict[str, str]:
+    """Copy ``env`` while removing operator-only capabilities.
+
+    Tenant runtimes commonly build subprocess environments from ``os.environ``
+    and then overlay a descriptor. Sanitizing only the descriptor is therefore
+    insufficient: an ambient value still crosses the process boundary. This is
+    the final child-spawn guard. Logs key names only, never credential values.
+    """
+    safe = dict(env)
+    removed = tuple(key for key in TENANT_FORBIDDEN_ENV_KEYS if key in safe)
+    for key in removed:
+        safe.pop(key, None)
+    if removed:
+        log.warning(
+            "tenant runtime: dropped forbidden credential key(s) %s from %s",
+            ", ".join(removed),
+            boundary,
+        )
+    return safe
+
+
+def scrub_tenant_forbidden_process_env(
+    env: MutableMapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Remove operator-only capabilities from the tenant runtime process.
+
+    The runtime process is itself inside the tenant trust boundary. Scrubbing at
+    boot protects SDK/CLI-managed children whose spawn is not directly controlled
+    by this package, while explicit child-spawn guards remain defense in depth.
+    Returns removed key names for tests/diagnostics; values are never returned.
+    """
+    target = os.environ if env is None else env
+    removed = tuple(key for key in TENANT_FORBIDDEN_ENV_KEYS if key in target)
+    for key in removed:
+        target.pop(key, None)
+    if removed:
+        log.warning(
+            "tenant runtime: scrubbed forbidden credential key(s) %s from process environment",
+            ", ".join(removed),
+        )
+    return removed
 
 # Bidirectional 1:1 canonical<->legacy renames. A box that sets EITHER name
 # populates BOTH keys (canonical value preferred when both are set), so:

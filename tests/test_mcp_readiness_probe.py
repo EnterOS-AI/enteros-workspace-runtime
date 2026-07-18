@@ -25,6 +25,7 @@ import pytest
 
 from molecule_runtime import mcp_readiness_probe as probe
 from molecule_runtime import platform_agent_identity as pai
+from molecule_runtime.privileged_mcp_env import TENANT_FORBIDDEN_ENV_KEYS
 
 
 PROVISION_ID = "mcp__molecule-platform__provision_workspace"
@@ -158,6 +159,25 @@ def test_resolve_from_settings_entry_merges_env(tmp_path, monkeypatch):
     assert argv == ["/usr/local/bin/molecule-mcp", "--stdio"]
     assert env["MOLECULE_MCP_MODE"] == "management"   # from the settings entry
     assert env["MOLECULE_API_KEY"] == "from-container"  # from os.environ base
+
+
+def test_resolve_launch_strips_tenant_forbidden_capability_from_ambient_and_entry(
+    tmp_path, monkeypatch
+):
+    forbidden = TENANT_FORBIDDEN_ENV_KEYS[0]
+    settings = _write_settings(tmp_path, {
+        "command": "molecule-mcp",
+        "env": {forbidden: "descriptor-capability"},
+    })
+    monkeypatch.setattr(probe, "SETTINGS_PATH", str(settings))
+    monkeypatch.setattr(probe.shutil, "which", lambda command: command)
+    monkeypatch.setenv(forbidden, "ambient-production-capability")
+
+    launch = probe.resolve_management_launch()
+
+    assert launch is not None
+    _argv, env = launch
+    assert forbidden not in env
 
 
 def test_resolve_none_when_not_declared_and_no_binary(tmp_path, monkeypatch):

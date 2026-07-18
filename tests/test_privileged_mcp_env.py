@@ -23,6 +23,7 @@ from molecule_runtime.privileged_mcp_env import (
     TENANT_FORBIDDEN_ENV_KEYS,
     WORKSPACE_TOKEN_FILE,
     inject_privileged_env,
+    scrub_tenant_forbidden_process_env,
 )
 
 # The org-admin CREDENTIAL keys — the actual privilege the enforcement seam keeps
@@ -101,6 +102,19 @@ def test_production_promote_credential_is_stripped_from_all_tenant_mcp_surfaces(
         assert _PRODUCTION_PROMOTE_KEY not in rendered.get("env", {}), (
             f"production promote capability leaked into tenant MCP surface {name}"
         )
+
+
+def test_tenant_runtime_scrubs_forbidden_capabilities_from_its_process_env():
+    env = {
+        _PRODUCTION_PROMOTE_KEY: "must-never-reach-a-tenant-child",
+        "PATH": "/usr/bin:/bin",
+    }
+
+    removed = scrub_tenant_forbidden_process_env(env)
+
+    assert removed == (_PRODUCTION_PROMOTE_KEY,)
+    assert _PRODUCTION_PROMOTE_KEY not in env
+    assert env["PATH"] == "/usr/bin:/bin"
 
 
 def test_forwards_every_contract_required_mgmt_mcp_env_key():

@@ -27,6 +27,7 @@ from molecule_runtime.platform_agent_identity import (
     loaded_mcp_tools,
     set_loaded_mcp_tools,
 )
+from molecule_runtime.privileged_mcp_env import TENANT_FORBIDDEN_ENV_KEYS
 
 
 class _ProbeAdapter(BaseAdapter):
@@ -305,6 +306,42 @@ class TestConnectedButToolless:
         assert observed == []
         assert loaded_mcp_tools() == []
         assert identity_gate_payload()["loaded_mcp_tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_env_strips_tenant_forbidden_capability_from_ambient_and_spec(
+    monkeypatch,
+):
+    """The real subprocess seam must not trust either parent env or descriptor.
+
+    Rendering already strips the descriptor in normal setup, but boot probes also
+    accept specs directly and begin from ``os.environ``. Assert the exact env passed
+    to ``create_subprocess_exec`` so a rendered-spec-only test cannot false-green.
+    """
+    forbidden = TENANT_FORBIDDEN_ENV_KEYS[0]
+    monkeypatch.setenv(forbidden, "ambient-production-capability")
+    captured = {}
+
+    class _ExitedProc:
+        returncode = 0
+
+    async def _capture_spawn(*_argv, **kwargs):
+        captured["env"] = kwargs["env"]
+        return _ExitedProc()
+
+    async def _connected_without_tools(_proc, _server):
+        return []
+
+    monkeypatch.setattr(probe.asyncio, "create_subprocess_exec", _capture_spawn)
+    monkeypatch.setattr(probe, "_handshake", _connected_without_tools)
+
+    result = await probe._list_tools_from_mcp_server(
+        "molecule-platform",
+        {"command": "fake-mcp", "env": {forbidden: "descriptor-capability"}},
+    )
+
+    assert result == []
+    assert forbidden not in captured["env"]
 
 
 # ---------------------------------------------------------------------------

@@ -88,6 +88,7 @@ from molecule_runtime.platform_agent_identity import (
     set_loaded_mcp_tools,
     set_mcp_tools_ready,
 )
+from molecule_runtime.privileged_mcp_env import tenant_safe_child_env
 
 # Share the platform-agent identity logger namespace so a stuck-readiness
 # investigation can ``grep platform-agent.identity`` and see BOTH the declared
@@ -214,7 +215,9 @@ def resolve_management_launch() -> Optional[tuple[list[str], dict]]:
             # Resolve the command on PATH so a bare name (e.g. ``molecule-mcp``)
             # spawns reliably; fall back to the bare name if which() misses.
             argv0 = shutil.which(command) or command
-            return [argv0, *arg_list], env
+            return [argv0, *arg_list], tenant_safe_child_env(
+                env, boundary="management MCP readiness child environment"
+            )
 
     # Baked-image fallback: the platform-agent image symlinks the management MCP
     # binary onto PATH as ``molecule-platform-mcp``.
@@ -223,7 +226,9 @@ def resolve_management_launch() -> Optional[tuple[list[str], dict]]:
         env = _base_env_with_launch_overlay()
         spec_env = MANAGEMENT_MCP_SPEC.get("env") or {}
         env.update({str(k): str(v) for k, v in spec_env.items()})
-        return [resolved], env
+        return [resolved], tenant_safe_child_env(
+            env, boundary="management MCP readiness child environment"
+        )
 
     return None
 
