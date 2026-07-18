@@ -555,6 +555,15 @@ async def start_poll_delivery_when_bound(
 
 
 async def main():  # pragma: no cover
+    # This process is always inside a tenant workspace or concierge trust boundary.
+    # Remove operator-only capabilities before any helper, SDK, CLI, or MCP child
+    # can inherit them. Core/CP provisioning deny them too; this is the runtime's
+    # independent fail-closed guard if an ambient value is ever misconfigured.
+    from molecule_runtime.privileged_mcp_env import (
+        scrub_tenant_forbidden_process_env,
+    )
+    scrub_tenant_forbidden_process_env()
+
     workspace_id = os.environ.get("WORKSPACE_ID", "")
     if not workspace_id:
         raise SystemExit("FATAL: WORKSPACE_ID env var is not set. Aborting.")

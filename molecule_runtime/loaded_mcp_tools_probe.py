@@ -85,6 +85,8 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+from molecule_runtime.privileged_mcp_env import tenant_safe_child_env
+
 if TYPE_CHECKING:  # avoid an import cycle at runtime (adapter_base imports this module)
     from molecule_runtime.adapter_base import AdapterConfig, BaseAdapter
 
@@ -440,6 +442,9 @@ async def _list_tools_from_mcp_server(server: str, spec: dict) -> list[str] | No
     if isinstance(spec_env, dict):
         for k, v in spec_env.items():
             child_env[str(k)] = str(v)
+    child_env = tenant_safe_child_env(
+        child_env, boundary="loaded MCP probe child environment"
+    )
 
     proc = None
     try:

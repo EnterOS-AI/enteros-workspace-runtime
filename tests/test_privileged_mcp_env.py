@@ -20,8 +20,10 @@ from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
 from molecule_runtime.privileged_mcp_env import (
     PRIVILEGED_ENV_KEYS,
     SELF_MCP_MODE,
+    TENANT_FORBIDDEN_ENV_KEYS,
     WORKSPACE_TOKEN_FILE,
     inject_privileged_env,
+    scrub_tenant_forbidden_process_env,
 )
 
 # The org-admin CREDENTIAL keys — the actual privilege the enforcement seam keeps
@@ -35,12 +37,84 @@ _ORG_SECRET_KEYS = (
     "MOLECULE_ADMIN_TOKEN",
 )
 
+_PRODUCTION_PROMOTE_KEY = "CP_PROMOTE_PROD_API_TOKEN"
+
 
 def _credentials_contract() -> dict:
     """The vendored molecule-ai-sdk contracts/credentials SSOT (drift-gated against
     SDK main by scripts/check-schemas-in-sync.sh)."""
     p = pathlib.Path(molecule_runtime.__file__).parent / "contracts" / "credentials.contract.json"
     return json.loads(p.read_text())
+
+
+def test_production_promote_contract_forbids_every_tenant_runtime_surface():
+    contract = _credentials_contract()
+    promote = next(
+        (
+            credential
+            for credential in contract["credentials"]
+            if credential["env_key"] == _PRODUCTION_PROMOTE_KEY
+        ),
+        None,
+    )
+    assert promote is not None, "vendored SDK contract is missing the promote capability"
+    assert set(promote["forbidden_on"]) >= {
+        "ordinary-workspace",
+        "tenant-platform-box",
+        "tenant-concierge",
+    }
+    assert _PRODUCTION_PROMOTE_KEY not in contract["management_mcp_env"]["required"]
+    assert _PRODUCTION_PROMOTE_KEY in contract["management_mcp_env"]["optional"]
+    assert _PRODUCTION_PROMOTE_KEY in TENANT_FORBIDDEN_ENV_KEYS
+
+
+def test_production_promote_credential_is_stripped_from_all_tenant_mcp_surfaces():
+    ambient = {
+        _PRODUCTION_PROMOTE_KEY: "ambient-production-capability",
+        "MOLECULE_API_URL": "https://tenant.example",
+        "WORKSPACE_ID": "ws-1",
+    }
+    cases = [
+        (
+            MANAGEMENT_MCP_NAME,
+            {
+                "command": "npx",
+                "audience": "org",
+                "env": {_PRODUCTION_PROMOTE_KEY: "descriptor"},
+            },
+        ),
+        (
+            "molecule-schedule-self",
+            {
+                "command": "npx",
+                "audience": "self",
+                "env": {_PRODUCTION_PROMOTE_KEY: "descriptor"},
+            },
+        ),
+        (
+            "image-gen",
+            {"command": "npx", "env": {_PRODUCTION_PROMOTE_KEY: "descriptor"}},
+        ),
+    ]
+
+    for name, spec in cases:
+        rendered = inject_privileged_env(name, spec, ambient)
+        assert _PRODUCTION_PROMOTE_KEY not in rendered.get("env", {}), (
+            f"production promote capability leaked into tenant MCP surface {name}"
+        )
+
+
+def test_tenant_runtime_scrubs_forbidden_capabilities_from_its_process_env():
+    env = {
+        _PRODUCTION_PROMOTE_KEY: "must-never-reach-a-tenant-child",
+        "PATH": "/usr/bin:/bin",
+    }
+
+    removed = scrub_tenant_forbidden_process_env(env)
+
+    assert removed == (_PRODUCTION_PROMOTE_KEY,)
+    assert _PRODUCTION_PROMOTE_KEY not in env
+    assert env["PATH"] == "/usr/bin:/bin"
 
 
 def test_forwards_every_contract_required_mgmt_mcp_env_key():
@@ -550,4 +624,3 @@ def test_self_audience_no_api_url_logs_misconfig(caplog):
         out = inject_privileged_env("schedule-self", {"audience": "self"}, {})
     assert "MOLECULE_API_URL" not in out["env"]
     assert "NO tenant API URL" in caplog.text
-

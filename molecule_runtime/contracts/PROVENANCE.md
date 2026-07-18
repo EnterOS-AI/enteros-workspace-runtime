@@ -121,9 +121,10 @@ Re-vendoring (instance):
 ## credentials.contract.json
 
 Source: molecule-ai-sdk `contracts/credentials/credentials.contract.json`.
-Source commit: `d464fc36f599757b4597bb14ef4e53ad25acc11e` (sdk#97 — declares
-shown-once credential disclosure and fail-closed persistence rules).
-Vendored at SDK main: `0ff6e1bf09c2be6d08b56a53e88cffd7354ef9b0`.
+Source commit: `2ed68a2b9fdf2b540d9e1d9e1670e92c22a53c0a` (sdk#127 — declares
+the route-scoped production promotion capability and forbids it on tenant
+workspace, platform-box, and concierge surfaces).
+Vendored at SDK main: `afd26e5f427cd2631ce5d1635f2c6a1540b96926`.
 This is the root-level credential/privilege SSOT.
 
 Why vendored: `tests/test_privileged_mcp_env.py` asserts `privileged_mcp_env`
