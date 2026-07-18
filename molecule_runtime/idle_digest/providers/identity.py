@@ -46,6 +46,23 @@ PRIORITIES_LINE = (
     "plugin work · goal — urgent items jump the queue."
 )
 
+# Reply routing — the delivery contract for this self-initiated turn. The
+# digest poster forwards the turn's reply text to the user's chat
+# (idle_digest/reply_forwarder.py), restoring symmetry with request-response
+# turns; without this line models "answer" housekeeping ticks into the void.
+# The ``(idle)`` sentinel is the silence valve — keep in lockstep with
+# reply_forwarder.IDLE_SENTINEL. BYTE BUDGET (review #327, empirical): the
+# pinned identity summary is tail-truncated at Policy.max_summary_bytes
+# (512); this line renders BEFORE the tool inventory, so every byte here
+# evicts a byte of "workspace MCP (N): ..." from the tail. Keep it ≤120
+# bytes — the 223-byte first draft truncated the entire tool inventory the
+# bridge-union fix exists to surface (pinned by
+# test_reply_routing_line_fits_byte_budget).
+REPLY_ROUTING_LINE = (
+    "Reply routing: this reply is sent to the user's chat (no separate send "
+    "needed); reply exactly (idle) to send nothing."
+)
+
 # Names-only cap per tool group before the engine's byte cap also applies.
 _MAX_NAMES_PER_GROUP = 8
 _IDENTITY_LINE_MAX_CHARS = 140
@@ -121,6 +138,15 @@ class IdentityCapabilitiesProvider:
     persona_reader: Optional[Callable[[str, Sequence[str]], str]] = None
     tools_source: Optional[Callable[[], Optional[Sequence[str]]]] = None
     platform_agent_check: Optional[Callable[[], bool]] = None
+    # The workspace "molecule" bridge is served IN-PROCESS (a2a_mcp_server);
+    # http/url-wired runtimes (e.g. hermes' gateway on :9100) declare it with
+    # no stdio command, so the spawn-probe skips it and the OBSERVED inventory
+    # under-reports "workspace MCP (0)" — telling the agent it lacks
+    # send_message_to_user / delegate_task / commit_memory when it has them.
+    # The runtime knows its own bridge registry authoritatively; this seam
+    # unions those ids into the header. Observed-inventory producers
+    # (heartbeat diagnostics) stay pure — the union is display-layer only.
+    bridge_tools_source: Optional[Callable[[], Sequence[str]]] = None
 
     def _read_persona(self) -> str:
         reader = self.persona_reader
@@ -133,6 +159,25 @@ class IdentityCapabilitiesProvider:
         except Exception:  # noqa: BLE001 — a bad persona file must never crash the tick
             return ""
 
+    def _read_bridge_tools(self) -> list[str]:
+        source = self.bridge_tools_source
+        if source is None:
+            def source() -> Sequence[str]:
+                from molecule_runtime.mcp_tools import MOLECULE_MCP_TOOLS
+
+                return [
+                    f"mcp__{WORKSPACE_MCP_SERVER}__{t['name']}"
+                    for t in MOLECULE_MCP_TOOLS
+                ]
+        try:
+            return list(source() or [])
+        except Exception as e:  # noqa: BLE001
+            # Degrading to observed-only inventory reproduces the
+            # "workspace MCP (0)" defect this seam exists to fix — never
+            # silently (review #327).
+            print(f"idle-digest identity: bridge tool registry unavailable — {e}", flush=True)
+            return []
+
     def _read_tools(self) -> list[str]:
         source = self.tools_source
         if source is None:
@@ -140,9 +185,14 @@ class IdentityCapabilitiesProvider:
 
             source = platform_agent_identity.loaded_mcp_tools
         try:
-            return list(source() or [])
+            observed = list(source() or [])
         except Exception:  # noqa: BLE001
-            return []
+            observed = []
+        # Union with the in-process bridge registry (see bridge_tools_source).
+        # Stdio-probed runtimes already report the same mcp__molecule__* ids —
+        # the set-union dedups them; http-wired runtimes gain the tools the
+        # probe could not spawn.
+        return sorted(set(observed) | set(self._read_bridge_tools()))
 
     def _is_platform_agent(self) -> bool:
         check = self.platform_agent_check
@@ -211,6 +261,7 @@ class IdentityCapabilitiesProvider:
         if responsibility:
             parts.append(responsibility)
         parts.append(PRIORITIES_LINE)
+        parts.append(REPLY_ROUTING_LINE)
         parts.append("Your available MCP tools (native):")
         parts.extend(group_lines)
         summary = "\n".join(parts)

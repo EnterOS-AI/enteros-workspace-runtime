@@ -1413,9 +1413,14 @@ async def main():  # pragma: no cover
                 )
 
             # Send initial prompt through the platform A2A proxy (not directly to self).
-            # The proxy logs an a2a_receive with source_id=NULL (canvas-style),
-            # broadcasts A2A_RESPONSE via WebSocket so the chat shows both the
-            # prompt (as user message) and the response (as agent message).
+            # NOTE (verified against a2a_proxy_helpers.go, review #327): the
+            # proxy's A2A_RESPONSE broadcast is gated on caller identity
+            # (callerID == "" || isCanvasUser) — a self_source_headers call is
+            # callerID == workspaceID, so THIS response is NOT auto-broadcast
+            # to the canvas. Any user-visible output of the initial-prompt
+            # turn must go through send_message_to_user; the response body
+            # read below is otherwise discarded (same class as the digest
+            # discard fixed by idle_digest/reply_forwarder — follow-up #327).
             # Uses urllib in a thread to avoid asyncio/httpx streaming hangs.
             import json as _json
             import urllib.request
@@ -1591,35 +1596,18 @@ async def main():  # pragma: no cover
                         pass
                     break
 
-            import json as _idle_json
-            from urllib import request as _idle_urlreq
-
             _IDLE_FIRE_TIMEOUT = max(60, min(300, _idle_policy.idle_fire_after_seconds))
 
-            async def _digest_poster(_text: str) -> None:
-                _payload = _idle_json.dumps({
-                    "method": "message/send",
-                    "params": build_message_send_params(
-                        _text,
-                        message_id=f"idle-{_uuid.uuid4().hex[:8]}",
-                        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
-                    ),
-                }).encode()
+            # The complete self-fire round trip — <SYSTEM IDLE PROMPT> framing,
+            # message/send POST, and forwarding the turn's reply text to the
+            # user — lives in idle_digest/poster.py so the wire behavior is
+            # conformance-tested (real builders, real HTTP) instead of sitting
+            # untestable in a boot closure.
+            from molecule_runtime.idle_digest.poster import make_digest_poster
 
-                def _post():
-                    _headers = {
-                        "Content-Type": "application/json",
-                        **self_source_headers(workspace_id),
-                    }
-                    _req = _idle_urlreq.Request(
-                        f"{platform_url}/workspaces/{workspace_id}/a2a",
-                        data=_payload,
-                        headers=_headers,
-                    )
-                    with _idle_urlreq.urlopen(_req, timeout=_IDLE_FIRE_TIMEOUT) as _r:
-                        _r.read()
-
-                await asyncio.get_running_loop().run_in_executor(None, _post)
+            _digest_poster = make_digest_poster(
+                platform_url, workspace_id, _IDLE_FIRE_TIMEOUT
+            )
 
             _idle_controller = _IDC(
                 providers=_idle_providers,
@@ -1817,6 +1805,11 @@ async def main():  # pragma: no cover
                     except Exception as e:  # pragma: no cover
                         print(f"Idle loop: executor callback crashed — {e}", flush=True)
 
+                # DELIBERATELY no reply forwarding here (review #327): this loop
+                # is the MOLECULE_MAILBOX_KERNEL=0 emergency opt-out whose
+                # contract is byte-identical pre-kernel behavior, and its raw
+                # config.idle_prompt carries no (idle) silence contract — the
+                # digest poster (idle_digest/poster.py) owns reply delivery.
                 fut = loop_ref.run_in_executor(None, _post_sync)
                 fut.add_done_callback(_log_result)
 

@@ -18,6 +18,9 @@ def _provider(persona="", tools=None, is_platform=False, **kw):
         persona_reader=lambda cp, pf: persona,
         tools_source=lambda: tools,
         platform_agent_check=lambda: is_platform,
+        # Neutralize the in-process bridge union so these tests keep pinning
+        # the OBSERVED-inventory rendering; the union has its own tests below.
+        bridge_tools_source=kw.pop("bridge_tools_source", lambda: []),
         **kw,
     )
 
@@ -128,6 +131,7 @@ async def test_persona_reader_raising_is_survived():
         persona_reader=boom,
         tools_source=lambda: [],
         platform_agent_check=lambda: False,
+        bridge_tools_source=lambda: [],
     )
     [c] = await p.contribute()
     assert c.summary.startswith("You are x —")  # fell back, did not raise
@@ -143,6 +147,7 @@ async def test_tools_source_raising_is_survived():
         persona_reader=lambda cp, pf: "Role",
         tools_source=boom,
         platform_agent_check=lambda: False,
+        bridge_tools_source=lambda: [],
     )
     [c] = await p.contribute()
     assert c.count == 0 and "workspace MCP (0)" in c.summary
@@ -180,3 +185,79 @@ async def test_header_assembles_first_and_is_empty_alone():
     # header alone is empty (never fires)
     d_header_only = assemble([header], Policy())
     assert d_header_only.is_empty is True
+
+
+@pytest.mark.asyncio
+async def test_bridge_union_fills_workspace_mcp_for_http_wired_runtimes():
+    """The core defect: the stdio spawn-probe skips http/url-wired servers, so
+    a hermes-style runtime OBSERVES only the management MCP and the header
+    reads "workspace MCP (0)" — telling the agent it lacks the bridge tools it
+    actually serves in-process. The bridge union must fill them in."""
+    p = _provider(
+        persona="Role",
+        tools=["mcp__molecule-platform__create_workspace"],
+        is_platform=True,
+        bridge_tools_source=lambda: [
+            "mcp__molecule__send_message_to_user",
+            "mcp__molecule__delegate_task",
+        ],
+    )
+    [c] = await p.contribute()
+    assert "workspace MCP (2): delegate_task \u00b7 send_message_to_user" in c.summary or \
+        "workspace MCP (2): delegate_task · send_message_to_user" in c.summary
+    assert "workspace MCP (0)" not in c.summary
+
+
+@pytest.mark.asyncio
+async def test_bridge_union_dedups_stdio_probed_ids():
+    """Stdio-wired runtimes already observe the same mcp__molecule__* ids —
+    the union must not double-count."""
+    p = _provider(
+        persona="Role",
+        tools=["mcp__molecule__send_message_to_user"],
+        bridge_tools_source=lambda: ["mcp__molecule__send_message_to_user"],
+    )
+    [c] = await p.contribute()
+    assert "workspace MCP (1)" in c.summary
+
+
+@pytest.mark.asyncio
+async def test_bridge_source_raising_is_survived():
+    def boom():
+        raise RuntimeError("registry import broke")
+
+    p = _provider(persona="Role", tools=["mcp__molecule__x"], bridge_tools_source=boom)
+    [c] = await p.contribute()
+    assert "workspace MCP (1)" in c.summary  # observed still renders
+
+
+@pytest.mark.asyncio
+async def test_reply_routing_line_fits_byte_budget():
+    """review #327 empirical guard: the pinned identity summary is
+    tail-truncated at Policy.max_summary_bytes (512). REPLY_ROUTING_LINE
+    renders BEFORE the tool inventory, so an oversized routing line evicts
+    the 'workspace MCP (N)' line — the exact regression the 223-byte first
+    draft caused (verified live: 861-byte raw summary, entire inventory
+    truncated). This pins the realistic worst case: platform concierge, 46
+    observed management tools, REAL bridge registry union."""
+    from molecule_runtime.idle_digest import assemble
+    from molecule_runtime.idle_digest.contract import Policy
+
+    mgmt = [f"mcp__molecule-platform__tool_{i:02d}" for i in range(46)]
+    p = IdentityCapabilitiesProvider(
+        workspace_name="Enter OS Agent",
+        runtime_kind="hermes",
+        persona_reader=lambda cp, pf: "the Org Concierge\nYou are the organization's platform agent: the single org-root agent",
+        tools_source=lambda: mgmt,
+        platform_agent_check=lambda: True,
+        # real registry deliberately (no bridge_tools_source injection)
+    )
+    contributions = await p.contribute()
+    assembled = assemble(contributions, Policy.default())
+    [c] = assembled.contributions
+    assert "workspace MCP (" in c.summary, (
+        f"routing line evicted the tool inventory again "
+        f"(summary={len(c.summary.encode())}B): {c.summary[-120:]!r}"
+    )
+    assert "Reply routing:" in c.summary, "routing contract itself was truncated"
+    assert "(idle)" in c.summary, "silence-valve instruction was truncated"
