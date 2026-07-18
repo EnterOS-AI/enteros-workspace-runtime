@@ -150,6 +150,126 @@ async def tool_broadcast_message(
         return f"Error sending broadcast: {e}"
 
 
+async def tool_install_plugin(
+    source: str,
+    workspace_id: str | None = None,
+) -> str:
+    """Install a plugin onto YOUR OWN workspace (self-scoped).
+
+    This is a self-service ability every workspace has by default —
+    like installing an app on your own phone. It equips THIS workspace
+    with a new plugin (extra skills, an MCP server, a channel, a
+    workflow sub-agent, …). It always targets the CALLER's own
+    workspace; you cannot install onto another workspace with this tool
+    (that is an orchestrator/platform privilege).
+
+    WHICH plugins you may install is still governed by your org's plugin
+    allowlist. If the org has configured an allowlist and the plugin
+    isn't on it, the platform returns a 403 and this tool surfaces a
+    clean "not allowed by org allowlist" hint — ask an org admin to add
+    it, then retry. An org with no allowlist configured allows any
+    plugin (allow-all, backward compatible).
+
+    Installing typically RESTARTS this workspace so the runtime loads the
+    new plugin; your current session ends and resumes afterward (the
+    platform leaves you a wake note). The return string tells you whether
+    a restart was scheduled.
+
+    Args:
+        source: The plugin source URL. Supported schemes:
+            ``local://<name>``            — platform-curated registry
+            ``github://owner/repo``       — a GitHub repo (unpinned)
+            ``github://owner/repo#v1.2.0``— a pinned ref (preferred)
+            Other schemes work when a resolver is registered.
+        workspace_id: Optional. Multi-workspace mode only (an external
+            agent registered into several workspaces): selects WHICH of
+            your own registered workspaces to install onto. Single-
+            workspace agents omit this — it defaults to this workspace.
+            It cannot be used to install onto a workspace you don't own:
+            the platform authenticates with that workspace's own token,
+            so a mismatch is rejected server-side.
+    """
+    if not source or not isinstance(source, str):
+        return (
+            "Error: source is required — e.g. 'local://my-plugin' or "
+            "'github://owner/repo#v1.2.0'"
+        )
+    target_workspace_id = (workspace_id or "").strip() or _resolve_workspace_id()
+    base = _resolve_platform_url(target_workspace_id)
+    try:
+        # Plugin install fetches + stages + delivers to the container, so
+        # give it a generous ceiling (the server also bounds it via
+        # PLUGIN_INSTALL_FETCH_TIMEOUT). This is a safety net, not a value
+        # we wait out on the success path.
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{base}/workspaces/{target_workspace_id}/plugins",
+                json={"source": source},
+                headers=_auth_headers_for_heartbeat(target_workspace_id),
+            )
+    except Exception as e:
+        return f"Error installing plugin: {e}"
+
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        name = data.get("plugin") or source
+        installed_from = data.get("source") or source
+        restarting = bool(data.get("restarting"))
+        note = (
+            " This workspace is restarting to load it — your current session "
+            "will end and resume afterward."
+            if restarting
+            else " No restart was needed (hot-reloaded)."
+        )
+        return f"Plugin '{name}' installed on this workspace from {installed_from}.{note}"
+    if resp.status_code == 403:
+        # Org plugin allowlist gate (checkOrgPluginAllowlist). Surface a
+        # clean, actionable hint instead of a raw 403.
+        reason = ""
+        try:
+            reason = resp.json().get("error", "")
+        except Exception:
+            reason = ""
+        return (
+            "Error: this plugin is not allowed by your org's plugin allowlist"
+            + (f" ({reason})" if reason else "")
+            + ". Ask an org admin to add it to the allowlist "
+            "(Settings → Plugins → Allowlist), then try again."
+        )
+    if resp.status_code == 401:
+        # A per-workspace token only authenticates its OWN workspace, so a
+        # 401 here means the target isn't yours — install-on-another is an
+        # orchestrator/platform privilege, not a self-service ability.
+        return (
+            "Error: not authorized to install onto that workspace. "
+            "install_plugin installs onto YOUR OWN workspace only; installing "
+            "onto another workspace is an orchestrator/platform privilege."
+        )
+    if resp.status_code == 422:
+        # External runtimes pull plugins instead of push-install.
+        hint = ""
+        err = ""
+        try:
+            body = resp.json()
+            hint = body.get("hint", "")
+            err = body.get("error", "")
+        except Exception:
+            pass
+        return (
+            f"Error: {err or 'plugin push-install is not supported for this runtime'}"
+            + (f" — {hint}" if hint else "")
+        )
+    detail = ""
+    try:
+        detail = resp.json().get("error", "")
+    except Exception:
+        detail = (resp.text or "")[:200]
+    return f"Error: platform returned {resp.status_code}{(': ' + detail) if detail else ''}"
+
+
 async def tool_send_message_to_user(
     message: str,
     attachments: list | None = None,

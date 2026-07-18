@@ -205,6 +205,113 @@ def test_broadcast_message_empty_returns_required_error(monkeypatch, stub_resolv
 
 
 # ==========================================================================
+# 1b. tool_install_plugin  (self-scoped plugin install)
+#
+# The operator principle: installing a plugin ON YOURSELF is a self-scoped
+# ability every workspace has by default (like installing an app on your own
+# phone). These tests pin that the tool ALWAYS targets the CALLER's own
+# workspace, surfaces the org-allowlist 403 as a clean hint, and reports the
+# "install-on-another is a platform privilege" boundary on a 401.
+# ==========================================================================
+
+def test_install_plugin_self_scoped_posts_to_own_workspace(monkeypatch, stub_resolve):
+    """Success path: install_plugin POSTs to /workspaces/<self>/plugins with
+    {"source": ...} using THIS workspace's own auth headers, and reports the
+    installed plugin name. Self-targeting is the whole security model — the
+    URL workspace id must be the resolved SELF id, never a caller-supplied
+    other id."""
+    import molecule_runtime.a2a_tools_messaging as m
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        m.httpx, "AsyncClient",
+        lambda timeout=None: _FakeAsyncClient(
+            [_FakeResponse(200, {"status": "installed", "plugin": "sonos-cli",
+                                 "source": "local://sonos-cli", "restarting": True})],
+            captured, timeout=timeout,
+        ),
+    )
+
+    result = asyncio.run(m.tool_install_plugin("local://sonos-cli"))
+
+    assert len(captured) == 1
+    assert captured[0]["url"] == f"{_BASE}/workspaces/{_WS}/plugins"
+    assert captured[0]["json"] == {"source": "local://sonos-cli"}
+    # Own-workspace auth headers were attached (self-scoped install).
+    assert captured[0]["headers"] == {"authorization": "token test"}
+    assert stub_resolve["auth"] == [_WS]
+    assert "sonos-cli" in result
+    assert "installed" in result.lower()
+
+
+def test_install_plugin_403_returns_allowlist_hint(monkeypatch, stub_resolve):
+    """403 → org plugin allowlist gate. The tool must surface a clean,
+    actionable 'not allowed by org allowlist' hint (not a raw 403), so the
+    agent knows to ask an admin rather than retry blindly."""
+    import molecule_runtime.a2a_tools_messaging as m
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        m.httpx, "AsyncClient",
+        lambda timeout=None: _FakeAsyncClient(
+            [_FakeResponse(403, {"error": 'plugin "evil-tool" is not in the org allowlist'})],
+            captured, timeout=timeout,
+        ),
+    )
+
+    result = asyncio.run(m.tool_install_plugin("github://acme/evil-tool"))
+
+    assert result.startswith("Error:")
+    assert "allowlist" in result.lower()
+    assert "org" in result.lower()
+
+
+def test_install_plugin_401_reports_self_only_boundary(monkeypatch, stub_resolve):
+    """401 → a per-workspace token only authenticates its OWN workspace, so a
+    401 means the target isn't yours. The tool must explain that installing
+    onto ANOTHER workspace is an orchestrator/platform privilege — this is the
+    'others stay platform-only' half of the contract, surfaced to the agent."""
+    import molecule_runtime.a2a_tools_messaging as m
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        m.httpx, "AsyncClient",
+        lambda timeout=None: _FakeAsyncClient(
+            [_FakeResponse(401, {"error": "invalid workspace auth token"})],
+            captured, timeout=timeout,
+        ),
+    )
+
+    result = asyncio.run(
+        m.tool_install_plugin("local://x", workspace_id="22222222-2222-2222-2222-222222222222")
+    )
+
+    assert result.startswith("Error:")
+    assert "your own workspace" in result.lower()
+    # The tool honored the explicit workspace_id when building the URL/auth —
+    # it never rewrites the target to SELF, so the server's per-workspace
+    # token check is what enforces the boundary (defense in depth).
+    assert captured[0]["url"].endswith("/workspaces/22222222-2222-2222-2222-222222222222/plugins")
+    assert stub_resolve["auth"] == ["22222222-2222-2222-2222-222222222222"]
+
+
+def test_install_plugin_empty_source_returns_required_error(monkeypatch, stub_resolve):
+    """Empty / missing source short-circuits to a clear error WITHOUT firing
+    any HTTP request (mirrors the broadcast empty-message regression guard)."""
+    import molecule_runtime.a2a_tools_messaging as m
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        m.httpx, "AsyncClient",
+        lambda timeout=None: _FakeAsyncClient([], captured, timeout=timeout),
+    )
+
+    assert asyncio.run(m.tool_install_plugin("")).startswith("Error: source is required")
+    assert asyncio.run(m.tool_install_plugin(None)).startswith("Error: source is required")
+    assert captured == [], "empty source must NOT trigger any HTTP call"
+
+
+# ==========================================================================
 # 2. tool_send_message_to_user  (the "talk_to_user" surface)
 # ==========================================================================
 

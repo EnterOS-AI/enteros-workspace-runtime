@@ -58,6 +58,7 @@ from molecule_runtime.a2a_tools import (
     tool_get_workspace_info,
     tool_inbox_peek,
     tool_inbox_pop,
+    tool_install_plugin,
     tool_list_peers,
     tool_recall_memory,
     tool_send_message_to_user,
@@ -545,6 +546,51 @@ _CREATE_APPROVAL = ToolSpec(
         "required": ["action"],
     },
     impl=tool_create_approval,
+    section=A2A_SECTION,
+)
+
+_INSTALL_PLUGIN = ToolSpec(
+    name="install_plugin",
+    short=(
+        "Install a plugin onto YOUR OWN workspace (self-scoped) — like installing "
+        "an app on your own phone. WHICH plugins are permitted is governed by the "
+        "org plugin allowlist; returns a 'not allowed by org allowlist' hint on 403."
+    ),
+    when_to_use=(
+        "Use to equip THIS workspace with a new capability (skills, an MCP server, "
+        "a channel, a workflow sub-agent). Every workspace can self-install by "
+        "default — no platform entitlement needed — but the plugin must be on your "
+        "org's allowlist if one is configured (else you get a clean 403 hint; ask "
+        "an org admin to add it). This ALWAYS targets your own workspace; installing "
+        "onto ANOTHER workspace is an orchestrator/platform privilege, not this tool. "
+        "Installing usually restarts this workspace to load the plugin — your session "
+        "ends and resumes afterward."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "source": {
+                "type": "string",
+                "description": (
+                    "Plugin source URL. Schemes: 'local://<name>' (platform "
+                    "registry), 'github://owner/repo' (unpinned), "
+                    "'github://owner/repo#v1.2.0' (pinned ref — preferred)."
+                ),
+            },
+            "workspace_id": {
+                "type": "string",
+                "description": (
+                    "Optional. Multi-workspace mode only: selects WHICH of your own "
+                    "registered workspaces to install onto. Single-workspace agents "
+                    "omit this — it defaults to this workspace. Cannot install onto a "
+                    "workspace you don't own (the platform authenticates with that "
+                    "workspace's own token; a mismatch is rejected server-side)."
+                ),
+            },
+        },
+        "required": ["source"],
+    },
+    impl=tool_install_plugin,
     section=A2A_SECTION,
 )
 
@@ -1044,6 +1090,7 @@ TOOLS: list[ToolSpec] = [
     _SEND_MESSAGE_TO_USER,
     _CREATE_REQUEST,
     _CREATE_APPROVAL,
+    _INSTALL_PLUGIN,
     # Desktop display
     _DESKTOP_STATUS,
     _DESKTOP_SCREENSHOT,

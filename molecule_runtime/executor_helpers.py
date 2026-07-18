@@ -501,6 +501,11 @@ _CLI_A2A_COMMAND_KEYWORDS: dict[str, str | None] = {
     # to None here for adapter consistency; flip to a keyword if the
     # a2a_cli grows a `history` subcommand in the future.
     "chat_history": None,
+    # `install_plugin` is an MCP-first self-service capability (self-scoped
+    # plugin install, governed by the org allowlist). The CLI subprocess
+    # interface doesn't expose a `plugin`/`install` subcommand today, so it
+    # maps to None; flip to a keyword if a2a_cli grows one.
+    "install_plugin": None,
 }
 
 

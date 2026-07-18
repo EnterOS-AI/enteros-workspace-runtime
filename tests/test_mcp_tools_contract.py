@@ -22,6 +22,7 @@ def test_mcp_tools_export_matches_runtime_server():
         "send_message_to_user",
         "create_request",
         "create_approval",
+        "install_plugin",
         "desktop_status",
         "desktop_screenshot",
         "desktop_click",
@@ -42,6 +43,30 @@ def test_mcp_tools_export_matches_runtime_server():
         "task_update",
         "task_complete",
     ]
+
+
+def test_install_plugin_is_a_default_self_scoped_tool():
+    """install_plugin is a DEFAULT tool for EVERY workspace (self-scoped
+    plugin install), so it must:
+      * appear in the SSOT tool list (offered to all workspaces), and
+      * NOT be gated by a runtime RBAC action in PERMISSION_MAP — the
+        server's org plugin allowlist + per-workspace-token auth are the
+        only gates. This mirrors broadcast_message (also ungated at the
+        runtime layer, enforced server-side), keeping the "install an app
+        on your own phone" default intact.
+    """
+    from molecule_runtime.mcp_tools import MOLECULE_MCP_TOOLS, PERMISSION_MAP
+
+    names = [tool["name"] for tool in MOLECULE_MCP_TOOLS]
+    assert "install_plugin" in names, (
+        "install_plugin must be in the SSOT tool list so every workspace "
+        "sees it by default (self-scoped install)."
+    )
+    assert "install_plugin" not in PERMISSION_MAP, (
+        "install_plugin must NOT be gated by a runtime RBAC action — it is a "
+        "self-scoped default; the org allowlist governs WHICH plugins, and the "
+        "server's per-workspace-token auth governs WHOSE workspace."
+    )
 
 
 def test_openai_function_tools_are_derived_from_mcp_schema():

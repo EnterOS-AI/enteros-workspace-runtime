@@ -134,6 +134,7 @@ from molecule_runtime.a2a_tools_messaging import (  # noqa: E402  (import after 
     tool_broadcast_message,
     tool_chat_history,
     tool_get_workspace_info,
+    tool_install_plugin,
     tool_list_peers,
     tool_send_message_to_user,
 )
