@@ -398,7 +398,15 @@ def install_npm_gitea_auth() -> None:
     registry = resolve_npm_registry()
     key = _auth_key(registry)
     if key is None:
-        log.warning("npm_auth: %s=%r has no scheme — skipping", _NPM_REGISTRY_ENV, registry)
+        # Don't name a single env var — resolve_npm_registry() may have taken the
+        # value from the provider-neutral MOLECULE_NPM_REGISTRY, the legacy
+        # MOLECULE_GITEA_NPM_REGISTRY alias, or forge-host derivation. Naming only
+        # one would misdirect an operator who set a different one (review [3]).
+        log.warning(
+            "npm_auth: resolved registry %r has no scheme — skipping "
+            "(check %s / %s)",
+            registry, _PROVIDER_NEUTRAL_NPM_REGISTRY_ENV, _NPM_REGISTRY_ENV,
+        )
         return
 
     registry_line = f"{_SCOPE}:registry={registry}"
