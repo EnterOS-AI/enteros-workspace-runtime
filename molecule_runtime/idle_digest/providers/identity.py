@@ -46,6 +46,19 @@ PRIORITIES_LINE = (
     "plugin work · goal — urgent items jump the queue."
 )
 
+# Reply routing — the delivery contract for this self-initiated turn. The
+# digest poster forwards the turn's reply text to the user's chat
+# (idle_digest/reply_forwarder.py), restoring symmetry with request-response
+# turns; without this line models "answer" housekeeping ticks into the void
+# or, worse, narrate to nobody. The ``(idle)`` sentinel is the silence valve —
+# keep it in lockstep with reply_forwarder.IDLE_SENTINEL.
+REPLY_ROUTING_LINE = (
+    "Reply routing: whatever you write as this turn's reply is delivered to "
+    "the user's chat — write it TO the user, and don't also call "
+    "send_message_to_user for the same content. Reply exactly (idle) to send "
+    "nothing this turn."
+)
+
 # Names-only cap per tool group before the engine's byte cap also applies.
 _MAX_NAMES_PER_GROUP = 8
 _IDENTITY_LINE_MAX_CHARS = 140
@@ -211,6 +224,7 @@ class IdentityCapabilitiesProvider:
         if responsibility:
             parts.append(responsibility)
         parts.append(PRIORITIES_LINE)
+        parts.append(REPLY_ROUTING_LINE)
         parts.append("Your available MCP tools (native):")
         parts.extend(group_lines)
         summary = "\n".join(parts)
