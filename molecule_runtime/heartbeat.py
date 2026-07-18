@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -199,6 +200,9 @@ def _persist_inbound_secret_from_heartbeat(resp) -> None:
 
 HEARTBEAT_INTERVAL = 30  # seconds — fallback default when no per-instance value is passed
 MAX_CONSECUTIVE_FAILURES = 10
+# Cap (seconds) for the exponential backoff applied after a heartbeat failure.
+# Prevents a persistently-unreachable platform from becoming a CPU busy-loop.
+HEARTBEAT_BACKOFF_MAX_SECONDS = 300
 MAX_SEEN_DELEGATION_IDS = 200
 SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to prevent loops
 # Statuses that warrant a user-visible canvas chat push. The agent self-
@@ -621,14 +625,32 @@ class HeartbeatLoop:
                                 self._consecutive_failures,
                                 e,
                             )
-                        if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        # Exponential backoff (capped + jittered) after a failure.
+                        # BUGFIX: the recreate `break` below used to skip the
+                        # bottom-of-loop sleep, so once consecutive>=MAX every
+                        # iteration recreated the client and re-attempted with NO
+                        # delay (~100/sec, ~90% CPU/container when the platform is
+                        # unreachable). Always back off here — including the
+                        # recreate path — so a down platform can never busy-loop.
+                        backoff = min(
+                            self._interval_seconds
+                            * (2 ** min(self._consecutive_failures - 1, 6)),
+                            HEARTBEAT_BACKOFF_MAX_SECONDS,
+                        )
+                        backoff += random.uniform(0.0, min(backoff * 0.25, 5.0))
+                        recreate = self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                        if recreate:
                             logger.info(
                                 "Heartbeat: recreating HTTP client after %d failures",
                                 self._consecutive_failures,
                             )
+                        # Interruptible sleep: wakes immediately on stop() so the
+                        # thread joins promptly during shutdown.
+                        self._hb_stop.wait(backoff)
+                        if recreate:
                             break  # drop to outer loop → recreate client
-                    # Interruptible sleep: wake immediately on stop() so the
-                    # thread joins promptly during shutdown.
+                        continue
+                    # Success — normal cadence.
                     self._hb_stop.wait(self._interval_seconds)
             except Exception as e:
                 logger.error(
