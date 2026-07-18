@@ -1,54 +1,79 @@
-"""Gitea npm-registry auth installer (npm companion to credential_helper.py).
+"""npm ``@molecule-ai`` scope-registry config (companion to credential_helper.py).
 
-Background — fleet-wide concierge degrade (RCA 2026-06-24)
-=========================================================
+Why this exists (PLATFORM CONTRACT, hard)
+=========================================
 
-The concierge's management MCP runs as ``npx @molecule-ai/mcp-server@<ver>`` —
-an **npm** fetch from the PRIVATE gitea npm registry. The box already
-authenticates its **git** fetches (the boot-install of the ``gitea://`` plugin
-repo) via ``GIT_HTTP_USERNAME``/``GIT_HTTP_PASSWORD`` (see
-``workspace-server`` ``conciergePlatformMCPEnv`` + ``setup-gitea-netrc``). But
-npm/npx had **no registry auth**, so it only ever saw the *unauthenticated*
-view of the private package — ``npm view`` returned just ``1.0.0`` and
-``npx @molecule-ai/mcp-server@1.6.1`` failed ``ETARGET`` → the MCP server never
-started → ``create_workspace`` never loaded → every concierge sat ``degraded``
-(``mcp_server_present=true`` but the required tool absent). Proven: supply a
-read:package token and the same ``npx`` starts ("Molecule AI MCP server running
-on stdio (96 tools available)").
+The concierge's management MCP runs as ``npx @molecule-ai/mcp-server@<ver>``.
+Every runtime container MUST be able to resolve the ``@molecule-ai`` npm scope
+or the MCP never starts, ``create_workspace`` never loads, and the platform
+FAIL-CLOSES the workspace (core#3082 ``loaded_mcp_tools`` gate). So this module
+writes the ``@molecule-ai:registry`` line into ``~/.npmrc`` UNCONDITIONALLY.
 
-This module writes ``~/.npmrc`` with the gitea ``@molecule-ai`` registry and an
-``_authToken`` taken from the **same** gitea read token the git auth already
-uses (SSOT — no new credential). It mirrors :func:`install_credential_helper`:
-called once early in startup, fail-soft, idempotent, additive (it preserves any
-unrelated ``.npmrc`` lines). Generic by construction — any ``npm``/``npx`` in
-the container that fetches a private ``@molecule-ai`` package now authenticates,
-not just the concierge MCP.
+Anonymous is the floor; auth is additive-only
+=============================================
+
+Proven live 2026-07-09: the Gitea npm registry serves the ``@molecule-ai``
+scope FULLY ANONYMOUSLY — anonymous packument HTTP 200 AND ``npm pack
+@molecule-ai/mcp-server`` fetches the full tarball with a scope-line-only
+``.npmrc`` (no token). So NO token is required for the common case.
+
+Critically, a token WITHOUT ``read:package`` is REJECTED with HTTP 401, whereas
+NO token falls through to anonymous 200 — **a mis-scoped token is strictly
+WORSE than no token** (it turns working anonymous access into a hard 401). The
+git-transport credential the concierge carries (``GIT_HTTP_USERNAME`` +
+``GIT_HTTP_PASSWORD=x-oauth-basic``, derived by core from a ``read:repository``
+PAT for the ``gitea://`` plugin git-clone — see ``workspace-server``
+``conciergePlatformMCPEnv`` + ``setup-gitea-netrc``) is exactly such a token:
+writing it as the npm ``_authToken`` 401-poisoned the registry and fail-closed
+the hermes concierge. So the npm ``_authToken`` is attached ONLY from a var
+explicitly DESIGNATED as a package token — ``MOLECULE_NPM_TOKEN`` →
+``MOLECULE_TEMPLATE_REPO_TOKEN`` → ``GITEA_TOKEN`` (see
+``_PACKAGE_TOKEN_ENV_PRECEDENCE`` / :func:`_npm_package_token`) — never inferred
+from a git-transport credential.
+
+npm token vs git token — one forge, two protocols (SSOT boundary)
+=================================================================
+This module ALSO owns the shared forge-host + token resolvers that ``git`` uses
+(``plugin_sources`` imports :func:`resolve_gitea_base` and
+:func:`gitea_read_token` — audit finding C1: one host, one credential
+resolution for BOTH git and npm). BUT the two protocols have DIFFERENT scope
+needs from that one forge:
+
+  * git (private plugin-repo clone) legitimately consumes a ``read:repository``
+    credential, INCLUDING the git-transport ``GIT_HTTP_*`` pair (a private
+    repo's 401 triggers git's credential helper, which supplies
+    :func:`gitea_read_token`). So :func:`gitea_read_token` KEEPS the git-http
+    path — dropping it would break private plugin clones on a concierge box that
+    carries only the git-transport credential.
+  * npm needs a ``read:package`` token and 401-poisons on a ``read:repository``
+    one. So npm does NOT reuse :func:`gitea_read_token`; it uses the strictly
+    designated-package-token resolver :func:`_npm_package_token`, which NEVER
+    consults the git-http pair.
+
+Same forge host (``resolve_npm_registry`` derives from ``resolve_gitea_base``),
+DIFFERENT token — the split is the reconciliation of the registry-host SSOT
+(finding C1) with the npm 401-poison guard.
 
 Registry resolution (single deriver, SSOT with git — audit finding C1)
 ======================================================================
-The npm registry URL resolves via :func:`resolve_npm_registry`: an explicit
-``MOLECULE_GITEA_NPM_REGISTRY`` full URL wins; else it is DERIVED from the
-forge base host (:func:`resolve_gitea_base` — ``MOLECULE_PLUGIN_REGISTRY`` →
+The npm registry URL resolves via :func:`resolve_npm_registry`: the
+provider-neutral ``MOLECULE_NPM_REGISTRY`` full URL wins outright, then the
+legacy ``MOLECULE_GITEA_NPM_REGISTRY`` alias, else it is DERIVED from the forge
+base host (:func:`resolve_gitea_base` — ``MOLECULE_PLUGIN_REGISTRY`` →
 ``MOLECULE_GITEA_BASE_URL`` → the documented default) plus the canonical npm
 path suffix. Before C1 this module hardcoded the registry host and never read
 the base-URL env, so entrypoints that SET ``MOLECULE_GITEA_BASE_URL`` were
-silently ignored here while git (``plugin_sources``) honored it — a
-registry-host migration would have left npm on the stale host. The base
-resolver now lives here (the lower module) and ``plugin_sources`` imports it,
-so the forge host is spelled in exactly one place for both git and npm.
+silently ignored here while git (``plugin_sources``) honored it. The base
+resolver lives here (the lower module) and ``plugin_sources`` imports it, so the
+forge host is spelled in exactly one place for both git and npm. The contract
+is "the ``@molecule-ai`` scope resolves", not "it resolves from Gitea" —
+``MOLECULE_NPM_REGISTRY`` is the provider-neutral escape hatch (GitHub Packages,
+a mirror, an artifact proxy, ...).
 
-Token source (precedence): canonical ``MOLECULE_TEMPLATE_REPO_TOKEN`` →
-``GITEA_TOKEN`` → the gitea HTTPS-auth pair. The HTTPS-auth pair has two shapes:
-the normal basic-auth case carries the token in ``GIT_HTTP_PASSWORD``; the
-**verified live concierge** case (workspace-server ``conciergePlatformMCPEnv``)
-carries the PAT in ``GIT_HTTP_USERNAME`` with ``GIT_HTTP_PASSWORD`` set to the
-literal ``x-oauth-basic`` sentinel. We resolve both, and NEVER write the literal
-``x-oauth-basic`` as the ``_authToken`` secret.
-
-NOTE (credential prerequisite): the gitea token MUST carry ``read:package``
-scope. The token used for git fetches (``MOLECULE_TEMPLATE_REPO_TOKEN``) is
-``read:repository`` only by default; for the SSOT to hold it must be widened to
-``read:repository,read:package`` so the one token serves both git and npm.
+Called at boot (main.py step 0.2b) AND re-asserted after ``adapter.setup()`` —
+template setup steps that install their own node stacks (hermes) clobbered the
+boot write. Writes to BOTH ``$HOME`` and the canonical agent home (HOME-split).
+Fail-soft, idempotent, additive.
 """
 from __future__ import annotations
 
@@ -94,9 +119,13 @@ _BACKCOMPAT_GITEA_BASE = "https://git.moleculesai.app"
 # Centralized here so the org/path segment is spelled exactly once.
 _NPM_REGISTRY_PATH = "/api/packages/molecule-ai/npm/"
 
-# Explicit full-URL npm-registry override. When set it wins outright (no base
-# composition) — an operator pointing npm at an arbitrary registry URL. Nothing
-# in the fleet sets it today; kept as the explicit escape hatch.
+# Provider-neutral full-URL npm-registry override. When set it wins outright (no
+# base composition) — the contract is "the @molecule-ai scope resolves", not
+# "it resolves from Gitea" (GitHub Packages, a mirror, an artifact proxy, ...).
+_PROVIDER_NEUTRAL_NPM_REGISTRY_ENV = "MOLECULE_NPM_REGISTRY"
+
+# Legacy explicit full-URL npm-registry override (Gitea-flavoured name). Kept as
+# a back-compat alias behind the provider-neutral override above.
 _NPM_REGISTRY_ENV = "MOLECULE_GITEA_NPM_REGISTRY"
 
 
@@ -126,12 +155,14 @@ def resolve_npm_registry(env: Mapping[str, str] | None = None) -> str:
     """Return the ``@molecule-ai`` npm-registry URL (always trailing-slashed).
 
     Precedence:
-      1. explicit ``MOLECULE_GITEA_NPM_REGISTRY`` full URL — wins if set;
-      2. else derive from the resolved forge base host (``resolve_gitea_base``:
+      1. provider-neutral ``MOLECULE_NPM_REGISTRY`` full URL — wins outright
+         (the contract is "the scope resolves", not "it resolves from Gitea");
+      2. legacy ``MOLECULE_GITEA_NPM_REGISTRY`` full URL — back-compat alias;
+      3. else derive from the resolved forge base host (``resolve_gitea_base``:
          ``MOLECULE_PLUGIN_REGISTRY`` → ``MOLECULE_GITEA_BASE_URL`` → default)
          plus the canonical npm path suffix — THIS is what makes a set-but-unread
          base-URL override actually take effect (audit finding C1, runtime-side);
-      3. the back-compat default host is the last-resort fallback, sourced from
+      4. the back-compat default host is the last-resort fallback, sourced from
          the one ``resolve_gitea_base`` literal — not re-spelled here.
 
     Trailing slashes are normalized when composing so ``<base>`` with or without
@@ -139,17 +170,50 @@ def resolve_npm_registry(env: Mapping[str, str] | None = None) -> str:
     """
     if env is None:
         env = os.environ
-    explicit = (env.get(_NPM_REGISTRY_ENV) or "").strip()
-    if explicit:
-        return explicit if explicit.endswith("/") else explicit + "/"
+    for name in (_PROVIDER_NEUTRAL_NPM_REGISTRY_ENV, _NPM_REGISTRY_ENV):
+        explicit = (env.get(name) or "").strip()
+        if explicit:
+            return explicit if explicit.endswith("/") else explicit + "/"
     base = resolve_gitea_base(env).rstrip("/")
     return base + _NPM_REGISTRY_PATH
 
+
+# ---------------------------------------------------------------------------
+# Token resolution — TWO resolvers for ONE forge, because git and npm need
+# DIFFERENT scopes from the same host (see module docstring).
+# ---------------------------------------------------------------------------
 # Canonical gitea token env vars, in precedence order.
 # MOLECULE_TEMPLATE_REPO_TOKEN is the read token the box holds for fetching
 # template/plugin repos (and, once widened with read:package, packages too);
 # GITEA_TOKEN is its alias. These take precedence over the gitea HTTPS-auth pair.
 _CANONICAL_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN")
+
+# npm PACKAGE-token env vars, in precedence order. ONLY vars whose token is
+# DESIGNATED to carry ``read:package`` scope — NEVER inferred from a
+# git-transport credential.
+#
+# WHY NOT the git-http pair (GIT_HTTP_USERNAME/PASSWORD/x-oauth-basic) for npm:
+# proven 2026-07-09 against the live Gitea npm registry, a token WITHOUT
+# read:package is REJECTED with HTTP 401, whereas NO token falls through to
+# ANONYMOUS access (HTTP 200) — the registry serves the @molecule-ai scope
+# (packument AND tarball) anonymously. The git-http PAT is a repo-transport
+# credential (read:repository), so writing it as the npm ``_authToken`` turns
+# working anonymous access into a hard 401. **A mis-scoped token is strictly
+# worse than no token.** So npm auth is ADDITIVE-ONLY over the anonymous floor:
+# it attaches an ``_authToken`` ONLY from a var explicitly designated as a
+# package token. MOLECULE_NPM_TOKEN is the purpose-specific override; the
+# canonical MOLECULE_TEMPLATE_REPO_TOKEN / GITEA_TOKEN are kept because they are
+# *intended* to be widened to read:package (see module docstring's credential
+# prerequisite), but the git-transport shapes are dropped for npm entirely.
+#
+# NOTE: this is SEPARATE from _CANONICAL_TOKEN_ENV_PRECEDENCE / gitea_read_token
+# below, which git (plugin_sources) uses and which DELIBERATELY keeps the
+# git-http path — git legitimately needs the read:repository transport cred.
+_PACKAGE_TOKEN_ENV_PRECEDENCE = (
+    "MOLECULE_NPM_TOKEN",
+    "MOLECULE_TEMPLATE_REPO_TOKEN",
+    "GITEA_TOKEN",
+)
 
 # Sentinel value core's concierge stores in GIT_HTTP_PASSWORD when the real PAT
 # lives in GIT_HTTP_USERNAME (the verified live concierge shape: workspace-server
@@ -159,11 +223,14 @@ _OAUTH_BASIC_SENTINEL = "x-oauth-basic"
 
 
 def gitea_read_token(env: Mapping[str, str] | None = None) -> str:
-    """Return the gitea read token, or "" if none is present.
+    """Return the gitea read token for GIT fetches, or "" if none is present.
 
-    SSOT: the SAME token the box uses for git fetches (git-native plugin_sources
-    clones consume this exact resolver too — one credential, one resolution).
-    Must carry read:package scope for npm fetches to succeed (see docstring).
+    SSOT for GIT: the SAME token the box uses for git fetches (git-native
+    plugin_sources clones consume this exact resolver — one credential, one
+    resolution). A private plugin repo's 401 triggers git's credential helper,
+    which supplies this token, so the git-transport ``GIT_HTTP_*`` pair is a
+    LEGITIMATE source here (a ``read:repository`` cred is exactly what a git
+    clone needs).
 
     ``env`` defaults to ``os.environ``; callers that resolve from an explicit
     mapping (e.g. the boot-install's ``env=`` parameter) pass it through.
@@ -172,14 +239,17 @@ def gitea_read_token(env: Mapping[str, str] | None = None) -> str:
       1. MOLECULE_TEMPLATE_REPO_TOKEN (canonical, highest precedence)
       2. GITEA_TOKEN (its alias)
       3. GIT_HTTP_PASSWORD when set and != the x-oauth-basic sentinel
-         (the normal basic-auth password-as-token shape, e.g. credential_helper's
-         name+password model where the secret lives in the password field)
+         (the normal basic-auth password-as-token shape)
       4. GIT_HTTP_USERNAME when GIT_HTTP_PASSWORD == the x-oauth-basic sentinel
          (the VERIFIED live concierge shape: PAT carried in the username field,
          the password field holding only the literal sentinel)
 
     The literal x-oauth-basic sentinel is never returned as a token: it merely
     routes us to read the PAT from GIT_HTTP_USERNAME instead.
+
+    IMPORTANT: npm does NOT use this resolver — the git-transport cred is
+    ``read:repository`` and 401-poisons the npm registry. npm uses the strictly
+    designated-package-token resolver :func:`_npm_package_token`.
     """
     if env is None:
         env = os.environ
@@ -204,6 +274,30 @@ def gitea_read_token(env: Mapping[str, str] | None = None) -> str:
 _gitea_read_token = gitea_read_token
 
 
+def _npm_package_token(env: Mapping[str, str] | None = None) -> str:
+    """Return a DESIGNATED npm package token, or "" for anonymous access.
+
+    Resolution (package-token precedence):
+      1. MOLECULE_NPM_TOKEN (purpose-specific, highest precedence)
+      2. MOLECULE_TEMPLATE_REPO_TOKEN (canonical; intended read:package)
+      3. GITEA_TOKEN (its alias)
+
+    Git-transport credentials (GIT_HTTP_USERNAME/GIT_HTTP_PASSWORD, incl. the
+    x-oauth-basic concierge shape) are DELIBERATELY NOT consulted: they are
+    repo-scoped and 401 the package registry, which is worse than the anonymous
+    floor. See _PACKAGE_TOKEN_ENV_PRECEDENCE for the full rationale. Returns ""
+    when no designated package token is set — the caller then writes the scope
+    line only (anonymous), which the registry serves.
+    """
+    if env is None:
+        env = os.environ
+    for var in _PACKAGE_TOKEN_ENV_PRECEDENCE:
+        v = (env.get(var) or "").strip()
+        if v:
+            return v
+    return ""
+
+
 def _auth_key(registry: str) -> str | None:
     """Derive npm's per-registry auth config key from a registry URL.
 
@@ -217,65 +311,124 @@ def _auth_key(registry: str) -> str | None:
     return "//" + path.rstrip("/") + "/"
 
 
+# The canonical agent home. Several runtimes split users between the runtime
+# main (often PID1 as root, HOME=/root) and the process that actually spawns
+# the management MCP (the agent user, HOME=/home/agent) — hermes proved this
+# live 2026-07-09: main.py wrote /root/.npmrc while the MCP's npx resolved
+# against a different home, and hermes's own node install clobbered the boot
+# write anyway. Writing the scope config to BOTH homes closes the HOME-split
+# class. Tests monkeypatch this constant.
+_AGENT_HOME = Path("/home/agent")
+
+
+def _npmrc_targets() -> list[Path]:
+    """The npmrc locations to configure: $HOME plus the canonical agent home."""
+    targets = [Path(os.environ.get("HOME", str(_AGENT_HOME))) / ".npmrc"]
+    agent_npmrc = _AGENT_HOME / ".npmrc"
+    if _AGENT_HOME.is_dir() and agent_npmrc not in targets:
+        targets.append(agent_npmrc)
+    return targets
+
+
+def _write_npmrc(npmrc: Path, key: str, registry_line: str, auth_line: "str | None") -> None:
+    """Additive + idempotent write of our scope (and optional auth) lines."""
+    existing = npmrc.read_text().splitlines() if npmrc.exists() else []
+    # Drop our own prior lines (so a token rotation replaces cleanly, no
+    # duplicates) and keep every unrelated line.
+    keep = [
+        ln for ln in existing
+        if not ln.startswith(f"{_SCOPE}:registry=")
+        and not ln.startswith(f"{key}:_authToken=")
+    ]
+    ours = [registry_line] + ([auth_line] if auth_line else [])
+    content = "\n".join(keep + ours) + "\n"
+    # Create 0600 from the start so a token never sits at a world-readable
+    # default mode (no write-then-chmod TOCTOU window); O_TRUNC rewrites an
+    # existing file. Then chmod to ALSO tighten a pre-existing file, whose
+    # mode O_CREAT would not change.
+    fd = os.open(npmrc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(content)
+    try:
+        os.chmod(npmrc, 0o600)  # token at rest — restrict like .netrc
+    except OSError as exc:
+        # A failed hardening of a secret file should be observable, not silent.
+        log.warning("npm_auth: could not chmod %s to 0600 (%s)", npmrc, exc)
+    # When root writes into another user's home (the HOME-split case), a
+    # root-owned 0600 file would be UNREADABLE by that user's npm — chown to the
+    # home directory's owner. Only root can chown to an arbitrary owner, so this
+    # is a no-op (and would EPERM) when we ourselves are the non-root agent
+    # re-asserting our own npmrc — guard on being root to avoid the noise.
+    if os.getuid() == 0:
+        try:
+            st = os.stat(npmrc.parent)
+            if (st.st_uid, st.st_gid) != (0, 0):
+                os.chown(npmrc, st.st_uid, st.st_gid)
+        except OSError as exc:
+            log.warning("npm_auth: could not chown %s to home owner (%s)", npmrc, exc)
+
+
 def install_npm_gitea_auth() -> None:
-    """Write ~/.npmrc so npm/npx can fetch private ``@molecule-ai`` packages.
+    """Configure npm so ``npx @molecule-ai/...`` resolves from the gitea registry.
 
-    Safe to call multiple times (idempotent). No-op when no gitea token is
-    present (non-concierge workspaces, pure-local dev). Fail-soft: a write error
-    logs a warning and returns — the runtime starting matters more than npm
-    auth being perfect, and the loud RCA#2970/#3082 gates surface a still-broken
-    MCP downstream.
+    PLATFORM CONTRACT (HARD, not optional): every runtime container must be able
+    to resolve the ``@molecule-ai`` scope — the concierge's management MCP is
+    ``npx @molecule-ai/mcp-server`` and the core#3082 ``loaded_mcp_tools`` gate
+    fail-closes the workspace when it cannot start. The gitea registry serves
+    the scope ANONYMOUSLY (D3 ruling, 2026-07-07), so the scope-registry line is
+    written UNCONDITIONALLY — a missing token no longer skips it (the
+    pre-2026-07-09 token-coupled skip is exactly what fail-closed the tokenless
+    self-host hermes concierge). The ``_authToken`` line is added only when a
+    DESIGNATED package token is present (:func:`_npm_package_token`); a
+    git-transport credential is NEVER written (it 401-poisons — see module
+    docstring).
+
+    Safe to call multiple times (idempotent, additive). Called at boot (main.py
+    step 0.2b) AND re-asserted after ``adapter.setup()`` — template setup steps
+    that install their own node stacks (hermes) clobbered the boot write. Writes
+    to BOTH ``$HOME`` and the canonical agent home (HOME-split). Fail-soft per
+    target: a write error logs a warning — the runtime starting matters more,
+    and the loud RCA#2970/#3082 gates surface a still-broken MCP downstream.
     """
-    token = gitea_read_token()
-    if not token:
-        log.info(
-            "npm_auth: no gitea token present (%s/GIT_HTTP_PASSWORD/GIT_HTTP_USERNAME)"
-            " — skipping npm registry auth",
-            "/".join(_CANONICAL_TOKEN_ENV_PRECEDENCE),
-        )
-        return
+    token = _npm_package_token()
 
-    # Single deriver (explicit full-URL override → base-host derivation → default).
-    # resolve_npm_registry already normalizes the trailing slash.
+    # Single deriver: provider-neutral override → legacy alias → base-host
+    # derivation → default. resolve_npm_registry already normalizes the trailing
+    # slash.
     registry = resolve_npm_registry()
     key = _auth_key(registry)
     if key is None:
-        log.warning("npm_auth: %s=%r has no scheme — skipping", _NPM_REGISTRY_ENV, registry)
+        # Don't name a single env var — resolve_npm_registry() may have taken the
+        # value from the provider-neutral MOLECULE_NPM_REGISTRY, the legacy
+        # MOLECULE_GITEA_NPM_REGISTRY alias, or forge-host derivation. Naming only
+        # one would misdirect an operator who set a different one (review [3]).
+        log.warning(
+            "npm_auth: resolved registry %r has no scheme — skipping "
+            "(check %s / %s)",
+            registry, _PROVIDER_NEUTRAL_NPM_REGISTRY_ENV, _NPM_REGISTRY_ENV,
+        )
         return
 
     registry_line = f"{_SCOPE}:registry={registry}"
-    auth_line = f"{key}:_authToken={token}"
-
-    npmrc = Path(os.environ.get("HOME", "/home/agent")) / ".npmrc"
-    try:
-        existing = npmrc.read_text().splitlines() if npmrc.exists() else []
-        # Additive + idempotent: drop our own prior lines (so a token rotation
-        # replaces cleanly, no duplicates) and keep every unrelated line.
-        keep = [
-            ln for ln in existing
-            if not ln.startswith(f"{_SCOPE}:registry=")
-            and not ln.startswith(f"{key}:_authToken=")
-        ]
-        content = "\n".join(keep + [registry_line, auth_line]) + "\n"
-        # Create 0600 from the start so the token never sits at a world-readable
-        # default mode (no write-then-chmod TOCTOU window); O_TRUNC rewrites an
-        # existing file. Then chmod to ALSO tighten a pre-existing file, whose
-        # mode O_CREAT would not change.
-        fd = os.open(npmrc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(content)
-        try:
-            os.chmod(npmrc, 0o600)  # token at rest — restrict like .netrc
-        except OSError as exc:
-            # A failed hardening of a secret file should be observable, not silent.
-            log.warning("npm_auth: could not chmod %s to 0600 (%s) — token left at default perms", npmrc, exc)
-        # SECURITY: never log the token value — only its length.
+    auth_line = f"{key}:_authToken={token}" if token else None
+    if not token:
         log.info(
-            "npm_auth: wrote %s with gitea %s registry + _authToken (token len=%d)",
-            npmrc, _SCOPE, len(token),
+            "npm_auth: no designated package token present — writing anonymous %s"
+            " scope registry (the registry serves the scope without auth)",
+            _SCOPE,
         )
-    except OSError as exc:
-        log.warning(
-            "npm_auth: could not write %s (%s) — npx of private %s packages may fail",
-            npmrc, exc, _SCOPE,
-        )
+
+    for npmrc in _npmrc_targets():
+        try:
+            _write_npmrc(npmrc, key, registry_line, auth_line)
+            # SECURITY: never log the token value — only its length.
+            log.info(
+                "npm_auth: wrote %s with gitea %s registry%s",
+                npmrc, _SCOPE,
+                f" + _authToken (token len={len(token)})" if token else " (anonymous)",
+            )
+        except OSError as exc:
+            log.warning(
+                "npm_auth: could not write %s (%s) — npx of %s packages may fail",
+                npmrc, exc, _SCOPE,
+            )

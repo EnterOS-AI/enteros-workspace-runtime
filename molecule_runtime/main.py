@@ -985,6 +985,16 @@ async def main():  # pragma: no cover
     executor = None
     try:
         await adapter.setup(adapter_config)
+
+        # Re-assert the @molecule-ai npm scope config AFTER adapter setup.
+        # PLATFORM CONTRACT (hard): the management MCP is `npx
+        # @molecule-ai/mcp-server`; the boot-time write (step 0.2b) can be
+        # CLOBBERED by template setup steps that install their own node stacks
+        # (hermes's installer rewrote the npmrc → ETARGET → the core#3082
+        # loaded_mcp_tools gate fail-closed the concierge, 2026-07-09).
+        # Idempotent + fail-soft: a no-op when setup touched nothing.
+        install_npm_gitea_auth()
+
         executor = await adapter.create_executor(adapter_config)
 
         # SSOT trace wrap: the single funnel every adapter's executor passes
