@@ -768,6 +768,62 @@ class BaseAdapter(ABC):
         )
         return target
 
+    def materialize_skills(self, config: "AdapterConfig") -> "Any":
+        """Surface the canonical skills dir (``<configs>/skills``) into THIS
+        runtime's NATIVE skill-discovery location (the skills-surfacing PORT).
+
+        DISPATCHES on the active runtime (``self.name()``) through
+        :func:`molecule_runtime.skills_render.materialize_skills_for` —
+        claude-code → ``~/.claude/skills`` symlink, codex →
+        ``$CODEX_HOME/skills/molecule`` symlink, openclaw →
+        ``<openclaw workspace>/skills`` symlink, hermes →
+        ``skills.external_dirs`` in ``$HERMES_HOME/config.yaml``, google-adk →
+        documented prompt-embedded skip. This generalizes
+        template-claude-code#224 (the per-template entrypoint symlink) into the
+        ONE cross-runtime contract: plugin skills installed into
+        ``/configs/skills`` become visible to the agent through the mechanism
+        ITS runtime actually scans, directory-level, so post-boot installs
+        surface on the runtime's next native scan.
+
+        Failure stance: skills are an ordinary capability (not privileged like
+        the management MCP), so a failure here must never brick the boot — but
+        it must NEVER pass silently either. An unmapped/unverified runtime
+        (``NotImplementedError``) or an unsatisfiable state
+        (``SkillsMaterializeError``, e.g. a real directory squatting the link
+        target) is downgraded to ``logger.error`` + returns ``None``, keeping
+        the boot alive and the failure loud in the workspace log.
+        Returns the native path asserted, or ``None``.
+        """
+        from molecule_runtime import skills_render
+
+        try:
+            target = skills_render.materialize_skills_for(
+                self.name(), config.config_path
+            )
+        except NotImplementedError as exc:
+            logger.error(
+                "materialize_skills: runtime %s has NO verified native skill-"
+                "discovery convention — plugin skills in %s are NOT natively "
+                "visible to this agent (%s). Pin the convention and add a "
+                "skills_render._RUNTIME_SKILLS entry.",
+                self.name(), skills_render.canonical_skills_dir(config.config_path), exc,
+            )
+            return None
+        except skills_render.SkillsMaterializeError as exc:
+            logger.error(
+                "materialize_skills: runtime %s could not satisfy its native "
+                "skill surface — %s",
+                self.name(), exc,
+            )
+            return None
+        if target is not None:
+            logger.info(
+                "materialize_skills: %s skills surfaced natively at %s (source: %s)",
+                self.name(), target,
+                skills_render.canonical_skills_dir(config.config_path),
+            )
+        return target
+
     def append_to_memory_hook(self, config: AdapterConfig, filename: str, content: str) -> None:
         """Append text to the durable memory file if the marker isn't present.
 

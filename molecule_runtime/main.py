@@ -954,6 +954,26 @@ async def main():  # pragma: no cover
     except Exception as _persona_err:  # noqa: BLE001 — persona is best-effort
         print(f"Warning: persona materialization failed (non-fatal): {_persona_err}")
 
+    # 5c. Surface the canonical skills dir into the ACTIVE runtime's NATIVE
+    # skill-discovery location (the skills-surfacing PORT — the generalization
+    # of template-claude-code#224's entrypoint symlink into ONE cross-runtime
+    # contract). Directory-level (symlink / config pointer), so plugin skills
+    # installed into /configs/skills — at boot OR post-boot — are visible to
+    # the runtime's next native scan. Runs BEFORE setup() on purpose: openclaw
+    # and codex spawn their gateway/app-server during setup(), and the native
+    # surface must exist before those processes take their first skill scan.
+    # Fail-loud-not-fatal: an unsatisfiable runtime logs an ERROR (via the
+    # adapter hook) but never bricks the boot — skills are not privileged.
+    try:
+        materialized_skills_target = adapter.materialize_skills(adapter_config)
+        if materialized_skills_target is not None:
+            print(
+                f"Skills: surfaced /configs/skills natively at "
+                f"{materialized_skills_target} (runtime={runtime})"
+            )
+    except Exception as _skills_err:  # noqa: BLE001 — never brick boot on skills
+        print(f"WARNING: skills materialization failed (non-fatal): {_skills_err}")
+
     # 6. Setup adapter and create executor
     # On failure: log + continue. The card route stays mounted (above);
     # the JSON-RPC route below returns -32603 "agent not configured" until
