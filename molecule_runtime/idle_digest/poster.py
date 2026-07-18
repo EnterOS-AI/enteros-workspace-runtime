@@ -26,9 +26,18 @@ import uuid
 from typing import Any, Callable, Optional
 from urllib import request as _urlreq
 
+# Module-level (not fire-time) imports, deliberately: a broken symbol must
+# fail LOUD at wiring/boot (degrading to the legacy loop via main.py's
+# try/except), not convert every digest tick into a silently-SKIPPED no-op
+# at fire time (review #327). Cycle-free: none of these import idle_digest.
+from molecule_runtime.a2a_client import build_message_send_params
+from molecule_runtime.a2a_executor import (
+    A2A_MESSAGE_SOURCE_TYPE,
+    A2A_SOURCE_SELF_IDLE,
+)
 from molecule_runtime.idle_digest.contract import frame_idle_prompt
 from molecule_runtime.idle_digest.reply_forwarder import (
-    extract_reply_text,
+    describe_reply,
     forward_reply_to_user,
 )
 
@@ -50,11 +59,6 @@ def make_digest_poster(
             from molecule_runtime.platform_auth import self_source_headers as _hf
         else:
             _hf = headers_fn
-        from molecule_runtime.a2a_client import build_message_send_params
-        from molecule_runtime.a2a_executor import (
-            A2A_MESSAGE_SOURCE_TYPE,
-            A2A_SOURCE_SELF_IDLE,
-        )
 
         payload = json.dumps(
             {
@@ -86,7 +90,14 @@ def make_digest_poster(
         # discarding it (the pre-fix behavior silently dropped every
         # digest-turn answer; see reply_forwarder.py).
         try:
-            reply_text = extract_reply_text(resp_body)
+            kind, reply_text = describe_reply(resp_body)
+            if kind != "result":
+                # Queued (busy/poll-mode target) and error envelopes are real
+                # outcomes, never silent (review #327): the reply — if any —
+                # will not arrive through this response body.
+                detail = f" — {reply_text}" if reply_text else ""
+                log(f"Idle digest: self-fire outcome {kind}{detail}")
+                return
             status = await forward_reply_to_user(
                 platform_url,
                 workspace_id,

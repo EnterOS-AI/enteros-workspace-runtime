@@ -1413,9 +1413,14 @@ async def main():  # pragma: no cover
                 )
 
             # Send initial prompt through the platform A2A proxy (not directly to self).
-            # The proxy logs an a2a_receive with source_id=NULL (canvas-style),
-            # broadcasts A2A_RESPONSE via WebSocket so the chat shows both the
-            # prompt (as user message) and the response (as agent message).
+            # NOTE (verified against a2a_proxy_helpers.go, review #327): the
+            # proxy's A2A_RESPONSE broadcast is gated on caller identity
+            # (callerID == "" || isCanvasUser) — a self_source_headers call is
+            # callerID == workspaceID, so THIS response is NOT auto-broadcast
+            # to the canvas. Any user-visible output of the initial-prompt
+            # turn must go through send_message_to_user; the response body
+            # read below is otherwise discarded (same class as the digest
+            # discard fixed by idle_digest/reply_forwarder — follow-up #327).
             # Uses urllib in a thread to avoid asyncio/httpx streaming hangs.
             import json as _json
             import urllib.request
@@ -1736,17 +1741,12 @@ async def main():  # pragma: no cover
                 # path as initial_prompt). The agent's own concurrency control
                 # rejects if the workspace becomes busy between this check and
                 # the post — that's the expected safety valve.
-                from molecule_runtime.idle_digest.contract import (
-                    frame_idle_prompt as _frame_idle_legacy,
-                )
-
                 payload = _json.dumps({
                     "method": "message/send",
                     # #2251: single model-based builder — params generated
                     # FROM the receiver's a2a-sdk v0.3 SendMessageRequest schema.
                     "params": build_message_send_params(
-                        # Same <SYSTEM IDLE PROMPT> framing as the digest poster.
-                        _frame_idle_legacy(config.idle_prompt),
+                        config.idle_prompt,
                         message_id=f"idle-{_uuid.uuid4().hex[:8]}",
                         # Stamp the typed self-ping marker so the executor (a)
                         # drops the idle fire instead of queuing it behind an
@@ -1758,10 +1758,8 @@ async def main():  # pragma: no cover
                 }).encode()
 
                 def _post_sync():
-                    # Returns (status_code, error_type, body) so the caller
-                    # logs the actual outcome instead of a bare "post failed"
-                    # line — and can forward the turn's reply text to the user
-                    # (same discard-fix as the digest poster; reply_forwarder).
+                    # Returns (status_code, error_type) so the caller logs the
+                    # actual outcome instead of a bare "post failed" line.
                     # #220: include auth_headers() on every idle fire. Without
                     # this, the idle loop 401s in multi-tenant mode.
                     # self_source_headers() adds X-Workspace-ID so the
@@ -1778,14 +1776,14 @@ async def main():  # pragma: no cover
                             headers=headers,
                         )
                         with _urlreq.urlopen(req, timeout=IDLE_FIRE_TIMEOUT_SECONDS) as resp:
-                            body = resp.read()
-                            return resp.status, None, body
+                            resp.read()
+                            return resp.status, None
                     except _urlerr.HTTPError as e:
-                        return e.code, type(e).__name__, b""
+                        return e.code, type(e).__name__
                     except _urlerr.URLError as e:
-                        return None, f"URLError: {e.reason}", b""
+                        return None, f"URLError: {e.reason}"
                     except Exception as e:  # pragma: no cover — catch-all safety net
-                        return None, type(e).__name__, b""
+                        return None, type(e).__name__
 
                 print(
                     f"Idle loop: firing (active_tasks=0, interval={config.idle_interval_seconds}s, "
@@ -1796,48 +1794,22 @@ async def main():  # pragma: no cover
 
                 def _log_result(future):
                     try:
-                        status, err, body = future.result()
+                        status, err = future.result()
                         if err:
                             print(
                                 f"Idle loop: post failed — status={status} err={err}",
                                 flush=True,
                             )
-                            return
-                        print(f"Idle loop: post ok status={status}", flush=True)
-                        # Forward the turn's reply text to the user — same
-                        # discard-fix as the digest poster (reply_forwarder).
-                        # Callback runs on the event-loop thread, so schedule
-                        # the async forward rather than awaiting.
-                        try:
-                            from molecule_runtime.idle_digest.reply_forwarder import (
-                                extract_reply_text as _extract_reply,
-                                forward_reply_to_user as _forward_reply,
-                            )
-
-                            _reply_text = _extract_reply(body)
-
-                            async def _do_forward():
-                                _fstatus = await _forward_reply(
-                                    platform_url, workspace_id, _reply_text
-                                )
-                                if _fstatus == "delivered":
-                                    print(
-                                        f"Idle loop: reply forwarded to user "
-                                        f"({len(_reply_text)} chars)",
-                                        flush=True,
-                                    )
-                                elif _fstatus != "suppressed":
-                                    print(
-                                        f"Idle loop: reply not delivered — {_fstatus}",
-                                        flush=True,
-                                    )
-
-                            loop_ref.create_task(_do_forward())
-                        except Exception as _fe:  # pragma: no cover
-                            print(f"Idle loop: reply forward error — {_fe}", flush=True)
+                        else:
+                            print(f"Idle loop: post ok status={status}", flush=True)
                     except Exception as e:  # pragma: no cover
                         print(f"Idle loop: executor callback crashed — {e}", flush=True)
 
+                # DELIBERATELY no reply forwarding here (review #327): this loop
+                # is the MOLECULE_MAILBOX_KERNEL=0 emergency opt-out whose
+                # contract is byte-identical pre-kernel behavior, and its raw
+                # config.idle_prompt carries no (idle) silence contract — the
+                # digest poster (idle_digest/poster.py) owns reply delivery.
                 fut = loop_ref.run_in_executor(None, _post_sync)
                 fut.add_done_callback(_log_result)
 

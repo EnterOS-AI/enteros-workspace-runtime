@@ -143,9 +143,15 @@ async def test_selffire_wire_roundtrip(fake_platform):
     sent_text = "\n".join(p.get("text", "") for p in sent_parts)
     assert sent_text.startswith(SYSTEM_IDLE_HEADER), sent_text[:80]
     # identity header must carry the in-process bridge — the live defect was
-    # "workspace MCP (0)" while 30 bridge tools were served in-process.
-    assert "workspace MCP (0)" not in sent_text
-    assert "send_message_to_user" in sent_text
+    # "workspace MCP (0)" while 30 bridge tools were served in-process. The
+    # names line shows only the first 8 alphabetical tools, so assert the
+    # COUNT is non-zero rather than any specific name (the old name check
+    # false-positived on the routing line's prose).
+    import re as _re
+
+    m = _re.search(r"workspace MCP \((\d+)\)", sent_text)
+    assert m, f"no workspace MCP line in digest: {sent_text[-200:]!r}"
+    assert int(m.group(1)) > 0, sent_text
     # metadata is the sibling params.metadata (build_message_send_params
     # contract), keyed by A2A_MESSAGE_SOURCE_TYPE ("source_type").
     assert params["metadata"]["source_type"] == "self-idle"

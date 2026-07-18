@@ -49,14 +49,18 @@ PRIORITIES_LINE = (
 # Reply routing — the delivery contract for this self-initiated turn. The
 # digest poster forwards the turn's reply text to the user's chat
 # (idle_digest/reply_forwarder.py), restoring symmetry with request-response
-# turns; without this line models "answer" housekeeping ticks into the void
-# or, worse, narrate to nobody. The ``(idle)`` sentinel is the silence valve —
-# keep it in lockstep with reply_forwarder.IDLE_SENTINEL.
+# turns; without this line models "answer" housekeeping ticks into the void.
+# The ``(idle)`` sentinel is the silence valve — keep in lockstep with
+# reply_forwarder.IDLE_SENTINEL. BYTE BUDGET (review #327, empirical): the
+# pinned identity summary is tail-truncated at Policy.max_summary_bytes
+# (512); this line renders BEFORE the tool inventory, so every byte here
+# evicts a byte of "workspace MCP (N): ..." from the tail. Keep it ≤120
+# bytes — the 223-byte first draft truncated the entire tool inventory the
+# bridge-union fix exists to surface (pinned by
+# test_reply_routing_line_fits_byte_budget).
 REPLY_ROUTING_LINE = (
-    "Reply routing: whatever you write as this turn's reply is delivered to "
-    "the user's chat — write it TO the user, and don't also call "
-    "send_message_to_user for the same content. Reply exactly (idle) to send "
-    "nothing this turn."
+    "Reply routing: this reply is sent to the user's chat (no separate send "
+    "needed); reply exactly (idle) to send nothing."
 )
 
 # Names-only cap per tool group before the engine's byte cap also applies.
@@ -167,7 +171,11 @@ class IdentityCapabilitiesProvider:
                 ]
         try:
             return list(source() or [])
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # Degrading to observed-only inventory reproduces the
+            # "workspace MCP (0)" defect this seam exists to fix — never
+            # silently (review #327).
+            print(f"idle-digest identity: bridge tool registry unavailable — {e}", flush=True)
             return []
 
     def _read_tools(self) -> list[str]:

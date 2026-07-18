@@ -15,6 +15,8 @@ import pytest
 
 from molecule_runtime.idle_digest.reply_forwarder import (
     IDLE_SENTINEL,
+    MAX_FORWARD_CHARS,
+    describe_reply,
     extract_reply_text,
     forward_reply_to_user,
     should_suppress,
@@ -75,15 +77,33 @@ def test_extract_accepts_decoded_dict():
 
 @pytest.mark.parametrize(
     "text",
-    ["", "   ", IDLE_SENTINEL, "(idle).", "(IDLE)", " (idle) ", "(no response generated)"],
+    [
+        "", "   ", IDLE_SENTINEL, "(idle).", "(IDLE)", " (idle) ",
+        "(no response generated)",
+        # decoration-only noise must never become a chat bubble
+        "```", ".", "...", "`'\"",
+        # the autonomous-loop guard's internal breaker notices (a2a_executor)
+        "[autonomous replay suppressed — delegation result already delivered; no new info, ending turn]",
+        "[autonomous loop halted — replay guard tripped]",
+        "[Autonomous loop halted — x]",
+    ],
 )
-def test_suppresses_sentinels_and_empties(text):
+def test_suppresses_sentinels_noise_and_guard_notices(text):
     assert should_suppress(text) is True
 
 
 @pytest.mark.parametrize(
     "text",
-    ["yo · hi", "I'm idle but here's a status update", "(idle) — but one thing:"],
+    [
+        "yo · hi",
+        "I'm idle but here's a status update",
+        "(idle) — but one thing:",
+        # a substantive one-word status reply is NOT the sentinel — only the
+        # parenthesized contract form is (review #327)
+        "idle",
+        "Idle.",
+        "'idle'",
+    ],
 )
 def test_real_replies_are_not_suppressed(text):
     assert should_suppress(text) is False
@@ -165,3 +185,61 @@ async def test_forward_exception_reports_error_without_raising():
         client=_FakeClient(exc=RuntimeError("conn refused")),
     )
     assert status == "error: conn refused"
+
+
+# ---------------------------------------------------------------------------
+# describe_reply — SSOT classification (queued/error are logged outcomes)
+# ---------------------------------------------------------------------------
+
+
+def test_describe_result():
+    kind, text = describe_reply(_envelope({"parts": [{"kind": "text", "text": "hi"}]}))
+    assert (kind, text) == ("result", "hi")
+
+
+def test_describe_queued_poll_mode():
+    body = json.dumps(
+        {"jsonrpc": "2.0", "id": "1", "status": "queued", "delivery_mode": "poll", "method": "message/send"}
+    ).encode()
+    assert describe_reply(body) == ("queued", "")
+
+
+def test_describe_queued_push_async_shape():
+    # a2a_proxy.go's cap-and-queue envelope predates parse()'s queued check.
+    body = json.dumps(
+        {"status": "queued", "delivery_mode": "push-async", "method": "message/send"}
+    ).encode()
+    assert describe_reply(body) == ("queued", "")
+
+
+def test_describe_queued_busy_push():
+    assert describe_reply(json.dumps({"queued": True, "queue_id": "q1"}).encode()) == ("queued", "")
+
+
+def test_describe_error_surfaces_message():
+    body = json.dumps({"jsonrpc": "2.0", "error": {"message": "boom", "code": -32000}}).encode()
+    kind, text = describe_reply(body)
+    assert kind == "error"
+    assert "boom" in text
+
+
+def test_describe_malformed():
+    assert describe_reply(b"not json")[0] == "malformed"
+
+
+# ---------------------------------------------------------------------------
+# forward length cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_forward_caps_wall_of_text():
+    client = _FakeClient(200)
+    long_text = "x" * (MAX_FORWARD_CHARS * 3)
+    status = await forward_reply_to_user(
+        "http://p", "ws-1", long_text, auth_headers=_headers, client=client
+    )
+    assert status == "delivered"
+    [(_, payload, _)] = client.calls
+    assert len(payload["message"]) == MAX_FORWARD_CHARS
+    assert payload["message"].endswith("[reply truncated]")

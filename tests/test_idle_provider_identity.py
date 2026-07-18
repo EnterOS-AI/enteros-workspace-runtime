@@ -229,3 +229,35 @@ async def test_bridge_source_raising_is_survived():
     p = _provider(persona="Role", tools=["mcp__molecule__x"], bridge_tools_source=boom)
     [c] = await p.contribute()
     assert "workspace MCP (1)" in c.summary  # observed still renders
+
+
+@pytest.mark.asyncio
+async def test_reply_routing_line_fits_byte_budget():
+    """review #327 empirical guard: the pinned identity summary is
+    tail-truncated at Policy.max_summary_bytes (512). REPLY_ROUTING_LINE
+    renders BEFORE the tool inventory, so an oversized routing line evicts
+    the 'workspace MCP (N)' line — the exact regression the 223-byte first
+    draft caused (verified live: 861-byte raw summary, entire inventory
+    truncated). This pins the realistic worst case: platform concierge, 46
+    observed management tools, REAL bridge registry union."""
+    from molecule_runtime.idle_digest import assemble
+    from molecule_runtime.idle_digest.contract import Policy
+
+    mgmt = [f"mcp__molecule-platform__tool_{i:02d}" for i in range(46)]
+    p = IdentityCapabilitiesProvider(
+        workspace_name="Enter OS Agent",
+        runtime_kind="hermes",
+        persona_reader=lambda cp, pf: "the Org Concierge\nYou are the organization's platform agent: the single org-root agent",
+        tools_source=lambda: mgmt,
+        platform_agent_check=lambda: True,
+        # real registry deliberately (no bridge_tools_source injection)
+    )
+    contributions = await p.contribute()
+    assembled = assemble(contributions, Policy.default())
+    [c] = assembled.contributions
+    assert "workspace MCP (" in c.summary, (
+        f"routing line evicted the tool inventory again "
+        f"(summary={len(c.summary.encode())}B): {c.summary[-120:]!r}"
+    )
+    assert "Reply routing:" in c.summary, "routing contract itself was truncated"
+    assert "(idle)" in c.summary, "silence-valve instruction was truncated"

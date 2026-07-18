@@ -1,8 +1,8 @@
 """Deliver a self-initiated turn's reply text to the user's canvas chat.
 
 Root cause this module exists for (core#4460 follow-up, observed live
-2026-07-17): a digest/idle self-fire POSTs ``message/send`` to the platform,
-the platform routes it back as a normal A2A turn, and the agent's reply comes
+2026-07-17): a digest self-fire POSTs ``message/send`` to the platform, the
+platform routes it back as a normal A2A turn, and the agent's reply comes
 back as the HTTP **response body of that self-POST** — which the poster used
 to ``read()`` and throw away. Request-response turns deliver their reply text
 to the initiator (the user's canvas), so models — correctly — treat "write my
@@ -10,15 +10,22 @@ answer as the turn reply" as delivery. In self-initiated turns that text
 silently evaporated: the agent answered the user into the void and believed
 it succeeded ("yo+hi delivered ✅" while the canvas showed nothing).
 
-This module restores the symmetry: parse the self-POST's JSON-RPC response,
-and forward non-empty reply text to the user via the same
-``POST /workspaces/<id>/notify`` endpoint ``send_message_to_user`` uses.
+This module restores the symmetry: classify the self-POST's response via the
+canonical envelope parser (``a2a_response.parse`` — the SSOT; queued/error
+envelopes are logged outcomes, never silently empty), extract the reply text
+(richer than the SSOT Result variant: Task-shaped ``status.message`` and
+``artifacts`` parts included), and forward non-empty, non-sentinel text to
+the user via the same ``POST /workspaces/<id>/notify`` endpoint
+``send_message_to_user`` uses.
 
 Silence valve: digests fire on a cadence forever, so unconditional forwarding
 would turn periodic housekeeping ticks into chat spam. The digest header
 (identity provider REPLY_ROUTING_LINE) instructs the agent to reply with
-exactly ``(idle)`` when nothing needs the user; that sentinel — plus empty
-text and the executor's ``(no response generated)`` — is suppressed here.
+exactly ``(idle)`` when nothing needs the user; that sentinel — plus empty or
+decoration-only text, the executor's ``(no response generated)``, and the
+autonomous-loop guard's bracketed ``[autonomous …]`` breaker notices (internal
+diagnostics, never user-facing) — is suppressed here. A substantive reply
+that merely CONTAINS the word "idle" is delivered.
 
 Everything network-touching is never-raise: a delivery failure must never
 crash the idle loop (it logs and moves on), and a 403 talk_to_user_disabled
@@ -28,7 +35,7 @@ is a policy outcome, not an error.
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 # Reply the agent uses to deliberately stay silent on a housekeeping tick.
 # Mirrored in providers/identity.py REPLY_ROUTING_LINE — keep in lockstep.
@@ -36,6 +43,18 @@ IDLE_SENTINEL = "(idle)"
 
 # Executor sentinel for an empty turn (see a2a_executor / a2a_cli).
 _NO_RESPONSE_SENTINEL = "(no response generated)"
+
+# The autonomous-loop guard substitutes final_text with bracketed breaker
+# notices for routine self-turns ("[autonomous replay suppressed — …]",
+# "[autonomous loop halted — …]", a2a_executor ~1002-1026). They are internal
+# diagnostics; forwarding them would deliver the very spam the guard exists
+# to stop. Prefix owned by the executor — keep in lockstep.
+_GUARD_NOTICE_PREFIX = "[autonomous "
+
+# Ceiling for a forwarded chat bubble. A verbose consolidation turn must not
+# land a wall of text in the user's chat every cadence tick.
+MAX_FORWARD_CHARS = 4000
+_TRUNCATION_MARKER = " …[reply truncated]"
 
 
 def _texts_from_parts(parts: Any) -> list[str]:
@@ -50,32 +69,26 @@ def _texts_from_parts(parts: Any) -> list[str]:
     return out
 
 
-def extract_reply_text(body: Any) -> str:
-    """Extract the agent's reply text from a message/send JSON-RPC response.
-
-    Accepts raw bytes/str (JSON) or an already-decoded dict, and tolerates
-    every shape the platform returns: a Message result (``result.parts``),
-    a Task result (``result.status.message.parts`` and/or
-    ``result.artifacts[].parts``), or an error envelope. Returns "" whenever
-    no user-visible text can be extracted — never raises.
-    """
+def _decode(body: Any) -> Optional[dict]:
+    """bytes/str/dict → dict, or None when undecodable. Never raises."""
     data = body
     if isinstance(data, (bytes, bytearray)):
         try:
             data = data.decode("utf-8", errors="replace")
         except Exception:  # noqa: BLE001
-            return ""
+            return None
     if isinstance(data, str):
         try:
             data = json.loads(data)
         except Exception:  # noqa: BLE001
-            return ""
-    if not isinstance(data, dict):
-        return ""
-    result = data.get("result")
-    if not isinstance(result, dict):
-        return ""
+            return None
+    return data if isinstance(data, dict) else None
 
+
+def _result_text(result: dict) -> str:
+    """Rich text extraction for a Result envelope: Message parts, Task
+    status.message parts, and artifacts parts (the SSOT parse() Result only
+    reads parts[0] — this caller needs the fuller sweep)."""
     texts = _texts_from_parts(result.get("parts"))
     if not texts:
         status = result.get("status")
@@ -89,21 +102,75 @@ def extract_reply_text(body: Any) -> str:
             for a in artifacts:
                 if isinstance(a, dict):
                     texts.extend(_texts_from_parts(a.get("parts")))
-
     return "\n".join(t.strip() for t in texts if t.strip()).strip()
 
 
+def describe_reply(body: Any) -> Tuple[str, str]:
+    """Classify a message/send response and extract its user-facing text.
+
+    Returns ``(kind, text)`` where kind ∈ {"result", "queued", "error",
+    "malformed"}. Variant detection is delegated to the canonical
+    ``a2a_response.parse`` (SSOT — no inline shape sniffing); the platform's
+    ``delivery_mode:"push-async"`` queued shape, which parse() predates, is
+    additionally recognized here. text is non-empty only for kind="result"
+    (the reply to deliver) and kind="error" (the message to log). Never
+    raises.
+    """
+    data = _decode(body)
+    if data is None:
+        return "malformed", ""
+    try:
+        from molecule_runtime.a2a_response import Error, Queued, Result, parse
+
+        variant = parse(data)
+        if isinstance(variant, Result):
+            return "result", _result_text(data.get("result") or {})
+        if isinstance(variant, Queued):
+            return "queued", ""
+        if isinstance(variant, Error):
+            return "error", str(getattr(variant, "message", "") or "")[:500]
+    except Exception:  # noqa: BLE001 — classification must never crash the loop
+        pass
+    # parse() predates the cap-and-queue {"status":"queued",
+    # "delivery_mode":"push-async"} envelope (a2a_proxy.go:556) — it would
+    # land in Malformed; recognize it as queued here.
+    if data.get("status") == "queued" or data.get("queued") is True:
+        return "queued", ""
+    if isinstance(data.get("result"), dict):
+        # Fallback path if the SSOT import itself failed above.
+        return "result", _result_text(data["result"])
+    return "malformed", ""
+
+
+def extract_reply_text(body: Any) -> str:
+    """The Result-variant reply text, or "" for every other outcome.
+
+    Kept for callers/tests that only need the deliverable text; prefer
+    :func:`describe_reply` where the queued/error outcome should be logged.
+    """
+    kind, text = describe_reply(body)
+    return text if kind == "result" else ""
+
+
 def should_suppress(text: str) -> bool:
-    """True when the reply is a deliberate-silence or empty sentinel."""
+    """True when the reply is deliberate silence, noise, or internal
+    diagnostics — anything that must not become a chat bubble."""
     stripped = (text or "").strip()
     if not stripped:
         return True
     if stripped == _NO_RESPONSE_SENTINEL:
         return True
-    # Exact sentinel or a bare sentinel with trivial decoration ("(idle)."),
-    # so a model that almost follows the contract still stays silent.
+    if stripped.lower().startswith(_GUARD_NOTICE_PREFIX):
+        return True
+    # Strip trivial decoration so "(idle)." / "`(idle)`" still count as the
+    # sentinel, and pure decoration ("```", "...") counts as silence. A bare
+    # word "idle" is NOT the sentinel — a substantive one-word status reply
+    # must be delivered (review #327: only the parenthesized form is the
+    # contract REPLY_ROUTING_LINE instructs).
     normalized = stripped.strip(" .!`'\"").lower()
-    return normalized == IDLE_SENTINEL.strip("()").lower() or normalized == IDLE_SENTINEL.lower()
+    if not normalized:
+        return True
+    return normalized == IDLE_SENTINEL.lower()
 
 
 async def forward_reply_to_user(
@@ -122,6 +189,8 @@ async def forward_reply_to_user(
     """
     if should_suppress(text):
         return "suppressed"
+    if len(text) > MAX_FORWARD_CHARS:
+        text = text[: MAX_FORWARD_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
     try:
         if auth_headers is None:
             from molecule_runtime.a2a_tools_rbac import (
