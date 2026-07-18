@@ -33,13 +33,28 @@ Descriptor-declared keys ALWAYS win — a spec that hardcodes a value is never
 overwritten. Until the server's canonical-name migration is verified on
 staging, keeping the aliases is the regression-safe choice.
 
-Gating
-------
-``inject_privileged_env`` is a NO-OP unless ``name == MANAGEMENT_MCP_NAME``
-(``molecule-platform``), so a tenant's image-gen / other MCP can NEVER receive
-an admin token. Merge is idempotent (descriptor-wins, same values), so during
-the template cutover the openclaw override's own loop double-injecting the
-identical legacy values is harmless.
+Gating — now audience-driven (RFC plugin-mcp-audience-contract, self-schedule v1)
+--------------------------------------------------------------------------------
+``inject_privileged_env`` dispatches on a plugin's DECLARED ``audience`` (the
+scalar ``self``|``org`` on an mcpServers descriptor, SDK contract-version 0.5.0).
+When ``audience`` is ABSENT it is DERIVED — ``org`` for ``MANAGEMENT_MCP_NAME``
+(``molecule-platform``), else ``None`` — a backward-compat bridge so every
+existing manifest keeps its EXACT current behavior with no flag-day.
+
+  * ``org``  → the org-admin env merge, byte-identical to before, and STILL gated
+    internally to ``name == MANAGEMENT_MCP_NAME``. This is THE invariant that keeps
+    the org-admin key off ordinary boxes (core ``platform_agent_test.go``): a
+    self-declared ``audience:"org"`` on any other plugin name resolves NOTHING, and
+    v1 defers org injection to that core-verified name (review security-major-2).
+  * ``self`` → the workspace's own-identity credential: the workspace-token FILE
+    PATH (never the token VALUE — /configs/.auth_token is restart-rotated),
+    ``MOLECULE_MCP_MODE=self``, and the tenant API base URL. NO org key, ever.
+  * ``None`` → no-op (a tenant's image-gen / other non-audience MCP can NEVER
+    receive an admin token — the original invariant, preserved).
+
+Merge is idempotent (descriptor-wins, same values), so during the template
+cutover the openclaw override's own loop double-injecting the identical legacy
+values is harmless.
 """
 from __future__ import annotations
 
@@ -81,6 +96,23 @@ _ALIAS_PAIRS: dict[str, str] = {
 # but ARE read by the privileged MCP — carried verbatim from their own env var.
 _LEGACY_ONLY_KEYS: tuple[str, ...] = ("PLATFORM_URL", "WORKSPACE_ID")
 
+# ── audience=self delivery (RFC plugin-mcp-audience-contract, self-schedule v1) ──
+# The self audience is the workspace acting as ITSELF; its bearer is the
+# NON-privileged workspace token, NOT the org key. The in-container SSOT for that
+# token is the restart-ROTATED file /configs/.auth_token (platform_auth.py), so the
+# self injector passes the FILE PATH and NEVER the token VALUE — a spawned mcp-server
+# child re-reads the file each request and never holds a snapshot that 401s after the
+# next restart rotates the token (RFC review BLOCKER). MOLECULE_MCP_MODE=self selects
+# the workspace-token registry inside @molecule-ai/mcp-server. No org key is ever
+# injected on this path — the audience mapping IS the security model.
+WORKSPACE_TOKEN_FILE = "/configs/.auth_token"
+WORKSPACE_TOKEN_FILE_ENV = "MOLECULE_WORKSPACE_TOKEN_FILE"
+SELF_MCP_MODE = "self"
+# The tenant API base URL the self MCP calls; resolved from whichever the container
+# already carries (canonical first). This is the base URL, NOT the org key.
+_SELF_API_URL_ENV = "MOLECULE_API_URL"
+_SELF_API_URL_SOURCE_KEYS: tuple[str, ...] = ("MOLECULE_API_URL", "PLATFORM_URL")
+
 # Bidirectional alias lookup: canonical->legacy and legacy->canonical.
 _ALIAS_OF: dict[str, str] = {}
 for _canon, _legacy in _ALIAS_PAIRS.items():
@@ -116,27 +148,84 @@ def _resolve(key: str, env: Mapping[str, str]) -> str | None:
     return None
 
 
+def _without_audience(spec: dict) -> dict:
+    """Drop the delivery-directive ``audience`` key from a rendered spec.
+
+    ``audience`` is a delivery directive, not a child env var, so it must never
+    render into the native ``mcpServers`` entry. Returns the SAME object when there
+    is no ``audience`` key — so the org path's ``out is spec`` no-op identity is
+    preserved for every existing manifest (none of which carry ``audience``);
+    otherwise a shallow copy without it.
+    """
+    if "audience" not in spec:
+        return spec
+    stripped = dict(spec)
+    stripped.pop("audience", None)
+    return stripped
+
+
 def inject_privileged_env(
     name: str,
     spec: dict,
     env: Mapping[str, str] | None = None,
 ) -> dict:
-    """Return a NEW spec with the org-admin env merged in — gated to the
-    privileged management MCP.
+    """Return a spec with the credential for its DECLARED AUDIENCE injected.
 
-    No-op (returns ``spec`` unchanged) unless ``name == MANAGEMENT_MCP_NAME``.
-    For the management MCP, each injected key absent from the descriptor's
-    ``env`` is resolved (canonical-or-alias) and merged as a literal;
-    descriptor-declared keys win. Returns the spec unchanged when no values
-    resolve (e.g. a non-concierge box with none of the env vars set), so an
-    ordinary workspace's MCP specs are untouched.
+    The audience field IS the security model (RFC plugin-mcp-audience-contract):
+
+      * ``audience`` is read from the descriptor; when ABSENT it is DERIVED —
+        ``org`` for the management MCP name (``MANAGEMENT_MCP_NAME``), else
+        ``None``. This backward-compat bridge keeps every existing manifest on its
+        exact current behavior with NO flag-day.
+      * ``org``  → the org-admin env merge, EXACTLY as before, and STILL gated
+        internally to ``name == MANAGEMENT_MCP_NAME`` (a core-verified signal). A
+        self-declared ``audience:"org"`` on any other plugin name resolves NOTHING:
+        the org key can never reach an ordinary box, and v1 defers org injection to
+        the core-verified name (review security-major-2).
+      * ``self`` → inject the workspace-token FILE PATH, ``MOLECULE_MCP_MODE=self``,
+        and the tenant API base URL. Never injects any org key or token VALUE.
+      * ``None`` → no-op; the spec is returned unchanged (same object).
+
+    The ``audience`` key itself is stripped from the rendered spec.
+    """
+    from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
+
+    audience = spec.get("audience") or ("org" if name == MANAGEMENT_MCP_NAME else None)
+    if audience is None:
+        return spec  # not an audience-bearing surface — untouched (same object)
+    if env is None:
+        env = os.environ
+
+    rendered = _without_audience(spec)
+    if audience == "self":
+        return _inject_self_env(name, rendered, env)
+    if audience == "org":
+        return _inject_org_env(name, rendered, env)
+    # Unknown audience value (schema forbids it) — fail safe: inject NOTHING, but
+    # still strip the bogus key so it never renders as a literal.
+    return rendered
+
+
+def _inject_org_env(
+    name: str,
+    spec: dict,
+    env: Mapping[str, str],
+) -> dict:
+    """audience=``org`` — the org-admin env merge, byte-identical to the original
+    ``inject_privileged_env`` behavior.
+
+    STILL gated to ``name == MANAGEMENT_MCP_NAME``: this is the invariant that keeps
+    the org-admin key off ordinary boxes (core ``platform_agent_test.go``). A
+    self-declared ``audience:"org"`` on a non-management plugin therefore resolves
+    NOTHING — org injection stays anchored to the core-verified NAME, never a
+    manifest field (review security-major-2). Each injected key absent from the
+    descriptor ``env`` is resolved (canonical-or-alias) and merged; descriptor keys
+    win. Returns the spec unchanged when nothing resolves.
     """
     from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
 
     if name != MANAGEMENT_MCP_NAME:
         return spec
-    if env is None:
-        env = os.environ
 
     descriptor_env = dict(spec.get("env") or {})
     resolved: dict[str, str] = {}
@@ -156,5 +245,49 @@ def inject_privileged_env(
     log.info(
         "inject_privileged_env: merged %d org-admin env key(s) into %r MCP spec",
         len(resolved), name,
+    )
+    return new_spec
+
+
+def _inject_self_env(
+    name: str,
+    spec: dict,
+    env: Mapping[str, str],
+) -> dict:
+    """audience=``self`` — inject the workspace's OWN-identity credential.
+
+    Injects the workspace-token FILE PATH (``MOLECULE_WORKSPACE_TOKEN_FILE`` ->
+    ``/configs/.auth_token``, never the token VALUE — the file is restart-rotated,
+    so the child re-reads it and never 401s on a stale snapshot), forces
+    ``MOLECULE_MCP_MODE=self`` (the workspace-token registry), and carries the tenant
+    API base URL resolved from the container env (``MOLECULE_API_URL`` or its
+    ``PLATFORM_URL`` fallback) so the child does not fall back to localhost.
+
+    NEVER injects the org key or any ``PRIVILEGED_ENV_KEYS`` credential — the self
+    surface is the non-privileged workspace-token bearer, scoped to its own ``:id``
+    by construction (a foreign id 401s server-side). Descriptor-declared keys win for
+    the URL and the token-file path; ``MOLECULE_MCP_MODE`` is AUTHORITATIVE (an
+    ``audience:self`` surface IS self mode — a descriptor can never downgrade it to
+    ``management`` to try to fish for the org registry).
+    """
+    descriptor_env = dict(spec.get("env") or {})
+    # MOLECULE_MCP_MODE=self is authoritative (audience-derived, not a free env var).
+    injected: dict[str, str] = {"MOLECULE_MCP_MODE": SELF_MCP_MODE}
+    if WORKSPACE_TOKEN_FILE_ENV not in descriptor_env:
+        injected[WORKSPACE_TOKEN_FILE_ENV] = WORKSPACE_TOKEN_FILE
+    if _SELF_API_URL_ENV not in descriptor_env:
+        for src in _SELF_API_URL_SOURCE_KEYS:
+            val = env.get(src)
+            if val:
+                injected[_SELF_API_URL_ENV] = val
+                break
+
+    new_spec = dict(spec)
+    descriptor_env.update(injected)
+    new_spec["env"] = descriptor_env
+    log.info(
+        "inject_privileged_env: wired self-audience MCP %r "
+        "(workspace-token-file + MOLECULE_MCP_MODE=self%s)",
+        name, ", api-url" if _SELF_API_URL_ENV in injected else "",
     )
     return new_spec

@@ -24,18 +24,28 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `a3d70972ee082a8d862fd083ec6f92bbea133185` (SDK RuntimeId became an open bounded/path-safe slug; official runtime support moved to the adapter registry)
-Vendored at sdk HEAD: `656eb86eb53d00718fa5a8f60bf98cc01ccf3353` (`sdk-v0.5.2`, main)
+Source commit:        `92f8a88a60b0d4c337278b3bc52f549de270f6bf` (sdk#119 — plugin MCP audience contract: contract-version 0.5.0 adds the scalar `audience` (self|org) to an mcpServers contribution, generalizing `privileged` into a declared audience→credential mapping; self-schedule v1 foundation)
+Vendored at sdk HEAD: `92f8a88a60b0d4c337278b3bc52f549de270f6bf` (branch `feat/mcp-audience-contract`, PENDING MERGE)
+
+GATED (sdk#119 audience contract): the SDK commit above is a HELD draft and not
+yet on sdk `main`. Re-vendored byte-for-byte from that branch (content sha256
+`e4031f178b124babbb80af39827eccde7b07df44caaf45fdfb4977b0bf327267`). Until
+sdk#119 merges, `scripts/check-schemas-in-sync.sh` REPORTS DRIFT for this file
+(it diffs against sdk `main`, which still carries contract-version 0.4.0) — that
+is expected and correct for this HELD runtime PR, which DEPENDS ON sdk#119. When
+the SDK contract merges, reconcile the two SHAs above to the sdk `main` merge
+commit; the file content is unchanged, so the drift gate goes green the moment
+sdk#119 lands.
 
 Why vendored: `molecule_runtime/manifest_ssot.py` validates plugin manifests
 against this schema at plugin **load** (`plugins.load_plugin_manifest`) and at
 **install** (`plugin_sources.install_declared_plugins`) — the ADVISORY phase of
 molecule-core#3383. Validation runs inside workspace containers at boot.
 
-Re-vendoring:
+Re-vendoring (from the sdk#119 branch while it is HELD; drop `-b …` once merged):
 
     curl -fsS -A "curl/8.4.0" \
-      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-manifest/plugin-manifest.schema.json \
+      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/feat/mcp-audience-contract/contracts/plugin-manifest/plugin-manifest.schema.json \
       -o molecule_runtime/contracts/plugin-manifest.schema.json
 
 ---
@@ -233,3 +243,49 @@ Re-vendoring:
     curl -fsS -A "curl/8.4.0" \
       "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin/native-plugins.registry.json" \
       -o "molecule_runtime/contracts/native-plugins.registry.json"
+
+## mcp-plugin-delivery.contract.json  (vendored at repo-root `contracts/`)
+
+Source: molecule-ai-sdk `contracts/mcp/mcp-plugin-delivery.contract.json` — the
+cross-repo SSOT for the MCP-plugin delivery seam (`settings_path`, `mcpservers_key`,
+`entry_shape`, the management-MCP server name/version/registry, and — as of
+sdk#119 — the `audiences` map: each declared `audience` → its delivery
+(`mcp_mode` + either an env-VALUE `credential_env` or a re-read FILE
+`credential_file`/`token_file_env`) the runtime honors). NOTE: this file is vendored at the REPO-ROOT `contracts/`
+dir (not `molecule_runtime/contracts/`) and is mapped under that repo-relative
+key in `scripts/check-schemas-in-sync.sh`; it is the copy
+`platform_agent_identity` + `tests/test_mcp_plugin_delivery_contract.py` pin
+every management-MCP literal against.
+
+Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
+Source path:          contracts/mcp/mcp-plugin-delivery.contract.json
+Source commit:        `69dbe781ed0ab0b65367844ed5a5aef7d759a491` (sdk#119 — adds the `audiences` delivery map: self→{mcp_mode:self, credential_file:/configs/.auth_token, token_file_env:MOLECULE_WORKSPACE_TOKEN_FILE} (FILE-delivered, rotation-safe), org→{mcp_mode:management, credential_env:MOLECULE_ORG_API_KEY})
+Vendored at sdk HEAD: `69dbe781ed0ab0b65367844ed5a5aef7d759a491` (branch `feat/mcp-audience-contract`, PENDING MERGE)
+
+GATED (sdk#119 audience contract): the SDK commit above is a HELD draft and not
+yet on sdk `main`. Re-vendored byte-for-byte from that branch (content sha256
+`060e5c3818aec81779f11e4cdb2aa234ed2405f61cb112c46c713e857552a57f`). Until
+sdk#119 merges, `scripts/check-schemas-in-sync.sh` REPORTS DRIFT for this file
+(it diffs against sdk `main`, which lacks the `audiences` block) — expected and
+correct for this HELD runtime PR, which DEPENDS ON sdk#119. When the SDK contract
+merges, reconcile the two SHAs above to the sdk `main` merge commit; the content
+is unchanged, so the drift gate goes green the moment sdk#119 lands.
+
+NOTE — contract ⇄ runtime delivery (RECONCILED in sdk#119): the contract now
+declares `self` as FILE-delivered — `credential_file: /configs/.auth_token` +
+`token_file_env: MOLECULE_WORKSPACE_TOKEN_FILE` — matching EXACTLY what the
+runtime injects. `privileged_mcp_env` sets
+`MOLECULE_WORKSPACE_TOKEN_FILE=/configs/.auth_token` (the restart-ROTATED
+in-container SSOT, `platform_auth.py`) and the mcp-server child re-reads the
+current token per call. It does NOT inject the token VALUE
+(`MOLECULE_WORKSPACE_TOKEN`) — an env snapshot would 401 after the next rotation
+(RFC review BLOCKER). Earlier revisions of this contract mis-declared
+`credential_env: MOLECULE_WORKSPACE_TOKEN` for `self` (documentation only —
+nothing machine-reads the audiences map); sdk#119 corrects that to the file
+fields so a future consumer cannot be misled into injecting the value.
+
+Re-vendoring (from the sdk#119 branch while it is HELD; drop `-b …` once merged):
+
+    curl -fsS -A "curl/8.4.0" \
+      "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/feat/mcp-audience-contract/contracts/mcp/mcp-plugin-delivery.contract.json" \
+      -o "contracts/mcp-plugin-delivery.contract.json"

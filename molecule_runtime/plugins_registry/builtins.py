@@ -607,10 +607,15 @@ class MCPServerAdaptor:
 
       1. Skills + rules → delegated to ``AgentskillsAdaptor.uninstall()``.
       2. ``mcpServers`` entries are intentionally **not** removed from
-         ``settings.json`` on uninstall. MCP server configurations are
-         often shared with other tools or manually curated, so removing
-         them could break a user's setup. The user must remove them
-         manually if desired.
+         ``settings.json`` on uninstall — EXCEPT audience=``self`` entries.
+         A generic MCP config is often shared with other tools or manually
+         curated, so removing it could break a user's setup; the user removes
+         those manually. But an ``audience:"self"`` entry is a workspace-token
+         surface the runtime CREDENTIALED at install (token-file path + self
+         mode), so on opt-out it MUST be torn down or it lingers on disk as a
+         live self-mode surface (RFC plugin-mcp-audience-contract, review
+         MAJOR-4). The strip is scoped NARROWLY to audience=``self`` entries —
+         every other entry keeps the intentionally-not-removed behavior.
 
     Usage — in the plugin's per-runtime adapter file:
 
@@ -665,6 +670,47 @@ class MCPServerAdaptor:
         return result
 
     async def uninstall(self, ctx: InstallContext) -> None:
+        # NOTE: mcpServers entries are intentionally NOT removed (see class docstring)
+        # — EXCEPT audience=self entries, which the runtime credentialed at install
+        # (workspace-token-file path + MOLECULE_MCP_MODE=self) and which therefore
+        # MUST be torn down on opt-out so no live self-mode surface lingers on disk
+        # (RFC plugin-mcp-audience-contract, review MAJOR-4). Scoped NARROWLY to
+        # audience=self; any other entry keeps the intentionally-not-removed behavior.
+        self._teardown_self_audience_entries(ctx)
         # Delegate to AgentskillsAdaptor for skills + rules cleanup.
-        # NOTE: mcpServers entries are intentionally NOT removed (see class docstring).
         await AgentskillsAdaptor(self.plugin_name, self.runtime).uninstall(ctx)
+
+    def _teardown_self_audience_entries(self, ctx: InstallContext) -> None:
+        """Strip this plugin's audience=self mcpServers entries from the rendered
+        native settings.json on opt-out.
+
+        Reads the SAME descriptor install wired, and for each entry that declared
+        ``audience: self`` removes that named entry — and with it the nested injected
+        credential env (the token-file path + self mode) — from the generic JSON
+        ``mcpServers`` config the base hook renders to
+        (``<configs_dir>/.claude/settings.json``). Every non-self entry is left
+        untouched, preserving the intentionally-not-removed behavior for shared /
+        curated MCP configs. Best-effort + fail-safe: a missing/malformed settings
+        file is a no-op (nothing to leak).
+
+        SCOPE (honest, v1): this strips the generic JSON default the base hook
+        writes. A runtime that renders a different native file via its OWN adapter
+        override (codex TOML, hermes/openclaw YAML/JSON) would need the symmetric
+        native remove; per-runtime teardown parity is a tracked follow-up
+        (RFC §9 item 6). v1's self-schedule sibling ships on the claude-code base
+        runtime, whose native config IS this generic JSON."""
+        from molecule_runtime.mcp_render import (
+            default_json_settings_path,
+            remove_json_mcp_servers,
+        )
+
+        descriptor = _read_mcp_descriptor(ctx.plugin_root)
+        settings_path = default_json_settings_path(ctx.configs_dir)
+        for name, spec in descriptor.items():
+            if not isinstance(spec, dict) or spec.get("audience") != "self":
+                continue
+            if remove_json_mcp_servers(settings_path, name):
+                ctx.logger.info(
+                    "%s: stripped audience=self MCP %r from %s on uninstall "
+                    "(opt-out teardown)", self.plugin_name, name, settings_path,
+                )

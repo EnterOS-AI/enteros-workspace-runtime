@@ -19,7 +19,20 @@ import molecule_runtime
 from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
 from molecule_runtime.privileged_mcp_env import (
     PRIVILEGED_ENV_KEYS,
+    SELF_MCP_MODE,
+    WORKSPACE_TOKEN_FILE,
     inject_privileged_env,
+)
+
+# The org-admin CREDENTIAL keys — the actual privilege the enforcement seam keeps
+# off ordinary boxes. These must NEVER appear on an ordinary box or a self surface.
+# NOTE: MOLECULE_API_URL is the non-secret tenant base URL (shared by BOTH audiences)
+# and is deliberately NOT in this set — leaking it grants nothing.
+_ORG_SECRET_KEYS = (
+    "MOLECULE_API_KEY",
+    "MOLECULE_ORG_API_KEY",
+    "ORG_API_KEY",
+    "MOLECULE_ADMIN_TOKEN",
 )
 
 
@@ -269,3 +282,129 @@ def test_base_funnel_does_not_enrich_non_management_mcp(monkeypatch, tmp_path):
     assert name == "image-gen"
     # a tenant MCP must NEVER receive the admin token
     assert "env" not in spec or "MOLECULE_ADMIN_TOKEN" not in (spec.get("env") or {})
+
+
+# ===========================================================================
+# Audience-driven injection — negative controls (RFC plugin-mcp-audience-contract,
+# self-schedule v1). Each test asserts a property that FAILS if its guard is
+# inverted, per the task's negative-control requirement:
+#   (a) an ordinary box (name != MANAGEMENT_MCP_NAME, audience absent OR 'self',
+#       AND a self-declared audience='org') NEVER receives any org/privileged key;
+#   (b) audience='self' injects the token-FILE-PATH + MOLECULE_MCP_MODE=self + API
+#       URL, and NOT a token value or org key;
+#   (c) the org path (name == MANAGEMENT_MCP_NAME OR audience=='org') injects the
+#       org creds byte-identically to before.
+# ===========================================================================
+
+
+# ── (a) ordinary box never receives an org/privileged key ──────────────────
+def test_ordinary_box_audience_absent_is_noop_no_org_key():
+    """(a) name != MANAGEMENT_MCP_NAME and audience ABSENT -> untouched no-op; no
+    org/privileged key is injected even when the full org env is present on the box.
+    Inverting the audience=None no-op to inject would surface an org key here."""
+    env = {k: f"val-{k}" for k in PRIVILEGED_ENV_KEYS}
+    env["MOLECULE_ADMIN_TOKEN"] = "org-admin"
+    spec = {"command": "image-gen", "env": {}}
+    out = inject_privileged_env("image-gen", spec, env)
+    assert out is spec  # same object — untouched
+    for k in _ORG_SECRET_KEYS:
+        assert k not in out["env"]
+
+
+def test_ordinary_box_self_audience_never_receives_org_key():
+    """(a) name != MANAGEMENT_MCP_NAME, audience='self' -> the self surface is wired
+    but NO org/privileged key is ever injected, even though the box carries the org
+    env. Inverting the self path to fall through to org injection leaks here."""
+    env = {
+        "MOLECULE_API_URL": "https://acme.moleculesai.app",
+        "MOLECULE_ORG_API_KEY": "org-secret",
+        "MOLECULE_API_KEY": "admin-secret",
+        "MOLECULE_ADMIN_TOKEN": "admin-secret",
+    }
+    spec = {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"], "audience": "self"}
+    out = inject_privileged_env("molecule-schedule-self", spec, env)
+    for k in _ORG_SECRET_KEYS:
+        assert k not in out["env"], f"org secret {k} leaked onto a self surface"
+
+
+def test_self_declared_org_audience_on_ordinary_plugin_injects_nothing():
+    """(a/c security-major-2) THE org-key-off-ordinary-box invariant. A self-declared
+    audience='org' on a NON-management plugin name must resolve NOTHING — org
+    injection stays anchored to the core-verified MANAGEMENT_MCP_NAME, never a
+    self-declared manifest field. Removing the org path's `name != MANAGEMENT_MCP_NAME`
+    gate leaks the org key here (the exact thing this seam exists to prevent)."""
+    env = {k: f"val-{k}" for k in PRIVILEGED_ENV_KEYS}
+    env["MOLECULE_ADMIN_TOKEN"] = "org-admin"
+    spec = {"command": "npx", "env": {}, "audience": "org"}
+    out = inject_privileged_env("image-gen", spec, env)
+    e = out.get("env", {})
+    for k in _ORG_SECRET_KEYS:
+        assert k not in e, f"org secret {k} leaked to ordinary plugin via self-declared audience=org"
+    assert e == {}  # nothing injected at all
+    assert "audience" not in out  # the directive is stripped, never rendered
+
+
+# ── (b) audience='self' injects file-path + mode + url, never a value/org key ──
+def test_self_audience_injects_token_file_mode_and_api_url():
+    """(b) audience='self' injects MOLECULE_WORKSPACE_TOKEN_FILE=/configs/.auth_token
+    (the FILE PATH, so the child re-reads the rotated token — never the token VALUE),
+    MOLECULE_MCP_MODE=self, and the tenant API base URL. Inverting any branch (value
+    instead of path, wrong mode, org key, missing url) fails an assert here."""
+    env = {
+        "MOLECULE_API_URL": "https://acme.moleculesai.app",
+        "MOLECULE_ORG_API_KEY": "org-secret",
+        "MOLECULE_ADMIN_TOKEN": "admin-secret",
+    }
+    spec = {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server"], "audience": "self"}
+    out = inject_privileged_env("molecule-schedule-self", spec, env)
+    e = out["env"]
+    assert e["MOLECULE_WORKSPACE_TOKEN_FILE"] == WORKSPACE_TOKEN_FILE == "/configs/.auth_token"
+    assert e["MOLECULE_MCP_MODE"] == SELF_MCP_MODE == "self"
+    assert e["MOLECULE_API_URL"] == "https://acme.moleculesai.app"
+    # the token VALUE is NEVER read or injected — only the file PATH
+    assert "MOLECULE_WORKSPACE_TOKEN" not in e
+    # NO org key on the self path, even though the box carries them
+    for k in _ORG_SECRET_KEYS:
+        assert k not in e
+    # audience directive stripped from the rendered spec (never a literal env var)
+    assert "audience" not in out
+
+
+def test_self_audience_api_url_falls_back_to_platform_url():
+    """(b) the tenant API base URL resolves from PLATFORM_URL when MOLECULE_API_URL
+    is unset (whatever the container already carries)."""
+    out = inject_privileged_env("schedule-self", {"audience": "self"}, {"PLATFORM_URL": "https://plat.example"})
+    assert out["env"]["MOLECULE_API_URL"] == "https://plat.example"
+
+
+def test_self_audience_descriptor_declared_url_wins_but_mode_is_authoritative():
+    """(b) descriptor-declared MOLECULE_API_URL wins; MOLECULE_MCP_MODE is
+    AUTHORITATIVE — a descriptor can NOT downgrade a self surface to management to
+    fish for the org registry."""
+    spec = {
+        "audience": "self",
+        "env": {"MOLECULE_API_URL": "https://declared", "MOLECULE_MCP_MODE": "management"},
+    }
+    out = inject_privileged_env("schedule-self", spec, {"MOLECULE_API_URL": "https://env"})
+    assert out["env"]["MOLECULE_API_URL"] == "https://declared"  # descriptor wins for url
+    assert out["env"]["MOLECULE_MCP_MODE"] == "self"  # mode is forced, not overridable
+
+
+# ── (c) org path unchanged — declared 'org' == derived (name) == pre-audience ──
+def test_org_audience_declared_matches_derived_and_forwards_org_creds():
+    """(c) audience='org' with the management name injects the org creds
+    byte-identically to the derived (name-based) org path — i.e. exactly the
+    pre-audience behavior. Inverting the org merge changes the env and fails here."""
+    env = {
+        "MOLECULE_API_URL": "http://cp",
+        "MOLECULE_API_KEY": "key",
+        "MOLECULE_ORG_API_KEY": "orgkey",
+        "ORG_SLUG": "acme",
+        "AUDIT_ACTOR": "a@x",
+    }
+    declared = inject_privileged_env(MANAGEMENT_MCP_NAME, {"command": "npx", "audience": "org"}, env)
+    derived = inject_privileged_env(MANAGEMENT_MCP_NAME, {"command": "npx"}, env)
+    assert declared["env"] == derived["env"]  # declared audience==org identical to derived
+    for key in PRIVILEGED_ENV_KEYS:
+        assert declared["env"][key] == env[key]
+    assert "audience" not in declared  # directive stripped

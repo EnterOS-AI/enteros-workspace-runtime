@@ -134,6 +134,34 @@ def read_json_mcp_servers(settings_path: Path) -> dict:
     return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
 
 
+def remove_json_mcp_servers(settings_path: Path, name: str) -> bool:
+    """Strip ``mcpServers.<name>`` (entry + its nested env) from a JSON native config.
+
+    The inverse of :func:`render_json_mcp_servers` — the NARROW teardown for an
+    opt-out: it removes ONLY the one named entry (dropping the whole descriptor,
+    including any injected credential env nested under it) and preserves every other
+    server + hand-written key. Byte-stable with the renderer (``json.dumps(indent=2)
+    + "\\n"``). No-op that returns ``False`` when the file is missing / unreadable /
+    malformed or the entry is absent; ``True`` when an entry was removed."""
+    settings_path = Path(settings_path)
+    if not settings_path.is_file():
+        return False
+    try:
+        data = json.loads(settings_path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    servers = data.get(MCPSERVERS_KEY)
+    if not isinstance(servers, dict) or name not in servers:
+        return False
+
+    del servers[name]
+    data[MCPSERVERS_KEY] = servers
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    return True
+
+
 def default_json_settings_path(config_path: str | os.PathLike) -> Path:
     """The default JSON native MCP-config path the BaseAdapter fallback resolves
     (``<config_path>/.claude/settings.json``).

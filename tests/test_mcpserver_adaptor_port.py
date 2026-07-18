@@ -216,3 +216,86 @@ async def test_nonprivileged_plugin_records_error_when_runtime_unsupported(tmp_p
     result = await MCPServerAdaptor("some-mcp-plugin", "some-unverified-runtime").install(ctx)
     assert result.errors
     assert any("unsupported on runtime" in e for e in result.errors)
+
+
+# ===========================================================================
+# (d) Opt-out teardown — an audience=self entry is stripped from settings.json on
+# uninstall, while every other (intentionally-not-removed) entry is preserved
+# (RFC plugin-mcp-audience-contract, review MAJOR-4).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_uninstall_strips_self_audience_entry_but_keeps_others(tmp_path):
+    """(d) On opt-out, an audience=self mcpServers entry — credentialed at install
+    with the workspace-token-file path + MOLECULE_MCP_MODE=self — is stripped from
+    the rendered settings.json (entry AND its injected credential env), while every
+    OTHER entry keeps the intentionally-not-removed behavior.
+
+    Negative control on BOTH sides: inverting the audience gate so it strips
+    nothing leaves 'schedule-self' present (first assert fails); dropping the
+    per-entry audience scope so it strips everything removes 'image-gen' (second
+    assert fails)."""
+    from molecule_runtime import mcp_render
+
+    # The plugin declares an audience=self mcpServers entry (what install wired).
+    root = _make_plugin(
+        tmp_path,
+        {"mcpServers": {
+            "schedule-self": {
+                "command": "npx",
+                "args": ["-y", "@molecule-ai/mcp-server"],
+                "audience": "self",
+            },
+        }},
+    )
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    settings = mcp_render.default_json_settings_path(configs)
+
+    # Simulate what install rendered: the self entry AFTER credential injection ...
+    mcp_render.render_json_mcp_servers(settings, "schedule-self", {
+        "command": "npx",
+        "args": ["-y", "@molecule-ai/mcp-server"],
+        "env": {
+            "MOLECULE_MCP_MODE": "self",
+            "MOLECULE_WORKSPACE_TOKEN_FILE": "/configs/.auth_token",
+        },
+    })
+    # ... plus an unrelated, curated MCP entry that must SURVIVE opt-out.
+    mcp_render.render_json_mcp_servers(settings, "image-gen", {"command": "npx", "args": ["gen"]})
+
+    await MCPServerAdaptor("molecule-schedule-self", "claude_code").uninstall(
+        _ctx(root, configs, lambda n, s: None)
+    )
+
+    servers = mcp_render.read_json_mcp_servers(settings)
+    # the credentialed self entry (+ its injected token-file / self-mode env) is gone
+    assert "schedule-self" not in servers
+    # every other entry is intentionally preserved
+    assert servers["image-gen"] == {"command": "npx", "args": ["gen"]}
+
+
+@pytest.mark.asyncio
+async def test_uninstall_leaves_non_self_entry_in_place(tmp_path):
+    """(d) The narrow scope holds: a plugin whose mcpServers entry has NO audience
+    (or a non-self audience) keeps the original intentionally-not-removed behavior —
+    uninstall does NOT strip it. Inverting the audience scope to strip unconditionally
+    fails here."""
+    from molecule_runtime import mcp_render
+
+    root = _make_plugin(
+        tmp_path,
+        {"mcpServers": {"image-gen": {"command": "npx", "args": ["gen"]}}},  # no audience
+    )
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    settings = mcp_render.default_json_settings_path(configs)
+    mcp_render.render_json_mcp_servers(settings, "image-gen", {"command": "npx", "args": ["gen"]})
+
+    await MCPServerAdaptor("image-gen-plugin", "claude_code").uninstall(
+        _ctx(root, configs, lambda n, s: None)
+    )
+
+    # untouched — the intentionally-not-removed behavior for non-self entries
+    assert mcp_render.read_json_mcp_servers(settings)["image-gen"] == {"command": "npx", "args": ["gen"]}

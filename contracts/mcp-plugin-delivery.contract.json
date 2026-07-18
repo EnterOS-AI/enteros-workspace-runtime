@@ -70,5 +70,17 @@
       "renderer": "HermesAgentAdapter.register_mcp_server_hook",
       "status": "implemented"
     }
+  },
+  "audiences": {
+    "self": {
+      "mcp_mode": "self",
+      "credential_file": "/configs/.auth_token",
+      "token_file_env": "MOLECULE_WORKSPACE_TOKEN_FILE",
+      "$comment": "The `self` credential is delivered as a re-read FILE PATH, NOT as an env VALUE: the runtime sets token_file_env (MOLECULE_WORKSPACE_TOKEN_FILE) to the path credential_file (/configs/.auth_token), and the mcp-server re-reads that file per call. Injecting the MOLECULE_WORKSPACE_TOKEN env VALUE instead would 401 after restart-rotation — /configs/.auth_token is rotated on restart, so a token value snapshotted into the child env goes stale (RFC review BLOCKER)."
+    },
+    "org": {
+      "mcp_mode": "management",
+      "credential_env": "MOLECULE_ORG_API_KEY"
+    }
   }
 }

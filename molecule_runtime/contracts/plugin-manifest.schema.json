@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-manifest/plugin-manifest.schema.json",
-  "$comment": "contract-version 0.4.0 — RuntimeId is an open bounded/path-safe slug and official support is separate; 0.3.1 made daemons contribution semantics first-class.",
+  "$comment": "contract-version 0.5.0 — an mcpServers contribution may declare a scalar `audience` (self|org) that generalizes the `privileged` boolean into a declared audience→credential mapping (self-schedule v1 foundation, RFC plugin-mcp-audience-contract); RuntimeId is an open bounded/path-safe slug and official support is separate; 0.3.1 made daemons contribution semantics first-class.",
   "title": "Marketplace Plugin Manifest Contract",
   "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace plugin manifest — the publishable shape of a `plugin.yaml` artifact (molecule-ai-plugin-* repos), authored marketplace-side per RFC molecule-core#3285 (Tool-Contract SSOT & Codegen). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-plugin-molecule-careful-bash/plugin.yaml, image-gen/plugin.yaml, gh-identity/plugin.yaml, molecule-hitl/plugin.yaml, validated by each plugin repo's `.molecule-ci/scripts/validate-plugin.py` (required: name/version/description; runtimes must be a list; content is one of SKILL.md/hooks/skills/rules). The design is VS-Code-shaped: `engines` pins the minimum host version (like engines.vscode), and `contributes` is the OPEN, forward-compatible contribution surface — its KNOWN keys are validated by shape while UNKNOWN contribution points are tolerated. RuntimeId is an open bounded/path-safe slug; official first-party support is discovered separately from the adapter registry and never acts as a universal allowlist.",
   "type": "object",
@@ -218,7 +218,12 @@
           "additionalProperties": { "type": "string", "description": "An environment variable value." },
           "description": "Optional environment map (var->value) for the MCP server process."
         },
-        "privileged": { "type": "boolean", "description": "Whether this MCP server is the privileged management surface." }
+        "privileged": { "type": "boolean", "description": "Whether this MCP server is the privileged management surface." },
+        "audience": {
+          "type": "string",
+          "enum": ["self", "org"],
+          "description": "Declared AUDIENCE of this MCP surface — WHO the runtime injects a credential for (RFC plugin-mcp-audience-contract, self-schedule v1). PER-SERVER: a plugin that exposes both audiences declares TWO mcpServers entries, one per audience. `self` = the workspace acting as ITSELF — the runtime injects the workspace token (MOLECULE_WORKSPACE_TOKEN), scoped to its own workspace :id (a foreign id fails closed); the self-schedule tool is the first consumer. `org` = the org/platform agent — the runtime injects the org API key (MOLECULE_ORG_API_KEY, tenant-admin), and MUST only ever be injected into a genuinely org-privileged context (core's platform_agent invariant), never an ordinary workspace. This field SUBSUMES `privileged`: `privileged:true` is equivalent to `audience:\"org\"`. When `audience` is ABSENT it is DERIVED from `privileged` (privileged:true -> org, else self), so every existing manifest keeps its current behavior with no flag-day (backward-compatible). See mcp/mcp-plugin-delivery.contract.json#/audiences for the audience -> {mcp_mode, credential_env} delivery mapping the runtime honors. v1 wires ONLY `self`; `org` is declared in the contract but its credential injection is deferred (kept anchored to a core-verified kind=platform signal, not a self-declared field)."
+        }
       }
     },
     "daemonContribution": {
