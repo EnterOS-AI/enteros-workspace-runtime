@@ -88,6 +88,9 @@ class PlatformMailSummarySource:
     # injected seams (tests)
     now_fn: callable = time.time
     _cached: Optional[MailSummary] = field(default=None, init=False)
+    #: the failure memoized for THIS tick (see fetch) — so both providers see
+    #: one outcome, not one success and one failure.
+    _error: Optional[str] = field(default=None, init=False)
     _cached_at: float = field(default=0.0, init=False)
     _lock: Optional[asyncio.Lock] = field(default=None, init=False)
 
@@ -102,23 +105,47 @@ class PlatformMailSummarySource:
             now = self.now_fn()
             if self._cached is not None and (now - self._cached_at) < self.cache_ttl_seconds:
                 return self._cached
+            # FAILURES ARE MEMOIZED TOO, and that is the whole point of the lock.
+            #
+            # Memoizing only successes made the lock half a fix: on a FAILING
+            # tick the first provider raised and left the cache empty, so the
+            # second provider re-acquired and issued a SECOND GET. During a
+            # rolling deploy (502 then 200) that produced exactly the divergence
+            # the contract forbids — sent-folder marked failed and excluded from
+            # the delta hash while inbound-a2a rendered a full envelope — and
+            # then a spurious re-fire on the next tick when sent-folder's hash
+            # reappeared unchanged. It also doubled the GETs (2 x 4s timeouts)
+            # inside the runner's 5s per-provider budget on a hard outage.
+            #
+            # One outcome per tick, shared by both providers — success or
+            # failure, symmetrically.
+            if self._error is not None and (now - self._cached_at) < self.cache_ttl_seconds:
+                raise CommsSummaryUnavailable(self._error)
             try:
                 data = await asyncio.get_running_loop().run_in_executor(None, self._get)
+                if data is None:
+                    raise CommsSummaryUnavailable("mail summary: non-object response")
+                summary = MailSummary(
+                    received_unread=int(data.get("received_unread", 0) or 0),
+                    replies_unread=int(data.get("replies_unread", 0) or 0),
+                    sent_awaiting_reply=int(data.get("sent_awaiting_reply", 0) or 0),
+                    overdue=tuple(data.get("overdue") or ()),
+                    overdue_count=int(
+                        # The TRUE uncapped total. Falls back to the list length
+                        # only for a server that predates the field — rendering
+                        # len(list) is what under-reported 25 overdue as "10".
+                        data.get("overdue_count", len(data.get("overdue") or ()))
+                        or 0
+                    ),
+                    overdue_after_seconds=int(
+                        data.get("overdue_after_seconds", DEFAULT_OVERDUE_AFTER_SECONDS)
+                        or DEFAULT_OVERDUE_AFTER_SECONDS
+                    ),
+                )
             except Exception as exc:
+                self._cached, self._error, self._cached_at = None, str(exc), now
                 raise CommsSummaryUnavailable(str(exc)) from exc
-            if data is None:
-                raise CommsSummaryUnavailable("mail summary: non-object response")
-            summary = MailSummary(
-                received_unread=int(data.get("received_unread", 0) or 0),
-                replies_unread=int(data.get("replies_unread", 0) or 0),
-                sent_awaiting_reply=int(data.get("sent_awaiting_reply", 0) or 0),
-                overdue=tuple(data.get("overdue") or ()),
-                overdue_after_seconds=int(
-                    data.get("overdue_after_seconds", DEFAULT_OVERDUE_AFTER_SECONDS)
-                    or DEFAULT_OVERDUE_AFTER_SECONDS
-                ),
-            )
-            self._cached, self._cached_at = summary, now
+            self._cached, self._error, self._cached_at = summary, None, now
             return summary
 
     def _get(self) -> Optional[dict]:
@@ -205,15 +232,20 @@ class SentMailProvider:
         if s.sent_awaiting_reply == 0:
             return []
         overdue = list(s.overdue)
+        # The COUNT is the uncapped total; `overdue` is only a capped SAMPLE used
+        # to name a few offenders. Rendering len(overdue) under-reports the blast
+        # radius (25 overdue shown as "10") and freezes the delta signal once the
+        # cap saturates, so an 11th delegation going overdue changes nothing.
+        overdue_total = s.overdue_count or len(overdue)
         hours = max(1, s.overdue_after_seconds // 3600)
         summary = f"You have {s.sent_awaiting_reply} sent message(s) awaiting a reply."
-        if overdue:
+        if overdue_total:
             names = ", ".join(
                 str(o.get("target_workspace_id", "?"))[:8] for o in overdue[:_OVERDUE_NAMES_CAP]
             )
-            more = "…" if len(overdue) > _OVERDUE_NAMES_CAP else ""
+            more = "…" if overdue_total > len(overdue[:_OVERDUE_NAMES_CAP]) else ""
             summary += (
-                f" ⚠ {len(overdue)} sent >{hours}h with no reply — the target agent"
+                f" ⚠ {overdue_total} sent >{hours}h with no reply — the target agent"
                 f" may have an issue ({names}{more})."
             )
         summary += " Use the Molecules AI workspace communication MCP to see detail."
@@ -221,18 +253,21 @@ class SentMailProvider:
         return [
             Contribution(
                 provider_id=self.provider_id,
-                band=Band.URGENT if overdue else Band.BASE,
+                band=Band.URGENT if overdue_total else Band.BASE,
                 tier=SENT_TIER,
                 # D2: an overdue no-reply jumps the tier queue.
-                urgency=Urgency.URGENT if overdue else Urgency.NORMAL,
+                urgency=Urgency.URGENT if overdue_total else Urgency.NORMAL,
                 count=s.sent_awaiting_reply,
                 summary=summary,
                 age_band=_age_band_for_seconds(oldest_age) if overdue else AgeBand.NONE,
                 # awaiting count + the overdue id SET are the delta signal; the
                 # ids keep the digest firing when a DIFFERENT delegation goes
                 # overdue even if the count happens to match.
+                # The uncapped total rides the delta signal alongside the id
+                # sample, so an 11th delegation going overdue still re-fires the
+                # digest even though the capped id set is unchanged.
                 item_ids=tuple(
-                    [f"awaiting:{s.sent_awaiting_reply}"]
+                    [f"awaiting:{s.sent_awaiting_reply}", f"overdue_n:{overdue_total}"]
                     + sorted(f"overdue:{o.get('delegation_id','?')}" for o in overdue)
                 ),
                 pull=PullInstruction(

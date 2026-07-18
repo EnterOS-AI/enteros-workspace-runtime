@@ -50,7 +50,12 @@ class MailSummary:
     received_unread: int = 0
     replies_unread: int = 0
     sent_awaiting_reply: int = 0
+    #: a SAMPLE of the overdue sends, capped server-side for naming offenders.
     overdue: tuple = ()  # of dict: delegation_id, target_workspace_id, age_seconds
+    #: the TRUE, UNCAPPED overdue total. Render THIS, never len(overdue) — the
+    #: list is capped at 10, so 25 overdue rendered as "10" (under-reporting the
+    #: blast radius) and the delta signal froze once the cap saturated.
+    overdue_count: int = 0
     overdue_after_seconds: int = DEFAULT_OVERDUE_AFTER_SECONDS
 
 

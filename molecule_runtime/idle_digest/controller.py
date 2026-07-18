@@ -172,9 +172,68 @@ class IdleDigestController:
         # recompute the baseline POST-callback (re-gather so a cadence band that
         # reset on inclusion — goal-state — is baselined at its post-reset value;
         # this is what prevents the one-tick-later double fire).
-        post = await self._runner.gather(self.providers)
+        # peek=True: a pure READ. It probes no quarantined provider and mutates no
+        # failure state. The peek exists only to re-read providers whose cadence
+        # band RESET on inclusion (goal-state), so they are baselined at their
+        # post-reset value — that is what prevents the one-tick-later double fire.
+        post = await self._runner.gather(self.providers, peek=True)
         post_assembled = assemble(post.contributions, self.policy)
-        self._baseline = post_assembled.signature
+
+        # THE RULE: a provider's baseline entry may only change if that provider was
+        # RENDERED in the digest we just posted.
+        #
+        # (Stated precisely, because "the baseline only holds what the agent saw" is
+        # an OVERCLAIM and review caught it: the peek deliberately re-reads a
+        # rendered provider to capture a cadence band that RESET on inclusion —
+        # goal-state — so its entry is the post-reset value, which is NOT byte-wise
+        # what was rendered. That is the whole point of the peek, and it is confined
+        # to providers that WERE rendered. The rule below is what actually holds.)
+        #
+        # Everything the delta gate does rests on this. A baseline entry means "the
+        # agent has already read this" — so writing an entry for a section that was
+        # never rendered makes the digest permanently silent about it (it will look
+        # "unchanged" forever), and dropping an entry for a section that WAS rendered
+        # makes it re-fire a byte-identical duplicate.
+        #
+        # Two previous attempts got this wrong by enumerating failure shapes and
+        # patching each one. That approach cannot be finished: the set of ways a
+        # provider can fail to be rendered keeps growing (raised; timed out;
+        # quarantined; skipped; returned nothing), and every one it misses is a
+        # silent bug. So the rule is now structural — derived from `just_fired`, the
+        # set of providers that were genuinely IN the digest we posted:
+        #
+        #   rendered this tick        -> baseline it (post-reset value if the peek
+        #                                saw one, else exactly what we rendered)
+        #   NOT rendered this tick    -> its baseline cannot change. Keep what the
+        #                                agent last saw, if anything.
+        #
+        # ...with one deliberate exception: a provider that ran fine and simply had
+        # NOTHING to say (zero mail) must have its entry DROPPED, not carried — else
+        # when that content comes back it would match a stale baseline and never
+        # fire. `ran_ok_now` distinguishes "silent because healthy" from "absent
+        # because broken".
+        prev = dict(self._baseline)
+        just_fired = dict(assembled.signature)
+        post_sig = dict(post_assembled.signature)
+
+        ran_ok_now = {
+            p.provider_id
+            for p in self.providers
+            if p.provider_id not in post.failed
+            and p.provider_id not in gathered.failed
+            and not self._runner.is_disabled(p.provider_id)
+        }
+
+        merged: dict[str, str] = {}
+        for pid, sig in prev.items():
+            # A healthy provider with nothing to say drops out; a broken/quarantined
+            # one keeps the last thing the agent read from it.
+            if pid not in ran_ok_now:
+                merged[pid] = sig
+        for pid, sig in just_fired.items():
+            merged[pid] = post_sig.get(pid, sig)
+
+        self._baseline = tuple(sorted(merged.items()))
         self._last_fire = fired_at
         self._save(self._baseline, fired_at)
         return FIRED
