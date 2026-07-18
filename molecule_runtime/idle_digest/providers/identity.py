@@ -134,6 +134,15 @@ class IdentityCapabilitiesProvider:
     persona_reader: Optional[Callable[[str, Sequence[str]], str]] = None
     tools_source: Optional[Callable[[], Optional[Sequence[str]]]] = None
     platform_agent_check: Optional[Callable[[], bool]] = None
+    # The workspace "molecule" bridge is served IN-PROCESS (a2a_mcp_server);
+    # http/url-wired runtimes (e.g. hermes' gateway on :9100) declare it with
+    # no stdio command, so the spawn-probe skips it and the OBSERVED inventory
+    # under-reports "workspace MCP (0)" — telling the agent it lacks
+    # send_message_to_user / delegate_task / commit_memory when it has them.
+    # The runtime knows its own bridge registry authoritatively; this seam
+    # unions those ids into the header. Observed-inventory producers
+    # (heartbeat diagnostics) stay pure — the union is display-layer only.
+    bridge_tools_source: Optional[Callable[[], Sequence[str]]] = None
 
     def _read_persona(self) -> str:
         reader = self.persona_reader
@@ -146,6 +155,21 @@ class IdentityCapabilitiesProvider:
         except Exception:  # noqa: BLE001 — a bad persona file must never crash the tick
             return ""
 
+    def _read_bridge_tools(self) -> list[str]:
+        source = self.bridge_tools_source
+        if source is None:
+            def source() -> Sequence[str]:
+                from molecule_runtime.mcp_tools import MOLECULE_MCP_TOOLS
+
+                return [
+                    f"mcp__{WORKSPACE_MCP_SERVER}__{t['name']}"
+                    for t in MOLECULE_MCP_TOOLS
+                ]
+        try:
+            return list(source() or [])
+        except Exception:  # noqa: BLE001
+            return []
+
     def _read_tools(self) -> list[str]:
         source = self.tools_source
         if source is None:
@@ -153,9 +177,14 @@ class IdentityCapabilitiesProvider:
 
             source = platform_agent_identity.loaded_mcp_tools
         try:
-            return list(source() or [])
+            observed = list(source() or [])
         except Exception:  # noqa: BLE001
-            return []
+            observed = []
+        # Union with the in-process bridge registry (see bridge_tools_source).
+        # Stdio-probed runtimes already report the same mcp__molecule__* ids —
+        # the set-union dedups them; http-wired runtimes gain the tools the
+        # probe could not spawn.
+        return sorted(set(observed) | set(self._read_bridge_tools()))
 
     def _is_platform_agent(self) -> bool:
         check = self.platform_agent_check

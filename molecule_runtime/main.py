@@ -1597,6 +1597,14 @@ async def main():  # pragma: no cover
             _IDLE_FIRE_TIMEOUT = max(60, min(300, _idle_policy.idle_fire_after_seconds))
 
             async def _digest_poster(_text: str) -> None:
+                # <SYSTEM IDLE PROMPT> framing: mark the consolidation as
+                # system-generated in the agent's context and in traces —
+                # transport-layer concern, never part of the hashed digest.
+                from molecule_runtime.idle_digest.contract import (
+                    frame_idle_prompt as _frame_idle,
+                )
+
+                _text = _frame_idle(_text)
                 _payload = _idle_json.dumps({
                     "method": "message/send",
                     "params": build_message_send_params(
@@ -1780,12 +1788,17 @@ async def main():  # pragma: no cover
                 # path as initial_prompt). The agent's own concurrency control
                 # rejects if the workspace becomes busy between this check and
                 # the post — that's the expected safety valve.
+                from molecule_runtime.idle_digest.contract import (
+                    frame_idle_prompt as _frame_idle_legacy,
+                )
+
                 payload = _json.dumps({
                     "method": "message/send",
                     # #2251: single model-based builder — params generated
                     # FROM the receiver's a2a-sdk v0.3 SendMessageRequest schema.
                     "params": build_message_send_params(
-                        config.idle_prompt,
+                        # Same <SYSTEM IDLE PROMPT> framing as the digest poster.
+                        _frame_idle_legacy(config.idle_prompt),
                         message_id=f"idle-{_uuid.uuid4().hex[:8]}",
                         # Stamp the typed self-ping marker so the executor (a)
                         # drops the idle fire instead of queuing it behind an

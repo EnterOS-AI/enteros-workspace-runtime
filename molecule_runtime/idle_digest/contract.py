@@ -254,3 +254,27 @@ class Policy:
                 base.provider_timeout_seconds,
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# self-prompt framing
+# ---------------------------------------------------------------------------
+
+# Title line prepended to every self-initiated idle/digest prompt at the
+# POSTER (transport) layer — it frames the message in the agent's context and
+# in traces as a system-generated consolidation, not user input. Deliberately
+# NOT part of any Contribution: contributions are hashed for the fire/delta
+# decision and a static banner must not affect it.
+SYSTEM_IDLE_HEADER = "<SYSTEM IDLE PROMPT>"
+
+
+def frame_idle_prompt(text: str) -> str:
+    """Prepend the system-idle title to a rendered digest / idle prompt.
+
+    Idempotent (a text already carrying the header is returned unchanged) so
+    a retried or double-framed post can never stack banners.
+    """
+    body = text or ""
+    if body.lstrip().startswith(SYSTEM_IDLE_HEADER):
+        return body
+    return f"{SYSTEM_IDLE_HEADER}\n{body}"
