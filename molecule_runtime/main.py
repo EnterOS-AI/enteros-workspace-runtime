@@ -1591,70 +1591,18 @@ async def main():  # pragma: no cover
                         pass
                     break
 
-            import json as _idle_json
-            from urllib import request as _idle_urlreq
-
             _IDLE_FIRE_TIMEOUT = max(60, min(300, _idle_policy.idle_fire_after_seconds))
 
-            async def _digest_poster(_text: str) -> None:
-                # <SYSTEM IDLE PROMPT> framing: mark the consolidation as
-                # system-generated in the agent's context and in traces —
-                # transport-layer concern, never part of the hashed digest.
-                from molecule_runtime.idle_digest.contract import (
-                    frame_idle_prompt as _frame_idle,
-                )
+            # The complete self-fire round trip — <SYSTEM IDLE PROMPT> framing,
+            # message/send POST, and forwarding the turn's reply text to the
+            # user — lives in idle_digest/poster.py so the wire behavior is
+            # conformance-tested (real builders, real HTTP) instead of sitting
+            # untestable in a boot closure.
+            from molecule_runtime.idle_digest.poster import make_digest_poster
 
-                _text = _frame_idle(_text)
-                _payload = _idle_json.dumps({
-                    "method": "message/send",
-                    "params": build_message_send_params(
-                        _text,
-                        message_id=f"idle-{_uuid.uuid4().hex[:8]}",
-                        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
-                    ),
-                }).encode()
-
-                def _post() -> bytes:
-                    _headers = {
-                        "Content-Type": "application/json",
-                        **self_source_headers(workspace_id),
-                    }
-                    _req = _idle_urlreq.Request(
-                        f"{platform_url}/workspaces/{workspace_id}/a2a",
-                        data=_payload,
-                        headers=_headers,
-                    )
-                    with _idle_urlreq.urlopen(_req, timeout=_IDLE_FIRE_TIMEOUT) as _r:
-                        return _r.read()
-
-                _resp_body = await asyncio.get_running_loop().run_in_executor(
-                    None, _post
-                )
-                # The turn's reply text comes back as THIS response body —
-                # request-response turns deliver their reply to the initiator,
-                # and for a self-fire the initiator is us. Forward it to the
-                # user instead of discarding it (the pre-fix behavior silently
-                # dropped every digest-turn answer; see reply_forwarder.py).
-                try:
-                    from molecule_runtime.idle_digest.reply_forwarder import (
-                        extract_reply_text as _extract_reply,
-                        forward_reply_to_user as _forward_reply,
-                    )
-
-                    _reply_text = _extract_reply(_resp_body)
-                    _status = await _forward_reply(
-                        platform_url, workspace_id, _reply_text
-                    )
-                    if _status == "delivered":
-                        print(
-                            f"Idle digest: reply forwarded to user "
-                            f"({len(_reply_text)} chars)",
-                            flush=True,
-                        )
-                    elif _status != "suppressed":
-                        print(f"Idle digest: reply not delivered — {_status}", flush=True)
-                except Exception as _fwd_e:  # pragma: no cover — never crash the loop
-                    print(f"Idle digest: reply forward error — {_fwd_e}", flush=True)
+            _digest_poster = make_digest_poster(
+                platform_url, workspace_id, _IDLE_FIRE_TIMEOUT
+            )
 
             _idle_controller = _IDC(
                 providers=_idle_providers,
