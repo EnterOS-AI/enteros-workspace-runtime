@@ -351,6 +351,14 @@ async def test_parity_identity_provider_via_plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "molecule_runtime.loaded_mcp_tools_probe._is_platform_agent", lambda: True
     )
+    # Neutralize the in-process bridge union (identity._read_bridge_tools
+    # defaults to MOLECULE_MCP_TOOLS) so this parity test exercises the
+    # OBSERVED-inventory rendering it was written for — "workspace MCP (2)"
+    # for the 2 injected mcp__molecule__* tools. Both the baked and
+    # plugin-loaded providers use the same default, so parity is unaffected;
+    # an empty registry keeps the content assertions meaningful. The union
+    # itself is covered by test_idle_provider_identity.py (review #327).
+    monkeypatch.setattr("molecule_runtime.mcp_tools.MOLECULE_MCP_TOOLS", [])
 
     ctx = DigestProviderContext(
         config_path=str(tmp_path),
