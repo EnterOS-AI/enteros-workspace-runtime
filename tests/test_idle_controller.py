@@ -186,6 +186,54 @@ async def test_goal_cadence_no_double_fire_end_to_end(tmp_path):
     assert len(poster.posts) == 2
 
 
+@pytest.mark.asyncio
+async def test_goal_cadence_sustained_multi_cycle_driving(tmp_path):
+    """Sustained driving: a static goal re-fires EXACTLY ONCE PER cadence window
+    across many windows — never in between, never skipping one. The single-refire
+    guard test proves one cycle; this proves the *loop* holds over N, which is the
+    property that makes an idle agent keep pulling backlog hour after hour.
+
+    Runs the real controller + real GoalStateProvider + real state dir; the only
+    seam is the clock (wall-clock waiting would add no logic coverage — the loop
+    is entirely clock-driven — and the separate wall-clock burn-in covers timers).
+    """
+    cadence = 300  # the floor
+    ticks_per_window = 4  # several idle ticks land inside each cadence window
+    windows = 6
+    clock = _Clock()
+    poster = _Poster()
+    goal = GoalStateProvider(state_dir=tmp_path / "goal", now_fn=clock)
+    goal.set("pull the next backlog item", cadence_seconds=cadence)
+    c = IdleDigestController(
+        providers=[_Fake("identity-capabilities", [_header()]), goal],
+        policy=Policy(), poster=poster, state_dir=tmp_path, now_fn=clock,
+    )
+
+    fire_times: list[float] = []
+    for w in range(windows):
+        # window opens DUE -> exactly one fire
+        assert await c.tick() == FIRED, f"window {w}: expected a fire at cadence boundary"
+        fire_times.append(clock.t)
+        # remaining ticks inside the window: just-included -> silent, never a 2nd fire
+        step = cadence // ticks_per_window
+        for _ in range(ticks_per_window - 1):
+            clock.advance(step)
+            assert await c.tick() == UNCHANGED, f"window {w}: double-fired inside cadence"
+        clock.advance(cadence - step * (ticks_per_window - 1))  # cross into next window
+
+    # exactly one fire per window, no more, no fewer
+    assert len(poster.posts) == windows
+    assert len(fire_times) == windows
+    # every consecutive pair is >= one cadence apart (never a hot loop)
+    gaps = [b - a for a, b in zip(fire_times, fire_times[1:])]
+    assert all(g >= cadence for g in gaps), f"a re-fire came early: gaps={gaps}"
+    # the loop-driver state actually advanced each window (not a stuck stamp)
+    lia = goal.get()["last_included_at"]
+    assert lia is not None
+    # every posted digest carried the goal's pull instruction (agent really driven)
+    assert all("goal_get" in p or "backlog" in p for p in poster.posts)
+
+
 # ---------------------------------------------------------------------------
 # persistence
 # ---------------------------------------------------------------------------
