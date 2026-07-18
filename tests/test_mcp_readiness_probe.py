@@ -343,12 +343,12 @@ class TestProberPublishing:
         assert probe.management_provision_ready(pai.loaded_mcp_tools()) is False
         assert pai.mcp_tools_ready() is False
 
-    def test_run_retries_while_provision_absent_then_stops_on_provision_ready(self):
-        # CORRECTED loop-stop contract: "success" now means provision-READY, not
-        # merely a tools/list that returned SOME tool. A management MCP that lists
-        # tools but not provision_workspace is NOT ready — the prober must KEEP
-        # retrying (so a post-boot plugin reconcile that later delivers
-        # provision_workspace is still captured) and only STOP once provision-ready.
+    def test_run_retries_while_provision_absent_until_provision_ready(self):
+        # "success" means provision-READY, not merely a tools/list that returned
+        # SOME tool. A management MCP that lists tools but not provision_workspace is
+        # NOT ready — the prober must KEEP retrying (so a post-boot plugin reconcile
+        # that later delivers provision_workspace is still captured) and only publish
+        # True once provision-ready.
         calls = {"n": 0}
         ready = threading.Event()
 
@@ -364,16 +364,70 @@ class TestProberPublishing:
         pr = probe.MCPReadinessProber(retry_interval=0.01, interval=0.01, probe=_probe)
         pr.start()
         assert ready.wait(5.0), "prober never reached provision-ready"
-        # It kept retrying through the provision-absent probes (>=3 calls) and, once
-        # provision-ready, published True and stopped re-probing.
-        threading.Event().wait(0.2)
-        assert calls["n"] == 3, (
-            "prober did not stop after reaching provision-ready (or stopped early on "
-            "a provision-ABSENT tools/list)"
-        )
+        threading.Event().wait(0.05)
+        pr.stop()
+        # It kept retrying through the provision-absent probes (>=3 calls) and then
+        # published True on the provision-ready list.
+        assert calls["n"] >= 3
         assert pai.mcp_tools_ready() is True
         assert probe.management_provision_ready(pai.loaded_mcp_tools()) is True
+
+    def test_run_keeps_probing_after_success_and_reflects_provision_loss(self):
+        # LIVE-signal contract (fix for the #4457 EV2 availability hole): after the
+        # first provision-ready success the prober does NOT stop — it keeps
+        # re-probing at the steady interval so mcp_tools_ready reflects CURRENT
+        # reality. If provision_workspace is later UNREGISTERED while the management
+        # MCP SERVER stays up (a plugin reconcile drops the verb; mcp_server_present
+        # stays true), the holder must flip back to False so core degrades the box —
+        # NOT stay frozen True forever (the sustained-absence availability hole).
+        calls = {"n": 0}
+        lost = threading.Event()
+
+        def _probe(_t):
+            calls["n"] += 1
+            n = calls["n"]
+            if n < 3:
+                # MCP up but provision_workspace ABSENT -> not ready, keep retrying.
+                return ["mcp__molecule-platform__list_workspaces"]
+            if n == 3:
+                # plugin reconcile delivered provision_workspace -> ready.
+                return [PROVISION_ID]
+            # n >= 4: provision_workspace UNREGISTERED again while the server stays up.
+            lost.set()
+            return ["mcp__molecule-platform__list_workspaces"]
+
+        pr = probe.MCPReadinessProber(retry_interval=0.01, interval=0.01, probe=_probe)
+        pr.start()
+        assert lost.wait(5.0), (
+            "prober stopped after the first success — it did not keep probing to "
+            "observe the post-online provision_workspace loss"
+        )
+        # Let the loss-probe's publish land, then stop.
+        threading.Event().wait(0.2)
         pr.stop()
+        assert calls["n"] >= 4, f"prober did not keep re-probing after success (calls={calls['n']})"
+        # The live SIGNAL tracks the loss — this is the thing core degrades on.
+        assert pai.mcp_tools_ready() is False, (
+            "mcp_tools_ready stayed frozen True after provision_workspace was lost — "
+            "the signal is not live"
+        )
+        # loaded_mcp_tools is FROZEN at the ready list once we published ready ([5]):
+        # the loss probe's management-only subset must NOT have clobbered it (in
+        # production the per-turn producer owns it from first-ready on). If [5]
+        # regressed, loaded would track the prober again and this would be False.
+        assert probe.management_provision_ready(pai.loaded_mcp_tools()) is True, (
+            "loaded_mcp_tools was clobbered by the prober after first-ready — the "
+            "per-turn producer's list is not protected ([5])"
+        )
+        # RECOVERY CADENCE ([6]): a provision-loss flips _succeeded_once back to False
+        # so _run drops to the TIGHT retry until provision returns.
+        assert pr._succeeded_once is False, (
+            "_succeeded_once stayed True after a provision-loss — recovery would poll "
+            "on the slow steady interval instead of the tight retry ([6])"
+        )
+        # first_ready_at stays sticky (stamped once at the first ready) even though
+        # the live readiness flag went back to False.
+        assert pai.first_ready_at() is not None
 
     def test_run_once_swallows_probe_exception(self):
         def _boom(_t):
@@ -406,47 +460,43 @@ class TestProberPublishing:
         assert pr.start() is None  # disabled -> no thread
         assert pai.loaded_mcp_tools() is None
 
-    def test_run_retries_until_first_success_then_stops_reprobing(self):
-        # runtime EV3: the prober must KEEP retrying (tight cadence) until the
-        # first success — a management MCP delivered a few seconds post-boot is
-        # still picked up — and then STOP. The old loop re-spawned npx +
-        # handshake + tools/list FOREVER every 120s to re-publish a sticky signal
-        # that only changes on the added/removed edges (removed is caught by
-        # mcp_server_present() independently), so a running concierge cold-spawned
-        # a subprocess for nothing for its whole life.
+    def test_run_keeps_reprobing_after_first_success(self):
+        # LIVE-signal contract (fix for the #4457 EV2 availability hole): the prober
+        # must KEEP re-probing at the steady interval after the first success so
+        # mcp_tools_ready reflects CURRENT reality (a post-online provision loss can
+        # then flip it back to False — see
+        # test_run_keeps_probing_after_success_and_reflects_provision_loss). The old
+        # loop stopped after the first success, freezing the signal sticky-True and
+        # blinding core to a later loss. A transient probe FAILURE (None) must leave
+        # the holder UNCHANGED — only a real tools/list result writes it — so steady
+        # re-probing never false-degrades a healthy box on a blip.
         calls = {"n": 0}
-        done = threading.Event()
+        ready = threading.Event()
 
         def _probe(_t):
             calls["n"] += 1
-            # First TWO attempts miss (MCP not connectable yet) -> None; the third
-            # succeeds. Proves the retry-until-first-success loop still runs.
             if calls["n"] < 3:
-                return None
-            done.set()
-            return [PROVISION_ID]
+                return None  # MCP not connectable yet -> retry
+            if calls["n"] == 3:
+                ready.set()
+                return [PROVISION_ID]
+            return None  # post-success transient probe failures
 
         pr = probe.MCPReadinessProber(retry_interval=0.01, interval=0.01, probe=_probe)
         pr.start()
-        assert done.wait(5.0), "prober never reached its first success"
-        # After the first success the loop must EXIT: no further run_once calls.
-        # Give it well more than a retry interval's worth of chances to (wrongly)
-        # re-probe; the count must stay pinned at the success attempt.
+        assert ready.wait(5.0), "prober never reached its first success"
         threading.Event().wait(0.2)
-        assert calls["n"] == 3, (
-            "prober kept re-spawning after first success (steady-state re-probe "
-            "was not removed)"
+        # It kept re-probing after success (thread alive, calls growing past 3).
+        assert calls["n"] > 3, (
+            f"prober stopped re-probing after first success (calls={calls['n']}); "
+            "the signal is no longer live"
         )
-        # The sticky holder still carries the published tools after the loop ends.
+        assert pr._thread is not None and pr._thread.is_alive(), (
+            "prober thread terminated after first success — it must keep the signal live"
+        )
+        # Transient None probes did NOT clobber the holder — still provision-ready.
         assert pai.loaded_mcp_tools() == [PROVISION_ID]
-        # And the thread has actually terminated (returned), not just idling.
-        for _ in range(200):
-            if pr._thread is None or not pr._thread.is_alive():
-                break
-            threading.Event().wait(0.01)
-        assert pr._thread is None or not pr._thread.is_alive(), (
-            "prober thread did not terminate after first success"
-        )
+        assert pai.mcp_tools_ready() is True
         pr.stop()
 
 

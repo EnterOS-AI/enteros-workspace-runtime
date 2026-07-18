@@ -459,6 +459,11 @@ class MCPReadinessProber:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._succeeded_once = False
+        # Once we publish provision-ready the FIRST time, loaded_mcp_tools is handed
+        # to the per-turn producer for good and the prober stops writing it (#326
+        # re-review [5]). Distinct from _succeeded_once (which controls retry cadence
+        # and IS reset on a later provision-loss) so the loss window can't re-clobber.
+        self._loaded_frozen = False
 
     def start(self) -> Optional[threading.Thread]:
         if not probe_enabled():
@@ -485,9 +490,18 @@ class MCPReadinessProber:
             logger.exception("mcp readiness prober: probe raised")
             return None
         if result is not None:
-            # Always DUAL-WRITE the truthful loaded-tools list (even when it lacks
-            # provision_workspace — reported so the core gate degrades correctly).
-            set_loaded_mcp_tools(result)
+            # SEED loaded_mcp_tools only during the pre-ready phase (before the first
+            # provision-ready success). The prober cold-spawns ONLY the management
+            # MCP, so its 1-2-id result must NOT keep overwriting the per-turn
+            # producer's FULL cross-server list once turns start — otherwise the
+            # steady re-probe periodically clobbers loaded_mcp_tools down to the
+            # management subset (#326 re-review [5]). Once we've published ready,
+            # _loaded_frozen hands loaded_mcp_tools to the per-turn producer for good
+            # (kept frozen even across a later provision-loss so the loss window does
+            # not clobber it either). The prober's real, continuing job from then on
+            # is the readiness SIGNAL below.
+            if not self._loaded_frozen:
+                set_loaded_mcp_tools(result)
             # EV2 (fix for #4449/#320 regression): mcp_tools_ready MUST MEAN "the
             # REQUIRED provision_workspace verb is ready", NOT merely "some tools/list
             # succeeded". Only a provision-ready result flips the signal True — the
@@ -500,6 +514,7 @@ class MCPReadinessProber:
             if management_provision_ready(result):
                 set_mcp_tools_ready(True)
                 self._succeeded_once = True
+                self._loaded_frozen = True  # hand loaded_mcp_tools to the per-turn producer ([5])
                 logger.info(
                     "mcp readiness prober: published %d management tool(s); "
                     "provision_workspace_loaded=True mcp_tools_ready=True",
@@ -508,9 +523,15 @@ class MCPReadinessProber:
             else:
                 # Server is up and enumerable but the required verb is ABSENT. Record
                 # probed-not-ready and KEEP retrying — a post-boot plugin reconcile may
-                # still deliver provision_workspace (capture-first). Do NOT set
-                # _succeeded_once, so the retry loop does not stop on a not-ready list.
+                # still deliver provision_workspace (capture-first).
                 set_mcp_tools_ready(False)
+                # RECOVERY CADENCE (#326 re-review [6]): a provision LOSS after a
+                # prior success must be re-detected on the TIGHT retry cadence, not
+                # the slow steady interval. _run picks self._retry while
+                # _succeeded_once is False and self._interval after — so clear it here
+                # so re-probing accelerates until provision_workspace returns (then
+                # the True branch above re-sets it). first_ready_at stays sticky.
+                self._succeeded_once = False
                 logger.warning(
                     "mcp readiness prober: tools/list returned %d tool(s) but "
                     "provision_workspace ABSENT — mcp_tools_ready=False (not online-ready); "
@@ -522,24 +543,29 @@ class MCPReadinessProber:
     def _run(self) -> None:
         while not self._stop.is_set():
             self.run_once()
-            # Retry on a tight cadence UNTIL the first success: a management MCP
-            # delivered a few seconds after boot (post-online plugin reconcile)
-            # is an external settings.json write with no in-process event, so a
-            # bounded retry is the correct capture-first mechanism.
+            # Cadence: TIGHT retry until the first provision-ready success (a
+            # management MCP delivered a few seconds after boot via an external
+            # settings.json write has no in-process event, so a bounded retry is
+            # the correct capture-first mechanism), then a GENEROUS steady
+            # re-probe.
             #
-            # STOP once we've published at least once. The holder is STICKY —
-            # every heartbeat keeps reporting the last observed list between
-            # probes — and the only two edges that matter are already covered:
-            #   * "added"   → this retry loop catches it (up to first success);
-            #   * "removed" → caught INDEPENDENTLY by ``mcp_server_present()``
-            #                 going false (hard fail-closed, see DESIGN NOTES).
-            # The old steady-state 120s re-probe re-published a signal that only
-            # changes on those two edges, cold-spawning npx + a full
-            # handshake/tools-list every cycle FOREVER for nothing. Once
-            # succeeded, there is nothing left to capture — exit the loop.
-            if self._succeeded_once:
-                return
-            self._stop.wait(self._retry)
+            # We KEEP re-probing after success so mcp_tools_ready stays a LIVE
+            # signal. The earlier design stopped after the first success on the
+            # theory that a "removed" edge is always caught by mcp_server_present()
+            # going false — but provision_workspace can be UNREGISTERED while the
+            # management MCP SERVER stays up (a post-boot plugin reconcile drops the
+            # verb): mcp_server_present stays true, and a frozen sticky-true
+            # mcp_tools_ready then keeps core's reliable-signal short-circuit online
+            # FOREVER with the box silently unable to provision (the EV2 availability
+            # hole, #4457 code review). A steady re-probe flips the holder back to
+            # False on that loss so core degrades. The cost — one short-lived
+            # management-MCP spawn per steady interval — is bounded and configurable
+            # (MOLECULE_MCP_PROBE_INTERVAL_SECONDS); a silent un-provisionable
+            # concierge is far more expensive. A transient probe failure (result is
+            # None) leaves the holder UNCHANGED (run_once only writes on a real
+            # tools/list), so steady re-probing never false-degrades on a blip.
+            wait = self._interval if self._succeeded_once else self._retry
+            self._stop.wait(wait)
 
     def stop(self) -> None:
         self._stop.set()
