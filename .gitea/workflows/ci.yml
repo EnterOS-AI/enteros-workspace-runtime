@@ -78,6 +78,24 @@ jobs:
         # here means the real SDK is missing and the gate is inert.
         run: pytest -v -rs tests/test_boot_routes_subprocess.py
 
+      - name: Run plugin-fetch REAL-GIT regression gate
+        # Loud, merge-blocking, UNMOCKED gate for the SHA-pin incident
+        # (staging test5, 2026-07-13). Every other test in test_plugin_sources
+        # monkeypatches subprocess.run, and THAT is how the bug shipped: the
+        # fake happily accepted `git clone --branch <sha>` and returned a tree,
+        # while real git rejects a bare object id outright. CI was validating
+        # the fetcher against a git that does not exist, so it stayed green
+        # while every SHA-pinned plugin was unfetchable in production — which
+        # then starved the concierge of its management MCP and parked the agent
+        # in `failed`.
+        #
+        # These cases shell out to the REAL git binary against a REAL repo and
+        # fetch a REAL commit id whose branch tip has moved PAST the pin, so
+        # they cannot pass unless the pin is genuinely resolved. `-rs` makes a
+        # SKIP loud: if git is missing from the runner the gate is inert, and
+        # an inert gate must not read as green.
+        run: pytest -v -rs tests/test_plugin_sources.py -k real_git
+
       - name: Run delegation-harvest active-await scoping regression gate
         # Loud, merge-blocking gate for the concierge delegation-result
         # RE-NARRATION loop (root fix, supersedes the watermark band-aid): the
@@ -141,6 +159,39 @@ jobs:
           RESP_E2E_IDLE_CAP: "3"
           RESP_E2E_POLL_DEADLINE: "25"
         run: pytest -q tests/integration
+
+      - name: Run LIVE plugin-fetch gate (real git, real forge, real SHA)
+        # The e2e for the test5 incident (2026-07-13): a plugin pinned to a
+        # commit SHA could not be fetched at all (`clone --branch <sha>` resolves
+        # ref NAMES, never an object id), the failed source aborted the whole
+        # tree swap, the concierge's management MCP went down with it, and the
+        # agent fail-closed to `failed`. Nothing mocked here — it fetches the
+        # ACTUAL commit from the ACTUAL forge, so it fails for the same reason
+        # production did.
+        #
+        # `-rs` is load-bearing: the step above runs `pytest -q`, where a SKIP is
+        # SILENT. If the forge is unreachable from a runner this gate would then
+        # quietly evaporate and the lane would read green having tested nothing —
+        # the same class of blind spot that let the bug ship. `-rs` prints the
+        # skip reason so an inert gate is visible in the log.
+        env:
+          # Overridable so a runner that cannot reach the public edge (CF bot-
+          # protection 1010 on act_runner's client) can point at the internal
+          # forge instead of silently skipping.
+          MOLECULE_GITEA_BASE_URL: ${{ vars.MOLECULE_GITEA_API_HOST || 'https://git.moleculesai.app' }}
+          # PROVIDER MATRIX (comma-separated declared-plugin sources, each pinned
+          # to a commit SHA). The fetch + credential layers are provider-agnostic
+          # — a source may name github, gitlab, or a customer's self-hosted forge
+          # — so the live gate must be able to prove that on a forge that is NOT
+          # ours, without a code change. Add one here and it is fetched for real:
+          #   https://github.com/o/r#<sha>,https://gitlab.com/o/r#<sha>
+          # Private repos authenticate through the same per-host token map the
+          # runtime uses (MOLECULE_GIT_TOKENS / MOLECULE_GIT_TOKEN__<HOST>), so
+          # this exercises multi-forge credentials too. Empty = no extra forge
+          # configured; the parametrize then yields no cases and says so.
+          MOLECULE_PLUGIN_E2E_SOURCES: ${{ vars.MOLECULE_PLUGIN_E2E_SOURCES }}
+          MOLECULE_GIT_TOKENS: ${{ secrets.MOLECULE_GIT_TOKENS }}
+        run: pytest -v -rs tests/integration/test_plugin_fetch_live_gitea.py
 
   lint:
     runs-on: ubuntu-latest

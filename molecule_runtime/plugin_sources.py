@@ -53,10 +53,22 @@ Two accepted source forms (any forge)
 Any other scheme (e.g. ``github://``, ``presign://``) is skipped + logged,
 exactly like the shell.
 
-Token source (SSOT): the SAME resolution npm auth uses — ``npm_auth`` is the one
-resolver (``MOLECULE_TEMPLATE_REPO_TOKEN`` → ``GITEA_TOKEN`` → the gitea
-git-http cred: ``GIT_HTTP_PASSWORD``, or ``GIT_HTTP_USERNAME`` when the password
-is the ``x-oauth-basic`` sentinel). No new credential is introduced.
+Token source — PER HOST, N providers (``_host_token_map``). A source may name any
+forge, so the credential layer is keyed by host, not to one forge:
+
+  * ``MOLECULE_GIT_TOKENS`` — JSON ``{"<host>": "<token>", ...}`` (general form);
+  * ``MOLECULE_GIT_TOKEN__<HOST>`` — one var per host, ``.``/``-`` folded to
+    ``_`` (e.g. ``MOLECULE_GIT_TOKEN__GITHUB_COM``);
+  * the gitea read token (SSOT ``npm_auth.gitea_read_token``:
+    ``MOLECULE_TEMPLATE_REPO_TOKEN`` → ``GITEA_TOKEN`` → the gitea git-http cred)
+    seeded for the configured gitea host — the original single-forge credential,
+    kept so nothing regresses.
+
+A token is offered ONLY to the host it is keyed to (git resolves the helper per
+``<scheme>://<host>``), so one forge's credential is never transmitted to
+another. Before this, the map held only the gitea host, so a PRIVATE plugin repo
+on github/gitlab/self-hosted got no token, 401'd, and failed the boot — the
+fetch layer was provider-agnostic while the credential layer was not.
 
 Atomic build-then-swap (hardening win #2 over the shell)
 ========================================================
@@ -97,6 +109,7 @@ template repo) before the shell can be treated as consistent with this module.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -133,6 +146,11 @@ _DEFAULT_GIT_BINARY = "git"
 # OUT of git's argv (no ``ps`` leak) and out of the clone URL — git reads it only
 # when it invokes the helper, which happens only on a 401 challenge.
 _CRED_TOKEN_ENVVAR = "MOLECULE_GIT_CRED_TOKEN"
+
+# Per-host credential env convention for the N-provider case:
+# MOLECULE_GIT_TOKEN__GITHUB_COM=ghp_… (host `.`/`-` folded to `_`). The JSON map
+# MOLECULE_GIT_TOKENS is the general form; this is the flat-env alternative.
+_PER_HOST_TOKEN_PREFIX = "MOLECULE_GIT_TOKEN__"
 
 # Git URL schemes accepted as a full self-contained source (any forge). ``git+``
 # variants are normalized to plain http(s) for the actual clone.
@@ -475,6 +493,49 @@ def _atomic_swap_dir(staging_dir: Path, target_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 # Fetch core — one git-clone path shared by every provider.
 # ---------------------------------------------------------------------------
+# A git object id: 40 hex chars (sha1) or 64 (sha256, for repos on the newer
+# object format). Anything else — `main`, `v0.5.1`, `release/x` — is a ref name
+# git can resolve remotely, and takes the `clone --branch` path.
+_COMMIT_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
+
+def _is_commit_sha(ref: str) -> bool:
+    """True when ``ref`` is a bare commit SHA (needs fetch-by-object-id, not
+    ``clone --branch``, which only resolves branch/tag NAMES)."""
+    return bool(_COMMIT_SHA_RE.match((ref or "").strip().lower()))
+
+
+def _rmtree_force(path: Path) -> None:
+    """``rmtree`` that also removes read-only entries.
+
+    git marks objects in ``.git`` read-only. A plain
+    ``rmtree(..., ignore_errors=True)`` cannot unlink those on platforms that
+    enforce the read-only bit (Windows), so it silently gives up and the ``.git``
+    dir SHIPS INSIDE the plugins tree — the strip looks like it worked because
+    the errors were swallowed. Chmod-then-retry on each failure.
+    """
+    def _on_error(func, p, _exc):
+        try:
+            os.chmod(p, 0o700)
+            func(p)
+        except OSError:
+            pass  # genuinely stuck — fail soft, as before
+
+    shutil.rmtree(path, onerror=_on_error)
+
+
+def _iter_dirs(parent: Path) -> "list[Path]":
+    """Immediate sub-directories of ``parent`` ([] when it does not exist).
+
+    Used to carry an already-installed plugins tree forward across a swap when
+    some source failed this boot.
+    """
+    try:
+        return [p for p in parent.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+
+
 def _host_cred_config_args(scheme: str, host: str) -> list[str]:
     """git ``-c`` args wiring a per-host inline credential helper.
 
@@ -506,20 +567,30 @@ def _git_fetch_tree(
     workdir: Path,
     timeout: float,
 ) -> Path | None:
-    """``git clone`` ``clone_url`` at ``ref`` into ``workdir`` and return the dir
-    whose contents become ``<plugins_dir>/<name>/`` (the clone root, or
-    ``<clone_root>/<subpath>``), or None on a clone/subpath failure.
+    """Fetch ``clone_url`` at ``ref`` into ``workdir`` and return the dir whose
+    contents become ``<plugins_dir>/<name>/`` (the clone root, or
+    ``<clone_root>/<subpath>``), or None on a fetch/subpath failure.
 
     Anonymous by default: the token (if any) is supplied ONLY via a per-host
     credential helper that git consults on a 401, never on the URL/argv. Fail-
     soft: any error logs ``[plugins] fetch/extract failed`` and returns None so
     the caller continues with the next source.
 
-    NOTE (ref shape): ``--branch`` accepts a branch or tag name (the common case
-    for declared plugins, incl. the mgmt-MCP's ``main``). A raw commit SHA is NOT
-    a valid ``--branch`` argument — the old archive-by-<sha> path accepted one;
-    pinning a declared plugin to a bare SHA is unsupported by this git-native
-    fetch and would need an ``init``+``fetch``+``checkout`` variant.
+    REF SHAPE — two paths, because git needs different plumbing for each:
+
+    * a branch or tag name -> ``clone --depth 1 --branch <ref>``.
+    * a bare commit SHA    -> ``init`` + ``fetch --depth 1 origin <sha>`` +
+      ``checkout FETCH_HEAD``. ``--branch`` does NOT accept a raw SHA; git
+      resolves it against the remote's refs and fails with "Remote branch <sha>
+      not found in upstream origin".
+
+    The SHA path is not hypothetical: the catalog pins declared plugins BY
+    COMMIT (that is what a pin is for). When the fetch moved from archive-by-SHA
+    to git-clone, the producer kept emitting SHA pins the consumer could no
+    longer resolve, so every SHA-pinned plugin failed to install — and because a
+    failed source aborts the tree swap, a concierge on a de-baked image lost its
+    management MCP with it and fail-closed to `failed`. Ref: the test5 incident,
+    2026-07-13.
     """
     if token and scheme.lower() != "https":
         log.warning(
@@ -530,45 +601,110 @@ def _git_fetch_tree(
 
     clone_dir = workdir / "clone"
 
-    cmd = [git_binary]
     child_env = dict(os.environ)
     child_env["GIT_TERMINAL_PROMPT"] = "0"  # never block boot on a cred prompt
+    cred_args: list[str] = []
     if token and host:
         # Wire the 401-only per-host helper and hand git the token via env.
-        cmd += _host_cred_config_args(scheme, host)
+        cred_args = _host_cred_config_args(scheme, host)
         child_env[_CRED_TOKEN_ENVVAR] = token
-    cmd += [
-        "clone",
-        "--depth", "1",
-        "--single-branch",
-        "--branch", ref,
-        clone_url,
-        str(clone_dir),
-    ]
+
+    def _git(*args: str) -> list[str]:
+        return [git_binary, *cred_args, *args]
+
+    if _is_commit_sha(ref):
+        # PROVIDER-AGNOSTIC by necessity: a plugin source can name ANY forge
+        # (gitea://, or a full git URL to github / gitlab / a self-hosted box —
+        # see _PROVIDERS), and forges do NOT agree on whether a bare object id
+        # may be requested directly.
+        #
+        # Preferred: fetch the single commit by object id — cheap (--depth 1),
+        # one round trip. This needs `uploadpack.allowReachableSHA1InWant` on the
+        # REMOTE. Gitea, GitHub and GitLab all enable it; plain `git` ships with
+        # it OFF, so a self-hosted remote answers "Server does not allow request
+        # for unadvertised object" and this path fails.
+        #
+        # Fallback: clone the repo normally and check the pin out of local
+        # history. Costs full history, but works against EVERY git server, so a
+        # SHA-pinned plugin on a restrictive forge still resolves instead of
+        # failing the boot. Correctness does not depend on the remote's config —
+        # only speed does.
+        cmds = [
+            _git("init", "--quiet", str(clone_dir)),
+            _git("-C", str(clone_dir), "remote", "add", "origin", clone_url),
+            _git("-C", str(clone_dir), "fetch", "--depth", "1", "origin", ref),
+            _git("-C", str(clone_dir), "checkout", "--quiet", "--detach", "FETCH_HEAD"),
+        ]
+        fallback_cmds = [
+            _git("clone", "--quiet", clone_url, str(clone_dir)),
+            _git("-C", str(clone_dir), "checkout", "--quiet", "--detach", ref),
+        ]
+    else:
+        cmds = [
+            _git(
+                "clone",
+                "--depth", "1",
+                "--single-branch",
+                "--branch", ref,
+                clone_url,
+                str(clone_dir),
+            )
+        ]
+        fallback_cmds = []
+
+    def _run_all(sequence: "list[list[str]]") -> None:
+        for cmd in sequence:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=child_env,
+            )
 
     try:
-        subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=child_env,
-        )
+        _run_all(cmds)
     except (subprocess.SubprocessError, OSError) as exc:
         stderr = (getattr(exc, "stderr", "") or "").strip()
-        log.warning(
-            "[plugins] fetch/extract failed: %s (%s) %s",
+        if not fallback_cmds:
+            # The label is host/path only and the stderr is redacted of the
+            # token, the ref, and any URL userinfo/query before it reaches the
+            # log — a cred must never surface even if git echoes one.
+            log.warning(
+                "[plugins] fetch/extract failed: %s (%s) %s",
+                _source_log_label(raw),
+                exc.__class__.__name__,
+                _redact_log_text(stderr, token, ref)[:500],
+            )
+            return None
+
+        # SHA pin, and fetch-by-object-id was refused (most likely the remote
+        # does not allow requesting an unadvertised object). Retry the
+        # server-agnostic way: clone, then check the pin out of local history.
+        log.info(
+            "[plugins] fetch-by-object-id refused for %s (%s) — retrying via "
+            "clone+checkout (works on any git server)",
             _source_log_label(raw),
-            exc.__class__.__name__,
-            _redact_log_text(stderr, token, ref)[:500],
+            _redact_log_text(stderr, token, ref)[:200],
         )
-        return None
+        _rmtree_force(clone_dir)  # the half-initialized repo must not poison it
+        try:
+            _run_all(fallback_cmds)
+        except (subprocess.SubprocessError, OSError) as exc2:
+            stderr2 = (getattr(exc2, "stderr", "") or "").strip()
+            log.warning(
+                "[plugins] fetch/extract failed: %s (%s) %s",
+                _source_log_label(raw),
+                exc2.__class__.__name__,
+                _redact_log_text(stderr2, token, ref)[:500],
+            )
+            return None
 
     # Strip VCS metadata so the installed tree matches the old archive semantics
     # (a tarball of the tree carried no ``.git``) and the plugins dir never holds
     # a nested repo.
-    shutil.rmtree(clone_dir / ".git", ignore_errors=True)
+    _rmtree_force(clone_dir / ".git")
 
     content_dir = clone_dir / subpath if subpath else clone_dir
     if not _is_within(clone_dir, content_dir):
@@ -673,19 +809,75 @@ _resolve_gitea_base = resolve_gitea_base
 
 
 def _host_token_map(env: Mapping[str, str], base_url: str) -> dict[str, str]:
-    """Map ``host -> token`` for the hosts the box holds a credential for.
+    """Map ``host -> token`` for every forge the box holds a credential for.
 
-    Currently the one credential the box carries is the gitea read token (SSOT:
-    ``npm_auth.gitea_read_token``), keyed to the configured gitea host. A full
-    git URL that targets that same host reuses it; any other host has no token
-    here and clones anonymously (or relies on a globally-configured helper, e.g.
-    the github.com helper ``credential_helper.py`` installs).
+    The plugin-source layer is provider-agnostic BY DESIGN (``_PROVIDERS``): a
+    source may name our gitea, github, gitlab, or a customer's self-hosted box.
+    The credential layer must be too, or the abstraction is a lie — a PRIVATE
+    plugin repo on any host other than the configured gitea would get no token,
+    take a 401, and (with GIT_TERMINAL_PROMPT=0) fail the boot. So the map is
+    built from config, not hardcoded to one forge:
+
+      1. ``MOLECULE_GIT_TOKENS`` — a JSON object ``{"<host>": "<token>", ...}``.
+         The general, N-provider form. Hosts are matched on netloc.
+      2. ``MOLECULE_GIT_TOKEN__<HOST>`` — one var per host, with the host's
+         ``.`` and ``-`` folded to ``_`` (e.g. ``MOLECULE_GIT_TOKEN__GITHUB_COM``).
+         For operators who would rather not ship a JSON blob.
+      3. the gitea read token (SSOT ``npm_auth.gitea_read_token``), keyed to the
+         configured gitea host — the existing single-forge credential, kept as a
+         SEED so nothing regresses.
+
+    Later sources do not clobber earlier ones: an explicit per-host entry wins
+    over the inherited gitea default for the same host. Tokens are only ever
+    handed to git through the per-host 401-only credential helper — never in a
+    URL, never on argv (see ``_host_cred_config_args``).
     """
-    token = gitea_read_token(env)
-    if not token:
-        return {}
-    host = urlsplit(base_url).netloc
-    return {host: token} if host else {}
+    tokens: dict[str, str] = {}
+
+    raw_json = (env.get("MOLECULE_GIT_TOKENS") or "").strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except ValueError as exc:
+            # Never fail the boot on a malformed credential blob — a plugin that
+            # needs the token will fail loudly on its own 401.
+            log.warning("[plugins] MOLECULE_GIT_TOKENS is not valid JSON (%s) — ignored", exc)
+            parsed = None
+        if isinstance(parsed, Mapping):
+            for host, token in parsed.items():
+                host = _netloc(str(host))
+                if host and isinstance(token, str) and token:
+                    tokens[host] = token
+        elif parsed is not None:
+            log.warning("[plugins] MOLECULE_GIT_TOKENS must be a JSON object — ignored")
+
+    for key, value in env.items():
+        if not key.startswith(_PER_HOST_TOKEN_PREFIX) or not value:
+            continue
+        suffix = key[len(_PER_HOST_TOKEN_PREFIX):]
+        if not suffix:
+            continue
+        # GITHUB_COM -> github.com. A host with a dash cannot be recovered from
+        # the folded form, so an operator with one should use the JSON map.
+        host = suffix.lower().replace("_", ".")
+        tokens.setdefault(host, value)
+
+    gitea_host = _netloc(base_url)
+    gitea_tok = gitea_read_token(env)
+    if gitea_host and gitea_tok:
+        tokens.setdefault(gitea_host, gitea_tok)
+
+    return tokens
+
+
+def _netloc(url_or_host: str) -> str:
+    """netloc of a URL, or the string itself when already a bare host."""
+    value = (url_or_host or "").strip()
+    if not value:
+        return ""
+    if "//" in value:
+        return urlsplit(value).netloc
+    return value.split("/", 1)[0]
 
 
 def install_declared_plugins(
@@ -858,17 +1050,81 @@ def install_declared_plugins(
             )
             report.installed.append(source.raw)
 
-        # Atomic swap — ONLY when every declared source materialized. On any
-        # failure keep the existing live tree (no swap), so a transient gitea
-        # blip never deletes already-installed skills for this boot.
-        if report.failed:
+        # A failed source fails THAT SOURCE — not the whole tree.
+        #
+        # This used to abort the swap entirely whenever any source failed, to
+        # protect already-installed skills from a transient gitea blip. But the
+        # veto is indiscriminate: it also discards the sources that fetched
+        # FINE, and on a de-baked image one of those is the concierge's own
+        # management MCP. So an unfetchable third-party plugin took the mgmt-MCP
+        # down with it, `register` fail-closed on mcp_server_present=false, and
+        # the agent parked in `failed` — permanently, since every retry hit the
+        # same bad source. Worse, the "keep the existing tree" safety net is
+        # VACUOUS on a first boot: there is no previous tree to keep, so the
+        # workspace booted with an EMPTY plugins dir. A guard meant to preserve
+        # state, applied where no state exists, destroyed the boot instead.
+        # (Live: staging test5, 2026-07-13 — Lark pinned to an unfetchable SHA.)
+        #
+        # We keep the original intent WITHOUT the collateral damage. On a
+        # partial failure, carry EVERY live dir the successful sources are not
+        # replacing into staging, then swap. So:
+        #
+        #   * a source that fetched fine goes live regardless of its neighbours
+        #     (the mgmt-MCP is no longer hostage to a third-party plugin);
+        #   * a transient blip cannot delete an already-installed plugin — its
+        #     previous copy is carried forward byte-for-byte;
+        #   * anything else already live (e.g. a plugin added at runtime via
+        #     install_plugin, absent from MOLECULE_DECLARED_PLUGINS) is carried
+        #     forward too, exactly as the old no-swap path preserved it;
+        #   * a plugin that never installed and has no previous copy is simply
+        #     absent — not a half-written tree.
+        #
+        # A boot where EVERY source fails promotes nothing: there is nothing to
+        # promote, so we skip the swap and leave the live tree untouched (the
+        # cheapest correct thing, and it keeps the swap off the failure path).
+        if report.failed and not report.installed:
             log.warning(
-                "[plugins] %d of %d source(s) failed — keeping existing plugins "
-                "tree intact (no swap); will retry next boot",
-                len(report.failed), len(sources),
+                "[plugins] all %d source(s) failed — keeping the existing plugins "
+                "tree intact (no swap); will retry next boot", len(sources),
             )
             report.swapped = False
             return report
+
+        if report.failed:
+            carry_failed = False
+            for previous in _iter_dirs(target_dir):
+                if (staging_dir / previous.name).exists():
+                    continue  # a successful source owns this name — it wins
+                try:
+                    shutil.copytree(previous, staging_dir / previous.name)
+                    log.info(
+                        "[plugins] carrying the already-installed %s forward "
+                        "(a source failed this boot; not deleting it)",
+                        previous.name,
+                    )
+                except OSError as exc:
+                    # A transient copytree error (dangling symlink / unreadable /
+                    # special file in the EXISTING plugin) must NOT delete a working
+                    # plugin: promoting staging now would drop it, since it is absent
+                    # from staging (review [1]). Abort the partial swap and keep the
+                    # live tree intact — the successful new sources retry next boot,
+                    # preserving the "a transient blip cannot delete an already-
+                    # installed plugin" invariant. Discard any half-written copy.
+                    carry_failed = True
+                    shutil.rmtree(staging_dir / previous.name, ignore_errors=True)
+                    log.warning(
+                        "[plugins] could not carry %s forward (%s) — keeping the "
+                        "existing plugins tree intact (no swap this boot)",
+                        previous.name, exc,
+                    )
+            if carry_failed:
+                report.swapped = False
+                return report
+            log.warning(
+                "[plugins] %d of %d source(s) failed — promoting the %d that "
+                "succeeded; failed sources retry next boot",
+                len(report.failed), len(sources), len(report.installed),
+            )
 
         try:
             _atomic_swap_dir(staging_dir, target_dir)
