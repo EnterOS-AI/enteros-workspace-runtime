@@ -377,6 +377,32 @@ def test_self_audience_api_url_falls_back_to_platform_url():
     assert out["env"]["MOLECULE_API_URL"] == "https://plat.example"
 
 
+def test_self_audience_injects_org_routing_id_never_the_org_key():
+    """(b) audience='self' injects MOLECULE_ORG_ID (the tenant ROUTING id the SaaS
+    API requires — 400 TENANT_ORG_HEADER_REQUIRED otherwise) from the container env,
+    but NEVER an org key. Routing selects the tenant; the workspace token still gates
+    auth (a foreign :id 401s). Dropping the org-id injection reproduces the live-gate
+    self-mode create 400; leaking an org SECRET here is the invariant (a) guards."""
+    env = {
+        "MOLECULE_API_URL": "https://acme.moleculesai.app",
+        "MOLECULE_ORG_ID": "org-uuid-777",
+        "MOLECULE_ORG_API_KEY": "org-secret",
+        "MOLECULE_ADMIN_TOKEN": "admin-secret",
+    }
+    out = inject_privileged_env("molecule-schedule-self", {"audience": "self"}, env)
+    e = out["env"]
+    assert e["MOLECULE_ORG_ID"] == "org-uuid-777"  # routing id injected
+    for k in _ORG_SECRET_KEYS:
+        assert k not in e, f"org secret {k} leaked onto the self surface"
+
+
+def test_self_audience_omits_org_id_when_source_absent():
+    """(b) MOLECULE_ORG_ID injection is a tolerable no-op when the container carries
+    no org id (a non-SaaS/loopback topology may route without it) — never invented."""
+    out = inject_privileged_env("schedule-self", {"audience": "self"}, {"MOLECULE_API_URL": "http://cp"})
+    assert "MOLECULE_ORG_ID" not in out["env"]
+
+
 def test_self_audience_descriptor_declared_url_wins_but_mode_is_authoritative():
     """(b) descriptor-declared MOLECULE_API_URL wins; MOLECULE_MCP_MODE is
     AUTHORITATIVE — a descriptor can NOT downgrade a self surface to management to
@@ -524,3 +550,4 @@ def test_self_audience_no_api_url_logs_misconfig(caplog):
         out = inject_privileged_env("schedule-self", {"audience": "self"}, {})
     assert "MOLECULE_API_URL" not in out["env"]
     assert "NO tenant API URL" in caplog.text
+

@@ -132,6 +132,16 @@ _SELF_API_URL_SOURCE_KEYS: tuple[str, ...] = (
 _SELF_WORKSPACE_ID_ENVS: tuple[str, ...] = ("WORKSPACE_ID", "MOLECULE_WORKSPACE_ID")
 _SELF_WORKSPACE_ID_SOURCE_KEYS: tuple[str, ...] = ("WORKSPACE_ID", "MOLECULE_WORKSPACE_ID")
 
+# The tenant ROUTING id (X-Molecule-Org-Id). The SaaS tenant API REQUIRES it on
+# every request (400 TENANT_ORG_HEADER_REQUIRED otherwise), and the spawned MCP
+# child is not guaranteed to inherit the container env ambiently — so the self
+# branch must inject it, exactly like the workspace id. It is NOT a credential: it
+# selects the tenant, while the per-workspace token (token-file) still gates auth
+# to the OWN :id (a foreign :id 401s at core WorkspaceAuth). Sourced from the
+# container env; the mcp-server reads MOLECULE_ORG_ID (src/api.ts authHeaders).
+_SELF_ORG_ID_ENV = "MOLECULE_ORG_ID"
+_SELF_ORG_ID_SOURCE_KEYS: tuple[str, ...] = ("MOLECULE_ORG_ID", "MOLECULE_ORGANIZATION_ID")
+
 # Sentinel distinguishing an ABSENT ``audience`` key (→ derive the default) from a
 # PRESENT one whose value is falsy/invalid (→ honored as an explicit, no-injection
 # declaration; NEVER silently re-derived to the name-based default). Used by
@@ -359,14 +369,27 @@ def _inject_self_env(
                 name, "/".join(_SELF_API_URL_SOURCE_KEYS),
             )
 
+    # The tenant ROUTING id — descriptor-declared wins; NOT a credential (it selects
+    # the tenant; the workspace token still gates auth). Omitting it makes every
+    # self-mode tenant call 400 (TENANT_ORG_HEADER_REQUIRED). Absent-source is a
+    # tolerable no-op (a non-SaaS/loopback topology may route without it).
+    if _SELF_ORG_ID_ENV not in descriptor_env:
+        for src in _SELF_ORG_ID_SOURCE_KEYS:
+            val = env.get(src)
+            if val:
+                injected[_SELF_ORG_ID_ENV] = val
+                break
+
     new_spec = dict(spec)
     descriptor_env.update(injected)
     new_spec["env"] = descriptor_env
     log.info(
         "inject_privileged_env: wired self-audience MCP %r "
-        "(workspace-token-file[forced] + MOLECULE_MCP_MODE=self%s%s)",
+        "(workspace-token-file[forced] + MOLECULE_MCP_MODE=self%s%s%s)",
         name,
         ", workspace-id" if any(k in injected for k in _SELF_WORKSPACE_ID_ENVS) else "",
         ", api-url" if _SELF_API_URL_ENV in injected else "",
+        ", org-id" if _SELF_ORG_ID_ENV in injected else "",
     )
     return new_spec
+

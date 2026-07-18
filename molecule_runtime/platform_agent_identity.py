@@ -97,7 +97,7 @@ MANAGEMENT_PROVISION_TOOL_ID = f"mcp__{MANAGEMENT_MCP_NAME}__{REQUIRED_TOOL}"
 # never silently drift from the SSOT (Guard D lockstep).
 MANAGEMENT_MCP_NPM_PACKAGE = "@molecule-ai/mcp-server"
 # The ONE concrete version the prebake BAKES (deterministic build target).
-MANAGEMENT_MCP_PINNED_VERSION = "1.9.2"
+MANAGEMENT_MCP_PINNED_VERSION = "1.9.3"
 # The semver RANGE the LAUNCH resolves against. The plugin fragment launches
 # ``@molecule-ai/mcp-server@<compatible_range>`` and ``npx --prefer-offline``
 # resolves it offline to whatever in-range version THIS image baked — so a
