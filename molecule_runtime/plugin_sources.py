@@ -1091,6 +1091,7 @@ def install_declared_plugins(
             return report
 
         if report.failed:
+            carry_failed = False
             for previous in _iter_dirs(target_dir):
                 if (staging_dir / previous.name).exists():
                     continue  # a successful source owns this name — it wins
@@ -1102,9 +1103,23 @@ def install_declared_plugins(
                         previous.name,
                     )
                 except OSError as exc:
+                    # A transient copytree error (dangling symlink / unreadable /
+                    # special file in the EXISTING plugin) must NOT delete a working
+                    # plugin: promoting staging now would drop it, since it is absent
+                    # from staging (review [1]). Abort the partial swap and keep the
+                    # live tree intact — the successful new sources retry next boot,
+                    # preserving the "a transient blip cannot delete an already-
+                    # installed plugin" invariant. Discard any half-written copy.
+                    carry_failed = True
+                    shutil.rmtree(staging_dir / previous.name, ignore_errors=True)
                     log.warning(
-                        "[plugins] could not carry %s forward (%s)", previous.name, exc,
+                        "[plugins] could not carry %s forward (%s) — keeping the "
+                        "existing plugins tree intact (no swap this boot)",
+                        previous.name, exc,
                     )
+            if carry_failed:
+                report.swapped = False
+                return report
             log.warning(
                 "[plugins] %d of %d source(s) failed — promoting the %d that "
                 "succeeded; failed sources retry next boot",

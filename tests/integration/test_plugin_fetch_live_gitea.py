@@ -62,13 +62,23 @@ def _forge_reachable() -> bool:
         return False
 
 
-requires_forge = pytest.mark.skipif(
-    not _forge_reachable(),
-    reason=f"{GITEA_BASE} unreachable or git missing — LIVE gate inert",
-)
+# Reachability is probed via an AUTOUSE fixture, not a module-level
+# `pytest.mark.skipif`, so the 30s `git ls-remote` runs at TEST SETUP (only when a
+# live test actually executes) rather than at COLLECTION time. A module-level
+# skipif's condition is evaluated on import, so every `pytest tests/integration`
+# collection paid this blocking network probe — and ci.yml collects this module
+# twice (review [4]). Module scope caches the probe to one call per run.
+@pytest.fixture(scope="module")
+def _forge_ok() -> bool:
+    return _forge_reachable()
 
 
-@requires_forge
+@pytest.fixture(autouse=True)
+def _require_forge(_forge_ok):
+    if not _forge_ok:
+        pytest.skip(f"{GITEA_BASE} unreachable or git missing — LIVE gate inert")
+
+
 def test_live_fetch_of_the_sha_that_bricked_test5(tmp_path):
     """The literal incident: fetch the Lark plugin at its pinned commit."""
     report = ps.install_declared_plugins(
@@ -91,7 +101,6 @@ def test_live_fetch_of_the_sha_that_bricked_test5(tmp_path):
     assert not (installed / ".git").exists()
 
 
-@requires_forge
 def test_live_a_broken_plugin_does_not_take_the_mgmt_mcp_down(tmp_path):
     """THE blast radius, live. A bogus source must not stop the management MCP
     from installing — that is what turned an unfetchable plugin into a dead
@@ -155,7 +164,6 @@ def test_live_sha_pin_on_any_configured_provider(source, tmp_path):
     assert installed and any(p.iterdir() for p in installed if p.is_dir())
 
 
-@requires_forge
 def test_live_git_really_does_reject_branch_sha(tmp_path):
     """Pins the PREMISE of the fix against the real forge.
 
