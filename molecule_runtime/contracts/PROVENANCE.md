@@ -24,28 +24,30 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `92f8a88a60b0d4c337278b3bc52f549de270f6bf` (sdk#119 — plugin MCP audience contract: contract-version 0.5.0 adds the scalar `audience` (self|org) to an mcpServers contribution, generalizing `privileged` into a declared audience→credential mapping; self-schedule v1 foundation)
-Vendored at sdk HEAD: `92f8a88a60b0d4c337278b3bc52f549de270f6bf` (branch `feat/mcp-audience-contract`, PENDING MERGE)
+Source commit:        `f2dd96c238b66fb5ab67dedbfb4ebaf30061c5e2` (sdk `fix/audience-schema-descriptions` — corrects the `audience` field DESCRIPTIONS to match runtime SSOT: `self` injects the workspace token as a re-read FILE PATH (MOLECULE_WORKSPACE_TOKEN_FILE=/configs/.auth_token), and the absent/`org` audience anchors org-credential injection to the core-verified MANAGEMENT_MCP_NAME — never a self-declared tenant plugin. Description-only; no structural/enum change vs the sdk#119 contract-version 0.5.0 that added the scalar `audience` (self|org).)
+Vendored at sdk HEAD: `f2dd96c238b66fb5ab67dedbfb4ebaf30061c5e2` (branch `fix/audience-schema-descriptions`, PENDING MERGE; layered on sdk#119 `feat/mcp-audience-contract`)
 
-GATED (sdk#119 audience contract): the SDK commit above is a HELD draft and not
-yet on sdk `main`. Re-vendored byte-for-byte from that branch (content sha256
-`e4031f178b124babbb80af39827eccde7b07df44caaf45fdfb4977b0bf327267`). Until
-sdk#119 merges, `scripts/check-schemas-in-sync.sh` REPORTS DRIFT for this file
+GATED (sdk#119 audience contract + description fix): the SDK commit above is a
+HELD draft and not yet on sdk `main`. Re-vendored byte-for-byte from that branch
+(content sha256
+`60de766d38805c5ffd1c0a35dd10eea44b6c8852cdd9f4c505ff0e1c64829d1c`). Until the
+SDK branch merges, `scripts/check-schemas-in-sync.sh` REPORTS DRIFT for this file
 (it diffs against sdk `main`, which still carries contract-version 0.4.0) — that
-is expected and correct for this HELD runtime PR, which DEPENDS ON sdk#119. When
-the SDK contract merges, reconcile the two SHAs above to the sdk `main` merge
-commit; the file content is unchanged, so the drift gate goes green the moment
-sdk#119 lands.
+is expected and correct for this HELD runtime PR, which DEPENDS ON the SDK branch.
+When the SDK contract merges, reconcile the two SHAs above to the sdk `main` merge
+commit; the file content is unchanged, so the drift gate goes green the moment the
+SDK branch lands.
 
 Why vendored: `molecule_runtime/manifest_ssot.py` validates plugin manifests
 against this schema at plugin **load** (`plugins.load_plugin_manifest`) and at
 **install** (`plugin_sources.install_declared_plugins`) — the ADVISORY phase of
 molecule-core#3383. Validation runs inside workspace containers at boot.
 
-Re-vendoring (from the sdk#119 branch while it is HELD; drop `-b …` once merged):
+Re-vendoring (from the SDK fix branch while it is HELD; switch to `/raw/branch/main/`
+once merged):
 
     curl -fsS -A "curl/8.4.0" \
-      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/feat/mcp-audience-contract/contracts/plugin-manifest/plugin-manifest.schema.json \
+      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/fix/audience-schema-descriptions/contracts/plugin-manifest/plugin-manifest.schema.json \
       -o molecule_runtime/contracts/plugin-manifest.schema.json
 
 ---

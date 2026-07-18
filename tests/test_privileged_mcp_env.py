@@ -408,3 +408,119 @@ def test_org_audience_declared_matches_derived_and_forwards_org_creds():
     for key in PRIVILEGED_ENV_KEYS:
         assert declared["env"][key] == env[key]
     assert "audience" not in declared  # directive stripped
+
+
+# ===========================================================================
+# Review-finding negative controls (fix/audience-injector-review):
+#   #1 force MOLECULE_WORKSPACE_TOKEN_FILE authoritatively (security)
+#   #2 inject WORKSPACE_ID / MOLECULE_WORKSPACE_ID on the self surface (functional)
+#   #3 fix the truthy-`or` audience coercion (correctness)
+#   #4 always resolve a tenant API URL, log a misconfig otherwise (reachability)
+# Each asserts a property that FAILS if its guard is inverted.
+# ===========================================================================
+
+
+# ── #1 token-file is AUTHORITATIVE (injector-wins over descriptor) ──────────
+def test_self_audience_token_file_is_authoritative_over_descriptor():
+    """#1 (security) MOLECULE_WORKSPACE_TOKEN_FILE is forced AUTHORITATIVELY to
+    /configs/.auth_token — a descriptor that points the self server's Bearer at a
+    DIFFERENT file is OVERWRITTEN, exactly like MOLECULE_MCP_MODE. Reverting this to
+    the old descriptor-wins guard lets a manifest repoint the Bearer (the token-
+    substitution hole this fix closes) and fails the assert."""
+    spec = {
+        "command": "npx",
+        "audience": "self",
+        "env": {"MOLECULE_WORKSPACE_TOKEN_FILE": "/tmp/evil"},
+    }
+    out = inject_privileged_env(
+        "molecule-schedule-self", spec, {"MOLECULE_API_URL": "https://acme"}
+    )
+    assert out["env"]["MOLECULE_WORKSPACE_TOKEN_FILE"] == WORKSPACE_TOKEN_FILE == "/configs/.auth_token"
+    assert out["env"]["MOLECULE_WORKSPACE_TOKEN_FILE"] != "/tmp/evil"
+
+
+# ── #2 workspace id injected under both read-names ──────────────────────────
+def test_self_audience_injects_workspace_id_from_container_env():
+    """#2 (functional) the self surface injects the workspace's OWN id under BOTH
+    names the self server's selfWorkspaceId() reads (WORKSPACE_ID /
+    MOLECULE_WORKSPACE_ID), sourced from the container env — so create_schedule's
+    self-default resolves the own id. Dropping the injection fails these asserts."""
+    env = {"MOLECULE_API_URL": "https://acme.moleculesai.app", "WORKSPACE_ID": "ws-self-42"}
+    out = inject_privileged_env("molecule-schedule-self", {"audience": "self"}, env)
+    assert out["env"]["WORKSPACE_ID"] == "ws-self-42"
+    assert out["env"]["MOLECULE_WORKSPACE_ID"] == "ws-self-42"
+
+
+def test_self_audience_workspace_id_sources_from_molecule_alias():
+    """#2 (functional) WORKSPACE_ID resolves from MOLECULE_WORKSPACE_ID when the
+    plain container name is unset."""
+    env = {"MOLECULE_API_URL": "https://x", "MOLECULE_WORKSPACE_ID": "ws-alias"}
+    out = inject_privileged_env("schedule-self", {"audience": "self"}, env)
+    assert out["env"]["WORKSPACE_ID"] == "ws-alias"
+    assert out["env"]["MOLECULE_WORKSPACE_ID"] == "ws-alias"
+
+
+def test_self_audience_workspace_id_absent_when_container_has_none():
+    """#2 (functional, negative control) with no WORKSPACE_ID source in the container
+    env, NO empty workspace-id is injected — never an empty string the self server
+    would mis-resolve to."""
+    out = inject_privileged_env("schedule-self", {"audience": "self"}, {"MOLECULE_API_URL": "https://x"})
+    assert "WORKSPACE_ID" not in out["env"]
+    assert "MOLECULE_WORKSPACE_ID" not in out["env"]
+
+
+# ── #3 truthy-`or` audience coercion closed ─────────────────────────────────
+def test_present_but_empty_audience_does_not_fall_through_to_org():
+    """#3 (correctness) a PRESENT-but-empty audience ("") on the management name must
+    NOT silently fall through to the derived org default. The old truthy-`or` coerced
+    "" to "org" and injected the full org-admin env; the presence check honors the
+    explicit falsy value as a NO-injection declaration (and strips the bogus key).
+    Reverting to the truthy-`or` re-injects the org secrets and fails here."""
+    env = {k: f"val-{k}" for k in PRIVILEGED_ENV_KEYS}
+    env["MOLECULE_ADMIN_TOKEN"] = "org-admin"
+    out = inject_privileged_env(MANAGEMENT_MCP_NAME, {"command": "npx", "audience": ""}, env)
+    e = out.get("env", {})
+    for k in _ORG_SECRET_KEYS:
+        assert k not in e, f"org secret {k} injected via empty-audience fall-through on the mgmt name"
+    assert "audience" not in out  # the falsy directive is stripped, never rendered
+
+
+def test_present_null_audience_on_management_name_injects_nothing():
+    """#3 (correctness) an explicit `audience: null` on the management name is honored
+    as a no-injection declaration, NOT re-derived to org — guards the same coercion
+    hole for the null (rather than empty-string) falsy value."""
+    env = {"MOLECULE_ADMIN_TOKEN": "org-admin", "MOLECULE_ORG_API_KEY": "org-secret"}
+    out = inject_privileged_env(MANAGEMENT_MCP_NAME, {"command": "npx", "audience": None}, env)
+    e = out.get("env", {})
+    for k in _ORG_SECRET_KEYS:
+        assert k not in e
+    assert "audience" not in out
+
+
+def test_absent_audience_on_management_name_still_derives_org():
+    """#3 (correctness, non-regression) the presence check must NOT change the ABSENT
+    case — an omitted audience on the management name still derives 'org' and injects
+    the org creds (the backward-compat bridge every existing manifest relies on)."""
+    env = {"MOLECULE_ADMIN_TOKEN": "org-admin"}
+    out = inject_privileged_env(MANAGEMENT_MCP_NAME, {"command": "npx"}, env)
+    assert out["env"]["MOLECULE_API_KEY"] == "org-admin"
+
+
+# ── #4 tenant API URL always resolved (or logged) ───────────────────────────
+def test_self_audience_api_url_falls_back_to_cp_url_alias():
+    """#4 (reachability) the tenant API base URL resolves from the MOLECULE_CP_URL
+    legacy alias when MOLECULE_API_URL and PLATFORM_URL are unset — the self server
+    must always get a usable URL, never silently default to localhost."""
+    out = inject_privileged_env("schedule-self", {"audience": "self"}, {"MOLECULE_CP_URL": "https://cp.legacy"})
+    assert out["env"]["MOLECULE_API_URL"] == "https://cp.legacy"
+
+
+def test_self_audience_no_api_url_logs_misconfig(caplog):
+    """#4 (reachability) when the container carries NO API URL source, the injector
+    LOGS a misconfig warning rather than silently omitting the URL (which would let
+    the child fall back to an unreachable localhost). No URL key is injected."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="molecule_runtime.privileged_mcp_env"):
+        out = inject_privileged_env("schedule-self", {"audience": "self"}, {})
+    assert "MOLECULE_API_URL" not in out["env"]
+    assert "NO tenant API URL" in caplog.text

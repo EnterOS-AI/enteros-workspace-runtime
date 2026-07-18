@@ -1293,6 +1293,18 @@ class MCPServerAdaptor:
          MAJOR-4). The strip is scoped NARROWLY to audience=``self`` entries —
          every other entry keeps the intentionally-not-removed behavior.
 
+    ⚠ NOT-YET-WIRED (honest scope): NOTHING in the runtime currently calls this
+    adaptor's ``uninstall()`` with a real ``InstallContext``. The plugin pipeline
+    dispatches only ``install()`` (``adapter_base.install_plugins_via_registry``);
+    there is no symmetric removal pipeline, and plugin removal takes a full restart
+    (``daemon_runtime`` module docstring: "Hot-REMOVE (uninstall) is intentionally
+    out of scope"). Because the base hook renders ``mcpServers`` by ADDITIVE MERGE
+    into a ``settings.json`` on the persistent ``/configs`` volume
+    (``mcp_render.render_json_mcp_servers``), a removed self entry genuinely lingers
+    across restarts — so the teardown below is a CORRECT-when-invoked strip that is
+    not reached in production yet. The audience=self opt-out teardown is therefore
+    only exercised by tests until a removal pipeline is wired (follow-up).
+
     Usage — in the plugin's per-runtime adapter file:
 
     .. code-block:: python
@@ -1356,6 +1368,12 @@ class MCPServerAdaptor:
         # MUST be torn down on opt-out so no live self-mode surface lingers on disk
         # (RFC plugin-mcp-audience-contract, review MAJOR-4). Scoped NARROWLY to
         # audience=self; any other entry keeps the intentionally-not-removed behavior.
+        #
+        # ⚠ NOT-YET-WIRED: this method has NO production caller — the plugin pipeline
+        # only dispatches install(); removal takes a restart (see class docstring).
+        # The teardown below is correct-when-invoked but currently reached only by
+        # tests. Do not treat the audience=self opt-out strip as an active runtime
+        # guarantee until a removal pipeline calls this with a real InstallContext.
         self._teardown_self_audience_entries(ctx)
         # Delegate to AgentskillsAdaptor for skills + rules cleanup.
         await AgentskillsAdaptor(self.plugin_name, self.runtime).uninstall(ctx)
@@ -1373,12 +1391,18 @@ class MCPServerAdaptor:
         curated MCP configs. Best-effort + fail-safe: a missing/malformed settings
         file is a no-op (nothing to leak).
 
-        SCOPE (honest, v1): this strips the generic JSON default the base hook
-        writes. A runtime that renders a different native file via its OWN adapter
-        override (codex TOML, hermes/openclaw YAML/JSON) would need the symmetric
-        native remove; per-runtime teardown parity is a tracked follow-up
-        (RFC §9 item 6). v1's self-schedule sibling ships on the claude-code base
-        runtime, whose native config IS this generic JSON."""
+        SCOPE (honest, v1): TWO limitations, neither yet closed —
+          1. NOT-INVOKED: no production removal path calls ``uninstall()`` (see the
+             class + ``uninstall`` docstrings), so this strip runs only under test.
+          2. HARDCODED TARGET: it strips the generic JSON default the base hook
+             writes (``default_json_settings_path``). A runtime that renders a
+             DIFFERENT native file via its OWN adapter override (codex TOML,
+             hermes/openclaw YAML/JSON) would need the symmetric native remove —
+             install/uninstall disagree for non-claude runtimes. Per-runtime
+             teardown parity (strip the adapter's ACTUAL render target) is a tracked
+             follow-up (RFC §9 item 6). v1's self-schedule sibling ships on the
+             claude-code base runtime, whose native config IS this generic JSON, so
+             the hardcoded path is correct for that one runtime only."""
         from molecule_runtime.mcp_render import (
             default_json_settings_path,
             remove_json_mcp_servers,
