@@ -185,6 +185,31 @@ class ScheduleStore:
             return norm
         raise ScheduleError(f"no such schedule: {name!r}")
 
+    def set_enabled(self, name: str, value: bool) -> dict[str, Any]:
+        """Flip ``enabled`` WITHOUT restamping ``source`` (RFC invariant #8).
+
+        This is the auto-disable engine's single writer. It must NOT reuse
+        :meth:`update`, which force-stamps ``source='runtime'`` to mark a user
+        edit — doing so on an engine-driven disable would corrupt a
+        template-seeded schedule's provenance and defeat reconcile-on-boot
+        (the entry would stop matching its template on the next restart). A
+        health-driven disable is not a user edit, so the source is preserved
+        verbatim. No-op (still returns the entry) if the value already matches.
+        """
+        entries = self.load()
+        for index, entry in enumerate(entries):
+            if entry["name"] != name:
+                continue
+            if bool(entry.get("enabled", True)) == bool(value):
+                return entry
+            merged = {k: entry[k] for k in _ENTRY_FIELDS if k in entry}
+            merged["enabled"] = bool(value)
+            norm = validate_entry(merged)  # preserves source (never restamped)
+            entries[index] = norm
+            self._write(entries)
+            return norm
+        raise ScheduleError(f"no such schedule: {name!r}")
+
     def delete(self, name: str) -> bool:
         entries = self.load()
         remaining = [e for e in entries if e["name"] != name]

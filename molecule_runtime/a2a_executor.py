@@ -275,17 +275,81 @@ _ROUTINE_SELF_MESSAGE_PREFIXES = (
 )
 
 
-def _get_message_source_type(context: RequestContext) -> str | None:
-    """Return the typed source_type marker from the inbound A2A envelope, if any."""
+def _get_message_metadata(context: RequestContext) -> dict | None:
+    """Return the inbound A2A envelope's metadata dict, if any."""
     metadata = None
     message = getattr(context, "message", None)
     if message is not None:
         metadata = getattr(message, "metadata", None)
     if metadata is None:
         metadata = getattr(context, "metadata", None)
-    if isinstance(metadata, dict):
-        return metadata.get(A2A_MESSAGE_SOURCE_TYPE)
-    return None
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _get_message_source_type(context: RequestContext) -> str | None:
+    """Return the typed source_type marker from the inbound A2A envelope, if any."""
+    metadata = _get_message_metadata(context)
+    return metadata.get(A2A_MESSAGE_SOURCE_TYPE) if metadata is not None else None
+
+
+# Metadata key the trigger daemon attaches (SDK scaffold) so the runtime can
+# attribute a completed self-scheduled turn's outcome back to its schedule.
+A2A_MESSAGE_SCHEDULE_NAME = "schedule_name"
+
+
+def _attribute_schedule_outcome(
+    context: RequestContext,
+    *,
+    final_text: str | None = None,
+    error_text: str | None = None,
+) -> None:
+    """Record a self-scheduled turn's outcome for the auto-disable/stale engine.
+
+    Pass ``final_text`` for a completed turn (classified empty/ok) or ``error_text``
+    for a failed one (classified provider-error/neutral). A no-op for everything
+    except a trigger-daemon fire — a fire is identified by
+    ``source_type == self-scheduler`` AND a ``schedule_name`` in the envelope
+    metadata (the mailbox scheduler tick shares the source_type but carries no
+    schedule_name, so it is correctly ignored). On the 3rd consecutive provider
+    error the schedule is disabled via the source-preserving
+    :meth:`ScheduleStore.set_enabled`. Fully guarded: health bookkeeping must
+    never break a turn, so any failure is logged and swallowed.
+    """
+    try:
+        if _get_message_source_type(context) != A2A_SOURCE_SELF_SCHEDULER:
+            return
+        metadata = _get_message_metadata(context) or {}
+        schedule_name = metadata.get(A2A_MESSAGE_SCHEDULE_NAME)
+        if not isinstance(schedule_name, str) or not schedule_name:
+            return  # older plugin without the correlation key — nothing to attribute
+        # Lazy imports: keep these (jsonschema/cronspec-dragging) modules off the
+        # module-load path, and out of the hot path for non-scheduled turns.
+        from molecule_runtime import schedule_outcome
+        from molecule_runtime.trigger_state import resolve_grid_path, resolve_trigger_state_dir
+
+        if error_text is not None:
+            outcome = schedule_outcome.classify_error_text(error_text)
+            error = error_text
+        else:
+            outcome = schedule_outcome.classify_final_text(final_text or "")
+            error = ""
+
+        action = schedule_outcome.record_and_persist(
+            resolve_trigger_state_dir(), schedule_name, outcome, error=error
+        )
+        if action.disable:
+            from molecule_runtime.schedule_engine import DISABLE_AFTER_SDK_ERRORS
+            from molecule_runtime.schedule_store import ScheduleStore
+
+            ScheduleStore(resolve_grid_path()).set_enabled(schedule_name, False)
+            logger.warning(
+                "auto-disabled schedule %r after %d consecutive provider errors "
+                "(RFC invariant #8)",
+                schedule_name,
+                DISABLE_AFTER_SDK_ERRORS,
+            )
+    except Exception as exc:  # never let health bookkeeping break the turn
+        logger.debug("schedule-outcome attribution skipped: %s", exc)
 
 
 def _is_routine_self_message(context: RequestContext, text: str) -> bool:
@@ -1110,6 +1174,11 @@ class RuntimeA2AExecutor(AgentExecutor):
                 await updater.complete(message=msg)
                 _result = final_text
 
+                # RFC invariant #8: attribute a completed self-scheduled turn's
+                # outcome (empty → stale streak; content → reset) to its schedule.
+                # No-op for every non-trigger turn; fully guarded internally.
+                _attribute_schedule_outcome(context, final_text=final_text)
+
             except Exception as e:
                 logger.error("A2A execute error: %s", e, exc_info=True)
                 try:
@@ -1130,6 +1199,11 @@ class RuntimeA2AExecutor(AgentExecutor):
                         context_id=context_id,
                     )
                 )
+                # RFC invariant #8: a self-scheduled turn that failed on a
+                # persistent provider error (rate-limit / quota, after the
+                # adapter's retries) advances the auto-disable streak; an
+                # internal error is neutral. Classified on the raw exception text.
+                _attribute_schedule_outcome(context, error_text=str(e))
             finally:
                 await set_current_task(self._heartbeat, "")
                 # MUST-FIX 1/3: stop the turn-lease activity watcher. None on

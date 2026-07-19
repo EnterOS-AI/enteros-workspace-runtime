@@ -223,6 +223,34 @@ def test_create_stamps_source_runtime(tmp_path: Path) -> None:
     assert created["source"] == "runtime"
 
 
+def test_set_enabled_preserves_source_unlike_update(tmp_path: Path) -> None:
+    # RFC invariant #8: an engine-driven auto-disable is NOT a user edit, so it
+    # must flip `enabled` WITHOUT restamping source (else a template schedule's
+    # provenance is corrupted and reconcile-on-boot stops recognizing it).
+    store = _store(tmp_path)
+    store.upsert_template([{"name": "nightly", "cron": "0 3 * * *", "prompt": "seed"}])
+    assert store.get("nightly")["source"] == "template"
+    assert store.get("nightly")["enabled"] is True
+
+    disabled = store.set_enabled("nightly", False)
+    assert disabled["enabled"] is False
+    assert disabled["source"] == "template"  # NOT restamped to 'runtime'
+    # contrast: update() WOULD have taken ownership
+    assert store.update("nightly", {"prompt": "x"})["source"] == "runtime"
+
+
+def test_set_enabled_is_a_noop_when_value_matches(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create({"name": "u", "cron": "0 * * * *", "prompt": "p"})  # enabled default True
+    same = store.set_enabled("u", True)
+    assert same["enabled"] is True and same["source"] == "runtime"
+
+
+def test_set_enabled_missing_schedule_raises(tmp_path: Path) -> None:
+    with pytest.raises(ScheduleError):
+        _store(tmp_path).set_enabled("ghost", False)
+
+
 def test_editing_a_template_schedule_survives_reseed(tmp_path: Path) -> None:
     # This is the finding #1 regression: a user edit via update() must not be
     # reverted by the next reconcile-on-boot seeding.
