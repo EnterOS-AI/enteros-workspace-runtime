@@ -4,10 +4,10 @@
   "plugins": {
     "molecule-scheduler": {
       "name": "molecule-scheduler",
-      "source": "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0",
       "kind": "trigger",
       "install": "default",
-      "description": "Per-workspace cron scheduler (scheduler-as-trigger-plugin RFC). Runs the trigger daemon that fires self-scheduler turns from the workspace's schedule grid. Installed on every workspace so any workspace can schedule."
+      "description": "Per-workspace scheduler (scheduler-as-trigger-plugin RFC + plugin-mcp-audience-contract self-schedule v1). Ships BOTH halves of self-scheduling: the trigger daemon that fires self-scheduler turns from the workspace's schedule grid, AND a self-audience MCP surface (molecule-self) giving the workspace's own agent the create/list/update/delete/run/history schedule tools scoped to its own :id. Installed on every workspace (core declares it unconditionally at provision). The org/cross-workspace schedule management stays on the concierge management MCP (install:concierge), not here."
     },
     "molecule-ai-plugin-molecule-platform-mcp": {
       "name": "molecule-ai-plugin-molecule-platform-mcp",
@@ -18,7 +18,7 @@
     },
     "molecule-ai-plugin-digest-identity": {
       "name": "molecule-ai-plugin-digest-identity",
-      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.2.0",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.2.1",
       "kind": "digest-provider",
       "install": "default",
       "description": "Native idle-digest identity-capabilities provider (tier 0, the pinned second-person header). Delivered to every workspace (RFC molecule-core#4413)."
@@ -32,7 +32,7 @@
     },
     "molecule-ai-plugin-digest-mail": {
       "name": "molecule-ai-plugin-digest-mail",
-      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.2.0",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.2.1",
       "kind": "digest-provider",
       "install": "default",
       "description": "Native idle-digest comms providers: sent-folder (tier 2) + inbound-a2a (tier 3). The comms source is bound by the runtime."

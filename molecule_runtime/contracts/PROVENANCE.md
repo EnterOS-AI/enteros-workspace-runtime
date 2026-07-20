@@ -16,6 +16,18 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-07-20 — sdk main `be85511`
+
+Bulk re-sync after the schema-sync gate flagged drift (which had been
+blocking auto-release for every main push). Files re-fetched byte-identical
+from molecule-ai-sdk main `be85511b`: idle-prompt.contract.json,
+workspace-data.contract.json, credentials.contract.json, cron.fixtures.json,
+schedule.fixtures.json, agent-trace.contract.json,
+native-plugins.registry.json, and the top-level
+contracts/mcp-plugin-delivery.contract.json (management_mcp_server
+pinned_version 1.9.4).
+
+
 ## `plugin-manifest.schema.json`
 
 Byte-for-byte copy of:
