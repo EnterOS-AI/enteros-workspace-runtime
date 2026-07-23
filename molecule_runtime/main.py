@@ -554,7 +554,7 @@ async def start_poll_delivery_when_bound(
     )
 
 
-async def main():  # pragma: no cover
+async def main(prepare_only: bool = False):  # pragma: no cover
     # This process is always inside a tenant workspace or concierge trust boundary.
     # Remove operator-only capabilities before any helper, SDK, CLI, or MCP child
     # can inherit them. Core/CP provisioning deny them too; this is the runtime's
@@ -1004,6 +1004,39 @@ async def main():  # pragma: no cover
         # Idempotent + fail-soft: a no-op when setup touched nothing.
         install_npm_gitea_auth()
 
+        if prepare_only:
+            # PREPARE MODE (runtime#357 / core#4587): materialize config ONLY.
+            # By here boot-install (step 1) has written the boot-installed
+            # plugins' mcp_servers stanzas, and adapter.setup() has written
+            # persona, skills, and the management/self MCP stanzas — the full
+            # config block is now on disk. Return BEFORE create_executor /
+            # registration / heartbeat / uvicorn so a template can run this as a
+            # pre-step and launch its agent gateway against a COMPLETE config on
+            # the gateway's FIRST boot.
+            #
+            # Motivation: hermes >= 0.19 discovers MCP servers EAGERLY at gateway
+            # startup. Writing them post-launch (the historical order) forced a
+            # gateway restart to pick them up — a ~90s unreachable window on
+            # every fresh boot (core#4587). Pre-materializing removes the
+            # restart entirely.
+            #
+            # SSOT: this is the SAME boot-install + adapter.setup() the real
+            # serve runs, so the pre-written block is byte-identical and the
+            # real serve's later rewrite is a no-op (a hermes-side reconcile
+            # watcher, if present, sees no post-launch change and stays dormant).
+            # The heartbeat was CREATED (not started) above; stop() defensively.
+            if hasattr(heartbeat, "stop"):
+                try:
+                    await heartbeat.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            print(
+                "MOLECULE_PREPARE_OK: config materialized "
+                "(mcp_servers + persona + skills); exiting before serve",
+                flush=True,
+            )
+            return 0
+
         executor = await adapter.create_executor(adapter_config)
 
         # SSOT trace wrap: the single funnel every adapter's executor passes
@@ -1163,6 +1196,19 @@ async def main():  # pragma: no cover
         # Heartbeat keeps running so the platform marks the workspace as
         # reachable-but-misconfigured. Operators can then redeploy with the
         # correct env vars without having to chase a crash-loop.
+        if prepare_only:
+            # Prepare could NOT materialize config (setup failed). Exit
+            # non-zero so the template does NOT trust a partial config and
+            # falls back to its normal launch + the post-launch reconcile
+            # path. Prepare is strictly a best-effort optimization; a failure
+            # here must never brick boot, only forgo the optimization.
+            print(
+                f"MOLECULE_PREPARE_FAILED: adapter.setup() failed in prepare "
+                f"mode ({adapter_error}); caller should fall back to its "
+                f"normal post-launch reconcile path",
+                flush=True,
+            )
+            return 1
 
     # 7. Wrap in A2A.
     #
@@ -1974,6 +2020,25 @@ def main_sync():  # pragma: no cover
     stable so installed console scripts can enter the async runtime safely.
     """
     asyncio.run(main())
+
+
+def prepare_sync():  # pragma: no cover
+    """Entry point for the ``molecule-runtime-prepare`` console script.
+
+    Runs boot-install + adapter.setup() to MATERIALIZE the workspace config
+    (mcp_servers, persona, skills) then exits WITHOUT registering or serving,
+    so a template can pre-write a complete config before launching its agent
+    gateway. Exit 0 = config materialized; non-zero = fell short (the caller
+    should fall back to its normal launch path).
+
+    A DEDICATED console entry (not an env flag on ``molecule-runtime``) is the
+    robust capability signal: a wheel predating this feature simply does not
+    install the ``molecule-runtime-prepare`` binary, so a caller detects its
+    absence (``command -v``) and skips the pre-step — an old runtime can never
+    mis-interpret an unknown flag and serve when the caller expected a
+    prepare-and-exit.
+    """
+    raise SystemExit(asyncio.run(main(prepare_only=True)) or 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -86,6 +86,12 @@ test = ["pytest", "pytest-asyncio", "jsonschema>=4.18"]
 
 [project.scripts]
 molecule-runtime = "molecule_runtime.main:main_sync"
+# Pre-materialize config (mcp_servers + persona + skills) then exit, WITHOUT
+# serving — lets a template write a complete config before launching its agent
+# gateway (hermes >= 0.19 discovers MCP servers eagerly at startup; writing them
+# post-launch forced a ~90s gateway restart, core#4587). A dedicated entry so a
+# wheel predating this feature simply lacks the binary and callers auto-skip.
+molecule-runtime-prepare = "molecule_runtime.main:prepare_sync"
 # External-runtime MCP server — operators running an agent outside the
 # platform's container fleet (Claude Code, hermes, codex, etc.) install
 # this wheel and run `molecule-mcp` locally. It uses the same registry-backed
