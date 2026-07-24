@@ -612,22 +612,24 @@ _DEFAULT_SESSION_CONTEXT_ID_ENV = "MOLECULE_DEFAULT_SESSION_CONTEXT_ID"
 def default_self_turn_context_id() -> str:
     """The stable per-workspace session id a self-originated turn lands in.
 
-    This MUST equal the platform's ``canvasSessionContextID(workspace_id)`` —
-    ``"canvas-" + workspace_id`` (workspace-server
-    ``internal/handlers/a2a_proxy.go``) — so a runtime self-wake and the
-    platform's own restart / first-boot turns all share ONE session with the
-    user's canvas conversation. Without it, a self-turn is POSTed to the local
-    executor with NO ``contextId``, the a2a-sdk mints a FRESH ``context_id`` per
-    turn, and ``TracingExecutor`` (which reads ``session_id`` from
-    ``context.context_id``) files every idle / harvester / delegation-result /
-    boot self-wake under its own throwaway Langfuse session — the "session keeps
-    changing after a restart / plugin install" fragmentation.
+    CORE owns this id. The platform's provisioner injects it into every
+    workspace container as ``MOLECULE_DEFAULT_SESSION_CONTEXT_ID`` (from
+    workspace-server ``internal/sessionid.DefaultContextID`` — the SAME authority
+    the a2a proxy belt + platform restart / first-boot self-turns stamp), and we
+    read it at HIGHEST precedence so the runtime consumes core's value rather than
+    re-deriving the convention. Absent the env (unit / CLI / an older platform
+    that predates the injection) we fall back to deriving ``canvas-<WORKSPACE_ID>``
+    — currently identical to what core produces.
 
-    The platform may override the exact id via
-    ``MOLECULE_DEFAULT_SESSION_CONTEXT_ID`` (so this convention has ONE authority
-    if it ever moves); absent the override we derive ``canvas-<WORKSPACE_ID>``.
-    Returns ``""`` when neither is available (unit/CLI) — the caller then leaves
-    ``contextId`` unset, preserving legacy behaviour.
+    Without a stamped id, a self-turn is POSTed to the local executor with NO
+    ``contextId``, the a2a-sdk mints a FRESH ``context_id`` per turn, and
+    ``TracingExecutor`` (which reads ``session_id`` from ``context.context_id``)
+    files every idle / harvester / delegation-result / boot self-wake under its
+    own throwaway Langfuse session — the "session keeps changing after a restart /
+    plugin install" fragmentation.
+
+    Returns ``""`` when neither env nor WORKSPACE_ID is available — the caller
+    then leaves ``contextId`` unset, preserving legacy behaviour.
     """
     override = os.environ.get(_DEFAULT_SESSION_CONTEXT_ID_ENV, "").strip()
     if override:
