@@ -51,6 +51,28 @@ from pathlib import Path
 MCPSERVERS_KEY = "mcpServers"
 
 
+def _atomic_write_text(settings_path: Path, text: str) -> None:
+    """Write ``text`` to ``settings_path`` atomically (review wf_3a7b849d #8).
+
+    A bare ``write_text`` truncates-then-writes, so a SIGKILL mid-write (e.g. a
+    prepare step hitting its backstop ``timeout``) leaves a half-written /
+    truncated config.yaml, and the gateway then boots on invalid JSON and
+    crash-loops. Write to a sibling temp file and ``os.replace`` (atomic rename
+    on the same filesystem) so a reader/loader only ever sees the whole old or
+    the whole new file, never a torn one. Falls back to a direct write if the
+    temp/rename path is unavailable (e.g. a read-only parent surfaced later)."""
+    tmp = settings_path.with_name(settings_path.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, settings_path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        settings_path.write_text(text)
+
+
 def normalize_runtime(runtime: str) -> str:
     """Canonicalize a runtime identifier to the underscore dispatch key
     (``claude-code`` -> ``claude_code``).
@@ -104,7 +126,7 @@ def render_json_mcp_servers(settings_path: Path, name: str, spec: dict) -> None:
     servers[name] = dict(spec)
     data[MCPSERVERS_KEY] = servers
 
-    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    _atomic_write_text(settings_path, json.dumps(data, indent=2) + "\n")
 
 
 def json_mcp_servers_has(settings_path: Path, name: str) -> bool:
@@ -158,7 +180,7 @@ def remove_json_mcp_servers(settings_path: Path, name: str) -> bool:
 
     del servers[name]
     data[MCPSERVERS_KEY] = servers
-    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    _atomic_write_text(settings_path, json.dumps(data, indent=2) + "\n")
     return True
 
 
