@@ -285,14 +285,39 @@ def consume_wake_note(plan: WakePlan) -> bool:
 
 
 def build_wake_note(additions: list[str]) -> str:
-    """The post-reprovision self-message (design §5.2 step 3 — never silent)."""
+    """The post-reprovision self-message (design §5.2 step 3 — never silent).
+
+    Delivery contract (core#4587 follow-up, 2026-07-24). This wake is stamped
+    ``self-lifecycle`` so the replay guard governs restart loops (see the
+    A2A_SOURCE_SELF_LIFECYCLE stamp in send_wake_note_when_ready). But that
+    same membership in ``_ROUTINE_SELF_SOURCE_TYPES`` routes the agent's TURN
+    REPLY through the silent drop-path built for cron/harvester nudges — so a
+    plain reply here never reaches the user (confirmed on a real lark-channel
+    install: the agent replied 769 chars, none of it reached canvas, then hung
+    83s on a consent-gated terminal command trying to "do" the work instead).
+    The reliable channel is the ``send_message_to_user`` tool
+    (a2a_tools_messaging → platform ``/notify`` → canvas): every runtime
+    exposes it, and it is INDEPENDENT of the suppressed turn reply. So this
+    note instructs the agent to (1) reach the user via that tool explicitly,
+    not via the turn reply, and (2) PRESENT interactive next steps rather than
+    run blocking / consent-gated commands unattended — an interactive
+    device-flow (e.g. a lark scan) cannot complete without the user, and an
+    unprompted terminal call just hangs on the consent gate. Cross-runtime by
+    construction: it lives in the shared runtime, so hermes / claude-code /
+    codex / openclaw all get the same behavior."""
     names = ", ".join(additions)
     return (
         f"You just self-reprovisioned: your workspace restarted and boot-install "
         f"activated newly installed plugin(s): {names}. "
-        f"Proactively tell the user what you installed and what you can now do "
-        f"with it (new tools, skills, or channels — check your tool list), "
-        f"then resume your prior work."
+        f"Use the send_message_to_user tool to tell the user — in one clear "
+        f"message — what you installed and what they can now do with it (new "
+        f"tools, skills, or channels — check your tool list). Do NOT rely on "
+        f"replying in this turn: this is a self-message, so your turn reply is "
+        f"NOT shown to the user — send_message_to_user is the channel that "
+        f"reaches them. If activating it needs an interactive step (for example "
+        f"a device-flow scan or an approval), PRESENT that next step in your "
+        f"message and wait for the user; do NOT run blocking or consent-gated "
+        f"terminal commands unprompted. Then resume your prior work."
     )
 
 

@@ -273,3 +273,11 @@ def test_build_wake_note_names_plugins_and_instructs_proactive_announce():
     # The operator contract: never wake silent — tell the user, then resume.
     assert "tell the user" in note
     assert "resume" in note
+    # Delivery contract (core#4587): the self-lifecycle turn reply is
+    # suppressed (replay-guard classification), so the note MUST steer the
+    # agent to the reliable cross-runtime channel — send_message_to_user —
+    # and away from relying on the (dropped) turn reply.
+    assert "send_message_to_user" in note
+    # And it must NOT hang: present interactive steps, don't run blocking /
+    # consent-gated terminal commands unprompted (the observed 83s hang).
+    assert "consent-gated" in note or "blocking" in note
