@@ -44,6 +44,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1238,6 +1239,56 @@ def _resolve_plugin_local_mcp_paths(plugin_root: Path, spec: dict) -> dict:
     return resolved
 
 
+# Explicit secret-binding sigil for an MCP server's ``env`` values:
+# ``${secret:NAME}``. A plugin BUNDLE carries only the secret NAME — never the
+# value — and the runtime resolves it HERE, before the spec reaches the
+# runtime-agnostic ``register_mcp_server`` PORT. Resolving at this layer (instead
+# of relying on the downstream launcher to expand it) makes the binding behave
+# IDENTICALLY on every runtime: hermes happens to expand a bare ``${VAR}`` from
+# its inherited ``os.environ`` at spawn, but the claude-code JSON adapter (and
+# hermes multiplex profiles) write env values verbatim and would otherwise ship
+# the literal placeholder to the subprocess. Only this explicit sigil is
+# resolved; a bare ``${VAR}`` is deliberately left untouched (backward compatible
+# with the existing hermes passthrough). Values resolve against the workspace's
+# own injected environment (the provisioner delivers workspace secrets as
+# container env) — the same source hermes already reads — so this adds
+# portability, not a new trust surface. A missing secret DROPS the key so an
+# audience:self MCP can fall back to pulling it via its workspace token.
+_MCP_SECRET_REF = re.compile(r"\A\$\{secret:([A-Za-z_][A-Za-z0-9_]*)\}\Z")
+
+
+def _resolve_mcp_secret_refs(spec: dict, lookup=None) -> dict:
+    """Resolve ``${secret:NAME}`` bindings in an MCP spec's ``env`` map.
+
+    ``lookup(name) -> value | None`` supplies each secret; defaults to
+    ``os.environ.get``. A value that is EXACTLY ``${secret:NAME}`` is replaced by
+    the resolved secret. When the named secret is absent/empty the env key is
+    DROPPED (not passed as a useless literal) so the MCP server falls back to its
+    own resolution (e.g. a self-fetch via the audience:self workspace token).
+    Every other value — a bare ``${VAR}``, a plain literal, a non-string — passes
+    through unchanged. Returns a NEW spec; the input is not mutated.
+    """
+    env = spec.get("env")
+    if not isinstance(env, dict):
+        return spec
+    if lookup is None:
+        lookup = os.environ.get
+    resolved: dict = {}
+    for key, value in env.items():
+        if isinstance(value, str):
+            match = _MCP_SECRET_REF.match(value.strip())
+            if match:
+                secret = lookup(match.group(1))
+                if secret:
+                    resolved[key] = str(secret)
+                # else: drop the key — let the server self-resolve
+                continue
+        resolved[key] = value
+    out = dict(spec)
+    out["env"] = resolved
+    return out
+
+
 class MCPServerAdaptor:
     """Sub-type adaptor for plugins that wrap an MCP server.
 
@@ -1336,9 +1387,10 @@ class MCPServerAdaptor:
         descriptor = _read_mcp_descriptor(ctx.plugin_root)
         for name, spec in descriptor.items():
             try:
-                ctx.register_mcp_server(
-                    name, _resolve_plugin_local_mcp_paths(ctx.plugin_root, spec)
+                resolved_spec = _resolve_mcp_secret_refs(
+                    _resolve_plugin_local_mcp_paths(ctx.plugin_root, spec)
                 )
+                ctx.register_mcp_server(name, resolved_spec)
                 ctx.logger.info("%s: wired MCP server %r via register_mcp_server (runtime=%s)",
                                 self.plugin_name, name, self.runtime)
             except NotImplementedError as exc:
