@@ -68,6 +68,11 @@ WORKSPACE_CONFIG_PATH_ENV = "WORKSPACE_CONFIG_PATH"
 
 DEFAULT_CONFIG_PATH = "/configs"
 
+# Idempotency marker: written into config_path after a bundle is unpacked,
+# holding the bundle's sha256, so a second prelude call in the same provision
+# (molecule-runtime-prepare then the real serve) skips the one-shot re-fetch.
+_RELAY_MARKER_NAME = ".config-relay-materialized"
+
 # Path charset SSOT — mirrors the CP-side workspaceConfigPathPattern
 # (internal/provisioner/workspace_config_seed.go): ^[A-Za-z0-9._/-]+$. The CP
 # validates on WRITE; we re-validate on UNPACK so a corrupt or hostile bundle can
@@ -370,6 +375,26 @@ def run_config_relay_prelude(
     if config_path is None:
         config_path = (env.get(WORKSPACE_CONFIG_PATH_ENV) or DEFAULT_CONFIG_PATH).strip() or DEFAULT_CONFIG_PATH
 
+    # IDEMPOTENCY (review wf_3a7b849d #1). The bundle is a ONE-SHOT object: the
+    # ack triggers CP deletion, so a SECOND fetch of the same URI 404s and the
+    # fail-closed fetch below would SystemExit — bricking boot. That second
+    # call is now real: molecule-runtime-prepare runs this prelude to
+    # pre-materialize config before the gateway launches, then the actual
+    # serve runs it again in the SAME container boot (same env, same URI).
+    # Guard with a marker keyed on the bundle's sha256: once THIS bundle is
+    # unpacked, any later call in the same provision (prepare→serve, or a
+    # crash-retry) sees the marker and skips the fetch/ack — the config is
+    # already on disk. A genuinely NEW provision delivers a different sha,
+    # whose marker mismatch re-fetches. The marker lives in config_path (the
+    # persistent volume), so if the config is wiped the marker goes with it.
+    marker = Path(config_path) / _RELAY_MARKER_NAME
+    try:
+        if marker.is_file() and marker.read_text(encoding="utf-8").strip() == expected_sha256:
+            _log(f"bundle {expected_sha256[:12]} already materialized this provision — skipping fetch (config on disk)")
+            return RelayResult(written=[], acked=True)
+    except OSError:
+        pass  # unreadable marker → fall through and re-materialize (fail-safe)
+
     _log(f"active — fetching config bundle over presigned HTTPS into {config_path} (ws={workspace_id or '?'})")
     try:
         body = fetch_bundle(uri, expected_sha256, client=client, sleep=sleep)
@@ -380,6 +405,16 @@ def run_config_relay_prelude(
         raise SystemExit(f"FATAL: config-relay delivery failed — refusing to boot on incomplete/tampered config: {exc}")
 
     _log(f"unpacked {len(written)} file(s) into {config_path}")
+
+    # Mark BEFORE the ack: the ack deletes the object, so if we crash between
+    # ack and mark the config is gone AND unmarked and the next boot re-fetches
+    # a 404. Marking first means a crash after unpack (even before ack) still
+    # lets the serve skip — the config is on disk; the CP reaper/lifecycle rule
+    # deletes any un-acked object.
+    try:
+        marker.write_text(expected_sha256, encoding="utf-8")
+    except OSError as exc:
+        _log(f"could not write relay materialization marker (non-fatal, may re-fetch if re-run): {exc}")
 
     cp_url = (env.get(CP_URL_ENV) or "").strip()
     acked = post_ack(cp_url, workspace_id, ack_token, client=client, sleep=sleep)

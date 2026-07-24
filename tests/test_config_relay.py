@@ -265,6 +265,74 @@ def test_prelude_end_to_end_fetch_unpack_ack(tmp_path):
     assert ack_seen["auth"] == "Bearer the-ack-token"
 
 
+def test_prelude_idempotent_second_call_skips_fetch(tmp_path):
+    """review wf_3a7b849d #1: molecule-runtime-prepare runs the prelude, then
+    the real serve runs it AGAIN in the same provision. The bundle is one-shot
+    (ack -> CP deletes it), so the second fetch would 404 -> SystemExit and
+    brick boot. The materialization marker must make the second call a no-op."""
+    files = {"config.yaml": b"model: claude\n"}
+    payload, sha = _make_bundle(files)
+    env = {
+        "MOLECULE_CONFIG_RELAY_URI": "https://r2.example/relay/ws-9/n.json?sig=abc",
+        "MOLECULE_CONFIG_RELAY_SHA256": sha,
+        "MOLECULE_CONFIG_RELAY_ACK_TOKEN": "the-ack-token",
+        "MOLECULE_CP_URL": "https://api.example",
+        "WORKSPACE_ID": "ws-9",
+    }
+    calls = {"get": 0, "ack": 0}
+
+    def first(req):
+        if req.method == "GET":
+            calls["get"] += 1
+            return httpx.Response(200, content=payload)
+        calls["ack"] += 1
+        return httpx.Response(204)
+
+    r1 = run_config_relay_prelude(workspace_id="ws-9", config_path=tmp_path, env=env,
+                                  client=_client(first), sleep=_NO_SLEEP)
+    assert r1 is not None and r1.acked is True
+    assert calls["get"] == 1
+    assert (tmp_path / "config.yaml").read_bytes() == files["config.yaml"]
+
+    # Second call (real serve): the object is GONE — any GET/POST 404s. The
+    # prelude must SKIP via the marker, not raise SystemExit.
+    def gone(req):
+        return httpx.Response(404)
+
+    r2 = run_config_relay_prelude(workspace_id="ws-9", config_path=tmp_path, env=env,
+                                  client=_client(gone), sleep=_NO_SLEEP)
+    assert r2 is not None, "second prelude call must return (skip), not brick boot"
+    assert calls["get"] == 1, "second call must NOT re-fetch the deleted one-shot bundle"
+    assert (tmp_path / "config.yaml").read_bytes() == files["config.yaml"]
+
+
+def test_prelude_new_bundle_sha_refetches_despite_stale_marker(tmp_path):
+    """A genuinely NEW provision delivers a DIFFERENT sha; the stale marker from
+    a prior bundle must NOT suppress the fresh fetch."""
+    (tmp_path / ".config-relay-materialized").write_text("old-sha-deadbeef", encoding="utf-8")
+    files = {"config.yaml": b"model: new\n"}
+    payload, sha = _make_bundle(files)
+    env = {
+        "MOLECULE_CONFIG_RELAY_URI": "https://r2.example/relay/ws-9/n2.json?sig=xyz",
+        "MOLECULE_CONFIG_RELAY_SHA256": sha,
+        "MOLECULE_CONFIG_RELAY_ACK_TOKEN": "tok2",
+        "MOLECULE_CP_URL": "https://api.example",
+        "WORKSPACE_ID": "ws-9",
+    }
+    got = {"get": 0}
+
+    def handler(req):
+        if req.method == "GET":
+            got["get"] += 1
+            return httpx.Response(200, content=payload)
+        return httpx.Response(204)
+
+    r = run_config_relay_prelude(workspace_id="ws-9", config_path=tmp_path, env=env,
+                                 client=_client(handler), sleep=_NO_SLEEP)
+    assert r is not None and got["get"] == 1, "a new sha must re-fetch despite a stale marker"
+    assert (tmp_path / "config.yaml").read_bytes() == files["config.yaml"]
+
+
 def test_prelude_fail_closed_on_sha_mismatch_aborts_boot(tmp_path):
     payload, _ = _make_bundle({"config.yaml": b"x\n"})
     env = {

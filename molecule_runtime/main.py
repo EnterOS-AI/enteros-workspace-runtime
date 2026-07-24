@@ -2038,7 +2038,41 @@ def prepare_sync():  # pragma: no cover
     mis-interpret an unknown flag and serve when the caller expected a
     prepare-and-exit.
     """
-    raise SystemExit(asyncio.run(main(prepare_only=True)) or 0)
+    # Couple the two prepare contracts AT THE SOURCE (review wf_3a7b849d #7).
+    # The adapter's config-only path (which skips the gateway /a2a/health probe
+    # — the gateway is intentionally not up yet) keys on the
+    # MOLECULE_RUNTIME_PREPARE_ONLY env, while the runtime's early return keys
+    # on the prepare_only param. Nothing linked them, so running the binary
+    # without also exporting the env made setup() probe the down gateway and
+    # always exit 1 (the ~90s outage silently returns). Set the env here so the
+    # binary is SELF-SUFFICIENT for every caller (start.sh, an operator per the
+    # docstring, another template) without a second thing to remember. It also
+    # gates the boot-step telemetry (see emit_boot_step) so a prepared boot does
+    # not double-emit steps 1-4 (#4).
+    os.environ["MOLECULE_RUNTIME_PREPARE_ONLY"] = "1"
+
+    # Internal deadline (review wf_3a7b849d #15): do NOT rely on each caller's
+    # external `timeout`. Bound the whole prepare so a hung plugin setup.sh or a
+    # stalled fetch can never wedge boot; on timeout, exit non-zero so the
+    # caller falls back to its normal launch path (a prepare that "fell short"
+    # is a no-op optimization loss, never a boot brick).
+    try:
+        deadline = float(os.environ.get("MOLECULE_RUNTIME_PREPARE_DEADLINE_SECS", "150") or "150")
+    except ValueError:
+        deadline = 150.0
+
+    async def _run_prepare() -> int:
+        try:
+            return await asyncio.wait_for(main(prepare_only=True), timeout=deadline)
+        except asyncio.TimeoutError:
+            print(
+                f"MOLECULE_PREPARE_FAILED: prepare exceeded {deadline:.0f}s deadline; "
+                "caller should fall back to its normal launch path",
+                flush=True,
+            )
+            return 1
+
+    raise SystemExit(asyncio.run(_run_prepare()) or 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

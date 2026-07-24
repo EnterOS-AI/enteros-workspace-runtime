@@ -29,6 +29,23 @@ import pytest
 import molecule_runtime.main as main_mod
 
 
+@pytest.fixture(autouse=True)
+def _isolate_prepare_env():
+    """prepare_sync writes MOLECULE_RUNTIME_PREPARE_ONLY into the real process
+    env (correct in production — it runs in its own subprocess). In-test that
+    would leak into sibling suites (e.g. boot_step_emit's, which the env now
+    silences), so snapshot and restore it around every test here."""
+    import os
+    saved = os.environ.get("MOLECULE_RUNTIME_PREPARE_ONLY")
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("MOLECULE_RUNTIME_PREPARE_ONLY", None)
+        else:
+            os.environ["MOLECULE_RUNTIME_PREPARE_ONLY"] = saved
+
+
 def test_main_accepts_prepare_only_keyword():
     """The template invokes prepare via a dedicated binary, but the param is
     the contract seam. If a refactor drops/renames it, prepare silently
@@ -51,12 +68,50 @@ def test_prepare_sync_translates_main_return_to_exit_code(returned, expected_cod
         called["prepare_only"] = prepare_only
         return returned
 
-    with mock.patch.object(main_mod, "main", fake_main):
-        with pytest.raises(SystemExit) as exc:
-            main_mod.prepare_sync()
+    import os
+    # prepare_sync writes MOLECULE_RUNTIME_PREPARE_ONLY into the REAL process
+    # env (in production it runs in its own subprocess so that never leaks to
+    # the serve; in-test it would leak into other tests, e.g. boot_step_emit's).
+    # Restore it around this test.
+    _saved = os.environ.pop("MOLECULE_RUNTIME_PREPARE_ONLY", None)
+    try:
+        with mock.patch.object(main_mod, "main", fake_main):
+            with pytest.raises(SystemExit) as exc:
+                main_mod.prepare_sync()
 
-    assert called["prepare_only"] is True
-    assert exc.value.code == expected_code
+        assert called["prepare_only"] is True
+        assert exc.value.code == expected_code
+        # review wf_3a7b849d #7: prepare_sync couples the adapter env to the
+        # param at the source, so the binary is self-sufficient (the adapter
+        # probe-skip fires even if a caller forgets to export the env).
+        assert os.environ.get("MOLECULE_RUNTIME_PREPARE_ONLY") == "1"
+    finally:
+        os.environ.pop("MOLECULE_RUNTIME_PREPARE_ONLY", None)
+        if _saved is not None:
+            os.environ["MOLECULE_RUNTIME_PREPARE_ONLY"] = _saved
+
+
+def test_prepare_sync_bounds_with_internal_deadline(monkeypatch):
+    """review wf_3a7b849d #15: prepare_sync must impose its OWN deadline so a
+    hung caller (no external timeout) cannot wedge boot forever — on timeout it
+    exits non-zero (fell short) so the caller falls back."""
+    import asyncio as _asyncio
+
+    monkeypatch.setenv("MOLECULE_RUNTIME_PREPARE_DEADLINE_SECS", "0.2")
+    monkeypatch.delenv("MOLECULE_RUNTIME_PREPARE_ONLY", raising=False)
+
+    async def hang(prepare_only=False):
+        await _asyncio.sleep(10)  # exceeds the 0.2s deadline
+        return 0
+
+    try:
+        with mock.patch.object(main_mod, "main", hang):
+            with pytest.raises(SystemExit) as exc:
+                main_mod.prepare_sync()
+        assert exc.value.code == 1, "a prepare that blows its deadline must exit non-zero (fall back), not hang"
+    finally:
+        import os
+        os.environ.pop("MOLECULE_RUNTIME_PREPARE_ONLY", None)
 
 
 def test_prepare_sync_propagates_setup_exception():
