@@ -133,10 +133,12 @@ Re-vendoring (instance):
 ## credentials.contract.json
 
 Source: molecule-ai-sdk `contracts/credentials/credentials.contract.json`.
-Source commit: `2ed68a2b9fdf2b540d9e1d9e1670e92c22a53c0a` (sdk#127 — declares
-the route-scoped production promotion capability and forbids it on tenant
-workspace, platform-box, and concierge surfaces).
-Vendored at SDK main: `afd26e5f427cd2631ce5d1635f2c6a1540b96926`.
+Source commit: `1250c4664bf98d7632830f4e58bfe6d064470f5b` (docs — rewords the
+`tenant-url` routing notes to drop the retired Core hermes-channel reference;
+no structural change. Prior: `2ed68a2b` sdk#127 — declares the route-scoped
+production promotion capability and forbids it on tenant workspace,
+platform-box, and concierge surfaces).
+Vendored at SDK main: `aa5089209f6e2fdd4c94a8acb73b7d0c69e28199`.
 This is the root-level credential/privilege SSOT.
 
 Why vendored: `tests/test_privileged_mcp_env.py` asserts `privileged_mcp_env`
