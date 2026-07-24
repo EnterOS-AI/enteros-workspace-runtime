@@ -167,6 +167,15 @@ def emit_boot_step(
         if status not in _VALID_STATUSES:
             logger.debug("emit_boot_step: dropping invalid status %r", status)
             return
+        # Prepare mode (review wf_3a7b849d #4): molecule-runtime-prepare runs
+        # main() through steps 1-4 BEFORE the real serve does, so without this
+        # guard every prepared boot double-emits those steps — the canvas
+        # progress bar visibly resets to 1/8 mid-boot and operator tooling
+        # counting boot-step events misreads a healthy boot as a restart.
+        # prepare_sync sets this env at the source, so the real serve (a
+        # separate process without it) still emits normally.
+        if os.environ.get("MOLECULE_RUNTIME_PREPARE_ONLY") == "1":
+            return
         if not _is_concierge():
             # Ordinary tenant boot — don't spam the endpoint.
             return
