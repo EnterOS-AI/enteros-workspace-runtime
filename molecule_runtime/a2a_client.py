@@ -593,6 +593,63 @@ def normalize_a2a_message_send_params(
 # All OUTBOUND construction goes through ``build_message_send_params``.
 _A2A_COMPAT_TYPES_MODULE = "a2a.compat.v0_3.types"
 
+# --- Self-turn session convergence -----------------------------------------
+# Every turn the runtime sends to ITSELF (idle / harvester / delegation-result /
+# cron / scheduler / goal-nudge / lifecycle boot + reprovision wake) carries a
+# ``source_type`` in ``params.metadata`` whose value starts with this prefix.
+# a2a_executor.py owns the canonical A2A_SOURCE_SELF_* constants + the routine
+# drop set; here we only need the shared PREFIX (import-free to avoid an
+# a2a_executor<->a2a_client cycle) to recognise "this is a self-turn".
+_A2A_SOURCE_TYPE_KEY = "source_type"
+_SELF_SOURCE_TYPE_PREFIX = "self-"
+
+# Env the platform MAY set to hand the runtime the authoritative default-session
+# id; absent it we derive the same value the platform's canvasSessionContextID
+# produces (see below).
+_DEFAULT_SESSION_CONTEXT_ID_ENV = "MOLECULE_DEFAULT_SESSION_CONTEXT_ID"
+
+
+def default_self_turn_context_id() -> str:
+    """The stable per-workspace session id a self-originated turn lands in.
+
+    This MUST equal the platform's ``canvasSessionContextID(workspace_id)`` —
+    ``"canvas-" + workspace_id`` (workspace-server
+    ``internal/handlers/a2a_proxy.go``) — so a runtime self-wake and the
+    platform's own restart / first-boot turns all share ONE session with the
+    user's canvas conversation. Without it, a self-turn is POSTed to the local
+    executor with NO ``contextId``, the a2a-sdk mints a FRESH ``context_id`` per
+    turn, and ``TracingExecutor`` (which reads ``session_id`` from
+    ``context.context_id``) files every idle / harvester / delegation-result /
+    boot self-wake under its own throwaway Langfuse session — the "session keeps
+    changing after a restart / plugin install" fragmentation.
+
+    The platform may override the exact id via
+    ``MOLECULE_DEFAULT_SESSION_CONTEXT_ID`` (so this convention has ONE authority
+    if it ever moves); absent the override we derive ``canvas-<WORKSPACE_ID>``.
+    Returns ``""`` when neither is available (unit/CLI) — the caller then leaves
+    ``contextId`` unset, preserving legacy behaviour.
+    """
+    override = os.environ.get(_DEFAULT_SESSION_CONTEXT_ID_ENV, "").strip()
+    if override:
+        return override
+    ws = os.environ.get("WORKSPACE_ID", "").strip()
+    return f"canvas-{ws}" if ws else ""
+
+
+def _metadata_is_self_source(metadata: dict[str, Any] | None) -> bool:
+    """True when ``metadata`` marks the send as a runtime self-turn.
+
+    Keyed on the ``self-`` ``source_type`` prefix so EVERY current and future
+    self-* kind converges automatically (no per-kind allowlist to keep in sync).
+    Peer delegations (``parent_task_id`` / ``source_workspace_id`` metadata) and
+    user/canvas sends carry no ``self-`` source_type, so they are untouched and
+    keep minting their own per-conversation context.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    st = metadata.get(_A2A_SOURCE_TYPE_KEY)
+    return isinstance(st, str) and st.startswith(_SELF_SOURCE_TYPE_PREFIX)
+
 
 def _build_message_send_params_from_model(
     text: str,
@@ -601,6 +658,7 @@ def _build_message_send_params_from_model(
     message_id: str,
     metadata: dict[str, Any] | None,
     attachments: list[dict[str, Any]] | None,
+    context_id: str | None = None,
 ):
     """Construct the real a2a-sdk ``MessageSendParams`` and dump it.
 
@@ -635,7 +693,13 @@ def _build_message_send_params_from_model(
     # by_alias → camelCase wire field names (messageId, etc.);
     # exclude_none → omit unset optionals so the body matches what the
     # hand-rolled fallback produces byte-for-byte where they overlap.
-    return params.model_dump(by_alias=True, exclude_none=True)
+    dumped = params.model_dump(by_alias=True, exclude_none=True)
+    # Stamp contextId post-dump (not via the Message constructor) so we do not
+    # depend on the compat model's field-name-vs-alias population rules — the
+    # wire key is always the camelCase ``contextId`` the receiver reads.
+    if context_id:
+        dumped.setdefault("message", {})["contextId"] = context_id
+    return dumped
 
 
 def build_message_send_params(
@@ -645,6 +709,7 @@ def build_message_send_params(
     message_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    context_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a schema-valid outbound ``message/send`` ``params`` body.
 
@@ -661,6 +726,15 @@ def build_message_send_params(
         each ``attachments`` entry becomes a ``FilePart``.
       * ``metadata`` — passed through as the sibling ``params.metadata``
         when supplied (e.g. delegation's ``parent_task_id`` chain).
+      * ``contextId`` — session id stamped on ``params.message``. An explicit
+        ``context_id`` always wins; otherwise, when ``metadata`` marks this as a
+        runtime self-turn (``source_type`` starts with ``self-``), it defaults
+        to :func:`default_self_turn_context_id` so idle / harvester /
+        delegation-result / boot / reprovision self-wakes converge on the
+        workspace's stable session instead of each minting a throwaway one
+        (Langfuse session fragmentation across restart / plugin install). Peer
+        and user sends carry no self-``source_type`` and are left unstamped, so
+        they keep their own per-conversation context.
 
     When a2a-sdk is installed (CI + the workspace image) the body is
     GENERATED FROM the real Pydantic model so it cannot drift from the
@@ -673,12 +747,19 @@ def build_message_send_params(
     if not message_id:
         message_id = str(uuid.uuid4())
 
+    # An explicit contextId wins; otherwise a self-turn inherits the stable
+    # default session so its trace groups with the canvas conversation.
+    effective_context_id = context_id
+    if not effective_context_id and _metadata_is_self_source(metadata):
+        effective_context_id = default_self_turn_context_id()
+
     from_model = _build_message_send_params_from_model(
         text,
         role=role,
         message_id=message_id,
         metadata=metadata,
         attachments=attachments,
+        context_id=effective_context_id,
     )
     if from_model is not None:
         return from_model
@@ -693,9 +774,10 @@ def build_message_send_params(
     # Typed against the SSOT contract (molecule-contracts A2aEnvelopeRequestParams)
     # for drift-prevention; the wire shape is unchanged and still flows through
     # normalize_a2a_message_send_params below.
-    raw: A2aEnvelopeRequestParams = {
-        "message": {"role": role, "messageId": message_id, "parts": parts}
-    }
+    message: dict[str, Any] = {"role": role, "messageId": message_id, "parts": parts}
+    if effective_context_id:
+        message["contextId"] = effective_context_id
+    raw: A2aEnvelopeRequestParams = {"message": message}
     if metadata is not None:
         raw["metadata"] = metadata
     return normalize_a2a_message_send_params(raw)

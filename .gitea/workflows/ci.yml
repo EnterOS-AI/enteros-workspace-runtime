@@ -106,6 +106,21 @@ jobs:
         # backlog; a restart does not re-deliver.
         run: pytest -v -rs tests/test_heartbeat_harvest_active_await.py tests/test_heartbeat_notify_routing.py
 
+      - name: Run session-continuity convergence gate
+        # Loud, merge-blocking gate for the user expectation (2026-07-24):
+        # "across any reason a workspace restarts or a plugin is installed, the
+        # session stays the same." Every runtime self-wake (idle / harvester /
+        # delegation-result / cron / scheduler / goal-nudge / boot initial_prompt
+        # + reprovision announce) is POSTed via build_message_send_params; before
+        # the fix it carried NO contextId, so the a2a-sdk minted a fresh
+        # context_id per tick and TracingExecutor filed each under its own
+        # throwaway Langfuse session (the "sessions still fragment after a plugin
+        # install" report). This pins BOTH halves end-to-end — the builder stamps
+        # canvas-<ws> on any self-* turn, and a self-wake + a canvas turn emit ONE
+        # session_id. Runtime-agnostic (fix lives in molecule_runtime → all
+        # adapters). -rs so a mis-collect surfaces loudly instead of green-passing.
+        run: pytest -v -rs tests/test_self_turn_session_convergence.py
+
   responsiveness-e2e:
     # Deterministic, merge-BLOCKING integration gate for the "busy agent
     # becomes unreachable / blocks ~300s" regression class (2026-06-10).
