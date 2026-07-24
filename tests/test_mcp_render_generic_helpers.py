@@ -157,3 +157,21 @@ def test_probe_failure_not_fatal_on_ordinary_workspace(monkeypatch):
 
     monkeypatch.delenv(PLATFORM_AGENT_IMAGE_ENV, raising=False)
     assert _probe_wiring_failure_is_fatal() is False
+
+
+def test_render_json_write_is_atomic_no_temp_leftover(tmp_path):
+    """review wf_3a7b849d #8: the config write goes through a temp+rename so a
+    mid-write SIGKILL can't leave a torn config.yaml. After a normal write the
+    target holds valid JSON and NO sibling .tmp.* file is left behind."""
+    settings = tmp_path / "config.json"
+    mcp_render.render_json_mcp_servers(settings, "svc", {"command": "sh"})
+    # target parses as JSON (not torn) ...
+    data = json.loads(settings.read_text())
+    assert data["mcpServers"]["svc"] == {"command": "sh"}
+    # ... and the atomic temp was renamed away, not orphaned.
+    leftovers = [p.name for p in tmp_path.iterdir() if ".tmp." in p.name]
+    assert leftovers == [], f"atomic-write temp file(s) left behind: {leftovers}"
+    # A second write (rename over an existing target) still leaves none.
+    mcp_render.render_json_mcp_servers(settings, "svc2", {"url": "http://x/mcp"})
+    assert [p.name for p in tmp_path.iterdir() if ".tmp." in p.name] == []
+    assert set(json.loads(settings.read_text())["mcpServers"]) == {"svc", "svc2"}
