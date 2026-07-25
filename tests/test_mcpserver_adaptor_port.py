@@ -21,6 +21,7 @@ from molecule_runtime.plugins_registry.builtins import (
     MCPServerAdaptor,
     _PRIVILEGED_MCP_PLUGIN,
     _read_mcp_descriptor,
+    _resolve_mcp_secret_refs,
 )
 from molecule_runtime.plugins_registry.protocol import InstallContext
 from molecule_runtime.adapter_base import PrivilegedPluginInstallError
@@ -299,3 +300,70 @@ async def test_uninstall_leaves_non_self_entry_in_place(tmp_path):
 
     # untouched — the intentionally-not-removed behavior for non-self entries
     assert mcp_render.read_json_mcp_servers(settings)["image-gen"] == {"command": "npx", "args": ["gen"]}
+
+
+# --- ${secret:NAME} declarative env binding -------------------------------------
+
+
+def test_secret_ref_resolves_from_lookup():
+    """`${secret:NAME}` is replaced with the resolved value; input not mutated."""
+    spec = {"command": "python", "env": {"ODOO_API_KEY": "${secret:ODOO_API_KEY}"}}
+    out = _resolve_mcp_secret_refs(spec, lookup={"ODOO_API_KEY": "real-key-123"}.get)
+    assert out["env"] == {"ODOO_API_KEY": "real-key-123"}
+    assert spec["env"]["ODOO_API_KEY"] == "${secret:ODOO_API_KEY}"  # not mutated
+
+
+def test_secret_ref_missing_secret_drops_key():
+    """An unresolved `${secret:...}` is DROPPED (not passed as a literal) so the
+    server can fall back to its own resolution (e.g. an audience:self self-fetch)."""
+    spec = {"env": {"ODOO_API_KEY": "${secret:ODOO_API_KEY}", "KEEP": "x"}}
+    out = _resolve_mcp_secret_refs(spec, lookup=lambda n: None)
+    assert out["env"] == {"KEEP": "x"}
+
+
+def test_secret_ref_leaves_bare_var_and_literals_untouched():
+    """Only the explicit sigil resolves; bare `${VAR}`, literals, non-strings pass
+    through (backward compatible with the hermes `${VAR}` passthrough)."""
+    spec = {"env": {"BARE": "${ODOO_API_KEY}", "LIT": "http://x:8069", "N": 1}}
+    out = _resolve_mcp_secret_refs(spec, lookup=lambda n: "SHOULD_NOT_APPEAR")
+    assert out["env"] == {"BARE": "${ODOO_API_KEY}", "LIT": "http://x:8069", "N": 1}
+
+
+def test_secret_ref_no_env_is_noop():
+    spec = {"command": "python", "args": ["s.py"]}
+    assert _resolve_mcp_secret_refs(spec, lookup=lambda n: "x") == spec
+
+
+@pytest.mark.asyncio
+async def test_install_resolves_secret_refs_in_env(tmp_path, monkeypatch):
+    """End to end: install() resolves `${secret:NAME}` from the workspace env
+    (os.environ) BEFORE the spec reaches register_mcp_server — so every runtime,
+    including the claude-code JSON adapter that does not expand ${VAR}, receives
+    the real value. Literals are left untouched."""
+    monkeypatch.setenv("ODOO_API_KEY", "env-secret-xyz")
+    root = tmp_path / "plugin"
+    root.mkdir()
+    (root / "plugin.yaml").write_text(
+        "name: demo-mcp\n"
+        "version: 0.1.0\n"
+        "description: demo\n"
+        "contributes:\n"
+        "  mcpServers:\n"
+        "    - name: demo-mcp\n"
+        "      command: python\n"
+        "      args: [server.py]\n"
+        "      env:\n"
+        '        ODOO_API_KEY: "${secret:ODOO_API_KEY}"\n'
+        '        ODOO_BASE_URL: "http://odoo:8069"\n'
+    )
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    calls = []
+    ctx = _ctx(root, configs, lambda n, s: calls.append((n, s)))
+
+    await MCPServerAdaptor("demo-mcp", "claude_code").install(ctx)
+
+    assert len(calls) == 1
+    _name, spec = calls[0]
+    assert spec["env"]["ODOO_API_KEY"] == "env-secret-xyz"      # resolved from os.environ
+    assert spec["env"]["ODOO_BASE_URL"] == "http://odoo:8069"   # literal untouched
