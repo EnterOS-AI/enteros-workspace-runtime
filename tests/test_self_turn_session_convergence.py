@@ -93,6 +93,14 @@ class _Msg:
         self.metadata = metadata
 
 
+# WHERE the sdk surfaces source_type. Production self-sends stamp it on the
+# ENVELOPE (MessageSendParams(metadata=...)) and build the Message with NO
+# metadata, so on the wire it arrives as context.metadata (the "envelope"
+# placement) — that is the branch real self-wakes take. We also cover the
+# message-level placement so both branches of the extraction ladder are guarded.
+_PLACEMENTS = ("envelope", "message")
+
+
 class _Queue:
     def __init__(self):
         self.events = []
@@ -114,11 +122,18 @@ class _Inner:
 class _Ctx:
     """A RequestContext-shaped stand-in. context_id is what the a2a-sdk minted
     for THIS turn (self-wakes get their own, distinct from canvas-<ws>);
-    message.metadata.source_type is the self/peer marker the sdk surfaces."""
+    source_type is placed exactly where the sdk surfaces it — on the ENVELOPE
+    (context.metadata, the production self-send shape) by default, or on
+    message.metadata when placement="message"."""
 
-    def __init__(self, text, context_id, source_type=None):
+    def __init__(self, text, context_id, source_type=None, placement="envelope"):
         md = {"source_type": source_type} if source_type is not None else None
-        self.message = _Msg(text, md)
+        if placement == "message":
+            self.message = _Msg(text, md)
+            self.metadata = None
+        else:  # "envelope" — production: message carries NO metadata
+            self.message = _Msg(text, None)
+            self.metadata = md
         self.context_id = context_id
 
 
@@ -130,10 +145,10 @@ def _reset_tracing():
     tracing._client = None
 
 
-def _emit_session(monkeypatch, *, context_id, source_type):
+def _emit_session(monkeypatch, *, context_id, source_type, placement="envelope"):
     calls = _install_fake_langfuse(monkeypatch)
     wrapped = tracing.wrap_executor(_Inner(), WS, "m")
-    asyncio.run(wrapped.execute(_Ctx("tick", context_id, source_type), _Queue()))
+    asyncio.run(wrapped.execute(_Ctx("tick", context_id, source_type, placement), _Queue()))
     assert tracing._drain(), "off-loop trace worker did not finish"
     assert calls["trace"], "no trace emitted"
     return calls["trace"][0]["session_id"]
@@ -141,13 +156,16 @@ def _emit_session(monkeypatch, *, context_id, source_type):
 
 # --- convergence: every self-wake traces into the canvas session ---------------
 
+@pytest.mark.parametrize("placement", _PLACEMENTS)
 @pytest.mark.parametrize("source_type", SELF_WAKE_SOURCE_TYPES)
-def test_self_wake_with_its_own_context_traces_into_canvas_session(monkeypatch, source_type):
+def test_self_wake_with_its_own_context_traces_into_canvas_session(monkeypatch, source_type, placement):
     # The self-wake ran on its OWN minted context_id (NOT canvas-<ws>) — proving
     # routing stays independent — yet its trace is filed under canvas-<ws>.
-    own_ctx = f"ctx-{source_type}-9f3a1b"
+    # Swept over BOTH metadata placements; "envelope" is the real production
+    # shape (context.metadata), the branch the previous test never exercised.
+    own_ctx = f"ctx-{source_type}-{placement}-9f3a1b"
     assert own_ctx != CANVAS_SESSION
-    assert _emit_session(monkeypatch, context_id=own_ctx, source_type=source_type) == CANVAS_SESSION
+    assert _emit_session(monkeypatch, context_id=own_ctx, source_type=source_type, placement=placement) == CANVAS_SESSION
 
 
 def test_scheduler_lane_converges_even_though_it_bypasses_the_builder(monkeypatch):

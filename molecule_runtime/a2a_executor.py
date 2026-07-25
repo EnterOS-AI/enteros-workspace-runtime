@@ -65,6 +65,8 @@ from molecule_runtime.executor_helpers import (
     error_detail_for_external,
     ensure_tool_activity_file,
     extract_attached_files,
+    get_message_metadata as _shared_get_message_metadata,
+    get_message_source_type as _shared_get_message_source_type,
     read_delegation_results,
     sanitize_agent_error,
     task_state_value,
@@ -275,21 +277,12 @@ _ROUTINE_SELF_MESSAGE_PREFIXES = (
 )
 
 
-def _get_message_metadata(context: RequestContext) -> dict | None:
-    """Return the inbound A2A envelope's metadata dict, if any."""
-    metadata = None
-    message = getattr(context, "message", None)
-    if message is not None:
-        metadata = getattr(message, "metadata", None)
-    if metadata is None:
-        metadata = getattr(context, "metadata", None)
-    return metadata if isinstance(metadata, dict) else None
-
-
-def _get_message_source_type(context: RequestContext) -> str | None:
-    """Return the typed source_type marker from the inbound A2A envelope, if any."""
-    metadata = _get_message_metadata(context)
-    return metadata.get(A2A_MESSAGE_SOURCE_TYPE) if metadata is not None else None
+# The inbound-metadata extraction ladder is the SSOT in executor_helpers (shared
+# with tracing's self-wake session convergence so the two never diverge on where
+# source_type is read — review wf_99182e6f). These thin aliases keep the local
+# call sites unchanged.
+_get_message_metadata = _shared_get_message_metadata
+_get_message_source_type = _shared_get_message_source_type
 
 
 # Metadata key the trigger daemon attaches (SDK scaffold) so the runtime can

@@ -739,6 +739,38 @@ def extract_message_text(message: Any) -> str:
     return _canonical_extract_message_text(message)
 
 
+# --- inbound A2A envelope metadata / source_type (SSOT extraction) -----------
+# The typed marker key a self/system turn stamps in its A2A metadata. Kept here
+# (a leaf helper module, imported by both a2a_executor and tracing) so the ONE
+# ladder that reads it lives in one place — a2a_executor uses it for the
+# drop/replay-guard decision, tracing uses it for self-wake session convergence,
+# and they can never diverge on WHERE source_type is read (review wf_99182e6f).
+A2A_MESSAGE_SOURCE_TYPE_KEY = "source_type"
+
+
+def get_message_metadata(context: Any) -> dict | None:
+    """Return the inbound A2A envelope's metadata dict, or None.
+
+    Reads ``message.metadata`` first, then falls back to the envelope-level
+    ``context.metadata``. The runtime's own self-sends stamp ``source_type`` on
+    the ENVELOPE (``MessageSendParams(metadata=...)``) with no message-level
+    metadata, so the fallback branch is the one production self-wakes actually
+    take — both branches are load-bearing."""
+    metadata = None
+    message = getattr(context, "message", None)
+    if message is not None:
+        metadata = getattr(message, "metadata", None)
+    if metadata is None:
+        metadata = getattr(context, "metadata", None)
+    return metadata if isinstance(metadata, dict) else None
+
+
+def get_message_source_type(context: Any) -> str | None:
+    """Return the typed ``source_type`` marker from the inbound A2A envelope."""
+    metadata = get_message_metadata(context)
+    return metadata.get(A2A_MESSAGE_SOURCE_TYPE_KEY) if metadata is not None else None
+
+
 # Word-boundary patterns for subprocess stderr classification. Using word
 # boundaries avoids false positives like "author" matching "auth" or
 # "generate" matching "rate".
