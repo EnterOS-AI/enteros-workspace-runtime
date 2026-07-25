@@ -409,29 +409,23 @@ def _self_wake_session_id(context: Any, workspace_id: str) -> str:
     """Return the workspace's canvas session id when ``context`` is a runtime
     self-wake, else ``""``.
 
-    Reads the inbound turn's ``source_type`` (message.metadata first, then the
-    envelope metadata — the same order a2a_executor._get_message_source_type
-    uses) and, for a ``self-*`` turn, returns ``"canvas-<workspace_id>"`` — the
-    SAME id core stamps on canvas / restart / first-boot turns
-    (workspace-server internal/sessionid.DefaultContextID and the a2a proxy
-    belt). That makes a self-wake's TRACE join the user's Langfuse session while
-    its routing context_id stays independent. Empty workspace id (unit/CLI) or a
+    Reads the inbound turn's ``source_type`` via the SSOT extraction ladder
+    (executor_helpers.get_message_source_type — the SAME one a2a_executor's
+    drop/replay guard uses, so trace convergence and routing can never disagree
+    on where source_type lives). For a ``self-*`` turn returns
+    ``"canvas-<workspace_id>"`` — which MUST equal core's
+    sessionid.DefaultContextID (workspace-server internal/sessionid) and the a2a
+    proxy belt, so a self-wake's TRACE joins the user's Langfuse session while its
+    routing context_id stays independent. Empty workspace id (unit/CLI) or a
     non-self turn yields ``""`` so the caller keeps the a2a context_id.
     """
     if not workspace_id:
         return ""
-    metadata = None
     try:
-        message = getattr(context, "message", None)
-        if message is not None:
-            metadata = getattr(message, "metadata", None)
-        if not isinstance(metadata, dict):
-            metadata = getattr(context, "metadata", None)
+        from molecule_runtime.executor_helpers import get_message_source_type
+        source_type = get_message_source_type(context)
     except Exception:
-        metadata = None
-    if not isinstance(metadata, dict):
-        return ""
-    source_type = metadata.get("source_type")
+        source_type = None
     if isinstance(source_type, str) and source_type.startswith(_SELF_WAKE_SOURCE_PREFIX):
         return "canvas-" + workspace_id
     return ""
