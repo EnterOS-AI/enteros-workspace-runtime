@@ -1,33 +1,28 @@
 """Session convergence across restart / plugin-install / every self-wake.
 
 THE expectation this pins (user, 2026-07-24): *across any reason a workspace
-restarts or a plugin is installed, the agent's session stays the same* — one
-Langfuse session, not a fresh one per boot / harvester / idle / delegation-result
-tick.
+restarts or a plugin is installed, the agent's Langfuse session stays the same* —
+one session, not a fresh one per boot / harvester / idle / delegation-result /
+scheduler tick.
 
-Why this file exists — the gap a prior CI missed
-=================================================
-The platform (workspace-server) stamps ``contextId = canvas-<ws>`` on its OWN
-self-turns (restart-context, first-boot) and its session-continuity test proves
-that. But the *runtime's* own self-wakes (idle loop, delegation harvester, cron,
-scheduler, goal-nudge, boot ``initial_prompt`` + reprovision announcement) are
-POSTed to the LOCAL executor via ``build_message_send_params`` — which, before
-this fix, set NO ``contextId``. The a2a-sdk then minted a FRESH ``context_id``
-per self-wake, and ``TracingExecutor`` (session_id = ``context.context_id``)
-filed each under its own throwaway Langfuse session. That is the "sessions still
-turn into different sessions after a plugin install" fragmentation — and no
-prior test exercised the runtime self-wake path, so it slipped through.
+Design (corrected after the xhigh review, wf_fbccb212)
+======================================================
+Session convergence is decoupled from turn ROUTING. A runtime self-wake keeps its
+OWN a2a ``context_id`` so the non-blocking inbox schedules it independently (it is
+never fast-ack+dropped against, nor defers, the user's in-flight canvas turn, and
+never compacts the shared thread). Only the Langfuse *trace* ``session_id`` is
+converged, in ``tracing.TracingExecutor``: a turn whose ``source_type`` starts
+with ``self-`` is filed under ``canvas-<wsid>`` regardless of its context_id.
 
-The two halves the convergence needs, tested end-to-end here:
-  1. SEND side — ``build_message_send_params`` stamps the stable
-     ``canvas-<ws>`` contextId on any self-* turn (:func:`test_*_stamps_*`).
-  2. TRACE side — ``TracingExecutor`` turns that contextId into the trace
-     session_id, so a self-wake and a canvas turn land in ONE session
-     (:func:`test_self_wake_and_canvas_turn_share_one_session`).
+Because the convergence reads the INBOUND ``RequestContext`` (not the outbound
+builder), it is builder-agnostic — it also covers the trigger/scheduler SDK lane
+(``channel_sdk.build_trigger_message_send_request``) that never routes through
+``build_message_send_params``. That was the live regression the previous,
+builder-side approach missed.
 
-Runtime-agnostic by construction: the fix lives in ``molecule_runtime`` (shared
-by every runtime adapter — hermes / openclaw / codex / …), so this guards all of
-them, not just hermes.
+Runtime-agnostic: the convergence lives in shared ``molecule_runtime.tracing``
+(the single funnel every adapter's executor is wrapped in), so it guards hermes /
+openclaw / codex / claude-code alike.
 """
 import asyncio
 import sys
@@ -36,100 +31,26 @@ import types
 import pytest
 
 from molecule_runtime import tracing
-from molecule_runtime.a2a_client import (
-    build_message_send_params,
-    default_self_turn_context_id,
-)
+from molecule_runtime.a2a_client import build_message_send_params
 
 WS = "ea3cfcf1-cb9c-53b4-90fd-c53123569c4a"
 CANVAS_SESSION = f"canvas-{WS}"
 
-# Every self-wake reason the runtime injects. Each MUST converge on canvas-<ws>.
-# (The literal strings are the source_type markers a2a_executor stamps; kept as
-# literals here so this test does not depend on importing the full a2a-sdk to
-# read the A2A_SOURCE_SELF_* constants in the stub unit-test env.)
+# Every self-wake reason the runtime injects. Each must TRACE into canvas-<ws>,
+# INCLUDING self-scheduler — whose production turns are built by the trigger SDK
+# lane, not build_message_send_params (the exact path the old fix missed).
 SELF_WAKE_SOURCE_TYPES = [
     "self-idle",              # idle self-wake (main._run_idle_loop)
     "self-harvester",         # heartbeat delegation-results harvester
     "self-delegation-result", # mailbox-kernel delegation harvest turn
     "self-cron",              # platform cron self-tick
-    "self-scheduler",         # mailbox scheduler tick
+    "self-scheduler",         # trigger-daemon / mailbox scheduler tick (SDK lane)
     "self-goal-nudge",        # goal / plan re-engagement nudge
     "self-lifecycle",         # boot initial_prompt + reprovision-wake announce
 ]
 
 
-@pytest.fixture(autouse=True)
-def _ws_env(monkeypatch):
-    monkeypatch.setenv("WORKSPACE_ID", WS)
-    monkeypatch.delenv("MOLECULE_DEFAULT_SESSION_CONTEXT_ID", raising=False)
-    yield
-
-
-# --- SEND side: the canonical builder stamps the stable session ----------------
-
-@pytest.mark.parametrize("source_type", SELF_WAKE_SOURCE_TYPES)
-def test_self_wake_stamps_stable_canvas_context_id(source_type):
-    params = build_message_send_params(
-        "wake up and check your work",
-        metadata={"source_type": source_type},
-    )
-    assert params["message"].get("contextId") == CANVAS_SESSION, (
-        f"{source_type} self-wake did not converge on the canvas session — it "
-        f"would fragment into a fresh Langfuse session on every tick"
-    )
-
-
-def test_future_self_prefixed_kind_also_converges():
-    """Any NEW self-* kind converges automatically — the rule keys on the
-    ``self-`` prefix, not a per-kind allowlist that a future sender could miss."""
-    params = build_message_send_params("x", metadata={"source_type": "self-brand-new"})
-    assert params["message"].get("contextId") == CANVAS_SESSION
-
-
-def test_peer_delegation_send_is_not_stamped():
-    """A delegation to a PEER (parent_task_id metadata, no self- source_type)
-    keeps its own per-conversation context — converging it would drag peer
-    traffic into the human's session."""
-    params = build_message_send_params(
-        "do this task",
-        metadata={"parent_task_id": "t-1", "source_workspace_id": WS},
-    )
-    assert "contextId" not in params["message"]
-
-
-def test_plain_user_send_is_not_stamped():
-    params = build_message_send_params("hello")
-    assert "contextId" not in params["message"]
-
-
-def test_explicit_context_id_wins_over_self_default():
-    """A caller-supplied contextId (e.g. a user's rotated New-Session id threaded
-    through) is never overridden by the self-turn default."""
-    params = build_message_send_params(
-        "x", metadata={"source_type": "self-idle"}, context_id="sess-rotated-123"
-    )
-    assert params["message"].get("contextId") == "sess-rotated-123"
-
-
-def test_no_workspace_id_leaves_context_unset(monkeypatch):
-    """Unit/CLI with no WORKSPACE_ID must not stamp a nonsense ``canvas-`` id —
-    it leaves contextId unset (legacy behaviour), never ``canvas-``."""
-    monkeypatch.delenv("WORKSPACE_ID", raising=False)
-    assert default_self_turn_context_id() == ""
-    params = build_message_send_params("x", metadata={"source_type": "self-idle"})
-    assert "contextId" not in params["message"]
-
-
-def test_platform_override_env_is_authoritative(monkeypatch):
-    """If the platform hands the runtime the authoritative default-session id, it
-    wins over the derived canvas-<ws> — so the convention has ONE authority."""
-    monkeypatch.setenv("MOLECULE_DEFAULT_SESSION_CONTEXT_ID", "canvas-override-xyz")
-    params = build_message_send_params("x", metadata={"source_type": "self-harvester"})
-    assert params["message"].get("contextId") == "canvas-override-xyz"
-
-
-# --- TRACE side + end-to-end convergence ---------------------------------------
+# --- fakes ---------------------------------------------------------------------
 
 def _install_fake_langfuse(monkeypatch):
     calls = {"trace": [], "flush": 0}
@@ -191,12 +112,13 @@ class _Inner:
 
 
 class _Ctx:
-    """A RequestContext-shaped stand-in that carries the a2a context_id the
-    same way the sdk surfaces it (built FROM the message.contextId the sender
-    stamped)."""
+    """A RequestContext-shaped stand-in. context_id is what the a2a-sdk minted
+    for THIS turn (self-wakes get their own, distinct from canvas-<ws>);
+    message.metadata.source_type is the self/peer marker the sdk surfaces."""
 
-    def __init__(self, text, context_id, metadata=None):
-        self.message = _Msg(text, metadata)
+    def __init__(self, text, context_id, source_type=None):
+        md = {"source_type": source_type} if source_type is not None else None
+        self.message = _Msg(text, md)
         self.context_id = context_id
 
 
@@ -208,44 +130,77 @@ def _reset_tracing():
     tracing._client = None
 
 
-def _emit_session_for_self_turn(monkeypatch, source_type):
-    """Full path: build the self-turn params (SEND side) → feed its stamped
-    contextId into a RequestContext → run TracingExecutor → return the emitted
-    trace session_id (TRACE side)."""
+def _emit_session(monkeypatch, *, context_id, source_type):
     calls = _install_fake_langfuse(monkeypatch)
-    params = build_message_send_params("tick", metadata={"source_type": source_type})
-    stamped = params["message"]["contextId"]  # what the sdk will set context_id to
     wrapped = tracing.wrap_executor(_Inner(), WS, "m")
-    asyncio.run(wrapped.execute(_Ctx("tick", stamped), _Queue()))
+    asyncio.run(wrapped.execute(_Ctx("tick", context_id, source_type), _Queue()))
     assert tracing._drain(), "off-loop trace worker did not finish"
     assert calls["trace"], "no trace emitted"
     return calls["trace"][0]["session_id"]
 
 
+# --- convergence: every self-wake traces into the canvas session ---------------
+
 @pytest.mark.parametrize("source_type", SELF_WAKE_SOURCE_TYPES)
-def test_every_self_wake_traces_into_the_canvas_session(monkeypatch, source_type):
-    assert _emit_session_for_self_turn(monkeypatch, source_type) == CANVAS_SESSION
+def test_self_wake_with_its_own_context_traces_into_canvas_session(monkeypatch, source_type):
+    # The self-wake ran on its OWN minted context_id (NOT canvas-<ws>) — proving
+    # routing stays independent — yet its trace is filed under canvas-<ws>.
+    own_ctx = f"ctx-{source_type}-9f3a1b"
+    assert own_ctx != CANVAS_SESSION
+    assert _emit_session(monkeypatch, context_id=own_ctx, source_type=source_type) == CANVAS_SESSION
+
+
+def test_scheduler_lane_converges_even_though_it_bypasses_the_builder(monkeypatch):
+    # Regression guard for the xhigh-review finding: self-scheduler turns are
+    # built by the trigger SDK (no contextId stamped) and mint their own
+    # context_id. Convergence is builder-agnostic (trace-side), so they STILL
+    # land in the canvas session.
+    assert _emit_session(monkeypatch, context_id="ctx-trigger-daemon-tick", source_type="self-scheduler") == CANVAS_SESSION
+
+
+def test_future_self_prefixed_kind_also_converges(monkeypatch):
+    assert _emit_session(monkeypatch, context_id="ctx-brand-new", source_type="self-brand-new") == CANVAS_SESSION
+
+
+def test_canvas_turn_traces_under_its_own_context(monkeypatch):
+    # A real canvas turn already carries contextId=canvas-<ws> (belt/client) and
+    # no self- source_type: it traces under that id — same session as the wakes.
+    assert _emit_session(monkeypatch, context_id=CANVAS_SESSION, source_type=None) == CANVAS_SESSION
+
+
+def test_peer_turn_keeps_its_own_session(monkeypatch):
+    # A peer-agent turn is NOT a self-wake: it must keep its own per-conversation
+    # session, never be dragged into the human's canvas session.
+    assert _emit_session(monkeypatch, context_id="peer-conv-abc", source_type="peer") == "peer-conv-abc"
 
 
 def test_self_wake_and_canvas_turn_share_one_session(monkeypatch):
-    """THE end-to-end guarantee: a canvas user turn (contextId injected by the
-    platform belt = canvas-<ws>) and a runtime self-wake (any reason) emit the
-    SAME Langfuse session_id — so a restart / plugin-install / idle tick never
-    starts a new session."""
+    """THE end-to-end guarantee: a canvas user turn and a runtime self-wake (on
+    its own distinct context_id) emit the SAME Langfuse session_id — so a
+    restart / plugin-install / idle / scheduler tick never starts a new session."""
     calls = _install_fake_langfuse(monkeypatch)
     wrapped = tracing.wrap_executor(_Inner(), WS, "m")
-
-    # 1) A canvas turn as the platform belt delivers it.
-    asyncio.run(wrapped.execute(_Ctx("hi from canvas", CANVAS_SESSION), _Queue()))
-    # 2) A self-wake, built through the real sender then traced.
-    self_params = build_message_send_params(
-        "delegation results are ready", metadata={"source_type": "self-delegation-result"}
-    )
-    asyncio.run(wrapped.execute(_Ctx("results", self_params["message"]["contextId"]), _Queue()))
+    asyncio.run(wrapped.execute(_Ctx("hi from canvas", CANVAS_SESSION, None), _Queue()))
+    asyncio.run(wrapped.execute(_Ctx("results", "ctx-self-wake-xyz", "self-delegation-result"), _Queue()))
     assert tracing._drain(), "off-loop trace worker did not finish"
-
     sessions = {t["session_id"] for t in calls["trace"]}
-    assert sessions == {CANVAS_SESSION}, (
-        f"canvas turn and self-wake landed in different sessions: {sessions} — "
-        f"the fragmentation this fix closes"
+    assert sessions == {CANVAS_SESSION}, f"self-wake and canvas turn diverged: {sessions}"
+
+
+# --- routing decoupling: the builder must NOT stamp contextId ------------------
+
+@pytest.mark.parametrize("source_type", SELF_WAKE_SOURCE_TYPES)
+def test_builder_does_not_stamp_contextid_on_self_turns(source_type):
+    # The convergence is trace-side ONLY. build_message_send_params must leave
+    # contextId UNSET so every self-wake keeps its own routing context (the fix
+    # for the fast-ack-drop / canvas-deferral regressions).
+    params = build_message_send_params("wake", metadata={"source_type": source_type})
+    assert "contextId" not in params["message"], (
+        f"{source_type}: builder must not stamp contextId — self-wakes keep their "
+        f"own routing context; convergence is trace-side only"
     )
+
+
+def test_builder_does_not_stamp_contextid_on_plain_send():
+    params = build_message_send_params("hello")
+    assert "contextId" not in params["message"]

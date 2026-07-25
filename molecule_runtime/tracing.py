@@ -398,6 +398,45 @@ except Exception:  # pragma: no cover
     _AgentExecutor = object  # type: ignore
 
 
+# Runtime self-wake source types are stamped as ``params.metadata.source_type``
+# and all begin with this prefix (a2a_executor.A2A_SOURCE_SELF_*). Matching on
+# the prefix keeps this builder-agnostic and future-proof without importing the
+# heavy a2a_executor module (which would risk an import cycle).
+_SELF_WAKE_SOURCE_PREFIX = "self-"
+
+
+def _self_wake_session_id(context: Any, workspace_id: str) -> str:
+    """Return the workspace's canvas session id when ``context`` is a runtime
+    self-wake, else ``""``.
+
+    Reads the inbound turn's ``source_type`` (message.metadata first, then the
+    envelope metadata — the same order a2a_executor._get_message_source_type
+    uses) and, for a ``self-*`` turn, returns ``"canvas-<workspace_id>"`` — the
+    SAME id core stamps on canvas / restart / first-boot turns
+    (workspace-server internal/sessionid.DefaultContextID and the a2a proxy
+    belt). That makes a self-wake's TRACE join the user's Langfuse session while
+    its routing context_id stays independent. Empty workspace id (unit/CLI) or a
+    non-self turn yields ``""`` so the caller keeps the a2a context_id.
+    """
+    if not workspace_id:
+        return ""
+    metadata = None
+    try:
+        message = getattr(context, "message", None)
+        if message is not None:
+            metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = getattr(context, "metadata", None)
+    except Exception:
+        metadata = None
+    if not isinstance(metadata, dict):
+        return ""
+    source_type = metadata.get("source_type")
+    if isinstance(source_type, str) and source_type.startswith(_SELF_WAKE_SOURCE_PREFIX):
+        return "canvas-" + workspace_id
+    return ""
+
+
 class TracingExecutor(_AgentExecutor):  # type: ignore[misc]
     """Wraps an adapter's executor and emits one Langfuse trace per turn.
 
@@ -432,6 +471,22 @@ class TracingExecutor(_AgentExecutor):  # type: ignore[misc]
             )
         except Exception:
             pass
+        # Self-wake session convergence (the "sessions fragment after a restart /
+        # plugin install" fix). A runtime self-wake (idle / harvester /
+        # delegation-result / cron / scheduler / goal-nudge / lifecycle) runs on
+        # its OWN minted context_id so the non-blocking inbox schedules it
+        # independently — it must NOT share the canvas contextId, or a self-wake
+        # would be fast-ack+dropped against, or defer, the user's in-flight canvas
+        # turn (and could compact the shared thread). But its TRACE must still
+        # join the workspace's canvas session so autonomous work doesn't open a
+        # throwaway Langfuse session per tick. So we converge only the trace
+        # session_id here, decoupled from routing. Reading the inbound
+        # RequestContext's source_type makes this builder-agnostic: it also
+        # covers self-turn lanes that never touch build_message_send_params (the
+        # trigger/scheduler SDK).
+        self_session = _self_wake_session_id(context, self._wsid)
+        if self_session:
+            session_id = self_session
         try:
             return await self._inner.execute(context, cap)
         finally:
