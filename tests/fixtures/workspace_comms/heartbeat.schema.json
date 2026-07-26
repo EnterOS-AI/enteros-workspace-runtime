@@ -74,6 +74,14 @@
         "first_ready_at": {
           "type": "string",
           "description": "EV2: RFC3339 timestamp of the FIRST `tools/list` success that set mcp_tools_ready=true. Optional (`,omitempty`), observability/latency only (provisioning->ready wall-clock); consumers MUST NOT gate on it. Absent until the first probe success, then stable across subsequent beats."
+        },
+        "observed_generation": {
+          "type": "integer",
+          "description": "Optional (facts-up). The runtime echoing the last desired-state generation it has reconciled (k8s-style observedGeneration). Core compares it to the desired-state `generation` it hands down in the heartbeat response to know whether the runtime has applied the current wake-lifecycle intent. Absent from runtimes that predate the versioned-heartbeat contract."
+        },
+        "schema_version": {
+          "type": "string",
+          "description": "Optional (facts-up). The heartbeat-envelope version the runtime speaks, so core can detect a runtime on an older/newer wire contract and adapt. Lives on the `request` body (the actual wire payload), NOT the test-validation wrapper. Absent from runtimes that predate the versioned-heartbeat contract."
         }
       }
     },
@@ -91,6 +99,10 @@
         "platform_inbound_secret": {
           "type": "string",
           "description": "Optional. The shared inbound-signing secret, re-delivered (lazy-healed) on the beat so volume-less SaaS workspaces can re-populate /configs/.platform_inbound_secret mid-life. Omitted when the heal read is empty/errors (fail-open)."
+        },
+        "generation": {
+          "type": "integer",
+          "description": "Optional (desired-state-down). Core's current desired-state generation for this workspace's wake-lifecycle (k8s-style, monotonically bumped on each intent change). The runtime echoes it back as request.observed_generation once reconciled, closing the versioned-heartbeat loop. Omitted on beats that carry no desired-state generation."
         }
       }
     }
