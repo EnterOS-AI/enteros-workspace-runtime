@@ -74,6 +74,14 @@
         "first_ready_at": {
           "type": "string",
           "description": "EV2: RFC3339 timestamp of the FIRST `tools/list` success that set mcp_tools_ready=true. Optional (`,omitempty`), observability/latency only (provisioning->ready wall-clock); consumers MUST NOT gate on it. Absent until the first probe success, then stable across subsequent beats."
+        },
+        "observed_generation": {
+          "type": "integer",
+          "description": "Facts-up (k8s observedGeneration): the last desired-state `generation` the runtime has reconciled — i.e. the newest `response.generation` it has caught up to. Echoes the last-seen desired-state generation so core can tell which desired-state the runtime is on. Optional; 0 when none seen yet."
+        },
+        "schema_version": {
+          "type": "string",
+          "description": "Facts-up: the heartbeat envelope version the runtime speaks (HEARTBEAT_SCHEMA_VERSION). Optional; lets core reason about producer capability across a rolling upgrade."
         }
       }
     },
@@ -91,6 +99,10 @@
         "platform_inbound_secret": {
           "type": "string",
           "description": "Optional. The shared inbound-signing secret, re-delivered (lazy-healed) on the beat so volume-less SaaS workspaces can re-populate /configs/.platform_inbound_secret mid-life. Omitted when the heal read is empty/errors (fail-open)."
+        },
+        "generation": {
+          "type": "integer",
+          "description": "Desired-state-down (k8s-style): core's CURRENT desired-state generation. The runtime captures it as the last-seen desired-state generation and echoes it back as `request.observed_generation` on the next beat. Optional; absent means core is not (yet) publishing a generation."
         }
       }
     }
