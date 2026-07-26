@@ -1035,6 +1035,19 @@ def cli_main(transport: str = "stdio", port: int = 9100) -> None:  # pragma: no 
 
 
 if __name__ == "__main__":  # pragma: no cover
+    # Standalone entry (start.sh's `python3 -m molecule_runtime.a2a_mcp_server
+    # --transport http --port 9100`). This process's root logger is otherwise
+    # unconfigured, so logger.info/.debug here and in every helper this module
+    # imports (inbox.py, mcp_tools, …) is silently dropped — never reaching the
+    # log file start.sh mirrors to stdout. Mirrors main.py's bootstrap so this
+    # process's logs actually land somewhere. No-op when imported as a library
+    # into an already-configured process.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            stream=sys.stdout,
+        )
     parser = argparse.ArgumentParser(description="A2A MCP Server")
     parser.add_argument(
         "--transport",
