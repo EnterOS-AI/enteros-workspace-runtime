@@ -1352,3 +1352,120 @@ async def test_preemption_yields_idle_turn_and_runs_queued_user_message(monkeypa
     # is cleared at turn end.
     assert entry.in_flight_source_type is None
     assert entry.preempt_requested is False
+
+
+@pytest.mark.asyncio
+async def test_natural_drain_carrying_preempt_resets_flags_and_honors_stop(monkeypatch):
+    """Re-review race: a request_interrupt (user-preempts-idle) lands just as
+    the idle stream is naturally closing, so the loop exits via
+    StopAsyncIteration (with _stopped == False) BEFORE the interrupt-check and
+    the queued user message is drained by the NATURAL-COMPLETION block rather
+    than the _stopped preempt handler.
+
+    The natural-drain restart block must mirror the _stopped handler's flag
+    resets (in_flight_source_type -> None, preempt_requested -> False) BEFORE
+    restarting; otherwise the leaked idle-turn flags corrupt the restarted
+    (now-user) turn: (a) a later explicit Stop is mis-read as a preempt
+    (stop-means-stop violated), and (b) a further POST wrongly preempts the
+    in-flight user turn (in_flight_source_type stuck at self-idle).
+    """
+    from molecule_runtime.a2a_executor import (
+        A2A_MESSAGE_SOURCE_TYPE,
+        A2A_SOURCE_SELF_IDLE,
+        RuntimeA2AExecutor,
+    )
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-natural-drain-preempt"
+    captured_messages: list[list] = []
+    # Snapshot of the inbox flags as observed FROM the restarted (turn-2) turn.
+    restarted_flags: dict = {}
+
+    async def _agent_astream(payload, **_kwargs):
+        captured_messages.append(list(payload["messages"]))
+        entry = get_inbox().peek(context_id)
+        assert entry is not None
+        if len(captured_messages) == 1:
+            # Idle turn is running. Emit ONE event, then simulate a
+            # request_interrupt that lands AS the stream naturally closes:
+            # request_interrupt queues the user message + sets preempt +
+            # interrupt_event, but because it runs in the same __anext__ that
+            # then raises StopAsyncIteration, the per-event interrupt check
+            # never fires. The loop exits natural (_stopped == False) and the
+            # queued message is drained by the natural-completion block WHILE
+            # carrying a preempt.
+            yield {"event": "on_chat_model_start", "run_id": "r1", "data": {}}
+            entry.request_interrupt("user: answer me now")
+            # generator ends here -> StopAsyncIteration on next pull.
+        elif len(captured_messages) == 2:
+            # RESTARTED (now-user) turn. Capture the flag state the restart
+            # left behind: after the fix these mirror the _stopped handler.
+            restarted_flags["in_flight_source_type"] = entry.in_flight_source_type
+            restarted_flags["preempt_requested"] = entry.preempt_requested
+            yield {"event": "on_chat_model_start", "run_id": "r2", "data": {}}
+            # A user message arrives during this turn (deferred, no interrupt),
+            # then an explicit STOP (cancel(): interrupt_event, NO preempt).
+            entry.defer_message("user: second message")
+            entry.interrupt_event.set()
+            # One more event so the per-event interrupt check fires -> _stopped.
+            yield {"event": "on_chat_model_start", "run_id": "r2", "data": {}}
+        else:
+            # Turn 3 must NOT run: an explicit Stop terminates ("stop means
+            # stop"). Reaching here proves a leaked preempt_requested caused the
+            # Stop to be mis-read as a preempt and restarted.
+            yield {"event": "on_chat_model_end", "run_id": "r3", "data": {"output": None}}
+
+    agent = MagicMock()
+    agent.astream_events = _agent_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater",
+        lambda *a, **kw: fake_updater,
+    )
+
+    # First turn is a self-idle turn (records in_flight_source_type=self-idle).
+    ctx = _build_context(
+        "idle tick",
+        context_id,
+        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
+    )
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    await executor._core_execute(ctx, event_queue)
+
+    # The idle turn yielded and a SECOND astream ran with the user message
+    # merged in — the natural-drain-carrying-a-preempt path restarted the loop.
+    assert len(captured_messages) >= 2
+    second_history = captured_messages[1]
+    human_msgs = [content for role, content in second_history if role == "human"]
+    assert human_msgs == ["idle tick", "user: answer me now"], (
+        f"Preempted user message must run, not be discarded: {human_msgs!r}"
+    )
+
+    # (fix) The natural-drain restart reset BOTH flags before restarting, so the
+    # restarted (now-user) turn no longer sees the leaked idle-turn state.
+    assert restarted_flags["in_flight_source_type"] is None, (
+        "natural-drain restart must reset in_flight_source_type to None "
+        "(mirror the _stopped handler) so a further POST does not user-preempt-user"
+    )
+    assert restarted_flags["preempt_requested"] is False, (
+        "natural-drain restart must reset preempt_requested to False "
+        "(mirror the _stopped handler) so a later Stop is not mis-read as a preempt"
+    )
+
+    # (fix) With preempt_requested reset, the explicit Stop on the restarted
+    # turn TERMINATES it — no turn 3 — even though a message was queued. Leaked
+    # preempt_requested would have restarted (stop-means-stop violated).
+    assert len(captured_messages) == 2, (
+        "explicit Stop must terminate the restarted turn (stop means stop); "
+        f"a 3rd turn means a leaked preempt restarted a Stop: {captured_messages!r}"
+    )
+    entry = get_inbox().peek(context_id)
+    assert entry.turn_in_flight is False
+    assert entry.in_flight_source_type is None
+    assert entry.preempt_requested is False

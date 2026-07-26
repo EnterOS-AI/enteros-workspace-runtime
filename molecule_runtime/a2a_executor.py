@@ -1047,6 +1047,18 @@ class RuntimeA2AExecutor(AgentExecutor):
                         _pending = _inbox_entry.consume_pending()
                         if not _pending:
                             break
+                        # Re-review race fix: a request_interrupt (user-preempts-idle)
+                        # can land just as the idle stream naturally closes, so the loop
+                        # exits via StopAsyncIteration/natural break (with _stopped == False)
+                        # and the queued user message is drained HERE rather than by the
+                        # _stopped preempt handler. Mirror that handler's flag resets
+                        # (see ~:1010 and ~:1023) BEFORE restarting so the leaked idle-turn
+                        # flags don't corrupt the restarted (now-user) turn: without this a
+                        # later explicit Stop is mis-read as a preempt (stop-means-stop
+                        # violated) and a 2nd user POST wrongly preempts the in-flight user
+                        # turn (in_flight_source_type stuck at self-idle).
+                        _inbox_entry.in_flight_source_type = None
+                        _inbox_entry.preempt_requested = False
                         _partial = "".join(accumulated).strip()
                         if _partial:
                             messages.append(("ai", _partial))
