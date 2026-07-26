@@ -220,10 +220,18 @@ A2A_MESSAGE_SOURCE_TYPE = "source_type"
 A2A_SOURCE_SELF_CRON = "self-cron"
 A2A_SOURCE_SELF_HARVESTER = "self-harvester"
 # Idle self-wake (main.py _run_idle_loop): periodically re-pokes the agent
-# while the workspace is idle. Marked as a routine self-ping so (a) it drops
-# rather than queues behind an in-flight turn, and (b) its output is subject
-# to the autonomous-loop replay guard — the idle self-wake was the driver of
-# the 2026-06-29 runaway delegation-result replay incident.
+# while the workspace is idle. RFC §5.5 (the one-line agent model): idle runs
+# ON the canvas routing context (poster stamps context_id=canvas-<wsid>), NOT a
+# detached minted context — it is the agent's own low-priority work on its
+# single execution line. It stays a routine self-ping here so:
+#   (a) when idle ARRIVES while a turn is already in flight (a user turn, or a
+#       prior idle tick) it drops rather than queues — idle recurs next cycle,
+#       so nothing is lost and we never stack idle behind live work; AND
+#   (b) its output is subject to the autonomous-loop replay guard — the idle
+#       self-wake drove the 2026-06-29 runaway delegation-result replay incident.
+# The REVERSE direction (a user turn arriving while an idle turn is in flight)
+# is handled by CORE PREEMPTION, not here: workspace-server interrupts the
+# in-flight self-idle turn so the user turn runs immediately (highest priority).
 A2A_SOURCE_SELF_IDLE = "self-idle"
 
 # Mailbox-kernel autonomous self-turn kinds (native default-ON since 2026-07-13;
@@ -249,12 +257,16 @@ A2A_SOURCE_SELF_LIFECYCLE = "self-lifecycle"
 
 # Routine self-pings the runtime sends to ITSELF: the platform cron tick, the
 # heartbeat delegation-results harvester, and the idle self-wake. Under the
-# non-blocking fast-path these must NOT queue behind (or interrupt) a long
-# in-flight turn — the cron/idle recur every cycle and delegation results are
-# injected from DELEGATION_RESULTS_FILE at the next turn, so dropping a
-# mid-turn routine ping loses nothing while avoiding both task-interruption
-# and ping pile-up. These are also the ONLY turns the autonomous-loop replay
-# guard governs — a user-directed turn is never suppressed.
+# non-blocking fast-path, when ONE OF THESE ARRIVES while a turn is already in
+# flight it must NOT queue behind (or interrupt) that turn — the cron/idle
+# recur every cycle and delegation results are injected from
+# DELEGATION_RESULTS_FILE at the next turn, so dropping a mid-turn routine ping
+# loses nothing while avoiding both task-interruption and ping pile-up. (This
+# governs the INCOMING-ping direction only. It does NOT stop a user turn from
+# preempting an in-flight IDLE turn — that reverse-direction preemption is
+# driven by core, which interrupts the self-idle turn so the user runs now.)
+# These are also the ONLY turns the autonomous-loop replay guard governs — a
+# user-directed turn is never suppressed.
 _ROUTINE_SELF_SOURCE_TYPES = (
     A2A_SOURCE_SELF_CRON,
     A2A_SOURCE_SELF_HARVESTER,
@@ -265,6 +277,26 @@ _ROUTINE_SELF_SOURCE_TYPES = (
     A2A_SOURCE_SELF_DELEGATION,
     A2A_SOURCE_SELF_LIFECYCLE,
 )
+
+# Every typed ``self-*`` marker the runtime stamps on a turn it sends to
+# ITSELF. A message carrying one of these is a SELF turn; anything else —
+# most importantly a MISSING marker — is a NON-self USER turn. The rule-3
+# idle-preemption decision reads this to guarantee ONLY user turns preempt
+# an in-flight self-idle turn (self never preempts, user never preempts
+# user). Kept as a frozenset of the routine-self constants plus a
+# ``self-`` prefix fallback so a future self-* kind added to the constants
+# above is treated as self here even before it is registered.
+_SELF_SOURCE_TYPES = frozenset(_ROUTINE_SELF_SOURCE_TYPES)
+
+
+def _is_self_source_type(source_type: str | None) -> bool:
+    """True iff ``source_type`` marks one of the runtime's own self-* turns.
+
+    A ``None`` marker (the common case for a user message) is NOT self.
+    """
+    if source_type is None:
+        return False
+    return source_type in _SELF_SOURCE_TYPES or source_type.startswith("self-")
 
 # Deprecated text-prefix fallback. Wording drift has already been observed
 # (cron ticks no longer start with the registered literal), so new senders
@@ -564,14 +596,44 @@ class RuntimeA2AExecutor(AgentExecutor):
                             context_id,
                         )
                     else:
-                        logger.info(
-                            "A2A execute: turn in flight for context_id=%s — deferring "
-                            "new message (process after current turn)",
-                            context_id,
+                        _content = build_user_content_with_files(
+                            user_input, _attached_files
                         )
-                        _accepted = _inbox_entry.defer_message(
-                            build_user_content_with_files(user_input, _attached_files)
+                        # ── Rule-3 idle preemption (context-scoped, RUNTIME-side) ──
+                        # A NON-self (user) message arriving while the in-flight
+                        # turn ON THIS CONTEXT is a self-idle turn INTERRUPTS the
+                        # idle turn (request_interrupt sets interrupt_event) so the
+                        # user turn runs immediately — highest priority. Every other
+                        # case keeps the "queue, don't break" default (defer_message):
+                        #   • user during a USER turn  -> defer (never user-preempts-user)
+                        #   • idle/self during any turn -> already dropped above (routine
+                        #     self-ping) — self never preempts
+                        #   • idle during a USER turn  -> dropped above (routine)
+                        # Detecting in-flight self-idle: the executor records the
+                        # running turn's source_type on the inbox entry when it
+                        # starts (see turn_in_flight below); incoming self-ness is
+                        # read from THIS request's source_type marker.
+                        _incoming_is_self = _is_self_source_type(
+                            _get_message_source_type(context)
                         )
+                        _in_flight_is_idle = (
+                            _inbox_entry.in_flight_source_type == A2A_SOURCE_SELF_IDLE
+                        )
+                        if _in_flight_is_idle and not _incoming_is_self:
+                            logger.info(
+                                "A2A execute: user message arrived during in-flight "
+                                "self-idle turn for context_id=%s — PREEMPTING idle "
+                                "(request_interrupt; user turn runs now)",
+                                context_id,
+                            )
+                            _accepted = _inbox_entry.request_interrupt(_content)
+                        else:
+                            logger.info(
+                                "A2A execute: turn in flight for context_id=%s — deferring "
+                                "new message (process after current turn)",
+                                context_id,
+                            )
+                            _accepted = _inbox_entry.defer_message(_content)
                         if not _accepted:
                             # Inbox at capacity — emit structured backpressure so
                             # the caller can retry rather than silently dropping.
@@ -595,6 +657,11 @@ class RuntimeA2AExecutor(AgentExecutor):
                     )
                     return ""
                 _inbox_entry.turn_in_flight = True
+                # Record the STARTING turn's source_type so a follow-on POST
+                # can decide rule-3 preemption (user preempts an in-flight
+                # self-idle turn). None for an untyped user turn.
+                _inbox_entry.in_flight_source_type = _get_message_source_type(context)
+                _inbox_entry.preempt_requested = False
 
             # Turn-lease activity watcher handle (MUST-FIX 1/3). Initialized
             # here — before anything in the try body can raise — so the finally
@@ -917,12 +984,56 @@ class RuntimeA2AExecutor(AgentExecutor):
                                     last_ai_message = output
 
                         if _stopped:
-                            # Explicit Stop mid-turn — terminate, do NOT restart. Discard
-                            # any queued messages (stop means stop); cancel() emits the
-                            # terminal CANCELED event.
-                            if _inbox_entry is not None:
+                            # interrupt_event fired mid-turn. Two reasons, told
+                            # apart by the preempt_requested flag (set ONLY by
+                            # request_interrupt, never by cancel()/Stop):
+                            #
+                            #   (a) Idle PREEMPTION (rule-3): a higher-priority
+                            #       user message was queued via request_interrupt
+                            #       while a self-idle turn ran. Yield the idle turn
+                            #       and run the queued user message(s) NOW as the
+                            #       next turn — do NOT discard them.
+                            #   (b) Explicit STOP (cancel()/tasks-cancel): nothing
+                            #       was queued as a preemption. Terminate, do NOT
+                            #       restart, discard the queue ("stop means stop");
+                            #       cancel() emits the terminal CANCELED event.
+                            _preempt = (
+                                _inbox_entry is not None
+                                and _inbox_entry.preempt_requested
+                            )
+                            _preempt_pending = (
                                 _inbox_entry.consume_pending()
-                            break
+                                if _inbox_entry is not None
+                                else []
+                            )
+                            if _inbox_entry is not None:
+                                _inbox_entry.preempt_requested = False
+                            if not (_preempt and _preempt_pending):
+                                # Explicit Stop (or nothing to run) — terminate.
+                                break
+                            logger.info(
+                                "A2A execute: self-idle turn preempted for "
+                                "context_id=%s — running %d queued user message(s) now",
+                                context_id, len(_preempt_pending),
+                            )
+                            # The in-flight turn is now a USER turn, not idle —
+                            # update the recorded source_type so a further POST
+                            # does NOT mistake this for an idle turn and
+                            # user-preempt-user.
+                            _inbox_entry.in_flight_source_type = None
+                            _partial = "".join(accumulated).strip()
+                            if _partial:
+                                messages.append(("ai", _partial))
+                                _inbox_entry.last_accumulated = _partial
+                            for _m in _preempt_pending:
+                                messages.append(("human", _m))
+                            # Reset stream state for the restart so artifact IDs
+                            # and token accumulators don't bleed across.
+                            accumulated.clear()
+                            current_run_id = None
+                            artifact_id = str(uuid.uuid4())
+                            has_streamed = False
+                            continue
 
                         if _inbox_entry is None:
                             # Non-blocking off — single turn, no deferral.
@@ -936,6 +1047,18 @@ class RuntimeA2AExecutor(AgentExecutor):
                         _pending = _inbox_entry.consume_pending()
                         if not _pending:
                             break
+                        # Re-review race fix: a request_interrupt (user-preempts-idle)
+                        # can land just as the idle stream naturally closes, so the loop
+                        # exits via StopAsyncIteration/natural break (with _stopped == False)
+                        # and the queued user message is drained HERE rather than by the
+                        # _stopped preempt handler. Mirror that handler's flag resets
+                        # (see ~:1010 and ~:1023) BEFORE restarting so the leaked idle-turn
+                        # flags don't corrupt the restarted (now-user) turn: without this a
+                        # later explicit Stop is mis-read as a preempt (stop-means-stop
+                        # violated) and a 2nd user POST wrongly preempts the in-flight user
+                        # turn (in_flight_source_type stuck at self-idle).
+                        _inbox_entry.in_flight_source_type = None
+                        _inbox_entry.preempt_requested = False
                         _partial = "".join(accumulated).strip()
                         if _partial:
                             messages.append(("ai", _partial))
@@ -1217,6 +1340,10 @@ class RuntimeA2AExecutor(AgentExecutor):
                 if _inbox_entry is not None:
                     _inbox_entry.turn_in_flight = False
                     _inbox_entry.interrupt_event.clear()
+                    # Clear the rule-3 preemption bookkeeping so a stale
+                    # source_type / preempt flag can't leak into the next turn.
+                    _inbox_entry.in_flight_source_type = None
+                    _inbox_entry.preempt_requested = False
 
         return _result
 
