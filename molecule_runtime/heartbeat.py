@@ -198,6 +198,15 @@ def _persist_inbound_secret_from_heartbeat(resp) -> None:
         )
 
 
+# Versioned-heartbeat / generation contract (facts-up / desired-state-down),
+# matched byte-for-byte against SDK #169 which adds the same three optional
+# fields to the workspace-comms SSOT schema. HEARTBEAT_SCHEMA_VERSION is the
+# heartbeat envelope version this runtime speaks; emitted on every beat as
+# request.schema_version so core can reason about producer capability across a
+# rolling upgrade. Bump when the envelope shape changes in a way core must
+# branch on.
+HEARTBEAT_SCHEMA_VERSION = "1"
+
 HEARTBEAT_INTERVAL = 30  # seconds — fallback default when no per-instance value is passed
 MAX_CONSECUTIVE_FAILURES = 10
 # Cap (seconds) for the exponential backoff applied after a heartbeat failure.
@@ -451,6 +460,14 @@ class HeartbeatLoop:
         # mailbox kernel is on (else _is_harvested/_commit_harvested are no-ops).
         self._harvest_tombstones: set[tuple[str, str]] = set()
         self._harvest_tombstones_loaded = False
+        # Versioned-heartbeat / generation contract (consumer half). The last
+        # desired-state generation core published in a heartbeat RESPONSE
+        # (`response.generation`), captured in-memory. Echoed back as
+        # `request.observed_generation` on the next beat so core can see which
+        # desired-state the runtime has caught up to (k8s observedGeneration).
+        # CAPTURE-ONLY for now: default 0 = "no generation seen yet"; wiring it
+        # into actual reconcile behavior is a later step.
+        self._last_seen_generation = 0
 
     @property
     def error_rate(self) -> float:
@@ -516,6 +533,34 @@ class HeartbeatLoop:
             logger.debug("heartbeat: is_busy probe failed; reporting not-busy")
             return False
 
+    def _capture_generation_from_heartbeat(self, resp) -> None:
+        """Capture the desired-state ``generation`` from a heartbeat response.
+
+        Consumer half of the versioned-heartbeat / generation contract
+        (desired-state-down). Core's heartbeat ack MAY carry ``generation`` =
+        its CURRENT desired-state generation (k8s-style). We persist it
+        IN-MEMORY as the last-seen desired-state generation so the NEXT beat
+        echoes it back as ``request.observed_generation`` and core can tell
+        which desired-state the runtime has caught up to.
+
+        CAPTURE-ONLY for now: wiring the generation into actual reconcile
+        behavior is a later step. Best-effort — a non-JSON body, a missing /
+        non-int ``generation`` field, or any error leaves the last-seen value
+        unchanged (the echo simply stays put). ``bool`` is explicitly rejected
+        (it is an ``int`` subclass in Python, and a JSON ``true`` is never a
+        generation).
+        """
+        try:
+            body = resp.json()
+        except Exception:
+            return
+        if not isinstance(body, dict):
+            return
+        gen = body.get("generation")
+        if isinstance(gen, bool) or not isinstance(gen, int):
+            return
+        self._last_seen_generation = gen
+
     def _send_heartbeat(self, client: httpx.Client) -> None:
         """Send one alive-signal heartbeat POST (sync). Runs on the dedicated
         OS thread. Mirrors the original async POST: same /registry/heartbeat
@@ -542,6 +587,12 @@ class HeartbeatLoop:
             "is_busy": self._is_busy(),
             "current_task": self.current_task,
             "uptime_seconds": int(time.time() - self.start_time),
+            # Versioned-heartbeat / generation contract (facts-up), matched to
+            # SDK #169. schema_version = the envelope version this runtime
+            # speaks; observed_generation = the last desired-state generation
+            # captured from a heartbeat response (0 until core publishes one).
+            "schema_version": HEARTBEAT_SCHEMA_VERSION,
+            "observed_generation": self._last_seen_generation,
             **identity_gate_payload(),
         }
         # #2421: backfill agent_card when the initial register failed. Only
@@ -563,6 +614,9 @@ class HeartbeatLoop:
             self.request_count = 0
             self._consecutive_failures = 0
             _persist_inbound_secret_from_heartbeat(resp)
+            # Consumer half of the generation contract: capture core's
+            # desired-state generation so the next beat echoes it back.
+            self._capture_generation_from_heartbeat(resp)
             return
         except Exception as e:
             # Issue #1877: on 401, re-read the token from disk and retry once.
@@ -586,6 +640,10 @@ class HeartbeatLoop:
                 "is_busy": self._is_busy(),
                 "current_task": self.current_task,
                 "uptime_seconds": int(time.time() - self.start_time),
+                # Versioned-heartbeat / generation contract — kept in sync with
+                # the primary body above (facts-up).
+                "schema_version": HEARTBEAT_SCHEMA_VERSION,
+                "observed_generation": self._last_seen_generation,
                 **identity_gate_payload(),
             }
             if self.agent_card is not None:
@@ -599,6 +657,9 @@ class HeartbeatLoop:
             self._consecutive_failures = 0
             self.request_count += 1
             _persist_inbound_secret_from_heartbeat(retry_resp)
+            # Consumer half of the generation contract (retry path — kept in
+            # sync with the primary path above).
+            self._capture_generation_from_heartbeat(retry_resp)
 
     def _heartbeat_thread_loop(self) -> None:
         """Dedicated-OS-thread alive-signal loop (#2723). Keeps POSTing
