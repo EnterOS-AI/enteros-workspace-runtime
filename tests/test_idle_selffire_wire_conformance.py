@@ -2,12 +2,16 @@
 drive the REAL builders and capture the REAL bytes over real HTTP).
 
 Covers, in one composed flow against a fake platform:
-  * the outgoing message/send payload is framed with <SYSTEM IDLE PROMPT>
-    and stamped source=self-idle;
+  * the outgoing message/send payload is framed with <SYSTEM IDLE PROMPT> +
+    the §5.5 idle behavior contract, and stamped source=self-idle;
+  * RFC §5.5 one-line model: the payload carries message.contextId ==
+    canvas-<wsid> so the idle turn runs on the agent's single canvas execution
+    line (preemptible by a user turn);
   * the identity header inside the digest reports the in-process workspace
     bridge (never "workspace MCP (0)" — send_message_to_user must be listed);
-  * the response body's reply text is forwarded to /notify (the
-    discarded-reply fix), while an (idle) reply is suppressed.
+  * the response body's reply text is forwarded to /notify as the FALLBACK
+    final-reply delivery (the primary §5.5 delivery is the agent's in-turn
+    send_message_to_user self-reports), while an (idle) reply is suppressed.
 """
 
 from __future__ import annotations
@@ -142,6 +146,18 @@ async def test_selffire_wire_roundtrip(fake_platform):
     sent_parts = params["message"]["parts"]
     sent_text = "\n".join(p.get("text", "") for p in sent_parts)
     assert sent_text.startswith(SYSTEM_IDLE_HEADER), sent_text[:80]
+    # RFC §5.5 one-line model: the idle turn runs on the agent's single canvas
+    # execution line — the builder must stamp message.contextId = canvas-<wsid>
+    # (equal to core's sessionid.DefaultContextID) so the turn shares the user's
+    # memory and is preemptible, instead of a detached minted context.
+    assert sent_parts, "no message parts in idle payload"
+    assert params["message"].get("contextId") == f"canvas-{WS}", (
+        f"idle payload must carry canvas contextId, got {params['message'].get('contextId')!r}"
+    )
+    # The §5.5 behavior contract travels WITH the prompt (ack-before-work,
+    # report-per-item, exhaust backlog+goals). Assert the ack directive is
+    # present so the framing can't silently regress to a bare digest.
+    assert "picking up" in sent_text, "idle §5.5 behavior contract (ack) missing from framing"
     # identity header must carry the in-process bridge — the live defect was
     # "workspace MCP (0)" while 30 bridge tools were served in-process. The
     # names line shows only the first 8 alphabetical tools, so assert the

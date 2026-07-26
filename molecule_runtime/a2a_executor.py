@@ -220,10 +220,18 @@ A2A_MESSAGE_SOURCE_TYPE = "source_type"
 A2A_SOURCE_SELF_CRON = "self-cron"
 A2A_SOURCE_SELF_HARVESTER = "self-harvester"
 # Idle self-wake (main.py _run_idle_loop): periodically re-pokes the agent
-# while the workspace is idle. Marked as a routine self-ping so (a) it drops
-# rather than queues behind an in-flight turn, and (b) its output is subject
-# to the autonomous-loop replay guard — the idle self-wake was the driver of
-# the 2026-06-29 runaway delegation-result replay incident.
+# while the workspace is idle. RFC §5.5 (the one-line agent model): idle runs
+# ON the canvas routing context (poster stamps context_id=canvas-<wsid>), NOT a
+# detached minted context — it is the agent's own low-priority work on its
+# single execution line. It stays a routine self-ping here so:
+#   (a) when idle ARRIVES while a turn is already in flight (a user turn, or a
+#       prior idle tick) it drops rather than queues — idle recurs next cycle,
+#       so nothing is lost and we never stack idle behind live work; AND
+#   (b) its output is subject to the autonomous-loop replay guard — the idle
+#       self-wake drove the 2026-06-29 runaway delegation-result replay incident.
+# The REVERSE direction (a user turn arriving while an idle turn is in flight)
+# is handled by CORE PREEMPTION, not here: workspace-server interrupts the
+# in-flight self-idle turn so the user turn runs immediately (highest priority).
 A2A_SOURCE_SELF_IDLE = "self-idle"
 
 # Mailbox-kernel autonomous self-turn kinds (native default-ON since 2026-07-13;
@@ -249,12 +257,16 @@ A2A_SOURCE_SELF_LIFECYCLE = "self-lifecycle"
 
 # Routine self-pings the runtime sends to ITSELF: the platform cron tick, the
 # heartbeat delegation-results harvester, and the idle self-wake. Under the
-# non-blocking fast-path these must NOT queue behind (or interrupt) a long
-# in-flight turn — the cron/idle recur every cycle and delegation results are
-# injected from DELEGATION_RESULTS_FILE at the next turn, so dropping a
-# mid-turn routine ping loses nothing while avoiding both task-interruption
-# and ping pile-up. These are also the ONLY turns the autonomous-loop replay
-# guard governs — a user-directed turn is never suppressed.
+# non-blocking fast-path, when ONE OF THESE ARRIVES while a turn is already in
+# flight it must NOT queue behind (or interrupt) that turn — the cron/idle
+# recur every cycle and delegation results are injected from
+# DELEGATION_RESULTS_FILE at the next turn, so dropping a mid-turn routine ping
+# loses nothing while avoiding both task-interruption and ping pile-up. (This
+# governs the INCOMING-ping direction only. It does NOT stop a user turn from
+# preempting an in-flight IDLE turn — that reverse-direction preemption is
+# driven by core, which interrupts the self-idle turn so the user runs now.)
+# These are also the ONLY turns the autonomous-loop replay guard governs — a
+# user-directed turn is never suppressed.
 _ROUTINE_SELF_SOURCE_TYPES = (
     A2A_SOURCE_SELF_CRON,
     A2A_SOURCE_SELF_HARVESTER,

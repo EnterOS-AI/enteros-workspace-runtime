@@ -267,14 +267,38 @@ class Policy:
 # decision and a static banner must not affect it.
 SYSTEM_IDLE_HEADER = "<SYSTEM IDLE PROMPT>"
 
+# The §5.5 idle behavior contract (RFC concierge, the one-line agent model).
+# Prepended to every idle turn (after the header, before the rendered digest)
+# so the delivery/behavior contract travels WITH the prompt instead of relying
+# on per-provider prose. Transport-layer framing — like the header it is NOT
+# part of any hashed Contribution (a static directive must not affect the
+# fire/delta decision). Kept concise on purpose.
+IDLE_BEHAVIOR_CONTRACT = (
+    "You are idle — there is no active request from the user. This wake is "
+    "LOW-PRIORITY work on your single execution line; a user turn is HIGHEST "
+    "priority and will PREEMPT you mid-work. Triage the top-priority item from "
+    "the digest below (follow the Priorities order; urgent items jump the "
+    "queue). You MAY fan out subagents to work items in parallel. Before you "
+    'start, ACK the user in ONE line — e.g. "No active work from you — I\'m '
+    'picking up: <items>; I\'ll report each as it\'s done." Then report each '
+    "item to the user as you complete it (via send_message_to_user). Keep "
+    "pulling the next item until the backlog AND your long-term goals are "
+    "exhausted, then close out. If there is genuinely nothing to do, reply "
+    "exactly (idle) to send nothing."
+)
+
 
 def frame_idle_prompt(text: str) -> str:
-    """Prepend the system-idle title to a rendered digest / idle prompt.
+    """Prepend the system-idle title + §5.5 behavior contract to a rendered
+    digest / idle prompt.
 
     Idempotent (a text already carrying the header is returned unchanged) so
-    a retried or double-framed post can never stack banners.
+    a retried or double-framed post can never stack banners. The header stays
+    the FIRST line (poster + conformance assertions rely on
+    ``splitlines()[0] == SYSTEM_IDLE_HEADER``); the behavior contract follows,
+    then the rendered digest body.
     """
     body = text or ""
     if body.lstrip().startswith(SYSTEM_IDLE_HEADER):
         return body
-    return f"{SYSTEM_IDLE_HEADER}\n{body}"
+    return f"{SYSTEM_IDLE_HEADER}\n{IDLE_BEHAVIOR_CONTRACT}\n{body}"
