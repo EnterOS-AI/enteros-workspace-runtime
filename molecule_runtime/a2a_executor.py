@@ -267,6 +267,21 @@ A2A_SOURCE_SELF_LIFECYCLE = "self-lifecycle"
 # driven by core, which interrupts the self-idle turn so the user runs now.)
 # These are also the ONLY turns the autonomous-loop replay guard governs — a
 # user-directed turn is never suppressed.
+#
+# SSOT NOTE (RFC follow-up #29): this is a DELIBERATE, narrower GOVERNANCE
+# subset — the markers whose incoming ping DROPS-not-queues and whose output is
+# replay-guarded. It is intentionally DISTINCT from, and MUST NOT be unified
+# with, the platform's 12-marker CLASSIFICATION SSOT defined in the SDK contract
+# (molecule-ai-sdk contracts/workspace-comms/self-source-types.schema.json ->
+# molcontracts.SelfSourceTypes / canvas SELF_SOURCE_TYPES), which answers a
+# different question: "does this render as a system notice instead of a user
+# bubble?". Several classification markers (self-warmup, self-restart-context,
+# self-first-boot-greet, self-stall, self-nudge) are PLATFORM-FIRED inbound
+# wakes the runtime must QUEUE (deliver), not drop — so adding them here would
+# break platform wake delivery. General self-classification here is handled by
+# _is_self_source_type() below via _SELF_SOURCE_TYPES + the ``self-`` prefix
+# fallback, NOT by widening this governance tuple. Do not add markers here to
+# "match" the classification set.
 _ROUTINE_SELF_SOURCE_TYPES = (
     A2A_SOURCE_SELF_CRON,
     A2A_SOURCE_SELF_HARVESTER,
