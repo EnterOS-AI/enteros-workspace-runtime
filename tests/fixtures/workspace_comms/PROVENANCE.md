@@ -9,7 +9,7 @@ be rewritten here):
 
     molecule-ai-sdk/contracts/workspace-comms/{register,heartbeat,a2a-envelope,agent-card}.schema.json
 
-Source commit: `48670cf26706f9a3a547f188e8ef91d438748954` (EV2 — added mcp_tools_ready + first_ready_at to heartbeat.schema.json request; the SDK-owned positive tools-loaded readiness signal, runtime#273 landed the negative half)
+Source commit: `c475a0d729f76fb8c1413a0f8d2b642d29077b6d` (sdk#169 — added observed_generation + schema_version to heartbeat.schema.json request and generation to its response; the versioned-heartbeat / wake-lifecycle generation loop)
 Source repo:   https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:   contracts/workspace-comms/
 

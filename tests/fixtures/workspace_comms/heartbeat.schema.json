@@ -77,11 +77,11 @@
         },
         "observed_generation": {
           "type": "integer",
-          "description": "Facts-up (k8s observedGeneration): the last desired-state `generation` the runtime has reconciled — i.e. the newest `response.generation` it has caught up to. Echoes the last-seen desired-state generation so core can tell which desired-state the runtime is on. Optional; 0 when none seen yet."
+          "description": "Optional (facts-up). The runtime echoing the last desired-state generation it has reconciled (k8s-style observedGeneration). Core compares it to the desired-state `generation` it hands down in the heartbeat response to know whether the runtime has applied the current wake-lifecycle intent. Absent from runtimes that predate the versioned-heartbeat contract."
         },
         "schema_version": {
           "type": "string",
-          "description": "Facts-up: the heartbeat envelope version the runtime speaks (HEARTBEAT_SCHEMA_VERSION). Optional; lets core reason about producer capability across a rolling upgrade."
+          "description": "Optional (facts-up). The heartbeat-envelope version the runtime speaks, so core can detect a runtime on an older/newer wire contract and adapt. Lives on the `request` body (the actual wire payload), NOT the test-validation wrapper. Absent from runtimes that predate the versioned-heartbeat contract."
         }
       }
     },
@@ -102,7 +102,7 @@
         },
         "generation": {
           "type": "integer",
-          "description": "Desired-state-down (k8s-style): core's CURRENT desired-state generation. The runtime captures it as the last-seen desired-state generation and echoes it back as `request.observed_generation` on the next beat. Optional; absent means core is not (yet) publishing a generation."
+          "description": "Optional (desired-state-down). Core's current desired-state generation for this workspace's wake-lifecycle (k8s-style, monotonically bumped on each intent change). The runtime echoes it back as request.observed_generation once reconciled, closing the versioned-heartbeat loop. Omitted on beats that carry no desired-state generation."
         }
       }
     }
