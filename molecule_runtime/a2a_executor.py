@@ -230,8 +230,12 @@ A2A_SOURCE_SELF_HARVESTER = "self-harvester"
 #   (b) its output is subject to the autonomous-loop replay guard — the idle
 #       self-wake drove the 2026-06-29 runaway delegation-result replay incident.
 # The REVERSE direction (a user turn arriving while an idle turn is in flight)
-# is handled by CORE PREEMPTION, not here: workspace-server interrupts the
-# in-flight self-idle turn so the user turn runs immediately (highest priority).
+# is handled RUNTIME-SIDE below (see the "Rule-3 idle preemption" block): this
+# executor calls request_interrupt() on the in-flight self-idle turn so the user
+# turn runs immediately (highest priority). (Core's original tasks/cancel-by-
+# contextId approach — core#4864 — was a verified no-op: the a2a-sdk resolves
+# cancels by task_id, which core cannot supply, so it was closed and the
+# preemption lives entirely here.)
 A2A_SOURCE_SELF_IDLE = "self-idle"
 
 # Mailbox-kernel autonomous self-turn kinds (native default-ON since 2026-07-13;
@@ -264,7 +268,8 @@ A2A_SOURCE_SELF_LIFECYCLE = "self-lifecycle"
 # loses nothing while avoiding both task-interruption and ping pile-up. (This
 # governs the INCOMING-ping direction only. It does NOT stop a user turn from
 # preempting an in-flight IDLE turn — that reverse-direction preemption is
-# driven by core, which interrupts the self-idle turn so the user runs now.)
+# handled RUNTIME-SIDE below: the "Rule-3 idle preemption" block calls
+# request_interrupt on the self-idle turn so the user runs now.)
 # These are also the ONLY turns the autonomous-loop replay guard governs — a
 # user-directed turn is never suppressed.
 #
