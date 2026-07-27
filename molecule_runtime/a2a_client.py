@@ -677,9 +677,9 @@ def build_message_send_params(
     ON that line with the user's shared memory — it is LOW-priority work done
     while quiet, and a returning user turn PREEMPTS it (highest priority). The
     returning-user-vs-in-flight-idle collision the OLD independent context
-    avoided is now handled by CORE PREEMPTION (workspace-server interrupts an
-    in-flight self-idle turn when a user turn arrives), NOT by detaching idle
-    onto its own context. Every OTHER self-wake still passes ``context_id=None``
+    avoided is now handled by RUNTIME-SIDE preemption (a2a_executor's Rule-3
+    block calls request_interrupt on an in-flight self-idle turn when a user
+    turn arrives), NOT by detaching idle onto its own context. Every OTHER self-wake still passes ``context_id=None``
     and keeps its own minted context. Langfuse *session* convergence for
     self-wakes remains trace-side in ``tracing.TracingExecutor`` (session_id
     only), independent of this routing field.

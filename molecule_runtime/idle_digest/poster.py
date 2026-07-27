@@ -10,8 +10,8 @@ One poster call does the complete self-initiated turn round trip:
      ``build_message_send_params`` with the SELF_IDLE source marker AND
      ``context_id=canvas-<wsid>`` (RFC §5.5 one-line model): the idle wake
      runs on the agent's single canvas execution line, sharing memory with the
-     user's turns, and is PREEMPTIBLE by a returning user turn (core interrupts
-     the in-flight self-idle turn);
+     user's turns, and is PREEMPTIBLE by a returning user turn (a2a_executor
+     interrupts the in-flight self-idle turn, runtime-side);
   3. POST it to the platform's ``/workspaces/<id>/a2a`` (blocking urllib in a
      thread-pool executor — unchanged from the original closure);
   4. parse the response body — the agent's reply text — and forward non-empty,
@@ -86,8 +86,8 @@ def make_digest_poster(
                     # the agent's single canvas execution line (shared memory
                     # with the user's turns), NOT a detached minted context. It
                     # is low-priority work done while quiet; a returning user
-                    # turn PREEMPTS it (core interrupts the in-flight self-idle
-                    # turn). ``canvas-<wsid>`` MUST equal core's
+                    # turn PREEMPTS it (a2a_executor interrupts the in-flight
+                    # self-idle turn, runtime-side). ``canvas-<wsid>`` MUST equal core's
                     # sessionid.DefaultContextID / the a2a-proxy canvas belt.
                     context_id=f"canvas-{workspace_id}",
                 ),

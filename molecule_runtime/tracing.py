@@ -480,7 +480,8 @@ class TracingExecutor(_AgentExecutor):  # type: ignore[misc]
         # fast-ack+dropped against, or defer, the user's in-flight canvas turn
         # (and could compact the shared thread). IDLE is the ONE exception (RFC
         # §5.5 one-line model): it deliberately runs ON the canvas routing
-        # context and is preemptible by a user turn (core interrupts it), so its
+        # context and is preemptible by a user turn (a2a_executor interrupts it
+        # runtime-side), so its
         # routing id already IS canvas-<wsid>. Either way its TRACE must join the
         # workspace's canvas session so autonomous work doesn't open a throwaway
         # Langfuse session per tick. So we converge the trace session_id here for
