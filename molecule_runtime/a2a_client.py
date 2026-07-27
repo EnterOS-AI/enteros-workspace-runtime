@@ -601,6 +601,7 @@ def _build_message_send_params_from_model(
     message_id: str,
     metadata: dict[str, Any] | None,
     attachments: list[dict[str, Any]] | None,
+    context_id: str | None = None,
 ):
     """Construct the real a2a-sdk ``MessageSendParams`` and dump it.
 
@@ -630,7 +631,10 @@ def _build_message_send_params_from_model(
             file_obj = t.FileWithUri(**att)
         parts.append(t.Part(root=t.FilePart(file=file_obj)))
 
-    message = t.Message(role=role, messageId=message_id, parts=parts)
+    # contextId is OPT-IN (default None → unset, omitted by exclude_none). Only
+    # the idle self-wake stamps it (canvas-<wsid>) so it runs on the agent's one
+    # execution line; every other self-wake keeps its own minted context.
+    message = t.Message(role=role, messageId=message_id, parts=parts, contextId=context_id)
     params = t.MessageSendParams(message=message, metadata=metadata)
     # by_alias → camelCase wire field names (messageId, etc.);
     # exclude_none → omit unset optionals so the body matches what the
@@ -645,6 +649,7 @@ def build_message_send_params(
     message_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    context_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a schema-valid outbound ``message/send`` ``params`` body.
 
@@ -661,13 +666,23 @@ def build_message_send_params(
         each ``attachments`` entry becomes a ``FilePart``.
       * ``metadata`` — passed through as the sibling ``params.metadata``
         when supplied (e.g. delegation's ``parent_task_id`` chain).
+      * ``context_id`` — OPT-IN. Default ``None`` leaves ``message.contextId``
+        UNSET, preserving today's behavior for every existing caller
+        (delegation harvester, cron, scheduler, goal-nudge, lifecycle,
+        reprovision): those self-wakes keep their OWN minted routing context.
 
-    NOTE: this builder does NOT stamp ``message.contextId``. A runtime self-wake
-    must run on its OWN minted context_id so the non-blocking inbox schedules it
-    independently of the user's canvas turn (sharing the canvas contextId would
-    let a self-wake be fast-ack+dropped against, or defer, an in-flight canvas
-    turn). Langfuse *session* convergence for self-wakes is handled downstream in
-    ``tracing.TracingExecutor`` (session_id only), decoupled from routing.
+    CONTEXT MODEL (RFC §5.5 — the one-line agent model). The agent is ONE
+    execution line per workspace (the canvas context, ``canvas-<wsid>``). The
+    IDLE self-wake alone opts in with ``context_id="canvas-<wsid>"`` so it runs
+    ON that line with the user's shared memory — it is LOW-priority work done
+    while quiet, and a returning user turn PREEMPTS it (highest priority). The
+    returning-user-vs-in-flight-idle collision the OLD independent context
+    avoided is now handled by RUNTIME-SIDE preemption (a2a_executor's Rule-3
+    block calls request_interrupt on an in-flight self-idle turn when a user
+    turn arrives), NOT by detaching idle onto its own context. Every OTHER self-wake still passes ``context_id=None``
+    and keeps its own minted context. Langfuse *session* convergence for
+    self-wakes remains trace-side in ``tracing.TracingExecutor`` (session_id
+    only), independent of this routing field.
 
     When a2a-sdk is installed (CI + the workspace image) the body is
     GENERATED FROM the real Pydantic model so it cannot drift from the
@@ -686,6 +701,7 @@ def build_message_send_params(
         message_id=message_id,
         metadata=metadata,
         attachments=attachments,
+        context_id=context_id,
     )
     if from_model is not None:
         return from_model
@@ -700,9 +716,13 @@ def build_message_send_params(
     # Typed against the SSOT contract (molecule-contracts A2aEnvelopeRequestParams)
     # for drift-prevention; the wire shape is unchanged and still flows through
     # normalize_a2a_message_send_params below.
-    raw: A2aEnvelopeRequestParams = {
-        "message": {"role": role, "messageId": message_id, "parts": parts}
-    }
+    message_body: dict[str, Any] = {"role": role, "messageId": message_id, "parts": parts}
+    # Opt-in only (idle self-wake): stamp contextId so the fallback path matches
+    # the model path. Omitted entirely when unset, preserving the byte-for-byte
+    # shape every other caller relies on.
+    if context_id is not None:
+        message_body["contextId"] = context_id
+    raw: A2aEnvelopeRequestParams = {"message": message_body}
     if metadata is not None:
         raw["metadata"] = metadata
     return normalize_a2a_message_send_params(raw)

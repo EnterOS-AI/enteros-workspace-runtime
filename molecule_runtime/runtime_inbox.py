@@ -184,6 +184,18 @@ class InboxEntry:
     # (turn in flight) or fall through to the normal blocking path
     # (fresh turn).
     turn_in_flight: bool = False
+    # Typed ``source_type`` of the turn CURRENTLY in flight for this
+    # context (recorded by the executor when ``turn_in_flight`` flips
+    # True). The rule-3 idle-preemption decision reads it: a user message
+    # preempts ONLY when the in-flight turn is ``self-idle``. ``None`` when
+    # no turn is running or the in-flight turn is an untyped user turn.
+    in_flight_source_type: str | None = None
+    # Set by ``request_interrupt`` (context-scoped idle preemption) and
+    # NEVER by ``cancel()`` / an explicit Stop. Lets the executor's
+    # ``_stopped`` handler tell a PREEMPTION (yield the idle turn and run
+    # the queued higher-priority user message) apart from an explicit STOP
+    # (discard the queue and terminate — "stop means stop").
+    preempt_requested: bool = False
 
     def request_interrupt(self, new_message: Any) -> bool:
         """Queue a new message and signal the running turn to interrupt.
@@ -191,6 +203,12 @@ class InboxEntry:
         Idempotent — calling twice in rapid succession just enqueues both
         messages; the running turn drains them in order on its next
         interrupt check.
+
+        Used for context-scoped IDLE PREEMPTION: a non-self (user) message
+        arriving while the in-flight turn on this context is a ``self-idle``
+        turn interrupts the idle turn so the user turn runs immediately.
+        Sets ``preempt_requested`` (on the success path only) so the
+        executor distinguishes this from an explicit Stop.
 
         Returns ``True`` when the message was accepted, ``False`` when the
         inbox is at capacity (caller should emit a busy backpressure
@@ -209,6 +227,9 @@ class InboxEntry:
                 self.pending_messages.maxsize,
             )
             return False
+        # Mark this as a preemption (not a Stop) BEFORE waking the turn,
+        # and only now that the message is safely queued.
+        self.preempt_requested = True
         self.interrupt_event.set()
         return True
 

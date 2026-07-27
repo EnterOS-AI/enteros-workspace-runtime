@@ -56,6 +56,8 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+from molecule_runtime import plugin_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +84,8 @@ def daemon_specs_from_manifest(
     plugin_path: str,
     raw_daemons: object,
     plugin_kind: str = "",
+    settings: dict | None = None,
+    settings_file: str | None = None,
 ) -> list[DaemonSpec]:
     """Parse a manifest's ``contributes.daemons`` value into specs.
 
@@ -119,7 +123,21 @@ def daemon_specs_from_manifest(
                 plugin=plugin_name,
                 kind=plugin_kind,
                 command=[entry["command"], *entry.get("args", [])],
-                env={k: str(v) for k, v in (entry.get("env") or {}).items()},
+                # Per-install plugin settings: ${config:key} in the manifest's
+                # own env map resolves from the delivered settings file. This is
+                # the zero-code-change adoption path — a plugin that already
+                # reads an env var keeps working and simply sources it from
+                # settings. settings=None leaves the map untouched, so every
+                # existing plugin is byte-identical.
+                env=(
+                    plugin_settings.apply_to_env(
+                        {k: str(v) for k, v in (entry.get("env") or {}).items()},
+                        settings,
+                        settings_file,
+                    )
+                    if settings is not None
+                    else {k: str(v) for k, v in (entry.get("env") or {}).items()}
+                ),
                 cwd=cwd,
             )
         )
@@ -180,11 +198,25 @@ def discover_daemon_specs(
             if plugin.manifest.kind in ("channel", "trigger")
             else plugin.name
         ).strip()
+        # Layer 1 (declared defaults) comes from the manifest ON THE BOX; layers
+        # 2-5 arrive as the delivered settings file. The runtime is the only
+        # side that holds both, which is why resolution happens here.
+        # Opt-in: only plugins that declare configuration (or have a delivered
+        # file) get settings resolution. Everything else keeps a byte-identical
+        # daemon env.
+        if plugin_settings.has_settings(plugin.name, plugin.manifest.contributes):
+            resolved = plugin_settings.resolve(plugin.name, plugin.manifest.contributes)
+            resolved_file = plugin_settings.settings_path(plugin.name)
+        else:
+            resolved = None
+            resolved_file = None
         plugin_specs = daemon_specs_from_manifest(
             daemon_owner,
             plugin.path,
             raw,
             plugin_kind=plugin.manifest.kind,
+            settings=resolved,
+            settings_file=resolved_file,
         )
         if plugin_specs and plugin.manifest.kind == "channel":
             prior_path = channel_identity_paths.get(daemon_owner)

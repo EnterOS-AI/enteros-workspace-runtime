@@ -7,12 +7,24 @@ One poster call does the complete self-initiated turn round trip:
 
   1. frame the rendered digest with <SYSTEM IDLE PROMPT> (contract framing);
   2. build the message/send JSON-RPC payload via the canonical
-     ``build_message_send_params`` with the SELF_IDLE source marker;
+     ``build_message_send_params`` with the SELF_IDLE source marker AND
+     ``context_id=canvas-<wsid>`` (RFC §5.5 one-line model): the idle wake
+     runs on the agent's single canvas execution line, sharing memory with the
+     user's turns, and is PREEMPTIBLE by a returning user turn (a2a_executor
+     interrupts the in-flight self-idle turn, runtime-side);
   3. POST it to the platform's ``/workspaces/<id>/a2a`` (blocking urllib in a
      thread-pool executor — unchanged from the original closure);
   4. parse the response body — the agent's reply text — and forward non-empty,
      non-sentinel text to the user via ``/notify`` (reply_forwarder), logging
      the outcome.
+
+RFC §5.5 delivery: under the one-line model the agent SELF-REPORTS during the
+idle turn — it acks before working ("no active work from you — I'm picking up:
+<items>") and reports per work-item via its ``send_message_to_user`` tool
+(→ core AgentMessageWriter). The final-reply forward in step 4 is retained only
+as a FALLBACK for the last-reply text; the primary delivery is the in-turn
+self-reports, driven by the idle-prompt behavior contract (see
+idle_digest/contract.SYSTEM_IDLE_HEADER framing).
 
 Injectable seams (``headers_fn``, ``notify_auth_headers``, ``notify_client``)
 default to the production functions; tests point them at a fake platform.
@@ -70,6 +82,14 @@ def make_digest_poster(
                     frame_idle_prompt(text),
                     message_id=f"idle-{uuid.uuid4().hex[:8]}",
                     metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
+                    # RFC §5.5 (the one-line agent model): the idle wake runs ON
+                    # the agent's single canvas execution line (shared memory
+                    # with the user's turns), NOT a detached minted context. It
+                    # is low-priority work done while quiet; a returning user
+                    # turn PREEMPTS it (a2a_executor interrupts the in-flight
+                    # self-idle turn, runtime-side). ``canvas-<wsid>`` MUST equal core's
+                    # sessionid.DefaultContextID / the a2a-proxy canvas belt.
+                    context_id=f"canvas-{workspace_id}",
                 ),
             }
         ).encode()

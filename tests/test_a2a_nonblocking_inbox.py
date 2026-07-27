@@ -1137,3 +1137,335 @@ async def test_inbox_drops_mid_turn_self_cron_by_typed_marker(monkeypatch):
 
     assert result == ""
     assert entry.pending_messages.qsize() == 0, "routine self-ping must be dropped, not queued"
+
+
+# ─── rt#354 — context-scoped rule-3 idle preemption (runtime-side) ───────
+#
+# A NON-self (user) message arriving while the in-flight turn ON THIS CONTEXT
+# is a self-idle turn must PREEMPT the idle turn (request_interrupt → the
+# interrupt_event the executor's astream loop checks) so the user turn runs
+# immediately. Every other combination keeps the "queue, don't break" default
+# (defer) or the routine-self drop. This replaces the obsolete core-side
+# tasks/cancel-by-contextId no-op (a2a-sdk resolves cancels by task_id, which
+# core cannot supply).
+
+
+@pytest.mark.asyncio
+async def test_user_message_preempts_in_flight_self_idle_turn(monkeypatch):
+    """User message during an in-flight SELF-IDLE turn → request_interrupt.
+
+    The routing decision must call request_interrupt (queue + set
+    interrupt_event + mark preempt_requested), NOT defer_message. This is the
+    reverse-direction preemption that the runtime now owns end-to-end.
+    """
+    from molecule_runtime.a2a_executor import (
+        A2A_SOURCE_SELF_IDLE,
+        RuntimeA2AExecutor,
+    )
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-rule3-preempt"
+    entry = await get_inbox().get_or_create(context_id)
+    # Simulate the executor state after a self-idle turn started on this
+    # context (turn_in_flight + recorded source_type).
+    entry.turn_in_flight = True
+    entry.in_flight_source_type = A2A_SOURCE_SELF_IDLE
+
+    async def _hang_astream(*_a, **_k):
+        await asyncio.sleep(60)  # must NOT be entered on the fast-ack path
+        yield  # pragma: no cover
+
+    agent = MagicMock()
+    agent.astream_events = _hang_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+
+    # Incoming user message: NO source_type marker → non-self.
+    ctx = _build_context("stop that, do THIS instead", context_id, metadata=None)
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    result = await executor._core_execute(ctx, event_queue)
+
+    assert result == ""  # fast-acked
+    # PREEMPTION: interrupt signalled, message queued, marked as preemption.
+    assert entry.interrupt_event.is_set() is True
+    assert entry.preempt_requested is True
+    assert entry.pending_messages.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_user_message_during_user_turn_defers_not_preempt(monkeypatch):
+    """User message during an in-flight USER turn → defer (never preempt).
+
+    user-preempts-user is forbidden: the second user message queues and the
+    running turn is NOT interrupted (queue, don't break).
+    """
+    from molecule_runtime.a2a_executor import RuntimeA2AExecutor
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-rule3-user-user"
+    entry = await get_inbox().get_or_create(context_id)
+    entry.turn_in_flight = True
+    entry.in_flight_source_type = None  # a user (untyped) turn is in flight
+
+    async def _hang_astream(*_a, **_k):
+        await asyncio.sleep(60)
+        yield  # pragma: no cover
+
+    agent = MagicMock()
+    agent.astream_events = _hang_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+
+    ctx = _build_context("second user message", context_id, metadata=None)
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    result = await executor._core_execute(ctx, event_queue)
+
+    assert result == ""
+    # DEFER: queued but NOT interrupted, not marked as a preemption.
+    assert entry.interrupt_event.is_set() is False
+    assert entry.preempt_requested is False
+    assert entry.pending_messages.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_self_message_never_preempts_in_flight_idle_turn(monkeypatch):
+    """A self message arriving during an in-flight self-idle turn never
+    interrupts — it is a routine self-ping and is dropped (recurs next cycle).
+    """
+    from molecule_runtime.a2a_executor import (
+        A2A_MESSAGE_SOURCE_TYPE,
+        A2A_SOURCE_SELF_CRON,
+        A2A_SOURCE_SELF_IDLE,
+        RuntimeA2AExecutor,
+    )
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-rule3-self-self"
+    entry = await get_inbox().get_or_create(context_id)
+    entry.turn_in_flight = True
+    entry.in_flight_source_type = A2A_SOURCE_SELF_IDLE
+
+    async def _hang_astream(*_a, **_k):
+        await asyncio.sleep(60)
+        yield  # pragma: no cover
+
+    agent = MagicMock()
+    agent.astream_events = _hang_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+
+    # Incoming SELF message (a cron tick) — routine self-ping.
+    ctx = _build_context(
+        "AUTONOMOUS TICK",
+        context_id,
+        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_CRON},
+    )
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    result = await executor._core_execute(ctx, event_queue)
+
+    assert result == ""
+    # Self never preempts: no interrupt, and the routine ping is DROPPED.
+    assert entry.interrupt_event.is_set() is False
+    assert entry.preempt_requested is False
+    assert entry.pending_messages.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_preemption_yields_idle_turn_and_runs_queued_user_message(monkeypatch):
+    """End-to-end: a preemption (request_interrupt) during an in-flight
+    self-idle turn does NOT discard the queued user message (unlike an explicit
+    Stop). The idle turn yields and the executor re-enters astream with the
+    user message merged into history.
+    """
+    from molecule_runtime.a2a_executor import (
+        A2A_MESSAGE_SOURCE_TYPE,
+        A2A_SOURCE_SELF_IDLE,
+        RuntimeA2AExecutor,
+    )
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-rule3-e2e"
+    captured_messages: list[list] = []
+
+    async def _agent_astream(payload, **_kwargs):
+        captured_messages.append(list(payload["messages"]))
+        if len(captured_messages) == 1:
+            # First (idle) turn is running. Simulate a user POST that the
+            # routing layer turned into a PREEMPTION: request_interrupt
+            # queues the user message AND sets interrupt_event + preempt.
+            yield {"event": "on_chat_model_start", "run_id": "r1", "data": {}}
+            entry = get_inbox().peek(context_id)
+            assert entry is not None
+            entry.request_interrupt("user: answer me now")
+            # One more yield so the executor's per-event interrupt check fires.
+            yield {"event": "on_chat_model_start", "run_id": "r1", "data": {}}
+        else:
+            yield {"event": "on_chat_model_end", "run_id": "r2", "data": {"output": None}}
+
+    agent = MagicMock()
+    agent.astream_events = _agent_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater",
+        lambda *a, **kw: fake_updater,
+    )
+
+    # First turn is a self-idle turn (records in_flight_source_type=self-idle).
+    ctx = _build_context(
+        "idle tick",
+        context_id,
+        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
+    )
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    await executor._core_execute(ctx, event_queue)
+
+    # The idle turn yielded and a SECOND astream ran with the user message —
+    # the queued message was NOT discarded (that is the Stop-only behavior).
+    assert len(captured_messages) == 2
+    second_history = captured_messages[1]
+    human_msgs = [content for role, content in second_history if role == "human"]
+    assert human_msgs == ["idle tick", "user: answer me now"], (
+        f"Preempted user message must run, not be discarded: {human_msgs!r}"
+    )
+    entry = get_inbox().peek(context_id)
+    assert entry.pending_messages.empty()
+    assert entry.turn_in_flight is False
+    # The in-flight source_type flipped to a user turn during the restart and
+    # is cleared at turn end.
+    assert entry.in_flight_source_type is None
+    assert entry.preempt_requested is False
+
+
+@pytest.mark.asyncio
+async def test_natural_drain_carrying_preempt_resets_flags_and_honors_stop(monkeypatch):
+    """Re-review race: a request_interrupt (user-preempts-idle) lands just as
+    the idle stream is naturally closing, so the loop exits via
+    StopAsyncIteration (with _stopped == False) BEFORE the interrupt-check and
+    the queued user message is drained by the NATURAL-COMPLETION block rather
+    than the _stopped preempt handler.
+
+    The natural-drain restart block must mirror the _stopped handler's flag
+    resets (in_flight_source_type -> None, preempt_requested -> False) BEFORE
+    restarting; otherwise the leaked idle-turn flags corrupt the restarted
+    (now-user) turn: (a) a later explicit Stop is mis-read as a preempt
+    (stop-means-stop violated), and (b) a further POST wrongly preempts the
+    in-flight user turn (in_flight_source_type stuck at self-idle).
+    """
+    from molecule_runtime.a2a_executor import (
+        A2A_MESSAGE_SOURCE_TYPE,
+        A2A_SOURCE_SELF_IDLE,
+        RuntimeA2AExecutor,
+    )
+    from molecule_runtime.runtime_inbox import get_inbox
+
+    context_id = "ctx-natural-drain-preempt"
+    captured_messages: list[list] = []
+    # Snapshot of the inbox flags as observed FROM the restarted (turn-2) turn.
+    restarted_flags: dict = {}
+
+    async def _agent_astream(payload, **_kwargs):
+        captured_messages.append(list(payload["messages"]))
+        entry = get_inbox().peek(context_id)
+        assert entry is not None
+        if len(captured_messages) == 1:
+            # Idle turn is running. Emit ONE event, then simulate a
+            # request_interrupt that lands AS the stream naturally closes:
+            # request_interrupt queues the user message + sets preempt +
+            # interrupt_event, but because it runs in the same __anext__ that
+            # then raises StopAsyncIteration, the per-event interrupt check
+            # never fires. The loop exits natural (_stopped == False) and the
+            # queued message is drained by the natural-completion block WHILE
+            # carrying a preempt.
+            yield {"event": "on_chat_model_start", "run_id": "r1", "data": {}}
+            entry.request_interrupt("user: answer me now")
+            # generator ends here -> StopAsyncIteration on next pull.
+        elif len(captured_messages) == 2:
+            # RESTARTED (now-user) turn. Capture the flag state the restart
+            # left behind: after the fix these mirror the _stopped handler.
+            restarted_flags["in_flight_source_type"] = entry.in_flight_source_type
+            restarted_flags["preempt_requested"] = entry.preempt_requested
+            yield {"event": "on_chat_model_start", "run_id": "r2", "data": {}}
+            # A user message arrives during this turn (deferred, no interrupt),
+            # then an explicit STOP (cancel(): interrupt_event, NO preempt).
+            entry.defer_message("user: second message")
+            entry.interrupt_event.set()
+            # One more event so the per-event interrupt check fires -> _stopped.
+            yield {"event": "on_chat_model_start", "run_id": "r2", "data": {}}
+        else:
+            # Turn 3 must NOT run: an explicit Stop terminates ("stop means
+            # stop"). Reaching here proves a leaked preempt_requested caused the
+            # Stop to be mis-read as a preempt and restarted.
+            yield {"event": "on_chat_model_end", "run_id": "r3", "data": {"output": None}}
+
+    agent = MagicMock()
+    agent.astream_events = _agent_astream
+    executor = RuntimeA2AExecutor(agent, heartbeat=None, model="test")
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.set_current_task", AsyncMock()
+    )
+    fake_updater = _FakeUpdater()
+    monkeypatch.setattr(
+        "molecule_runtime.a2a_executor.TaskUpdater",
+        lambda *a, **kw: fake_updater,
+    )
+
+    # First turn is a self-idle turn (records in_flight_source_type=self-idle).
+    ctx = _build_context(
+        "idle tick",
+        context_id,
+        metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_IDLE},
+    )
+    event_queue = MagicMock()
+    event_queue.enqueue_event = AsyncMock()
+
+    await executor._core_execute(ctx, event_queue)
+
+    # The idle turn yielded and a SECOND astream ran with the user message
+    # merged in — the natural-drain-carrying-a-preempt path restarted the loop.
+    assert len(captured_messages) >= 2
+    second_history = captured_messages[1]
+    human_msgs = [content for role, content in second_history if role == "human"]
+    assert human_msgs == ["idle tick", "user: answer me now"], (
+        f"Preempted user message must run, not be discarded: {human_msgs!r}"
+    )
+
+    # (fix) The natural-drain restart reset BOTH flags before restarting, so the
+    # restarted (now-user) turn no longer sees the leaked idle-turn state.
+    assert restarted_flags["in_flight_source_type"] is None, (
+        "natural-drain restart must reset in_flight_source_type to None "
+        "(mirror the _stopped handler) so a further POST does not user-preempt-user"
+    )
+    assert restarted_flags["preempt_requested"] is False, (
+        "natural-drain restart must reset preempt_requested to False "
+        "(mirror the _stopped handler) so a later Stop is not mis-read as a preempt"
+    )
+
+    # (fix) With preempt_requested reset, the explicit Stop on the restarted
+    # turn TERMINATES it — no turn 3 — even though a message was queued. Leaked
+    # preempt_requested would have restarted (stop-means-stop violated).
+    assert len(captured_messages) == 2, (
+        "explicit Stop must terminate the restarted turn (stop means stop); "
+        f"a 3rd turn means a leaked preempt restarted a Stop: {captured_messages!r}"
+    )
+    entry = get_inbox().peek(context_id)
+    assert entry.turn_in_flight is False
+    assert entry.in_flight_source_type is None
+    assert entry.preempt_requested is False
