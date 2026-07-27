@@ -4,8 +4,10 @@ Loads config -> discovers adapter -> setup -> create executor -> wrap in A2A -> 
 """
 
 import asyncio
+import logging
 import os
 import socket
+import sys
 from collections.abc import Mapping
 
 import httpx
@@ -24,6 +26,28 @@ import uuid as _uuid
 
 from molecule_runtime.builtin_tools.telemetry import setup_telemetry, make_trace_middleware
 from molecule_runtime.policies.namespaces import resolve_awareness_namespace
+
+# --- stdout logging bootstrap (Dozzle / `docker logs ws-<id>` visibility) ---
+# Every submodule in this process (kernel, coordinator, heartbeat, mailbox_dir,
+# watcher/ConfigWatcher, platform_agent_identity, mcp_readiness_probe,
+# plugin_daemons, a2a_executor, …) plus the active template's executor.py (same
+# process, via adapter.create_executor()) does `logger = logging.getLogger(
+# __name__)` and calls logger.info/.debug for boot + turn-history diagnostics —
+# but nothing in this process ever called logging.basicConfig()/dictConfig().
+# Python's root logger has zero handlers by default, so INFO/DEBUG records are
+# silently DROPPED (not even to stderr); only WARNING+ escapes, unformatted, via
+# logging.lastResort. start.sh execs `molecule-runtime` as the container's PID 1,
+# so whatever this process writes to stdout IS `docker logs`/Dozzle — one guarded
+# root handler here makes every existing logger call across the whole runtime
+# visible, with zero per-module changes. Guarded so re-importing main.py (tests,
+# `-c` probes) never double-registers, and so it never fights uvicorn's own
+# dictConfig (disable_existing_loggers=False, scoped to uvicorn.* only).
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
 
 from typing import TYPE_CHECKING
 
