@@ -10,27 +10,21 @@ docs/superpowers/specs/2026-07-27-agent-desktop-sidecar-design.md §9). Keeping
 this tool surface in the runtime (rather than a platform MCP tool) is what makes
 it packageable as a native ``kind:mcp`` plugin later.
 
-Legacy note: ``tool_desktop_open_url`` / ``tool_desktop_check`` and the
-``_host_*`` helpers below still target the old host-co-located model
-(``chroot /host`` + Xvfb ``:99``). Re-pointing those to the sidecar (navigate
-the running kiosk browser via key/type; probe the gateway health) is a tracked
-follow-up.
+All tools — screenshot, click, type, key, open_url (navigate), status — now go
+through the gateway; the old host-co-located model (``chroot /host`` + Xvfb) and
+its ``_host_*`` helpers have been retired.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
-import subprocess
 import time
 import uuid
 from pathlib import Path
 
 import httpx
 
-DISPLAY = os.environ.get("MOLECULE_DISPLAY", ":99")
 SCREENSHOT_DIR = Path("/workspace/.molecule/display/screenshots")
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -87,48 +81,6 @@ async def _desktop_input(action: dict) -> None:
     resp.raise_for_status()
 
 
-def _host_cmd(args: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
-    cmd = [
-        "sudo",
-        "chroot",
-        "/host",
-        "/usr/bin/env",
-        f"DISPLAY={DISPLAY}",
-        *args,
-    ]
-    return subprocess.run(
-        cmd,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-    )
-
-
-def _host_spawn(args: list[str]) -> subprocess.Popen[str]:
-    cmd = [
-        "sudo",
-        "chroot",
-        "/host",
-        "/usr/bin/env",
-        f"DISPLAY={DISPLAY}",
-        *args,
-    ]
-    return subprocess.Popen(
-        cmd,
-        text=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-
-def _host_ok(binary: str) -> bool:
-    result = _host_cmd(["/bin/sh", "-lc", f"command -v {binary}"], timeout=5)
-    return result.returncode == 0
-
-
 def _json(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True)
 
@@ -175,38 +127,24 @@ def _png_dimensions(path: Path) -> tuple[int, int] | None:
     return width, height
 
 
-def _copy_screenshot_from_host_tmp(host_tmp_path: str, out_path: Path) -> None:
-    _ensure_safe_screenshot_dir()
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(out_path, flags, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as dst:
-            with open(Path("/host") / host_tmp_path.lstrip("/"), "rb") as src:
-                shutil.copyfileobj(src, dst)
-    except Exception:
-        try:
-            out_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-
-
 async def tool_desktop_status() -> str:
-    """Return whether host desktop-control dependencies are available."""
-    checks = {
-        "display": DISPLAY,
-        "host_mount": Path("/host").is_dir(),
-        "xdotool": _host_ok("xdotool"),
-        "scrot": _host_ok("scrot"),
-        "firefox": _host_ok("firefox"),
-        "falkon": _host_ok("falkon"),
-        "google_chrome": _host_ok("google-chrome"),
-        "chromium": _host_ok("chromium-browser") or _host_ok("chromium"),
-    }
-    checks["available"] = bool(checks["host_mount"] and checks["xdotool"] and checks["scrot"])
-    return _json(checks)
+    """Report desktop availability via the sidecar gateway (design decision B).
+
+    The desktop no longer lives on the host (no ``chroot /host`` / host binaries);
+    it runs in the wsdesk-<id> sidecar reached through the authenticated gateway.
+    A screenshot round-trip is the liveness probe — it exercises auth + the
+    control server end-to-end, and returns the scale-from-zero result too.
+    """
+    from .a2a_client import WORKSPACE_ID
+
+    out: dict = {"mode": "sidecar-gateway", "workspace_id": WORKSPACE_ID}
+    try:
+        await _desktop_screenshot_bytes()
+        out["available"] = True
+    except Exception as exc:
+        out["available"] = False
+        out["error"] = str(exc)
+    return _json(out)
 
 
 async def tool_desktop_screenshot(path: str = "") -> str:
@@ -282,96 +220,22 @@ async def tool_desktop_key(keys: str) -> str:
 
 
 async def tool_desktop_open_url(url: str) -> str:
-    """Open a URL in the host desktop browser."""
+    """Navigate the workspace desktop browser to a URL.
+
+    Re-pointed to the sidecar (design decision B): sends a ``navigate`` action
+    through the authenticated, lock-gated desktop gateway (``/desktop/input``),
+    which the sidecar control server turns into a Chromium single-instance
+    hand-off that navigates the pinned kiosk window. No host browser is spawned;
+    the fixed-resolution kiosk stays the one window (§3). A human holding control
+    yields a 409 (the agent pauses), same as every other input.
+    """
     url = (url or "").strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         return _json({"ok": False, "error": "url must start with http:// or https://"})
-    browser = "firefox" if _host_ok("firefox") else ""
-    if not browser:
-        browser = "falkon" if _host_ok("falkon") else ""
-    if not browser:
-        browser = "google-chrome" if _host_ok("google-chrome") else ""
-    if not browser:
-        browser = "chromium-browser" if _host_ok("chromium-browser") else ""
-    if not browser and _host_ok("chromium"):
-        browser = "chromium"
-    if not browser:
-        return _json({"ok": False, "error": "no supported desktop browser is installed"})
-    # internal#734 Ask-3 (SSOT, Option A): the control-plane provisioner is the
-    # single source of the browser-profile path — it publishes it as
-    # MOLECULE_BROWSER_PROFILE_DIR (provisioner const browserProfileDir). Read
-    # it from there so the path is defined ONCE; fall back to the historical
-    # literal only when the env is absent (older CP / local dev), for rollout
-    # safety. The dir lives under /workspace so it rides the cp#326 data volume.
-    profile = Path(os.environ.get("MOLECULE_BROWSER_PROFILE_DIR") or "/workspace/.browser-profile")
-    profile.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
-        _host_spawn([
-            "runuser",
-            "-u",
-            "ubuntu",
-            "--",
-            "/usr/bin/env",
-            f"DISPLAY={DISPLAY}",
-            *_browser_args(browser, profile, url),
-        ])
-        if browser in {"firefox", "falkon"}:
-            _size_browser_window(browser)
-    except OSError as exc:
+        await _desktop_input({"type": "navigate", "url": url})
+    except Exception as exc:
         return _json({"ok": False, "error": str(exc)})
-    return _json({"ok": True, "browser": browser, "url": url})
+    return _json({"ok": True, "url": url})
 
 
-def _browser_args(browser: str, profile: Path, url: str) -> list[str]:
-    if browser == "firefox":
-        return [
-            "XDG_RUNTIME_DIR=/tmp/runtime-ubuntu",
-            "MOZ_DISABLE_RDD_SANDBOX=1",
-            "MOZ_DISABLE_CONTENT_SANDBOX=1",
-            browser,
-            "--no-remote",
-            "--new-window",
-            url,
-        ]
-    if browser == "falkon":
-        return [
-            "XDG_RUNTIME_DIR=/tmp/runtime-ubuntu",
-            browser,
-            "--no-remote",
-            "--new-window",
-            "--profile",
-            "molecule-desktop",
-            url,
-        ]
-    return [
-        browser,
-        "--disable-gpu",
-        "--disable-dev-shm-usage",
-        "--no-first-run",
-        "--no-default-browser-check",
-        f"--user-data-dir={profile}",
-        url,
-    ]
-
-
-def _size_browser_window(browser: str) -> None:
-    _host_cmd([
-        "xdotool",
-        "search",
-        "--sync",
-        "--onlyvisible",
-        "--class",
-        browser,
-        "windowmove",
-        "%@",
-        "10",
-        "37",
-        "windowsize",
-        "%@",
-        "1280",
-        "800",
-        "windowactivate",
-        "%@",
-        "key",
-        "F11",
-    ], timeout=20)
