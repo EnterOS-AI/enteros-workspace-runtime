@@ -1,9 +1,20 @@
-"""Desktop-control MCP tools for display-enabled workspaces.
+"""Desktop-control tools for display-enabled workspaces.
 
-The display session runs on the workspace host, not inside the runtime
-container. Display-enabled workspaces mount the host at /host and grant sudo
-inside the privileged container, so these tools enter the host namespace with
-``chroot /host`` and drive the private Xvfb display on ``:99``.
+The agent-facing action tools (screenshot / click / type / key) call the
+platform's authenticated desktop **gateway route**
+(``/workspaces/<id>/desktop/{screenshot,input}``) — design decision B. The
+platform gateway owns control-lock arbitration, scale-from-zero, and
+per-sidecar auth; the desktop itself runs in the ``wsdesk-<id>`` sidecar
+container (design RFC: molecule-core
+docs/superpowers/specs/2026-07-27-agent-desktop-sidecar-design.md §9). Keeping
+this tool surface in the runtime (rather than a platform MCP tool) is what makes
+it packageable as a native ``kind:mcp`` plugin later.
+
+Legacy note: ``tool_desktop_open_url`` / ``tool_desktop_check`` and the
+``_host_*`` helpers below still target the old host-co-located model
+(``chroot /host`` + Xvfb ``:99``). Re-pointing those to the sidecar (navigate
+the running kiosk browser via key/type; probe the gateway health) is a tracked
+follow-up.
 """
 
 from __future__ import annotations
@@ -16,6 +27,8 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
+
+import httpx
 
 DISPLAY = os.environ.get("MOLECULE_DISPLAY", ":99")
 SCREENSHOT_DIR = Path("/workspace/.molecule/display/screenshots")
@@ -32,6 +45,46 @@ _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 # space and warn loudly if a larger display ever slips through.
 _VISION_SAFE_PIXELS = 1_150_000
 _VISION_SAFE_EDGE = 1568
+
+# Design decision B: the agent-facing desktop tools call the platform's
+# authenticated desktop gateway route (/workspaces/<id>/desktop/{screenshot,
+# input}) rather than driving the host display via `chroot /host`. The platform
+# gateway owns control-lock arbitration, scale-from-zero, and per-sidecar auth;
+# the desktop itself runs in the wsdesk-<id> sidecar container. Keeping the tool
+# surface HERE (not a platform MCP tool) is what makes it plugin-extractable —
+# the static platform mcp.go bridge can never host a plugin-contributed tool.
+_DESKTOP_TIMEOUT = 30.0
+
+
+async def _desktop_screenshot_bytes() -> bytes:
+    from .a2a_client import PLATFORM_URL, WORKSPACE_ID, auth_headers
+
+    url = f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/desktop/screenshot"
+    async with httpx.AsyncClient(timeout=_DESKTOP_TIMEOUT) as client:
+        resp = await client.get(
+            url, headers={"X-Workspace-ID": WORKSPACE_ID, **auth_headers(WORKSPACE_ID)}
+        )
+    resp.raise_for_status()
+    return resp.content
+
+
+async def _desktop_input(action: dict) -> None:
+    from .a2a_client import PLATFORM_URL, WORKSPACE_ID, auth_headers
+
+    url = f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/desktop/input"
+    async with httpx.AsyncClient(timeout=_DESKTOP_TIMEOUT) as client:
+        resp = await client.post(
+            url,
+            json=action,
+            headers={"X-Workspace-ID": WORKSPACE_ID, **auth_headers(WORKSPACE_ID)},
+        )
+    # 409 = a human holds the control lock; the agent must pause (§8), not fight
+    # for the cursor.
+    if resp.status_code == 409:
+        raise RuntimeError(
+            "a human currently holds desktop control; pause and retry when released"
+        )
+    resp.raise_for_status()
 
 
 def _host_cmd(args: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
@@ -162,18 +215,15 @@ async def tool_desktop_screenshot(path: str = "") -> str:
         out_path = _clean_screenshot_path(path)
     except ValueError as exc:
         return _json({"ok": False, "error": str(exc)})
-    host_path = f"/tmp/molecule-desktop-shot-{uuid.uuid4().hex}.png"
-    result = _host_cmd(["scrot", host_path], timeout=15)
-    if result.returncode != 0:
-        return _json({"ok": False, "error": result.stderr.strip() or result.stdout.strip()})
     try:
-        _copy_screenshot_from_host_tmp(host_path, out_path)
-    except FileExistsError:
-        return _json({"ok": False, "error": "screenshot path already exists"})
+        png = await _desktop_screenshot_bytes()
+    except Exception as exc:
+        return _json({"ok": False, "error": f"screenshot failed: {exc}"})
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(png)
     except OSError as exc:
         return _json({"ok": False, "error": str(exc)})
-    finally:
-        _host_cmd(["rm", "-f", host_path], timeout=5)
     payload: dict = {"ok": True, "path": str(out_path)}
     # Surface the exact pixel space so the agent never has to infer DPI/scale
     # (core#2200): the coordinates it reads off this screenshot are the same
@@ -201,18 +251,21 @@ async def tool_desktop_click(x: int, y: int, button: int = 1) -> str:
     """Move the mouse and click at absolute desktop coordinates."""
     if button not in (1, 2, 3):
         return _json({"ok": False, "error": "button must be 1, 2, or 3"})
-    result = _host_cmd(["xdotool", "mousemove", str(int(x)), str(int(y)), "click", str(button)])
-    if result.returncode != 0:
-        return _json({"ok": False, "error": result.stderr.strip() or result.stdout.strip()})
+    btn = {1: "left", 2: "middle", 3: "right"}[button]
+    try:
+        await _desktop_input({"type": "click", "x": int(x), "y": int(y), "button": btn})
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc)})
     return _json({"ok": True, "x": int(x), "y": int(y), "button": button})
 
 
 async def tool_desktop_type(text: str, delay_ms: int = 20) -> str:
     """Type text into the focused desktop application."""
-    delay = max(0, min(int(delay_ms), 1000))
-    result = _host_cmd(["xdotool", "type", "--clearmodifiers", "--delay", str(delay), text], timeout=30)
-    if result.returncode != 0:
-        return _json({"ok": False, "error": result.stderr.strip() or result.stdout.strip()})
+    _ = delay_ms  # kept for signature back-compat; the control server owns timing
+    try:
+        await _desktop_input({"type": "type", "text": text})
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc)})
     return _json({"ok": True, "chars": len(text)})
 
 
@@ -221,9 +274,10 @@ async def tool_desktop_key(keys: str) -> str:
     keys = (keys or "").strip()
     if not keys:
         return _json({"ok": False, "error": "keys is required"})
-    result = _host_cmd(["xdotool", "key", "--clearmodifiers", keys])
-    if result.returncode != 0:
-        return _json({"ok": False, "error": result.stderr.strip() or result.stdout.strip()})
+    try:
+        await _desktop_input({"type": "key", "keys": keys})
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc)})
     return _json({"ok": True, "keys": keys})
 
 
