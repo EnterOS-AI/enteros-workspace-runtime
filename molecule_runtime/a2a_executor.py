@@ -286,7 +286,9 @@ A2A_SOURCE_SELF_LIFECYCLE = "self-lifecycle"
 # break platform wake delivery. General self-classification here is handled by
 # _is_self_source_type() below via _SELF_SOURCE_TYPES + the ``self-`` prefix
 # fallback, NOT by widening this governance tuple. Do not add markers here to
-# "match" the classification set.
+# "match" the classification set. This deliberate relationship is guarded by
+# tests/test_self_source_governance_subset_guard.py (the SDK contract remains
+# the sole authority for the full classification set).
 _ROUTINE_SELF_SOURCE_TYPES = (
     A2A_SOURCE_SELF_CRON,
     A2A_SOURCE_SELF_HARVESTER,
