@@ -38,7 +38,8 @@ CANVAS_SESSION = f"canvas-{WS}"
 
 # Every self-wake reason the runtime injects. Each must TRACE into canvas-<ws>,
 # INCLUDING self-scheduler — whose production turns are built by the trigger SDK
-# lane, not build_message_send_params (the exact path the old fix missed).
+# lane, not build_message_send_params (the exact path the old fix missed). The
+# trace-side convergence is universal, so idle is included here.
 SELF_WAKE_SOURCE_TYPES = [
     "self-idle",              # idle self-wake (main._run_idle_loop)
     "self-harvester",         # heartbeat delegation-results harvester
@@ -48,6 +49,14 @@ SELF_WAKE_SOURCE_TYPES = [
     "self-goal-nudge",        # goal / plan re-engagement nudge
     "self-lifecycle",         # boot initial_prompt + reprovision-wake announce
 ]
+
+# ROUTING split (RFC §5.5 one-line model): every self-wake EXCEPT idle keeps its
+# OWN minted routing context — the builder must leave message.contextId UNSET for
+# them. IDLE is the exception: it opts into context_id=canvas-<wsid> so it runs on
+# the agent's single execution line and is preemptible by a user turn (core
+# interrupts the in-flight idle turn). So the "builder does not stamp contextId"
+# sweep runs over the NON-idle wakes only; idle is asserted separately below.
+NON_IDLE_SELF_WAKE_SOURCE_TYPES = [s for s in SELF_WAKE_SOURCE_TYPES if s != "self-idle"]
 
 
 # --- fakes ---------------------------------------------------------------------
@@ -207,18 +216,44 @@ def test_self_wake_and_canvas_turn_share_one_session(monkeypatch):
 
 # --- routing decoupling: the builder must NOT stamp contextId ------------------
 
-@pytest.mark.parametrize("source_type", SELF_WAKE_SOURCE_TYPES)
-def test_builder_does_not_stamp_contextid_on_self_turns(source_type):
-    # The convergence is trace-side ONLY. build_message_send_params must leave
-    # contextId UNSET so every self-wake keeps its own routing context (the fix
-    # for the fast-ack-drop / canvas-deferral regressions).
+@pytest.mark.parametrize("source_type", NON_IDLE_SELF_WAKE_SOURCE_TYPES)
+def test_builder_does_not_stamp_contextid_on_non_idle_self_turns(source_type):
+    # For every self-wake EXCEPT idle, the convergence is trace-side ONLY and
+    # build_message_send_params must leave contextId UNSET so the wake keeps its
+    # own routing context (the fix for the fast-ack-drop / canvas-deferral
+    # regressions). Idle is the §5.5 exception — asserted separately below.
     params = build_message_send_params("wake", metadata={"source_type": source_type})
     assert "contextId" not in params["message"], (
-        f"{source_type}: builder must not stamp contextId — self-wakes keep their "
-        f"own routing context; convergence is trace-side only"
+        f"{source_type}: builder must not stamp contextId — non-idle self-wakes "
+        f"keep their own routing context; convergence is trace-side only"
     )
 
 
 def test_builder_does_not_stamp_contextid_on_plain_send():
     params = build_message_send_params("hello")
+    assert "contextId" not in params["message"]
+
+
+def test_idle_self_wake_carries_canvas_context_id():
+    # RFC §5.5 one-line model: the IDLE self-wake OPTS IN to the canvas routing
+    # context so it runs on the agent's single execution line (shared memory) and
+    # is preemptible by a user turn. The poster passes context_id=canvas-<wsid>;
+    # the builder must stamp message.contextId accordingly.
+    params = build_message_send_params(
+        "idle tick",
+        metadata={"source_type": "self-idle"},
+        context_id=CANVAS_SESSION,
+    )
+    assert params["message"].get("contextId") == CANVAS_SESSION, (
+        "idle self-wake must run on the canvas routing context (canvas-<wsid>)"
+    )
+
+
+def test_builder_leaves_contextid_unset_when_context_id_not_passed():
+    # The opt-in default preserves TODAY's behavior for every non-idle caller:
+    # with no context_id argument, message.contextId is omitted entirely (the
+    # byte-for-byte shape delegation/cron/scheduler/lifecycle rely on).
+    params = build_message_send_params(
+        "idle tick", metadata={"source_type": "self-idle"}
+    )
     assert "contextId" not in params["message"]

@@ -415,9 +415,16 @@ def _self_wake_session_id(context: Any, workspace_id: str) -> str:
     on where source_type lives). For a ``self-*`` turn returns
     ``"canvas-<workspace_id>"`` — which MUST equal core's
     sessionid.DefaultContextID (workspace-server internal/sessionid) and the a2a
-    proxy belt, so a self-wake's TRACE joins the user's Langfuse session while its
-    routing context_id stays independent. Empty workspace id (unit/CLI) or a
-    non-self turn yields ``""`` so the caller keeps the a2a context_id.
+    proxy belt, so a self-wake's TRACE joins the user's Langfuse session.
+
+    Routing note: for EVERY self-wake EXCEPT idle the routing context_id stays
+    independent (its own minted id) and only the trace session is converged
+    here. IDLE is the exception (RFC §5.5 one-line model): it runs on the canvas
+    routing context (``build_message_send_params(context_id=canvas-<wsid>)``), so
+    for idle this trace session already matches its routing context — the
+    convergence is a no-op that keeps idle filed alongside every other wake.
+    Empty workspace id (unit/CLI) or a non-self turn yields ``""`` so the caller
+    keeps the a2a context_id.
     """
     if not workspace_id:
         return ""
@@ -466,15 +473,19 @@ class TracingExecutor(_AgentExecutor):  # type: ignore[misc]
         except Exception:
             pass
         # Self-wake session convergence (the "sessions fragment after a restart /
-        # plugin install" fix). A runtime self-wake (idle / harvester /
-        # delegation-result / cron / scheduler / goal-nudge / lifecycle) runs on
-        # its OWN minted context_id so the non-blocking inbox schedules it
-        # independently — it must NOT share the canvas contextId, or a self-wake
-        # would be fast-ack+dropped against, or defer, the user's in-flight canvas
-        # turn (and could compact the shared thread). But its TRACE must still
-        # join the workspace's canvas session so autonomous work doesn't open a
-        # throwaway Langfuse session per tick. So we converge only the trace
-        # session_id here, decoupled from routing. Reading the inbound
+        # plugin install" fix). A runtime self-wake (harvester / delegation-result
+        # / cron / scheduler / goal-nudge / lifecycle) runs on its OWN minted
+        # context_id so the non-blocking inbox schedules it independently — it
+        # must NOT share the canvas contextId, or such a self-wake would be
+        # fast-ack+dropped against, or defer, the user's in-flight canvas turn
+        # (and could compact the shared thread). IDLE is the ONE exception (RFC
+        # §5.5 one-line model): it deliberately runs ON the canvas routing
+        # context and is preemptible by a user turn (a2a_executor interrupts it
+        # runtime-side), so its
+        # routing id already IS canvas-<wsid>. Either way its TRACE must join the
+        # workspace's canvas session so autonomous work doesn't open a throwaway
+        # Langfuse session per tick. So we converge the trace session_id here for
+        # every self-wake, decoupled from routing. Reading the inbound
         # RequestContext's source_type makes this builder-agnostic: it also
         # covers self-turn lanes that never touch build_message_send_params (the
         # trigger/scheduler SDK).
