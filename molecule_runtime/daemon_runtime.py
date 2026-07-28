@@ -98,12 +98,25 @@ class DaemonRuntime:
                 from molecule_runtime.schedule_store import ScheduleStore
                 from molecule_runtime.trigger_state import resolve_grid_path
 
+                store = ScheduleStore(resolve_grid_path())
                 seeded_cfg = schedule_seed.seed_schedules_from_workspace_config(
-                    self.config_path, ScheduleStore(resolve_grid_path())
+                    self.config_path, store
                 )
                 if seeded_cfg:
                     logger.info(
                         "Schedule seed: %d workspace-config schedule(s)", seeded_cfg
+                    )
+                # Schedules delivered as a trigger plugin's own config (the M3
+                # location). Inert until a template uses it — every plugin
+                # without a `schedules` key is a clean no-op. Runs on the same
+                # boot AND /internal/daemons/reload path as the leg above, so a
+                # reload picks up a changed grid either way.
+                seeded_plugin = schedule_seed.seed_schedules_from_plugin_settings(
+                    self.config_path, store
+                )
+                if seeded_plugin:
+                    logger.info(
+                        "Schedule seed: %d plugin-config schedule(s)", seeded_plugin
                     )
             except Exception as e:  # noqa: BLE001 — seeding must never break a reload
                 logger.warning(
