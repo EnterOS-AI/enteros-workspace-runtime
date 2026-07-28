@@ -722,3 +722,224 @@ def test_main_boot_daemon_wiring_is_fail_open():
 
     holder_src = inspect.getsource(_dr)
     assert "non-fatal" in holder_src or "must never break a reload" in holder_src
+
+
+# ---------------------------------------------------------------------------
+# contributes.state — durable per-plugin state dir (RFC sdk#181, #360 defect A)
+# ---------------------------------------------------------------------------
+STATE_MANIFEST = """\
+name: gmail-channel-molecule
+version: 1.0.0
+description: channel bridge that keeps a poll cursor
+kind: channel
+contributes:
+  state:
+    durability: required
+    description: Gmail poll cursor.
+  daemons:
+    - name: bridge
+      command: python
+      args: ["-m", "gmail_channel_molecule.daemon"]
+"""
+
+# Deliberately NOT a channel/trigger plugin: contributes.state must be
+# kind-agnostic. A kind-gated implementation (e.g. injecting in channel_events,
+# which only runs for channel + trigger) passes every channel test and still
+# fails this one.
+SKILL_STATE_MANIFEST = """\
+name: notes-skill
+version: 1.0.0
+description: a skill plugin that nonetheless keeps state
+kind: skill
+contributes:
+  state:
+    durability: preferred
+  daemons:
+    - name: sync
+      command: python
+      args: ["-m", "notes_skill.sync"]
+"""
+
+
+def test_state_contribution_passes_ssot_validation():
+    """Same tolerance argument as `daemons`: if `contributes.state` produced
+    violations, fail-closed enforcement would refuse every stateful plugin."""
+    import yaml
+
+    raw = yaml.safe_load(STATE_MANIFEST)
+    assert manifest_ssot.validate_manifest_ssot(raw) == []
+
+
+def test_discovery_reads_contributes_state(tmp_path):
+    ws = tmp_path / "configs" / "plugins"
+    ws.mkdir(parents=True)
+    _write_plugin(ws, "gmail-channel-molecule", STATE_MANIFEST)
+    specs = discover_daemon_specs(workspace_plugins_dir=str(ws), shared_plugins_dir=str(tmp_path / "none"))
+    assert len(specs) == 1
+    assert specs[0].state == {
+        "durability": "required",
+        "description": "Gmail poll cursor.",
+    }
+
+
+def test_state_is_kind_agnostic(tmp_path):
+    """A `kind: skill` plugin declaring state still gets it carried through."""
+    ws = tmp_path / "configs" / "plugins"
+    ws.mkdir(parents=True)
+    _write_plugin(ws, "notes-skill", SKILL_STATE_MANIFEST)
+    specs = discover_daemon_specs(workspace_plugins_dir=str(ws), shared_plugins_dir=str(tmp_path / "none"))
+    assert len(specs) == 1
+    assert specs[0].kind == "skill"
+    assert specs[0].state == {"durability": "preferred"}
+
+
+def test_a_plugin_without_state_gets_none():
+    specs = daemon_specs_from_manifest(
+        "p", "/tmp/p", [{"name": "d", "command": "python"}], raw_state=None
+    )
+    assert specs[0].state is None
+
+
+def test_a_malformed_state_declaration_is_coerced_not_dropped(caplog):
+    """Skip-not-reject. A typo must not silently deny the plugin a state dir,
+    and must not fail manifest validation either."""
+    caplog.set_level("WARNING")
+    specs = daemon_specs_from_manifest(
+        "p", "/tmp/p", [{"name": "d", "command": "python"}], raw_state="durable-please"
+    )
+    assert specs[0].state == {"durability": "required"}
+    assert any("contributes.state is str" in r.getMessage() for r in caplog.records)
+
+
+def test_supervisor_injects_the_state_dir(tmp_path, monkeypatch):
+    from molecule_runtime import plugin_state
+
+    root = tmp_path / "durable-root"
+    root.mkdir()
+    monkeypatch.setenv(plugin_state.STATE_ROOT_ENV, str(root))
+    out = tmp_path / "state-env.txt"
+    script = (
+        "import os\n"
+        f"open({str(out)!r}, 'w').write("
+        f"os.environ.get({plugin_state.STATE_DIR_ENV!r}, 'MISSING') + '|' + "
+        f"os.environ.get({plugin_state.DURABLE_ENV!r}, 'MISSING'))\n"
+    )
+    spec = DaemonSpec(
+        name="d",
+        plugin="gmail-channel-molecule",
+        command=[sys.executable, "-c", script],
+        state={"durability": "required"},
+    )
+    sup = _fast_supervisor([spec])
+    sup.start()
+    try:
+        assert _wait_for(out.exists)
+        got_dir, got_durable = out.read_text().split("|")
+    finally:
+        sup.stop()
+    # Already namespaced by the runtime — the plugin never joins its own name.
+    assert got_dir == str(root / "gmail-channel-molecule")
+    assert got_durable in ("0", "1")  # honest either way; value is probe-dependent
+
+
+def test_a_manifest_cannot_forge_its_own_state_dir(tmp_path, monkeypatch):
+    """THE isolation test.
+
+    `contributes.state` has no path field, so the only way a plugin could name
+    its own directory is by smuggling the reserved var through its `env:` map.
+    The runtime sets both vars AFTER `child_env.update(spec.env)`, so the
+    manifest loses. If injection ever moves before the overlay, this fails.
+    """
+    from molecule_runtime import plugin_state
+
+    root = tmp_path / "durable-root"
+    root.mkdir()
+    monkeypatch.setenv(plugin_state.STATE_ROOT_ENV, str(root))
+    out = tmp_path / "forged.txt"
+    script = (
+        "import os\n"
+        f"open({str(out)!r}, 'w').write("
+        f"os.environ.get({plugin_state.STATE_DIR_ENV!r}, 'MISSING') + '|' + "
+        f"os.environ.get({plugin_state.DURABLE_ENV!r}, 'MISSING'))\n"
+    )
+    spec = DaemonSpec(
+        name="d",
+        plugin="evil-plugin",
+        command=[sys.executable, "-c", script],
+        env={
+            plugin_state.STATE_DIR_ENV: "/etc",          # try to escape
+            plugin_state.DURABLE_ENV: "1",               # try to lie
+        },
+        state={"durability": "required"},
+    )
+    sup = _fast_supervisor([spec])
+    sup.start()
+    try:
+        assert _wait_for(out.exists)
+        got_dir, got_durable = out.read_text().split("|")
+    finally:
+        sup.stop()
+    assert got_dir == str(root / "evil-plugin"), "manifest env overrode the state dir"
+    assert got_dir != "/etc"
+    # The forged "1" must not survive either — on a tmp root the probe
+    # downgrades, so the honest answer here is 0.
+    assert got_durable == "0", "manifest env forged the durability flag"
+
+
+def test_a_stale_inherited_state_dir_is_stripped(tmp_path, monkeypatch):
+    """Reserved means reserved: a daemon we resolve NO state dir for must not
+    see one the runtime happened to inherit from its own environment."""
+    from molecule_runtime import plugin_state
+
+    monkeypatch.setenv(plugin_state.STATE_DIR_ENV, "/tmp/stale-parent-state")
+    monkeypatch.setenv(plugin_state.DURABLE_ENV, "1")
+    out = tmp_path / "stale.txt"
+    script = (
+        "import os\n"
+        f"open({str(out)!r}, 'w').write("
+        f"str({plugin_state.STATE_DIR_ENV!r} in os.environ) + '|' + "
+        f"str({plugin_state.DURABLE_ENV!r} in os.environ))\n"
+    )
+    # state=None -> the plugin declared none, so nothing is injected.
+    spec = DaemonSpec(name="d", plugin="p", command=[sys.executable, "-c", script])
+    sup = _fast_supervisor([spec])
+    sup.start()
+    try:
+        assert _wait_for(out.exists)
+        assert out.read_text() == "False|False"
+    finally:
+        sup.stop()
+
+
+def test_a_plugin_without_state_gets_a_byte_identical_child_env(tmp_path, monkeypatch):
+    """No regression for every daemon that exists today.
+
+    A plugin that declares no state must see exactly the environment it saw
+    before this change — neither var present, nothing else perturbed.
+    """
+    from molecule_runtime import plugin_state
+
+    root = tmp_path / "durable-root"
+    root.mkdir()
+    monkeypatch.setenv(plugin_state.STATE_ROOT_ENV, str(root))
+    out = tmp_path / "clean.txt"
+    script = (
+        "import os, json\n"
+        f"open({str(out)!r}, 'w').write(json.dumps(sorted(\n"
+        f"    k for k in os.environ if k.startswith('MOLECULE_PLUGIN_STATE'))))\n"
+    )
+    spec = DaemonSpec(name="d", plugin="p", command=[sys.executable, "-c", script])
+    sup = _fast_supervisor([spec])
+    sup.start()
+    try:
+        assert _wait_for(out.exists)
+        import json as _json
+
+        present = _json.loads(out.read_text())
+    finally:
+        sup.stop()
+    # The provisioner's own root var is inherited (it always was); the two
+    # reserved daemon vars must NOT appear.
+    assert plugin_state.STATE_DIR_ENV not in present
+    assert plugin_state.DURABLE_ENV not in present
+    assert present == [plugin_state.STATE_ROOT_ENV]
