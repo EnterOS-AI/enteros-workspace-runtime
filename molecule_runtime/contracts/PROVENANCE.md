@@ -36,30 +36,42 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `f2dd96c238b66fb5ab67dedbfb4ebaf30061c5e2` (sdk `fix/audience-schema-descriptions` — corrects the `audience` field DESCRIPTIONS to match runtime SSOT: `self` injects the workspace token as a re-read FILE PATH (MOLECULE_WORKSPACE_TOKEN_FILE=/configs/.auth_token), and the absent/`org` audience anchors org-credential injection to the core-verified MANAGEMENT_MCP_NAME — never a self-declared tenant plugin. Description-only; no structural/enum change vs the sdk#119 contract-version 0.5.0 that added the scalar `audience` (self|org).)
-Vendored at sdk HEAD: `f2dd96c238b66fb5ab67dedbfb4ebaf30061c5e2` (branch `fix/audience-schema-descriptions`, PENDING MERGE; layered on sdk#119 `feat/mcp-audience-contract`)
+Source commit:        `bd26e4e2fb664a4b1e419ac7827aeba423535ce6` (sdk#176 — declares `contributes.configuration`, the per-install plugin-config declaration. Additive and purely structural: `contributes` was already `additionalProperties: true`, so a `configuration` block validated before this commit too. What it adds is a discoverable, codegen-visible shape plus two new `$defs` — `configurationContribution` and `configurationProperty`.)
+Vendored at sdk HEAD: `bd26e4e2fb664a4b1e419ac7827aeba423535ce6` (main)
 
-GATED (sdk#119 audience contract + description fix): the SDK commit above is a
-HELD draft and not yet on sdk `main`. Re-vendored byte-for-byte from that branch
-(content sha256
-`60de766d38805c5ffd1c0a35dd10eea44b6c8852cdd9f4c505ff0e1c64829d1c`). Until the
-SDK branch merges, `scripts/check-schemas-in-sync.sh` REPORTS DRIFT for this file
-(it diffs against sdk `main`, which still carries contract-version 0.4.0) — that
-is expected and correct for this HELD runtime PR, which DEPENDS ON the SDK branch.
-When the SDK contract merges, reconcile the two SHAs above to the sdk `main` merge
-commit; the file content is unchanged, so the drift gate goes green the moment the
-SDK branch lands.
+Content sha256: `aead19f477bb8fb725700ec1bef5dc4b754505d3b148035cd990821dda5713da`
+
+No longer gated: the previous record here pinned
+`f2dd96c238b66fb5ab67dedbfb4ebaf30061c5e2` on the PENDING-MERGE branch
+`fix/audience-schema-descriptions` (layered on sdk#119). That work has since
+landed on sdk `main`, and this re-vendor takes the file from `main` directly —
+so `scripts/check-schemas-in-sync.sh` now diffs green rather than reporting
+expected drift.
+
+TOLERANCE — `contributes.configuration` is deliberately UNCONSTRAINED at
+manifest level (`description` + `anyOf` + `examples`, no sibling assertions),
+mirroring `daemons` and `digestProviders`. This matters here specifically
+because THIS repo is the one that validates: `manifest_ssot.py` runs the schema
+at plugin load and install, and `plugin_settings.load_delivered` degrades to
+`{}` on any error while keeping the plugin. A strict `configuration` property
+would make a typo brick the plugin at the fail-closed install gate instead of
+degrading to declared defaults — the vendored copy must preserve that.
+
+GRAMMAR — `$defs/configurationContribution` constrains declared property names
+to `^[A-Za-z0-9_.-]+$`, which is exactly this repo's `plugin_settings._CONFIG_REF`
+character class. The two are asserted equal by
+`molecule-ai-sdk/tests/test_plugin_manifest_configuration_contract.py`; a key
+outside the class could be declared but never referenced as `${config:<key>}`.
 
 Why vendored: `molecule_runtime/manifest_ssot.py` validates plugin manifests
 against this schema at plugin **load** (`plugins.load_plugin_manifest`) and at
 **install** (`plugin_sources.install_declared_plugins`) — the ADVISORY phase of
 molecule-core#3383. Validation runs inside workspace containers at boot.
 
-Re-vendoring (from the SDK fix branch while it is HELD; switch to `/raw/branch/main/`
-once merged):
+Re-vendoring:
 
     curl -fsS -A "curl/8.4.0" \
-      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/fix/audience-schema-descriptions/contracts/plugin-manifest/plugin-manifest.schema.json \
+      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-manifest/plugin-manifest.schema.json \
       -o molecule_runtime/contracts/plugin-manifest.schema.json
 
 ---
