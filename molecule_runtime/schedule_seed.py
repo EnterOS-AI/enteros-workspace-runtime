@@ -178,9 +178,11 @@ def _seed_workspace_config(configs_dir: Path, store: ScheduleStore) -> int:
     return len(valid)
 
 
-def _normalize_config_entry(entry: Any, index: int, configs_dir: Path) -> dict[str, Any] | None:
+def _normalize_config_entry(
+    entry: Any, index: int, configs_dir: Path, source_label: str = "config.yaml schedules"
+) -> dict[str, Any] | None:
     """Validate one delivered entry; return the contract-normalized form or None (skip)."""
-    label = f"config.yaml schedules[{index}]"
+    label = f"{source_label}[{index}]"
     if not isinstance(entry, dict):
         print(f"schedule seed: skipped {label}: entry must be a mapping", flush=True)
         return None
@@ -235,3 +237,128 @@ def _read_confined_prompt_file(prompt_file: Any, configs_dir: Path, label: str) 
     except (OSError, UnicodeDecodeError) as exc:
         print(f"schedule seed: skipped {label}: prompt_file unreadable: {exc}", flush=True)
         return None
+
+
+# --- schedules delivered as PLUGIN CONFIG (the M3 location) -----------------
+#
+# Schedules are moving from a top-level `schedules:` key in the delivered
+# config.yaml onto the owning plugin's own configuration:
+#
+#     plugins:
+#       - source: gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0
+#         config:
+#           schedules:
+#             - {name: nightly-audit, cron: "0 3 * * *", prompt: ...}
+#
+# Core renders that to /configs/plugin-settings/<install-name>.json (the same
+# per-install settings channel every other plugin setting uses), and the entries
+# are read back here.
+#
+# WHY the owning plugin rather than a core-owned key: scheduling is a
+# `kind: trigger` plugin's job, so a different scheduler implementation can be
+# swapped in and bring its own grid without core knowing anything about cron.
+#
+# IDENTITY WARNING — a plugin has TWO names and they differ:
+#   * plugin.name           the install/checkout DIRECTORY, derived from the
+#                           source repo ("molecule-ai-plugin-scheduler").
+#                           Core keys the settings FILE on this, and
+#                           plugin_settings reads it back with the same key.
+#   * plugin.manifest.name  the manifest's own `name:` ("molecule-scheduler"),
+#                           used for trigger/channel daemon provenance.
+# Keying settings on the manifest name would look at a file that is never
+# written, and a missing settings file is a clean no-op here — so the failure
+# would be SILENT. Always pass plugin.name to plugin_settings.
+
+
+def seed_schedules_from_plugin_settings(
+    configs_dir: str | os.PathLike[str],
+    store: ScheduleStore,
+    workspace_plugins_dir: str | None = None,
+    shared_plugins_dir: str | None = None,
+) -> int:
+    """Reconcile schedules delivered as a trigger plugin's config into the grid.
+
+    Every installed ``kind: trigger`` plugin may carry a ``schedules`` list in
+    its resolved settings (declared defaults from the manifest ON THE BOX,
+    overlaid with whatever core delivered). Each plugin is seeded independently
+    via :meth:`ScheduleStore.upsert_template`, which is additive and keyed on
+    name — so two trigger plugins cannot clobber one another, and runtime edits
+    and tombstones are respected exactly as for the config.yaml leg.
+
+    Entry shape is identical to the config.yaml leg: ``name`` (required),
+    ``cron`` (or the authoring alias ``cron_expr``), ``prompt`` inline or
+    ``prompt_file`` (resolved STRICTLY confined to ``configs_dir``), ``enabled``
+    and ``timezone``. Validate-and-skip per entry.
+
+    Returns the number of entries seeded. FAIL-SOFT by contract: no exception
+    escapes to block boot or reload. A plugin with no ``schedules`` key — which
+    is every plugin today — is a clean no-op, so this is INERT until a template
+    starts using the new location.
+    """
+    try:
+        return _seed_plugin_settings(
+            Path(configs_dir), store, workspace_plugins_dir, shared_plugins_dir
+        )
+    except Exception as exc:  # noqa: BLE001 — seeding must never block boot/reload
+        print(
+            f"schedule seed: plugin-config seeding failed (non-fatal): {exc}",
+            flush=True,
+        )
+        return 0
+
+
+def _seed_plugin_settings(
+    configs_dir: Path,
+    store: ScheduleStore,
+    workspace_plugins_dir: str | None,
+    shared_plugins_dir: str | None,
+) -> int:
+    from molecule_runtime import plugin_settings
+    from molecule_runtime.plugins import load_plugins
+
+    loaded = load_plugins(
+        workspace_plugins_dir=workspace_plugins_dir,
+        shared_plugins_dir=shared_plugins_dir,
+    )
+    seeded = 0
+    for plugin in loaded.plugins:
+        if (plugin.manifest.kind or "").strip().lower() != "trigger":
+            continue
+        # plugin.name — the install DIRECTORY. See the identity warning above.
+        settings = plugin_settings.resolve(
+            plugin.name, plugin.manifest.contributes, str(configs_dir)
+        )
+        raw = settings.get("schedules")
+        if raw is None:
+            continue
+        if not isinstance(raw, list):
+            print(
+                f"schedule seed: `schedules` in {plugin.name} settings is not a list; ignored",
+                flush=True,
+            )
+            continue
+        if not raw:
+            continue
+
+        label = f"{plugin.name} config.schedules"
+        valid: list[dict[str, Any]] = []
+        for index, entry in enumerate(raw):
+            norm = _normalize_config_entry(entry, index, configs_dir, label)
+            if norm is not None:
+                valid.append(norm)
+        if not valid:
+            continue
+
+        try:
+            store.upsert_template(valid)
+        except ScheduleError as exc:
+            # Includes MAX_ENTRIES overflow on the merged grid — this plugin's
+            # schedules did NOT land and the prior grid is intact
+            # (replace_all is atomic). Other plugins are still attempted.
+            print(
+                f"schedule seed: {label} NOT applied (grid unchanged): {exc}",
+                flush=True,
+            )
+            continue
+        seeded += len(valid)
+    return seeded
