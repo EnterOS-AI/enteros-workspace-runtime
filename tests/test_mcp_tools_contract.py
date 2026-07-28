@@ -29,6 +29,7 @@ def test_mcp_tools_export_matches_runtime_server():
         "desktop_type",
         "desktop_key",
         "desktop_open_url",
+        "desktop_wait_for_control",
         "wait_for_message",
         "inbox_peek",
         "inbox_pop",

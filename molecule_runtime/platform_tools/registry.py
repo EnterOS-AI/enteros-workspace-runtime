@@ -81,6 +81,7 @@ from molecule_runtime.a2a_tools_desktop import (
     tool_desktop_screenshot,
     tool_desktop_status,
     tool_desktop_type,
+    tool_desktop_wait_for_control,
 )
 
 # Section name maps to the heading in the agent-facing system prompt.
@@ -710,6 +711,28 @@ _DESKTOP_OPEN_URL = ToolSpec(
     section=DISPLAY_SECTION,
 )
 
+_DESKTOP_WAIT_FOR_CONTROL = ToolSpec(
+    name="desktop_wait_for_control",
+    short="Wait until a human releases desktop control, then resume.",
+    when_to_use=(
+        "Use when a desktop_click/type/key/open_url reports that a human "
+        "currently holds desktop control. This blocks (polling) until control "
+        "is free or the timeout elapses, so you can resume driving the desktop "
+        "without fighting the human for the cursor."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "timeout_s": {
+                "type": "integer",
+                "description": "Max seconds to wait for control (1-600, default 60).",
+            },
+        },
+    },
+    impl=tool_desktop_wait_for_control,
+    section=DISPLAY_SECTION,
+)
+
 
 # ---------------------------------------------------------------------------
 # Inbox — inbound delivery for the standalone molecule-mcp path.
@@ -1098,6 +1121,7 @@ TOOLS: list[ToolSpec] = [
     _DESKTOP_TYPE,
     _DESKTOP_KEY,
     _DESKTOP_OPEN_URL,
+    _DESKTOP_WAIT_FOR_CONTROL,
     # Inbox (standalone-only; in-container returns informational error)
     _WAIT_FOR_MESSAGE,
     _INBOX_PEEK,

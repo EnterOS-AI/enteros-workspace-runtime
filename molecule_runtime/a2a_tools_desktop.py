@@ -17,6 +17,7 @@ its ``_host_*`` helpers have been retired.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -239,3 +240,42 @@ async def tool_desktop_open_url(url: str) -> str:
     return _json({"ok": True, "url": url})
 
 
+
+
+async def _desktop_control_status() -> dict:
+    """GET /desktop/control — {human_in_control, agent_can_control}."""
+    from .a2a_client import PLATFORM_URL, WORKSPACE_ID, auth_headers
+
+    url = f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/desktop/control"
+    async with httpx.AsyncClient(timeout=_DESKTOP_TIMEOUT) as client:
+        resp = await client.get(
+            url, headers={"X-Workspace-ID": WORKSPACE_ID, **auth_headers(WORKSPACE_ID)}
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def tool_desktop_wait_for_control(timeout_s: int = 60) -> str:
+    """Block until the agent can control the desktop (a human has released control).
+
+    When a click/type/key/navigate returns "a human currently holds desktop
+    control", pause and call this: it polls the gateway's /desktop/control status
+    until human_in_control clears or the timeout elapses, then the agent can
+    resume driving (design decision B, §8 arbitration — the human always wins the
+    one cursor, and the agent waits its turn).
+    """
+    timeout_s = max(1, min(int(timeout_s), 600))
+    poll = 2.0
+    waited = 0.0
+    while True:
+        try:
+            if not (await _desktop_control_status()).get("human_in_control", False):
+                return _json({"ok": True, "control": "available", "waited_s": round(waited, 1)})
+        except Exception as exc:
+            return _json({"ok": False, "error": str(exc)})
+        if waited >= timeout_s:
+            return _json(
+                {"ok": False, "control": "human", "error": f"still human-controlled after {timeout_s}s"}
+            )
+        await asyncio.sleep(poll)
+        waited += poll
