@@ -149,13 +149,13 @@ class GiteaClient:
         params: dict[str, str] | None = None,
         *,
         use_merge_token: bool = False,
+        anonymous: bool = False,
     ) -> tuple[int, Any]:
         url = f"{self.base_url}{path}"
         if params:
             url += "?" + urllib.parse.urlencode(params)
         token = self.merge_token if use_merge_token else self.read_token
         headers = {
-            "Authorization": f"token {token}",
             "Accept": "application/json",
             # CF edge 403s the default python-urllib UA (error 1010); send a
             # curl UA so calls through the CF-fronted git.moleculesai.app
@@ -166,6 +166,11 @@ class GiteaClient:
             # finally provisioned (2026-07-05).
             "User-Agent": "curl/8.4.0",
         }
+        # Anonymous calls deliberately omit Authorization entirely: Gitea
+        # rejects an out-of-scope token before falling back to public access,
+        # so sending it turns a 200 into a 403 (see user_exists).
+        if not anonymous:
+            headers["Authorization"] = f"token {token}"
         data: bytes | None = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -186,6 +191,36 @@ class GiteaClient:
                 return exc.code, json.loads(raw)
             except (json.JSONDecodeError, ValueError):
                 return exc.code, raw
+
+    def user_exists(self, login: str) -> bool:
+        """False only when `login` is DEFINITIVELY not an account (404).
+
+        Two things had to be got right here, both verified against live Gitea
+        on 2026-07-28 rather than assumed:
+
+        1. The call must be ANONYMOUS. `GET /users/{login}` is a public
+           endpoint, but presenting an out-of-scope token makes Gitea reject
+           on scope BEFORE it ever falls back to anonymous access:
+               GET /users/molecule-runtime-release-bot
+                 with the write:repository-only token -> 403
+                 {"message":"token does not have at least one of required
+                  scope(s), required=[read:user], token scope=write:repository"}
+                 with no Authorization header            -> 200
+           Sending the token here would make this guard reject EVERY login and
+           re-brick the sweeper — the exact failure it exists to prevent. (Same
+           edge the issue #311 liveness probe documents.)
+
+        2. It fails OPEN. Anything that is not a clean 404 — a private
+           instance that hides users, a network blip, an edge 5xx — means "I
+           could not check", not "this account is fake". Refusing on an
+           inconclusive answer would trade a silent no-op for a noisy one. The
+           real safety net is the drift alarm in run(); this is only here to
+           catch the typo class of error early.
+        """
+        status, _ = self._request(
+            "GET", f"/api/v1/users/{urllib.parse.quote(login, safe='')}", anonymous=True
+        )
+        return status != 404
 
     def whoami(self, *, use_merge_token: bool = False) -> str:
         """Login of the identity behind the chosen token; '' on failure.
@@ -391,6 +426,85 @@ def is_repo_opted_in(repo: str, client: GiteaClient) -> bool:
     return True
 
 
+def version_key(version: str) -> tuple[int, ...]:
+    """Comparable key for a `0.4.55`-style pin.
+
+    Factored out of the sort lambda because the regression guard now COMPARES
+    versions rather than just ordering them, so the two must not drift apart.
+
+    Non-numeric segments are dropped, matching the propagate script's
+    numeric-only version contract. Note this deliberately keeps the original
+    lambda's semantics — `0.4.55` -> (0, 4, 55) — rather than inventing a
+    richer semver parse the rest of the pipeline doesn't share.
+    """
+    return tuple(int(x) for x in version.strip().split(".") if x.isdigit())
+
+
+def resolve_identity(
+    client: "GiteaClient",
+    *,
+    configured: str,
+    token_env: str,
+    login_env: str,
+    role: str,
+    use_merge_token: bool,
+) -> tuple[str, str]:
+    """Resolve a token's account login. Returns (login, source).
+
+    Issue #339. The original design resolved this ONLY via `whoami()` and
+    refused to run otherwise, deliberately, to avoid the 2026-07-05 failure
+    where a HARDCODED author went stale and the sweeper no-opped green while
+    consumer pins drifted 5+ releases.
+
+    That is the right instinct but it collided with issue #311's fix: the
+    release-bot token was reissued `write:repository`-ONLY (no `read:user`)
+    on purpose, so `GET /user` is now *structurally* guaranteed to 401. The
+    sweeper has therefore died on every scheduled run since — the fleet
+    froze at 0.4.35, then 0.4.38, and each unblock has been manual.
+
+    So: prefer `whoami()` (authoritative — it reflects the credential
+    actually in use, and keeps working if the token later regains the
+    scope), and fall back to an explicit CONFIGURED login only when whoami
+    is unavailable. Config is a named env var, not a constant buried in the
+    source, and a wrong value can no longer no-op silently — see the
+    drift alarm in run(), which fails LOUD when bump-shaped PRs exist whose
+    author doesn't match. That alarm is what makes the fallback safe; it
+    is strictly stronger than the pre-#339 behaviour, which only caught
+    drift when whoami worked at all.
+    """
+    live = client.whoami(use_merge_token=use_merge_token)
+    configured = configured.strip()
+    if live:
+        if configured and configured != live:
+            # Not fatal: the live token is authoritative. But a stale
+            # override is exactly how the 2026-07-05 drift started, so say so.
+            print(
+                f"::warning::{login_env}={configured!r} disagrees with the live "
+                f"{role} identity {live!r} resolved from {token_env}; using the live "
+                f"value and ignoring the override. Update or unset {login_env}."
+            )
+        return live, "whoami"
+    if not configured:
+        return "", "unresolved"
+    # Validate the override names a real account. `/users/{login}` is public,
+    # so this works with the write-only token — it catches the typo class of
+    # error at startup rather than as a silent zero-match sweep.
+    if not client.user_exists(configured):
+        print(
+            f"::error::{login_env}={configured!r} is not a known Gitea account "
+            f"(GET /users/{configured} did not return 200); refusing to sweep "
+            f"against an identity that cannot have opened anything.",
+            file=sys.stderr,
+        )
+        return "", "invalid"
+    print(
+        f"::notice::{role} identity resolved from {login_env}={configured!r} "
+        f"(whoami via {token_env} unavailable — expected while that token is "
+        f"write:repository-only per issue #311)."
+    )
+    return configured, login_env
+
+
 def run() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default=os.environ.get("GITEA_HOST", "https://git.moleculesai.app"))
@@ -399,6 +513,12 @@ def run() -> int:
                         help="Env var holding the non-author approve+merge identity (runtime#131's contract).")
     parser.add_argument("--read-token-env", default="DISPATCH_TOKEN",
                         help="Env var holding the read-only token (default DISPATCH_TOKEN; used to list PRs, fetch files, check status, read the per-repo opt-out file).")
+    parser.add_argument("--opener-login-env", default="BUMP_OPENER_LOGIN",
+                        help="Env var holding the EXPECTED bump-PR author login, used only when whoami() "
+                             "is unavailable because the read token is write:repository-only (issue #339).")
+    parser.add_argument("--merge-login-env", default="BUMP_MERGE_LOGIN",
+                        help="Env var holding the approve+merge identity login, used only when whoami() "
+                             "is unavailable for the merge token.")
     parser.add_argument("--dry-run", action="store_true",
                         help="List the would-merge PRs + would-close PRs without mutating.")
     parser.add_argument("--repos", nargs="*", default=None,
@@ -444,22 +564,41 @@ def run() -> int:
     # token. Fail LOUD (non-zero) if either cannot be resolved or if they
     # coincide: a sweeper that guesses the author or can self-approve is
     # worse than a delayed sweep.
-    expected_author = client.whoami()
+    expected_author, opener_src = resolve_identity(
+        client,
+        configured=os.environ.get(args.opener_login_env, ""),
+        token_env=args.read_token_env,
+        login_env=args.opener_login_env,
+        role="opener",
+        use_merge_token=False,
+    )
     if not expected_author:
         print(
-            f"::error::cannot resolve the opener identity (GET /user with "
-            f"{args.read_token_env} failed); refusing to guess the bump-PR "
-            f"author.",
+            f"::error::cannot resolve the opener identity: GET /user with "
+            f"{args.read_token_env} failed (the release-bot token is "
+            f"write:repository-only BY DESIGN — see issue #311's least-privilege "
+            f"fix — so whoami is structurally unavailable) and {args.opener_login_env} "
+            f"is unset. Set {args.opener_login_env} to the account that opens the "
+            f"bump PRs; refusing to guess the bump-PR author.",
             file=sys.stderr,
         )
         return 2
-    merge_identity = "" if args.dry_run and not merge_token else client.whoami(use_merge_token=True)
+    merge_identity, merge_src = ("", "dry-run")
+    if not (args.dry_run and not merge_token):
+        merge_identity, merge_src = resolve_identity(
+            client,
+            configured=os.environ.get(args.merge_login_env, ""),
+            token_env=args.merge_token_env,
+            login_env=args.merge_login_env,
+            role="merger",
+            use_merge_token=True,
+        )
     if not args.dry_run:
         if not merge_identity:
             print(
                 f"::error::cannot resolve the merge identity (GET /user with "
-                f"{args.merge_token_env} failed); refusing to approve+merge "
-                f"blind.",
+                f"{args.merge_token_env} failed and {args.merge_login_env} is unset); "
+                f"refusing to approve+merge blind.",
                 file=sys.stderr,
             )
             return 2
@@ -477,13 +616,21 @@ def run() -> int:
     print(
         f"runtime#131 sweep: {len(repos)} consumer repos, "
         f"mode={'DRY-RUN' if args.dry_run else 'MERGE'}, "
-        f"opener={expected_author!r}, merger={merge_identity or '<dry-run>'!r}"
+        f"opener={expected_author!r} (via {opener_src}), "
+        f"merger={merge_identity or '<dry-run>'!r} (via {merge_src})"
     )
 
     total_merged = 0
     total_closed = 0
     total_skipped = 0
     rc = 0
+    # Issue #339 drift alarm. Authors seen on PRs that are bump-SHAPED (they
+    # touch only ALLOWED_BUMP_FILES) but whose author != expected_author. If
+    # this ends up non-empty while nothing matched, the configured/resolved
+    # opener is wrong and the sweep is a silent no-op — the precise 2026-07-05
+    # failure. We turn that into a red run instead of a green one.
+    unmatched_authors: set[str] = set()
+    matched_any = False
 
     for repo in repos:
         if not is_repo_opted_in(repo, client):
@@ -511,7 +658,16 @@ def run() -> int:
                 continue
             files = client.get_pr_files(repo, pr_number)
             if not is_runtime_bump_pr(pr, files, expected_author):
+                # Bump-SHAPED but authored by someone else → record for the
+                # drift alarm below. File shape alone is never enough to act
+                # on; it is only enough to notice that we might be filtering
+                # on the wrong identity.
+                if files and all(f in ALLOWED_BUMP_FILES for f in files):
+                    other = ((pr.get("user") or {}).get("login") or "?") if isinstance(pr.get("user"), dict) else "?"
+                    if other != expected_author:
+                        unmatched_authors.add(other)
                 continue
+            matched_any = True
             # Extract version from branch name. The propagate script's
             # actual branch grammar (per scripts/propagate_runtime_version.py)
             # is `bump/runtime-{target}` (with a slash); we also accept
@@ -544,7 +700,52 @@ def run() -> int:
         # script emits; non-numeric suffixes sort lexicographically but
         # the propagate script's version-string contract is numeric
         # segments only).
-        bump_prs.sort(key=lambda t: tuple(int(x) for x in t[0].split(".") if x.isdigit()), reverse=True)
+        bump_prs.sort(key=lambda t: version_key(t[0]), reverse=True)
+
+        # Never merge a bump that is not STRICTLY newer than what main already
+        # pins. Discovered live 2026-07-28: main was at 0.4.55 (PR #357 had
+        # been merged by hand during an outage unblock) while the newest OPEN
+        # bump was 0.4.54, so "merge the latest open bump" meant merging a
+        # REGRESSION of the production runtime pin.
+        #
+        # Today that merge happens to fail on a git conflict — but a conflict
+        # is luck, not a safety property: one rebase of the branch resolves it
+        # in the PR's favour and the pin silently goes backwards. Worse, the
+        # unconditional attempt also *wedged* the sweeper: it picked the stale
+        # PR, failed to merge, `continue`d, and so never closed the superseded
+        # ones — no progress, forever, even with the identity fix in place.
+        #
+        # So: compare against main and treat anything <= current as superseded
+        # (close it), leaving only strictly-newer bumps eligible to merge.
+        current_pin = (client.get_file(repo, ".runtime-version") or "").strip()
+        if current_pin:
+            newer = [b for b in bump_prs if version_key(b[0]) > version_key(current_pin)]
+            superseded = [b for b in bump_prs if version_key(b[0]) <= version_key(current_pin)]
+            if superseded:
+                print(
+                    f"  {repo}: main pins {current_pin}; "
+                    f"{len(superseded)} bump PR(s) at or below it are superseded"
+                )
+                for old_version, old_pr, _b in superseded:
+                    if args.dry_run:
+                        print(f"    DRY-RUN: would close superseded PR #{old_pr} ({old_version} <= {current_pin})")
+                        total_skipped += 1
+                        continue
+                    close_status = client.close_pr(repo, old_pr)
+                    if close_status in (200, 201, 204):
+                        print(f"    closed superseded PR #{old_pr} ({old_version} <= main's {current_pin})")
+                        total_closed += 1
+                    else:
+                        print(f"    close PR #{old_pr} failed (HTTP {close_status}); will retry next sweep")
+            bump_prs = newer
+            if not bump_prs:
+                print(f"  {repo}: no bump newer than {current_pin} — up to date")
+                continue
+        else:
+            # Couldn't read the pin (new repo, transient). Fall back to the
+            # old behaviour rather than blocking the sweep; the merge itself
+            # still gates on all-green status.
+            print(f"  {repo}: ::warning::could not read .runtime-version on main; skipping the regression guard")
 
         latest_version, latest_pr, latest_branch = bump_prs[0]
         print(f"  {repo}: latest bump = {latest_version} (PR #{latest_pr}, branch {latest_branch!r})")
@@ -610,6 +811,24 @@ def run() -> int:
                 total_closed += 1
             else:
                 print(f"    close PR #{older_pr} failed (HTTP {close_status}); will retry next sweep")
+
+    # Issue #339 drift alarm. If we matched NOTHING anywhere yet there are
+    # open PRs that look exactly like propagation bumps by file shape, the
+    # identity we filtered on is almost certainly wrong. Historically this
+    # combination produced a GREEN no-op run while every consumer template
+    # silently fell behind by releases at a time. Make it red and name both
+    # sides so the fix is a one-liner rather than an investigation.
+    if not matched_any and unmatched_authors:
+        print(
+            f"::error::sweep matched ZERO bump PRs as {expected_author!r} "
+            f"(resolved via {opener_src}), but found bump-shaped PRs authored by "
+            f"{sorted(unmatched_authors)!r}. The opener identity is stale or "
+            f"misconfigured — set {args.opener_login_env} to the correct account. "
+            f"Failing loudly: a silent no-op here is what let consumer pins drift "
+            f"5+ releases on 2026-07-05 and again on 2026-07-20/24.",
+            file=sys.stderr,
+        )
+        rc = 2
 
     print(f"runtime#131 sweep complete: merged={total_merged} closed={total_closed} skipped={total_skipped} mode={'DRY-RUN' if args.dry_run else 'MERGE'}")
     return rc
