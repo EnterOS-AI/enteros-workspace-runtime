@@ -165,6 +165,21 @@
           "examples": [
             [ { "provider_id": "org-roster-digest", "entrypoint": "molecule_platform_digest.roster:OrgRosterDigestProvider", "base_tier": 5, "summary": "Open workspaces and pending provisions across the org." } ]
           ]
+        },
+        "configuration": {
+          "description": "Per-install configuration declaration (ADDITIVE contribution point). Declares WHICH keys an install may set and how to render them; the VALUES are delivered out-of-band as `/configs/plugin-settings/<install-name>.json` (from a workspace template's `plugins[].config`, org defaults, or an operator edit) and resolved by the workspace runtime at daemon discovery, where `${config:<key>}` references in a daemon's `env` are interpolated. VALIDATION SEMANTICS — deliberately UNCONSTRAINED here, mirroring `daemons` and `digestProviders`: the runtime DROPS bad keys and KEEPS the plugin (molecule_runtime/plugin_settings.load_delivered degrades to `{}` on malformed/oversize/missing settings and interpolate() renders an unresolvable reference as empty, never the literal), so a typo cannot brick the plugin at the (future fail-closed) install gate — schema-constraining this property would CHANGE runtime semantics rather than capture them. The declaration is descriptive only: the VALUE SPACE is free-form per plugin, so each trigger plugin defines its own config and nothing here constrains what a template may set. `$defs/configurationContribution` documents the canonical WELL-FORMED shape emitters, the `.example` generator, and the platform plugin tab should use.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/configurationContribution",
+              "description": "The canonical, well-formed form — what emitters MUST produce. Kept as a live ref so the shape stays discoverable and $defs/configurationContribution is never orphaned."
+            },
+            {
+              "description": "Anything else — tolerated by design: the runtime falls back to declared defaults instead of failing manifest validation. This branch makes the anyOf always-satisfiable, which IS the contract."
+            }
+          ],
+          "examples": [
+            { "title": "Scheduler", "properties": { "timezone": { "type": "string", "default": "UTC", "description": "IANA timezone the cron grid is evaluated in." }, "max_concurrent": { "type": "integer", "default": 1, "description": "Overlapping runs allowed per schedule." } } }
+          ]
         }
       }
     },
@@ -302,6 +317,34 @@
       "properties": {
         "name": { "type": "string", "minLength": 1, "description": "Command name (e.g. `/seo-audit`)." },
         "description": { "type": "string", "description": "Optional human-readable description." }
+      }
+    },
+    "configurationContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "The canonical well-formed shape of `contributes.configuration`. PROPERTY NAMES must match the workspace runtime's reference grammar (`^[A-Za-z0-9_.-]+$` — molecule_runtime/plugin_settings._CONFIG_REF): a key outside it can be declared but could never be referenced as `${config:<key>}`, so the canonical branch rejects it while the tolerant branch of the property still accepts the manifest.",
+      "properties": {
+        "title": { "type": "string", "description": "Section heading for the platform plugin tab." },
+        "description": { "type": "string", "description": "Section help text." },
+        "properties": {
+          "type": "object",
+          "description": "Declared key -> declaration. Each key is referenced from a daemon's env as `${config:<key>}`.",
+          "propertyNames": { "pattern": "^[A-Za-z0-9_.-]+$" },
+          "additionalProperties": { "$ref": "#/$defs/configurationProperty" }
+        }
+      }
+    },
+    "configurationProperty": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "One declared, per-install configurable key — the unit the three consumers share. An ECOSYSTEM DEVELOPER reads `default` to run the plugin with no API call; an OPERATOR reads `description`/`enum` to review and reuse a value across workspaces; the PLATFORM UI renders the plugin tab from `type`/`enum`/`default` and masks the field when `sensitive`.",
+      "properties": {
+        "type": { "type": "string", "enum": ["string", "integer", "number", "boolean", "array", "object"], "description": "JSON type used to render and coerce the field." },
+        "default": { "description": "Layer-1 value. Lives in the manifest ON THE BOX — core cannot supply it at provision time (it holds no manifest then), so the runtime resolves it at daemon-discovery time." },
+        "description": { "type": "string", "description": "Human-facing help, shown in the plugin tab and emitted into the generated `.example`." },
+        "enum": { "type": "array", "minItems": 1, "items": { "description": "One allowed value, of whatever JSON type `type` declares." }, "description": "Closed value set; the UI renders a select rather than a free text field." },
+        "sensitive": { "type": "boolean", "default": false, "description": "True for credential-shaped values. The UI masks the field and the generated `.example` carries a PLACEHOLDER, never a real value; non-sensitive keys may carry a real example value." },
+        "required": { "type": "boolean", "default": false, "description": "Advisory only. An unset required key resolves to empty like any other unresolved reference — it does NOT fail the install, because the runtime drops bad keys and keeps the plugin." }
       }
     }
   }
