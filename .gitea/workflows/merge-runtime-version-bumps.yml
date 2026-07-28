@@ -139,6 +139,21 @@ jobs:
           #     path (validate-before-delete).
           CONSUMER_BUMP_MERGE_TOKEN: ${{ secrets.CONSUMER_BUMP_MERGE_TOKEN }}
           DISPATCH_TOKEN: ${{ env.DISPATCH_TOKEN }}
+          # issue #339. DISPATCH_TOKEN is RUNTIME_BOT_TOKEN, reissued
+          # write:repository-ONLY by issue #311's least-privilege fix — so
+          # `GET /user` 401s by design and the script's dynamic whoami() can
+          # never resolve the opener. That killed EVERY scheduled sweep since,
+          # and each unblock (2026-07-20, -24, -28) has been manual.
+          #
+          # This names the opener explicitly as a FALLBACK: whoami() still wins
+          # whenever it works, so re-granting read:user later silently restores
+          # the fully-dynamic behaviour with no edit here. A stale value can no
+          # longer no-op green — the script fails red when bump-shaped PRs
+          # exist under a different author.
+          #
+          # Verified 2026-07-28: all 66 open bump PRs across the four
+          # maintained templates are authored by molecule-runtime-release-bot.
+          BUMP_OPENER_LOGIN: molecule-runtime-release-bot
         run: |
           if [ -z "${CONSUMER_BUMP_MERGE_TOKEN:-}" ]; then
             echo "::warning::CONSUMER_BUMP_MERGE_TOKEN secret absent; skipping consumer runtime-version bump merge sweeper (runtime#131 + runtime#83). Provision a non-author identity with write on the consumer template repos to enable."

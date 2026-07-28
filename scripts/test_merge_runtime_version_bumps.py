@@ -21,6 +21,8 @@ import importlib.util
 import os
 import sys
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # Load the script module (it's a standalone CLI, not importable as a
@@ -526,3 +528,232 @@ class GiteaHostSchemeGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# issue #339 — opener-identity resolution + drift alarm.
+#
+# The sweeper died on EVERY scheduled run with "cannot resolve the opener
+# identity": DISPATCH_TOKEN is RUNTIME_BOT_TOKEN, reissued write:repository-ONLY
+# by issue #311's least-privilege fix, so GET /user 401s BY DESIGN. Dynamic
+# whoami() could therefore never succeed, and the script refused to run rather
+# than guess. Correct instinct, structurally unsatisfiable precondition.
+# ---------------------------------------------------------------------------
+
+resolve_identity = _mod.resolve_identity
+
+
+class _FakeClient:
+    """Stands in for GiteaClient over the two calls resolve_identity makes."""
+
+    def __init__(self, *, whoami_result: str = "", known_users: set[str] | None = None):
+        self._whoami = whoami_result
+        self._known = known_users if known_users is not None else {"molecule-runtime-release-bot"}
+        self.user_exists_calls: list[str] = []
+
+    def whoami(self, *, use_merge_token: bool = False) -> str:
+        return self._whoami
+
+    def user_exists(self, login: str) -> bool:
+        self.user_exists_calls.append(login)
+        return login in self._known
+
+
+def _resolve(client, configured: str):
+    return resolve_identity(
+        client,
+        configured=configured,
+        token_env="DISPATCH_TOKEN",
+        login_env="BUMP_OPENER_LOGIN",
+        role="opener",
+        use_merge_token=False,
+    )
+
+
+class OpenerIdentityResolution(unittest.TestCase):
+    def test_whoami_wins_when_it_works(self):
+        """The dynamic path stays authoritative — re-granting read:user later
+        must restore full auto-resolution with no config edit."""
+        login, src = _resolve(_FakeClient(whoami_result="core-devops"), "")
+        self.assertEqual(login, "core-devops")
+        self.assertEqual(src, "whoami")
+
+    def test_whoami_overrides_a_stale_configured_value(self):
+        login, src = _resolve(
+            _FakeClient(whoami_result="core-devops"), "molecule-runtime-release-bot"
+        )
+        self.assertEqual(login, "core-devops", "live credential must beat static config")
+        self.assertEqual(src, "whoami")
+
+    def test_configured_login_is_used_when_whoami_is_unavailable(self):
+        """THE #339 FIX: write:repository-only token → whoami '' → fall back."""
+        login, src = _resolve(_FakeClient(whoami_result=""), "molecule-runtime-release-bot")
+        self.assertEqual(login, "molecule-runtime-release-bot")
+        self.assertEqual(src, "BUMP_OPENER_LOGIN")
+
+    def test_unresolvable_with_no_config_still_refuses(self):
+        """The original safety property must survive: never guess."""
+        login, src = _resolve(_FakeClient(whoami_result=""), "")
+        self.assertEqual(login, "")
+        self.assertEqual(src, "unresolved")
+
+    def test_configured_login_that_is_not_a_real_account_is_refused(self):
+        """A typo'd override must fail at startup, not as a zero-match sweep."""
+        c = _FakeClient(whoami_result="", known_users={"molecule-runtime-release-bot"})
+        login, src = _resolve(c, "molecule-runtime-relase-bot")  # typo
+        self.assertEqual(login, "")
+        self.assertEqual(src, "invalid")
+        self.assertEqual(c.user_exists_calls, ["molecule-runtime-relase-bot"])
+
+    def test_whitespace_only_config_is_treated_as_absent(self):
+        login, src = _resolve(_FakeClient(whoami_result=""), "   ")
+        self.assertEqual(login, "")
+        self.assertEqual(src, "unresolved")
+
+    def test_configured_value_is_stripped_before_use(self):
+        login, src = _resolve(_FakeClient(whoami_result=""), "  molecule-runtime-release-bot \n")
+        self.assertEqual(login, "molecule-runtime-release-bot")
+        self.assertEqual(src, "BUMP_OPENER_LOGIN")
+
+    def test_user_exists_is_not_called_when_whoami_succeeds(self):
+        """Don't spend an API call validating config we're about to ignore."""
+        c = _FakeClient(whoami_result="core-devops")
+        _resolve(c, "molecule-runtime-release-bot")
+        self.assertEqual(c.user_exists_calls, [])
+
+
+class DriftAlarmShape(unittest.TestCase):
+    """The fallback is only safe because a WRONG opener now fails red.
+
+    is_runtime_bump_pr is the predicate the alarm brackets: a PR that is
+    bump-shaped by FILES but authored by someone else is exactly what the
+    alarm collects.
+    """
+
+    def test_bump_shaped_pr_by_another_author_is_not_a_match(self):
+        pr = _pr(user_login="somebody-else")
+        self.assertFalse(is_runtime_bump_pr(pr, [".runtime-version"], OPENER))
+
+    def test_but_its_files_are_still_bump_shaped(self):
+        """This is the condition the alarm keys on — file shape without author."""
+        files = [".runtime-version"]
+        self.assertTrue(all(f in ALLOWED_BUMP_FILES for f in files))
+
+    def test_a_non_bump_pr_is_not_bump_shaped(self):
+        """Unrelated PRs must NOT arm the alarm, or every quiet sweep goes red."""
+        files = ["README.md"]
+        self.assertFalse(all(f in ALLOWED_BUMP_FILES for f in files))
+
+    def test_empty_file_list_is_not_bump_shaped(self):
+        self.assertFalse(is_runtime_bump_pr(_pr(), [], OPENER))
+
+
+class UserExistsProbe(unittest.TestCase):
+    """Regression guards for two things that were WRONG in the first cut of
+    the #339 fix and were caught only by hitting live Gitea.
+
+    Verified live 2026-07-28:
+      GET /users/molecule-runtime-release-bot
+        + write:repository-only token -> 403 {"required":[read:user]}
+        + no Authorization header     -> 200
+    """
+
+    def _client(self, status: int):
+        c = _mod.GiteaClient("https://example.invalid", "m", "r", "molecule-ai")
+        seen: dict = {}
+
+        def fake_request(method, path, body=None, params=None, *, use_merge_token=False, anonymous=False):
+            seen.update(method=method, path=path, anonymous=anonymous)
+            return status, {}
+
+        c._request = fake_request  # type: ignore[assignment]
+        return c, seen
+
+    def test_probe_is_anonymous(self):
+        """Sending the out-of-scope token would 403 on EVERY login and refuse
+        every configured opener — re-bricking the sweeper."""
+        c, seen = self._client(200)
+        c.user_exists("molecule-runtime-release-bot")
+        self.assertTrue(seen["anonymous"], "user_exists must not present the token")
+
+    def test_404_is_the_only_refusal(self):
+        c, _ = self._client(404)
+        self.assertFalse(c.user_exists("nope"))
+
+    def test_200_accepts(self):
+        c, _ = self._client(200)
+        self.assertTrue(c.user_exists("molecule-runtime-release-bot"))
+
+    def test_403_fails_open(self):
+        """A scope/edge rejection means 'could not check', not 'fake account'."""
+        c, _ = self._client(403)
+        self.assertTrue(c.user_exists("molecule-runtime-release-bot"))
+
+    def test_5xx_fails_open(self):
+        c, _ = self._client(502)
+        self.assertTrue(c.user_exists("molecule-runtime-release-bot"))
+
+
+class RequestAuthHeader(unittest.TestCase):
+    def test_anonymous_omits_authorization_and_default_includes_it(self):
+        captured: list[dict] = []
+
+        def fake_urlopen(req, timeout=None):
+            # urllib title-cases header keys on the Request object.
+            captured.append(dict(req.headers))
+            raise urllib.error.HTTPError(req.full_url, 599, "stop", {}, None)
+
+        real = _mod.urllib.request.urlopen
+        _mod.urllib.request.urlopen = fake_urlopen
+        try:
+            c = _mod.GiteaClient("https://example.invalid", "mtok", "rtok", "molecule-ai")
+            c._request("GET", "/api/v1/x")
+            c._request("GET", "/api/v1/y", anonymous=True)
+        finally:
+            _mod.urllib.request.urlopen = real
+
+        self.assertEqual(captured[0].get("Authorization"), "token rtok")
+        self.assertNotIn("Authorization", captured[1])
+
+
+version_key = _mod.version_key
+
+
+class RegressionGuard(unittest.TestCase):
+    """Never merge a bump that isn't strictly newer than main's pin.
+
+    Live state on 2026-07-28 that motivated this: template main was at 0.4.55
+    (a hand-merged outage unblock) while the newest OPEN bump PR was 0.4.54.
+    "Merge the latest open bump" therefore meant merging a REGRESSION of the
+    production runtime pin — and, because that merge fails on a conflict and
+    the loop `continue`s, it also wedged the sweeper so it never closed the
+    superseded PRs.
+    """
+
+    def test_ordering_matches_the_previous_sort_semantics(self):
+        versions = ["0.4.9", "0.4.55", "0.4.10", "0.3.125"]
+        self.assertEqual(
+            sorted(versions, key=version_key, reverse=True),
+            ["0.4.55", "0.4.10", "0.4.9", "0.3.125"],
+        )
+
+    def test_numeric_not_lexicographic(self):
+        """The bug this would hide: '0.4.9' > '0.4.55' as strings."""
+        self.assertGreater(version_key("0.4.55"), version_key("0.4.9"))
+
+    def test_equal_version_is_not_newer(self):
+        """A bump equal to main's pin is superseded, not mergeable."""
+        self.assertFalse(version_key("0.4.55") > version_key("0.4.55"))
+
+    def test_older_version_is_not_newer(self):
+        self.assertFalse(version_key("0.4.54") > version_key("0.4.55"))
+
+    def test_strictly_newer_is_mergeable(self):
+        self.assertTrue(version_key("0.4.56") > version_key("0.4.55"))
+
+    def test_whitespace_is_tolerated(self):
+        """`.runtime-version` on main carries a trailing newline."""
+        self.assertEqual(version_key(" 0.4.55\n"), (0, 4, 55))
+
+    def test_non_numeric_segments_are_dropped(self):
+        self.assertEqual(version_key("0.4.55-rc1"), (0, 4))
