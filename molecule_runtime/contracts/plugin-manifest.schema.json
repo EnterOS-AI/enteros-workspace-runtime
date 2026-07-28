@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-manifest/plugin-manifest.schema.json",
-  "$comment": "contract-version 0.5.0 — an mcpServers contribution may declare a scalar `audience` (self|org) that generalizes the `privileged` boolean into a declared audience→credential mapping (self-schedule v1 foundation, RFC plugin-mcp-audience-contract); RuntimeId is an open bounded/path-safe slug and official support is separate; 0.3.1 made daemons contribution semantics first-class.",
+  "$comment": "contract-version 0.6.0 — `contributes.state` declares that a plugin keeps DURABLE state across restarts (RFC molecule-ai-sdk#181, defect A of molecule-ai-workspace-runtime#360); the resolved per-plugin directory and its honest durability flag are delivered to daemons per plugin-state/plugin-state.contract.json. 0.5.0 — an mcpServers contribution may declare a scalar `audience` (self|org) that generalizes the `privileged` boolean into a declared audience→credential mapping (self-schedule v1 foundation, RFC plugin-mcp-audience-contract); RuntimeId is an open bounded/path-safe slug and official support is separate; 0.3.1 made daemons contribution semantics first-class.",
   "title": "Marketplace Plugin Manifest Contract",
   "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace plugin manifest — the publishable shape of a `plugin.yaml` artifact (molecule-ai-plugin-* repos), authored marketplace-side per RFC molecule-core#3285 (Tool-Contract SSOT & Codegen). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-plugin-molecule-careful-bash/plugin.yaml, image-gen/plugin.yaml, gh-identity/plugin.yaml, molecule-hitl/plugin.yaml, validated by each plugin repo's `.molecule-ci/scripts/validate-plugin.py` (required: name/version/description; runtimes must be a list; content is one of SKILL.md/hooks/skills/rules). The design is VS-Code-shaped: `engines` pins the minimum host version (like engines.vscode), and `contributes` is the OPEN, forward-compatible contribution surface — its KNOWN keys are validated by shape while UNKNOWN contribution points are tolerated. RuntimeId is an open bounded/path-safe slug; official first-party support is discovered separately from the adapter registry and never acts as a universal allowlist.",
   "type": "object",
@@ -107,7 +107,7 @@
     "contributes": {
       "type": "object",
       "additionalProperties": true,
-      "description": "The contribution surface. KNOWN keys (skills/hooks/rules/mcpServers/commands v1; daemons per runtime#216; digestProviders per molecule-core#4413) below are validated by shape. UNKNOWN keys (future contribution points such as `themes`, `tabs`, `canvasElements`) are explicitly TOLERATED via additionalProperties:true — adding a new contribution point MUST NOT fail validation against this schema (forward-compat). `daemons` itself landed exactly this way: the runtime shipped it as an additive point tolerated by this open object, and this schema now captures its shape descriptively.",
+      "description": "The contribution surface. KNOWN keys (skills/hooks/rules/mcpServers/commands v1; daemons per runtime#216; digestProviders per molecule-core#4413; state per RFC sdk#181) below are validated by shape. UNKNOWN keys (future contribution points such as `themes`, `tabs`, `canvasElements`) are explicitly TOLERATED via additionalProperties:true — adding a new contribution point MUST NOT fail validation against this schema (forward-compat). `daemons` itself landed exactly this way: the runtime shipped it as an additive point tolerated by this open object, and this schema now captures its shape descriptively.",
       "properties": {
         "skills": {
           "type": "array",
@@ -180,6 +180,38 @@
           "examples": [
             { "title": "Scheduler", "properties": { "timezone": { "type": "string", "default": "UTC", "description": "IANA timezone the cron grid is evaluated in." }, "max_concurrent": { "type": "integer", "default": 1, "description": "Overlapping runs allowed per schedule." } } }
           ]
+        },
+        "state": {
+          "description": "DURABLE per-plugin state declaration (ADDITIVE contribution point, RFC molecule-ai-sdk#181 — defect A of molecule-ai-workspace-runtime#360). A plugin that must remember something ACROSS a container swap / instance recreate — a channel plugin's poll cursor is the motivating case — declares that here instead of GUESSING a path. Before this key there was NO word in the manifest for durable state, so `gmail-channel-molecule` guessed `~/.gmail-channel` (ephemeral root layer), then `/workspace/.gmail-channel` (MEASURED also wiped on local-docker, whose restart path destroys and re-seeds the `/workspace` volume), and its Gmail cursor re-pinned to `now()` on every restart — silently swallowing every older message. Four daemon plugins reached four incompatible answers to the same question (`/workspace`, `Path.home()`, `CONFIGS_DIR`, and a `MOLECULE_PLUGIN_STATE_DIR` that nothing set), which is what makes this a contract gap rather than four independent bugs. NOT A NEW MECHANISM: the runtime already resolves and injects a per-plugin-class state dir for `kind: trigger` daemons (`molecule_runtime/trigger_state.py`, `MOLECULE_TRIGGER_STATE_DIR`); this key is that seam made kind-agnostic, plugin-keyed and durable-rooted. PRESENCE is the declaration; the block carries only how loudly to complain when the substrate cannot honour it. DELIVERY is NOT described here — it is the plugin-state contract (plugin-state/plugin-state.contract.json), which owns the reserved daemon env vars (`MOLECULE_PLUGIN_STATE_DIR` + `MOLECULE_PLUGIN_STATE_DURABLE`), the per-plugin directory template, the provisioner-declared durability signal, and the degradation policy. ISOLATION — the directory is keyed on the VALIDATED MANIFEST NAME, never on a plugin-supplied path: a manifest cannot name, redirect, or escape its own state dir, and the env vars are RESERVED (stripped from the inherited environment before a daemon's own `env` map is applied, exactly like the channel A2A socket vars), so a manifest `env:` block cannot forge them. All of a plugin's daemons share ONE directory — they are one plugin and one trust domain. VALIDATION SEMANTICS — deliberately UNCONSTRAINED here, mirroring `daemons`, `digestProviders` and `configuration`: a malformed `state` value is treated as a bare declaration (durability defaults to `required`) and logged, never a manifest-validation failure, so a typo cannot brick the plugin at the (future fail-closed) install gate. `$defs/stateContribution` documents the canonical WELL-FORMED shape emitters should produce and codegen consumers should use.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/stateContribution",
+              "description": "The canonical, well-formed form — what emitters MUST produce. Kept as a live ref so the shape stays discoverable and $defs/stateContribution is never orphaned."
+            },
+            {
+              "description": "Anything else — tolerated by design: the runtime treats an unreadable declaration as a bare `durability: required` and warns, instead of failing manifest validation. This branch makes the anyOf always-satisfiable, which IS the contract."
+            }
+          ],
+          "examples": [
+            { "durability": "required", "description": "Gmail poll cursor — the high-water mark of already-relayed mail. Losing it re-pins the mark to now() and every older message becomes permanently invisible." }
+          ]
+        }
+      }
+    },
+    "stateContribution": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "The canonical well-formed shape of `contributes.state` — a plugin's declaration that it keeps state which MUST survive a container swap / instance recreate. There are no path, name, size or quota fields BY DESIGN: the platform, not the plugin, chooses where the directory lives (that is the whole defect being fixed), and a per-plugin quota is a separate concern with no consumer today. The only authored field is `durability`, which selects the degradation posture — the one thing the platform genuinely cannot infer.",
+      "properties": {
+        "durability": {
+          "type": "string",
+          "enum": ["required", "preferred"],
+          "default": "required",
+          "description": "How the plugin degrades when the substrate has NO durable storage (no provisioner-supplied state root — e.g. an EC2 workspace with the per-org data volume off, or any substrate the provisioner has not wired). The runtime ALWAYS injects a writable directory and ALWAYS reports the truth in `MOLECULE_PLUGIN_STATE_DURABLE`; this field selects only how loudly the platform complains and how the plugin is expected to behave. `required` (the default, and the correct value for anything holding a cursor / high-water mark): losing the state causes SILENT DATA LOSS, so the runtime logs at WARNING naming the plugin, and the plugin is expected to visibly degrade — e.g. use a bounded lookback plus id-dedup rather than pinning a cursor to now(). `preferred`: the state is a cache or an optimization, losing it costs work but not correctness, so the runtime logs at INFO and the plugin may silently start cold. NEITHER value ever refuses to spawn the daemon: a channel bridge that runs lossily still delivers today's mail, whereas one the platform refuses to start delivers nothing — and the runtime's daemon posture is already `failures are logged, never fatal`."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional human-readable statement of WHAT is kept and what breaks if it is lost. Surfaced by the platform plugin tab and by the runtime's degradation warning, so an operator reading a `state is not durable on this substrate` warning learns the consequence, not just the fact."
         }
       }
     },

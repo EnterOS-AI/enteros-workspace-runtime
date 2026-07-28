@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-state/plugin-state.schema.json",
+  "$comment": "contract-version 0.1.0 — initial durable per-plugin state contract (RFC molecule-ai-sdk#181, defect A of molecule-ai-workspace-runtime#360). Delivery half of plugin-manifest `contributes.state`. GENERALISES the shipped trigger-state seam (molecule_runtime/trigger_state.py: MOLECULE_TRIGGER_STATE_DIR resolved by the runtime and injected into the daemon subprocess) from kind:trigger-only and /configs-rooted to kind-agnostic and durable-rooted, and reuses the shipped durability detector (mailbox_dir.probe_durability) as a DOWNGRADE-only corroboration of the provisioner's declaration. Every literal below is `const`-pinned so a consumer reads the constant instead of re-typing it — the one pattern that held after three 'fixed in one place, not the other' regressions on #360.",
+  "title": "Durable Per-Plugin State Contract",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the durable per-plugin state directory. A plugin DECLARES that it keeps restart-surviving state via plugin-manifest `contributes.state`; this contract is the DELIVERY SSOT for what that declaration produces — the provisioner-injected durable root, the reserved daemon environment variables carrying the resolved per-plugin directory and its honest durability flag, the per-plugin directory template and mode, the degradation policy when no durable root exists, and the migration path for plugins that already guessed one. The SDK owns this SHAPE + constants; molecule-controlplane owns PROVISIONING a durable root on every substrate; molecule_runtime owns RESOLVING the per-plugin directory and INJECTING it at daemon spawn. Mirrors the workspace-data contract's three-way ownership split.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_layer",
+    "ownership",
+    "generalizes",
+    "box_env",
+    "daemon_env",
+    "paths",
+    "durability_signal",
+    "degradation",
+    "migration",
+    "isolation",
+    "substrates",
+    "workspace_data_interaction",
+    "known_consumers",
+    "open"
+  ],
+  "properties": {
+    "_doc": {
+      "description": "Free-form documentation block (array of prose lines). Not machine-validated.",
+      "type": "array",
+      "items": { "type": "string", "description": "One prose line." }
+    },
+    "schema_version": { "type": "string", "const": "plugin-state/v1", "description": "Contract layer version tag." },
+    "contract_layer": { "type": "string", "const": "plugin-state", "description": "Contract layer name." },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The three-way split. Each owner is pinned so a consumer cannot quietly take over another leg.",
+      "required": ["shape_owner", "provisioner_owner", "injector_owner", "declaration_surface"],
+      "properties": {
+        "shape_owner": { "type": "string", "const": "molecule-ai-sdk", "description": "Owns the SHAPE + constants (this contract) and the declaration surface in plugin-manifest." },
+        "provisioner_owner": { "type": "string", "const": "molecule-controlplane", "description": "Owns PROVISIONING a durable root on every substrate and injecting box_env.state_root. Nothing else may claim a path is durable." },
+        "injector_owner": { "type": "string", "const": "molecule_runtime", "description": "Owns RESOLVING the per-plugin directory from the declared manifest identity and INJECTING the reserved daemon env at spawn." },
+        "declaration_surface": { "type": "string", "const": "plugin-manifest/contributes.state", "description": "Where a plugin declares that it needs durable state. This contract never re-declares it." }
+      }
+    },
+    "generalizes": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The shipped seam this contract generalises. Recorded so review can check that v1 is an EXTENSION of working code rather than a parallel invention — and so the follow-up to converge the original is not lost.",
+      "required": ["seam", "existing_env", "existing_injection_site", "existing_root", "what_changes", "trigger_state_keeps_working"],
+      "properties": {
+        "seam": { "type": "string", "const": "molecule_runtime/trigger_state.py", "description": "The import-light module that already resolves one per-plugin-class state dir for both the runtime API and the daemon subprocess." },
+        "existing_env": { "type": "string", "const": "MOLECULE_TRIGGER_STATE_DIR", "description": "The env var that seam already injects — the naming and semantics this contract copies." },
+        "existing_injection_site": { "type": "string", "description": "Where the existing injection happens today (the channel-socket binder, trigger lane only)." },
+        "existing_root": { "type": "string", "description": "The root the existing seam uses, which is NOT durable on every substrate — the thing v1 changes." },
+        "what_changes": { "type": "array", "minItems": 1, "items": { "type": "string", "description": "One difference between the existing seam and this contract." }, "description": "The precise delta, so review can size it." },
+        "trigger_state_keeps_working": { "type": "string", "description": "Explicit statement that v1 does not break or re-root the existing trigger seam." }
+      }
+    },
+    "box_env": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Provisioner -> container. The ONLY signal that a durable root exists. Absent = no durable root on this box.",
+      "required": ["state_root"],
+      "properties": {
+        "state_root": { "type": "string", "const": "MOLECULE_PLUGIN_STATE_ROOT", "description": "In-container absolute path of the durable root the provisioner created and BINDS ACROSS RECREATE. Injected ONLY when the provisioner actually made it durable — never speculatively. Not forwarded to daemons; the runtime resolves the per-plugin directory from it." }
+      }
+    },
+    "daemon_env": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Runtime -> plugin daemon. RESERVED: stripped from the inherited environment before a daemon's own `env` map is applied, exactly like the channel A2A socket vars, so a manifest cannot forge either value.",
+      "required": ["state_dir", "durable", "durable_true", "durable_false", "reserved", "state_dir_is_already_namespaced"],
+      "properties": {
+        "state_dir": { "type": "string", "const": "MOLECULE_PLUGIN_STATE_DIR", "description": "Absolute path of the plugin's OWN state directory — already namespaced by the platform, created 0700, ready to write. Name adopted from discord-channel-molecule, which reached for it before any producer existed." },
+        "durable": { "type": "string", "const": "MOLECULE_PLUGIN_STATE_DURABLE", "description": "Whether that directory actually survives a container swap / instance recreate on THIS box. The machine-readable half of loud degradation: a plugin branches on it instead of assuming." },
+        "durable_true": { "type": "string", "const": "1", "description": "Value meaning durable." },
+        "durable_false": { "type": "string", "const": "0", "description": "Value meaning NOT durable — writable, but lost on recreate." },
+        "reserved": { "type": "boolean", "const": true, "description": "Both vars are runtime-owned capabilities, not ordinary workspace env: popped from the inherited environment before spec.env is overlaid." },
+        "state_dir_is_already_namespaced": { "type": "boolean", "const": true, "description": "state_dir is the plugin's directory, NOT a root to append a name to. Delegating namespacing to the plugin would hand directory identity back to the untrusted side." }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Where state lands. The plugin has NO say in any of it — that is the defect being fixed.",
+      "required": ["default_root", "fallback_root", "dir_template", "mode", "owner_uid", "identity_source"],
+      "properties": {
+        "default_root": { "type": "string", "const": "/home/agent/.molecule/plugin-state", "description": "Default in-container durable root. Chosen because it is OUTSIDE /workspace and /configs (both destroyed and re-seeded by the local-docker teardown path), is runtime-agnostic rather than keyed on a runtime's own dotdir, sits under the platform-owned `.molecule` namespace the SDK already uses for its token cache, and is baked by NO maintained runtime image — the bind-shadowing hazard that forced hermes to persist only /home/agent/.hermes/auth rather than the whole dotdir." },
+        "fallback_root": { "type": "string", "const": "/workspace/.plugin-state", "description": "Used when box_env.state_root is absent. Writable everywhere, reported DURABLE=0 unconditionally even where /workspace happens to be durable — deliberately conservative, because reporting durable-when-not is the failure mode that caused #360 and reporting ephemeral-when-durable only costs a plugin a redundant lookback." },
+        "dir_template": { "type": "string", "const": "{state_root}/{plugin_name}", "description": "One directory per plugin, shared by ALL of that plugin's daemons — they are one plugin and one trust domain." },
+        "mode": { "type": "string", "const": "0700", "description": "Directory mode. Excludes other uids; see isolation for why it is not a boundary between plugins." },
+        "owner_uid": { "type": "integer", "const": 1000, "description": "The agent user every runtime execs as." },
+        "identity_source": { "type": "string", "const": "validated-manifest-name", "description": "plugin_name comes from the VALIDATED manifest identity the runtime already uses for channel provenance — never the install directory, never a plugin-supplied string." }
+      }
+    },
+    "durability_signal": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How MOLECULE_PLUGIN_STATE_DURABLE is decided: provisioner DECLARES, probe may only DOWNGRADE.",
+      "required": ["credits_durable_when", "provisioner_declared", "detector", "why_not_probe_alone", "why_not_declaration_alone"],
+      "properties": {
+        "credits_durable_when": { "type": "array", "minItems": 1, "items": { "type": "string", "description": "One condition that must hold." }, "description": "ALL must hold to report durable_true." },
+        "provisioner_declared": { "type": "boolean", "const": true, "description": "Durability originates from the provisioner, not from an in-container guess." },
+        "detector": { "type": "string", "const": "molecule_runtime/mailbox_dir.py probe_durability", "description": "The shipped probe reused as corroboration. DOWNGRADE-only." },
+        "why_not_probe_alone": { "type": "string", "description": "The measured counter-example that rules out probing alone." },
+        "why_not_declaration_alone": { "type": "string", "description": "Why the declaration still needs a falsifier." }
+      }
+    },
+    "degradation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What happens on a substrate with no durable storage. The load-bearing decision of this contract.",
+      "required": ["policy", "on_no_state_root", "log_level_required", "log_level_preferred", "never_fail_spawn", "never_fail_manifest_validation", "rationale"],
+      "properties": {
+        "policy": { "type": "string", "const": "always-inject-never-refuse", "description": "A writable directory and an honest flag are ALWAYS injected." },
+        "on_no_state_root": { "type": "string", "const": "inject-fallback-root-and-report-durable-0", "description": "The concrete behaviour when box_env.state_root is absent." },
+        "log_level_required": { "type": "string", "const": "warning", "description": "Log level when the manifest declared durability:required and the substrate cannot honour it." },
+        "log_level_preferred": { "type": "string", "const": "info", "description": "Log level when the manifest declared durability:preferred." },
+        "never_fail_spawn": { "type": "boolean", "const": true, "description": "A missing durable root NEVER prevents the daemon from starting." },
+        "never_fail_manifest_validation": { "type": "boolean", "const": true, "description": "A malformed or unsatisfiable state declaration NEVER fails manifest validation or the install gate." },
+        "rationale": { "type": "string", "description": "The argument for degrade-loudly over fail-closed." }
+      }
+    },
+    "migration": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How a plugin that already guessed a path adopts this contract.",
+      "required": ["platform_moves_data", "plugin_pattern", "never_delete_legacy", "unset_state_dir_means", "rationale"],
+      "properties": {
+        "platform_moves_data": { "type": "boolean", "const": false, "description": "Neither the provisioner nor the runtime relocates a plugin's existing files." },
+        "plugin_pattern": { "type": "string", "const": "fill-absent-only-copy-from-legacy", "description": "On first boot with state_dir set, copy each legacy file that is ABSENT at the target. A file already at the target always wins, so a second boot can never overwrite live state with a stale copy." },
+        "never_delete_legacy": { "type": "boolean", "const": true, "description": "Copy-only. Rollback stays a clean revert and no deletion-path review is triggered." },
+        "unset_state_dir_means": { "type": "string", "const": "older-runtime-keep-the-existing-path", "description": "An unset state_dir means the runtime predates this contract, NOT that state is unwanted — the plugin keeps its current path so a new plugin runs on an old runtime." },
+        "rationale": { "type": "string", "description": "Why migration is plugin-side." }
+      }
+    },
+    "isolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The per-plugin boundary, stated honestly.",
+      "required": ["boundary", "escape_prevented_by", "not_a_privilege_boundary_because"],
+      "properties": {
+        "boundary": { "type": "string", "const": "namespacing-not-privilege", "description": "What the directory separation actually is." },
+        "escape_prevented_by": { "type": "array", "minItems": 1, "items": { "type": "string", "description": "One enforced property." }, "description": "The properties that stop a plugin naming, redirecting or escaping its own directory." },
+        "not_a_privilege_boundary_because": { "type": "string", "description": "The limitation, stated up front rather than discovered later." }
+      }
+    },
+    "substrates": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Per-substrate wiring status. `unwired` entries are exactly the work the provisioner leg must do.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "provisioner", "status", "mechanism", "no_durable_root_when"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "description": "Substrate identifier." },
+          "provisioner": { "type": "string", "minLength": 1, "description": "The controlplane file that owns it." },
+          "status": { "type": "string", "enum": ["wired", "unwired"], "description": "Whether a durable plugin-state root exists there TODAY." },
+          "mechanism": { "type": "string", "minLength": 1, "description": "How durability is achieved on this substrate and what must be added." },
+          "no_durable_root_when": { "type": "string", "minLength": 1, "description": "The condition under which even a wired substrate yields no durable root — the case degradation must handle." }
+        }
+      }
+    },
+    "workspace_data_interaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How this contract behaves before and after the workspace-data R2 default flips, since both claim to be about durability.",
+      "required": ["today", "after_default_on", "must_not"],
+      "properties": {
+        "today": { "type": "string", "description": "Behaviour while MOLECULE_WORKSPACE_DATA_PERSIST defaults false." },
+        "after_default_on": { "type": "string", "description": "Behaviour once it defaults true — and why the flip alone changes nothing here." },
+        "must_not": { "type": "string", "description": "The cross-contract mistake a consumer must not make." }
+      }
+    },
+    "known_consumers": {
+      "type": "array",
+      "description": "Plugins already reading a contract env var before a producer existed. Recorded because they constrain the naming.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin", "reads", "note"],
+        "properties": {
+          "plugin": { "type": "string", "minLength": 1, "description": "The plugin repo." },
+          "reads": { "type": "string", "minLength": 1, "description": "The env var it already reads." },
+          "note": { "type": "string", "minLength": 1, "description": "How its expectation differs from this contract and what that costs." }
+        }
+      }
+    },
+    "open": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Deliberately deferred in v1. Present so scope creep is visible rather than silent.",
+      "properties": {
+        "quota": { "type": "string", "description": "Per-plugin size limits." },
+        "backup": { "type": "string", "description": "Relationship to workspace-data snapshotting." },
+        "uninstall": { "type": "string", "description": "Reclaiming a directory on uninstall — a deletion path needing its own review." },
+        "trigger_reroot": { "type": "string", "description": "Converging the existing trigger-state seam onto this root." }
+      }
+    }
+  }
+}

@@ -1,0 +1,134 @@
+{
+  "schema_version": "plugin-state/v1",
+  "contract_layer": "plugin-state",
+  "_doc": [
+    "Durable PER-PLUGIN state directory — the delivery half of `contributes.state`.",
+    "plugin-manifest owns the DECLARATION (a plugin says it keeps state that must survive",
+    "a restart). This contract owns the DELIVERY: which directory that becomes, who creates",
+    "it, which reserved env vars carry it into a plugin daemon, and — the load-bearing part —",
+    "how the platform tells the plugin the TRUTH when the substrate cannot make it durable.",
+    "This is NOT a new mechanism. It GENERALISES the trigger-state seam the runtime already",
+    "ships (molecule_runtime/trigger_state.py + its injection at channel_events.py) from",
+    "`kind: trigger`-only and /configs-rooted to kind-agnostic and durable-rooted, and it",
+    "reuses the durability detector the runtime already ships (mailbox_dir.probe_durability).",
+    "Motivating defect: molecule-ai-workspace-runtime#360 defect A. gmail-channel-molecule had",
+    "no word in the manifest for durable state, guessed ~/.gmail-channel (ephemeral root layer),",
+    "then /workspace/.gmail-channel — measured ALSO wiped, because local-docker's restart path",
+    "destroys and re-seeds the /workspace volume. Its Gmail cursor re-pinned to now() on every",
+    "restart and every older message became permanently invisible. Four daemon plugins reached",
+    "four incompatible answers to one question (/workspace, Path.home(), CONFIGS_DIR, and a",
+    "MOLECULE_PLUGIN_STATE_DIR that nothing set) — which is what makes this a contract gap",
+    "rather than four independent bugs.",
+    "Three-way split, mirroring workspace-data: the SDK owns the shape and the constants,",
+    "molecule-controlplane provisions a durable root on every substrate, and molecule_runtime",
+    "resolves the per-plugin directory and injects it so a plugin never guesses again."
+  ],
+  "ownership": {
+    "shape_owner": "molecule-ai-sdk",
+    "provisioner_owner": "molecule-controlplane",
+    "injector_owner": "molecule_runtime",
+    "declaration_surface": "plugin-manifest/contributes.state"
+  },
+  "generalizes": {
+    "seam": "molecule_runtime/trigger_state.py",
+    "existing_env": "MOLECULE_TRIGGER_STATE_DIR",
+    "existing_injection_site": "molecule_runtime/channel_events.py (trigger lane only)",
+    "existing_root": "<configs_dir>/schedules",
+    "what_changes": [
+      "kind-agnostic — any plugin declaring contributes.state, not only kind:trigger",
+      "keyed on the plugin, not on the lane — one directory per plugin, shared by its daemons",
+      "rooted on a DURABLE root instead of /configs, which the local-docker teardown path destroys and re-seeds on every restart and which workspace-data lists in excluded_paths as provisioner-owned",
+      "injected in plugin_daemons (the generic spawn path) instead of the channel-socket binder"
+    ],
+    "trigger_state_keeps_working": "MOLECULE_TRIGGER_STATE_DIR and resolve_trigger_state_dir() are unchanged by this contract; re-rooting the scheduler grid onto plugin-state is a tracked follow-up, not part of v1"
+  },
+  "box_env": {
+    "state_root": "MOLECULE_PLUGIN_STATE_ROOT"
+  },
+  "daemon_env": {
+    "state_dir": "MOLECULE_PLUGIN_STATE_DIR",
+    "durable": "MOLECULE_PLUGIN_STATE_DURABLE",
+    "durable_true": "1",
+    "durable_false": "0",
+    "reserved": true,
+    "state_dir_is_already_namespaced": true
+  },
+  "paths": {
+    "default_root": "/home/agent/.molecule/plugin-state",
+    "fallback_root": "/workspace/.plugin-state",
+    "dir_template": "{state_root}/{plugin_name}",
+    "mode": "0700",
+    "owner_uid": 1000,
+    "identity_source": "validated-manifest-name"
+  },
+  "durability_signal": {
+    "credits_durable_when": [
+      "box_env.state_root-present-in-the-container-environment",
+      "resolved-per-plugin-dir-is-writable",
+      "mailbox_dir.probe_durability-does-not-classify-it-EPHEMERAL-or-UNWRITABLE"
+    ],
+    "provisioner_declared": true,
+    "detector": "molecule_runtime/mailbox_dir.py probe_durability",
+    "why_not_probe_alone": "probe_durability answers 'is this a distinct mount, or snapshot-credited', which is NOT the same question. On local-docker /workspace IS a distinct named volume and probes DURABLE — yet workspaceTeardownVolumes removes it on every restart/recreate, which is exactly how runtime#360 defect A stayed invisible for a day. Only the provisioner knows which of its own mounts its teardown path preserves. So the provisioner DECLARES durability by injecting box_env.state_root, and the probe may only DOWNGRADE that claim (unwritable / ephemeral root disk), never upgrade it.",
+    "why_not_declaration_alone": "a declared-durable root that turns out unwritable, or that the provisioner wired to the root filesystem by mistake, would otherwise be reported as durable and the plugin would trust it. The probe is the corroboration that makes the declaration falsifiable."
+  },
+  "degradation": {
+    "policy": "always-inject-never-refuse",
+    "on_no_state_root": "inject-fallback-root-and-report-durable-0",
+    "log_level_required": "warning",
+    "log_level_preferred": "info",
+    "never_fail_spawn": true,
+    "never_fail_manifest_validation": true,
+    "rationale": "Refusing to spawn turns a lossy channel bridge into no channel bridge. On every substrate where durability is not wired today — every local-docker box, every EC2 workspace with the per-org data volume off — fail-closed would take working-but-lossy delivery to zero delivery, for every channel plugin at once. It also contradicts the supervisor's existing posture (a daemon is auxiliary; failures are logged, never fatal). The defect in #360 was not degradation, it was SILENT degradation: nothing logged, and the plugin could not tell. So the platform degrades, but LOUDLY and OBSERVABLY — a named WARNING for durability:required, and a machine-readable MOLECULE_PLUGIN_STATE_DURABLE=0 the plugin can branch on."
+  },
+  "migration": {
+    "platform_moves_data": false,
+    "plugin_pattern": "fill-absent-only-copy-from-legacy",
+    "never_delete_legacy": true,
+    "unset_state_dir_means": "older-runtime-keep-the-existing-path",
+    "rationale": "The platform cannot know which files under a guessed directory are state, so a platform-side mover would be a deletion-path change. The plugin already knows: gmail-channel-molecule's sessions._migrate_legacy is exactly the fill-absent-only, copy-only, never-delete pattern this contract asks for — it only ever had the wrong target."
+  },
+  "isolation": {
+    "boundary": "namespacing-not-privilege",
+    "escape_prevented_by": [
+      "directory-keyed-on-the-validated-manifest-name-not-a-plugin-supplied-path",
+      "no-path-field-exists-in-the-declaration",
+      "reserved-env-stripped-from-the-inherited-environment-before-a-daemon-env-map-is-applied"
+    ],
+    "not_a_privilege_boundary_because": "every plugin daemon runs as the same uid-1000 agent user in one container, so mode 0700 separates plugins from OTHER uids, not from each other. A plugin that can run arbitrary code can read a sibling's directory. Real per-plugin confinement needs per-daemon uids or namespaces and is explicitly out of scope for v1."
+  },
+  "substrates": [
+    {
+      "id": "containerized-ec2",
+      "provisioner": "internal/provisioner/userdata_containerized.go",
+      "status": "unwired",
+      "mechanism": "renderRuntimeStateSeed mirrors each path under runtimeStateRoot (/workspace/.rtstate) on the cp#326 data volume and binds it back in. The seeded set is RUNTIME-keyed (runtimeStateDirs) plus the capability-keyed desktopControlStateDirs. Every maintained runtime HAS an entry, but each entry persists exactly one dotdir — the runtime's own — with no key, no wildcard and no extension point, so a plugin cannot obtain a durable path without a controlplane code change. A plugin-state root belongs in a third, ALWAYS-ON list because it is neither runtime- nor capability-specific.",
+      "no_durable_root_when": "dataVolumeGB == 0 — renderRuntimeStateSeed is only invoked inside `if dataVolumeGB > 0`, so a workspace with no data volume has no durable path at all"
+    },
+    {
+      "id": "local-docker",
+      "provisioner": "internal/provisioner/local_docker_workspace.go",
+      "status": "unwired",
+      "mechanism": "Each out-of-/workspace state dir gets its own durable named volume. workspaceTeardownVolumes ALWAYS removes the /configs and /workspace volumes — including on a restart — and preserves only the runtime-state volume, and only on the non-erase path. A plugin-state volume must be preserved on that same keepRuntimeState=true path and removed on an erase teardown.",
+      "no_durable_root_when": "never once wired — a named volume needs no org flag. NOTE claude-code is exempted from runtime-state binds entirely (localDurableRuntimeStateExempt), so today the widest-blast-radius runtime has NO durable path on this substrate; a plugin-state volume must NOT inherit that exemption, since it persists plugin state rather than perturbing the runtime's own container contract."
+    }
+  ],
+  "workspace_data_interaction": {
+    "today": "MOLECULE_WORKSPACE_DATA_PERSIST defaults false, so R2 snapshot/restore contributes nothing and plugin-state durability rests entirely on the provisioner-declared root above.",
+    "after_default_on": "workspace-data persisted_paths is [/workspace, /home/agent/.claude]. The default plugin-state root (/home/agent/.molecule/plugin-state) is in NEITHER, so flipping the R2 default does not make plugin state durable and does not make it snapshot-credited. Adding the plugin-state root to persisted_paths is the follow-up that makes the two mechanisms agree; until then the provisioner-declared root is the only signal, which is why this contract does not read the snapshot signal.",
+    "must_not": "credit snapshot-durability for plugin state on the basis of workspace-data alone — the paths do not overlap"
+  },
+  "known_consumers": [
+    {
+      "plugin": "discord-channel-molecule",
+      "reads": "MOLECULE_PLUGIN_STATE_DIR",
+      "note": "discord_config.load_config already reads this env and then joins its own plugin name onto it, treating it as a ROOT. This contract defines it as the ALREADY-NAMESPACED per-plugin directory, because delegating the namespacing to the plugin would hand identity back to the untrusted side. Discord therefore lands one redundant level deep (<root>/discord-channel-molecule/discord-channel-molecule) — cosmetic, still inside its own directory, and fixed by deleting the manual join. Tracked as a follow-up, not a blocker: the env name is adopted from discord precisely because the ecosystem already reached for it."
+    }
+  ],
+  "open": {
+    "quota": "v1-declares-no-per-plugin-size-limit-no-consumer-today",
+    "backup": "plugin-state-is-not-in-workspace-data-persisted_paths-add-it-when-r2-defaults-on",
+    "uninstall": "v1-does-not-reclaim-a-directory-when-a-plugin-is-uninstalled-deletion-path-needs-its-own-review",
+    "trigger_reroot": "the scheduler grid still lives under /configs which local-docker destroys on restart — re-rooting trigger_state onto plugin-state is a tracked follow-up"
+  }
+}

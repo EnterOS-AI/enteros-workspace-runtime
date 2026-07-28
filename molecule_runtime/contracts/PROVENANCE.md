@@ -16,6 +16,23 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-07-28 — sdk main `dea2155` (sdk#182 / RFC sdk#181)
+
+Paired with the merge of **molecule-ai-sdk#182**
+(`dea2155364272605fceab5247c1e71b4ba444b2d`), which added the durable
+per-plugin state contract. An SDK contract merge reds this repo's schema-sync
+gate immediately, so the re-vendor is part of that merge, not a follow-up.
+
+- `plugin-manifest.schema.json` re-fetched — `contributes.state` +
+  `$defs/stateContribution`; contract-version 0.5.0 → **0.6.0**
+- `plugin-state.schema.json` + `plugin-state.contract.json` — **new**, and the
+  first vendored files in this directory that this repo consumes as *executable
+  constants* rather than as a validation schema (see below)
+- `scripts/check-schemas-in-sync.sh` MAP gained both new rows, so they are
+  drift-gated from the first commit rather than from whenever someone remembers
+
+---
+
 ## Re-vendor 2026-07-20 — sdk main `be85511`
 
 Bulk re-sync after the schema-sync gate flagged drift (which had been
@@ -36,10 +53,18 @@ Byte-for-byte copy of:
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin-manifest/plugin-manifest.schema.json
-Source commit:        `bd26e4e2fb664a4b1e419ac7827aeba423535ce6` (sdk#176 — declares `contributes.configuration`, the per-install plugin-config declaration. Additive and purely structural: `contributes` was already `additionalProperties: true`, so a `configuration` block validated before this commit too. What it adds is a discoverable, codegen-visible shape plus two new `$defs` — `configurationContribution` and `configurationProperty`.)
-Vendored at sdk HEAD: `bd26e4e2fb664a4b1e419ac7827aeba423535ce6` (main)
+Source commit:        `dea2155364272605fceab5247c1e71b4ba444b2d` (sdk#182 / RFC sdk#181 — declares `contributes.state`, the durable per-plugin state declaration, and bumps contract-version to 0.6.0. Additive and purely structural, exactly like `configuration` before it: `contributes` was already `additionalProperties: true`, so a `state` block validated before this commit too. What it adds is a discoverable, codegen-visible shape plus one new `$def` — `stateContribution` — and, crucially, a WORD for durable state that a plugin previously had to guess a path for.)
+Vendored at sdk HEAD: `dea2155364272605fceab5247c1e71b4ba444b2d` (main)
 
-Content sha256: `aead19f477bb8fb725700ec1bef5dc4b754505d3b148035cd990821dda5713da`
+Content sha256: `76dcb1d7de18c4866ed2a2fac4f3f1d3ce5643a6e3e4d2e4344d5e783064520d`
+
+TOLERANCE (again, and for the same reason) — `contributes.state` is likewise
+UNCONSTRAINED at manifest level: its `anyOf` carries a bare-`description`
+second branch that makes it always-satisfiable. That is deliberate and this
+repo is why. `manifest_ssot.py` runs this schema at plugin load and install, so
+a strict `state` property would let a typo brick a plugin at the fail-closed
+install gate instead of degrading to `durability: required` with a warning. The
+vendored copy must preserve that always-satisfiable branch.
 
 No longer gated: the previous record here pinned
 `f2dd96c238b66fb5ab67dedbfb4ebaf30061c5e2` on the PENDING-MERGE branch
@@ -73,6 +98,57 @@ Re-vendoring:
     curl -fsS -A "curl/8.4.0" \
       https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-manifest/plugin-manifest.schema.json \
       -o molecule_runtime/contracts/plugin-manifest.schema.json
+
+---
+
+## `plugin-state.schema.json` + `plugin-state.contract.json`
+
+Byte-for-byte copies of the durable per-plugin state contract layer
+(RFC molecule-ai-sdk#181, defect A of molecule-ai-workspace-runtime#360):
+
+    molecule-ai-sdk/contracts/plugin-state/plugin-state.schema.json
+    molecule-ai-sdk/contracts/plugin-state/plugin-state.contract.json
+
+Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
+Source commit:        `dea2155364272605fceab5247c1e71b4ba444b2d` (sdk#182 merge)
+Vendored at sdk HEAD: `dea2155364272605fceab5247c1e71b4ba444b2d` (main)
+
+Content sha256:
+  plugin-state.schema.json    `0d1d7dd724c7411adb3c3d95d0ebe2f669486dbf937e42fafc121b340a8ff4a9`
+  plugin-state.contract.json  `02d4eb34826f794545d0b9868e3a33429ff625a92b1231b08e07cd57b008aba9`
+
+WHY THIS ONE IS DIFFERENT — every other file in this directory is vendored so
+something can be *validated* offline. These two are vendored so something can be
+*executed* offline: `molecule_runtime/plugin_state.py` reads its env-var names,
+its default and fallback roots, its directory template and its mode straight out
+of `plugin-state.contract.json` via `importlib.resources`, exactly the way
+`mailbox_dir` reads `workspace-data.contract.json`.
+
+That is the point, not an implementation detail. The contract `const`-pins every
+literal so its three consumers — the controlplane provisioner, this runtime, and
+the plugin itself — read ONE constant instead of re-typing three copies of a
+path. runtime#360 produced three separate "fixed in one place, not the other"
+regressions in a single day, and its own closing note named the remedy: *a shared
+constant plus a test that asserts both call sites use it is the pattern that
+actually holds.* `tests/test_plugin_state.py` is that test — it pins every
+runtime literal against this vendored instance, so re-typing a path here is a
+red build rather than a silent divergence.
+
+Consequence worth stating plainly: these files are LOAD-BEARING AT RUNTIME
+inside workspace containers, so they must ship in the wheel. They do, via the
+existing `[tool.setuptools.package-data]` `contracts/*.json` glob in
+`pyproject.toml` — no packaging change was needed, but `tests/test_plugin_state.py`
+asserts the resource actually resolves through `importlib.resources` rather than
+trusting the glob.
+
+Re-vendoring:
+
+    curl -fsS -A "curl/8.4.0" \
+      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-state/plugin-state.schema.json \
+      -o molecule_runtime/contracts/plugin-state.schema.json
+    curl -fsS -A "curl/8.4.0" \
+      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/plugin-state/plugin-state.contract.json \
+      -o molecule_runtime/contracts/plugin-state.contract.json
 
 ---
 
