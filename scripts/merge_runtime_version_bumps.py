@@ -35,6 +35,7 @@ on an already-merged PR is a no-op (the PR is no longer open).
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import os
 import sys
@@ -426,6 +427,36 @@ def is_repo_opted_in(repo: str, client: GiteaClient) -> bool:
     return True
 
 
+# How long a bump PR may sit unmergeable before the sweeper escalates instead of
+# skipping quietly. 24h is one full day of scheduled sweeps (every 30 min, 5-23h),
+# so a transient red — a flaky lane, an infra abort — self-clears without noise,
+# while a genuinely stuck bump surfaces the next morning rather than at the moment
+# its pin is evicted from the registry (molecule-ci#105).
+STALE_BUMP_ESCALATE_HOURS = 24.0
+
+
+def _pr_age_hours(pr: dict[str, Any] | None) -> float | None:
+    """Hours since the PR was opened, or None if the timestamp is unusable.
+
+    Age is the signal that separates "red right now" from "stuck": the sweeper runs
+    every 30 minutes and prints the same skip line each time, so without age a bump
+    blocked for a week is indistinguishable from one blocked for a minute.
+    """
+    if not isinstance(pr, dict):
+        return None
+    raw = pr.get("created_at")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        created = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=_dt.timezone.utc)
+    delta = _dt.datetime.now(_dt.timezone.utc) - created
+    return max(0.0, delta.total_seconds() / 3600.0)
+
+
 def version_key(version: str) -> tuple[int, ...]:
     """Comparable key for a `0.4.55`-style pin.
 
@@ -623,6 +654,7 @@ def run() -> int:
     total_merged = 0
     total_closed = 0
     total_skipped = 0
+    total_stale = 0
     rc = 0
     # Issue #339 drift alarm. Authors seen on PRs that are bump-SHAPED (they
     # touch only ALLOWED_BUMP_FILES) but whose author != expected_author. If
@@ -772,11 +804,40 @@ def run() -> int:
             continue
         combined = client.combined_status(repo, head_sha)
         if not all_required_statuses_success(combined):
-            statuses = [
-                f"{s.get('context', '?')}={s.get('state', '?')}"
+            # Name the BLOCKING contexts, not all of them.
+            #
+            # This read `s.get('state')` — but Gitea's combined-status CHILD rows
+            # carry the per-context result in `status` (only the top-level combined
+            # uses `state`). That is the same RC 13421 key confusion already fixed
+            # in all_required_statuses_success and left unfixed here, so every
+            # context rendered as `=?`: the log listed 19 contexts and identified
+            # none of them. Dumping all 19 unknowns also buried the 2 that mattered.
+            blocking = [
+                f"{s.get('context', '?')}={s.get('status') or s.get('state') or '?'}"
                 for s in combined.get("statuses", [])
+                if isinstance(s, dict) and (s.get("status") or s.get("state")) != "success"
             ]
-            print(f"    PR #{latest_pr} not all-green (combined={combined.get('state')}, statuses={statuses}); skip")
+            age = _pr_age_hours(latest_pr_full)
+            age_note = f", open {age:.0f}h" if age is not None else ""
+            print(
+                f"    PR #{latest_pr} not all-green (combined={combined.get('state')}{age_note}); "
+                f"blocking={blocking or '<none posted — required context absent>'}; skip"
+            )
+            # A bump PR that cannot merge does not just delay one repo: the template
+            # stays pinned to an older runtime, and the Gitea PyPI registry retains
+            # only ~18 versions, so a pin left behind long enough is EVICTED and the
+            # image stops building at the pip layer (molecule-ci#105). A silent
+            # per-cycle "skip" is what let that reach a collision last time, so a
+            # bump that has been stuck beyond the escalation window says so loudly.
+            if age is not None and age >= STALE_BUMP_ESCALATE_HOURS:
+                print(
+                    f"::warning::runtime bump for {repo} has been unmergeable for "
+                    f"{age:.0f}h (PR #{latest_pr}, > {STALE_BUMP_ESCALATE_HOURS}h). The template is "
+                    f"drifting behind the runtime and its current pin will eventually be "
+                    f"evicted from the registry's retention window (molecule-ci#105). "
+                    f"Blocking: {blocking}"
+                )
+                total_stale += 1
             total_skipped += 1
             continue
 
@@ -830,7 +891,19 @@ def run() -> int:
         )
         rc = 2
 
-    print(f"runtime#131 sweep complete: merged={total_merged} closed={total_closed} skipped={total_skipped} mode={'DRY-RUN' if args.dry_run else 'MERGE'}")
+    print(
+        f"runtime#131 sweep complete: merged={total_merged} closed={total_closed} "
+        f"skipped={total_skipped} stale={total_stale} "
+        f"mode={'DRY-RUN' if args.dry_run else 'MERGE'}"
+    )
+    if total_stale:
+        # Surfaced in the summary as well as per-repo: the per-repo warning scrolls
+        # past in a 6-repo sweep, and "skipped=1" alone reads as routine.
+        print(
+            f"::warning::{total_stale} runtime bump(s) have been unmergeable for over "
+            f"{STALE_BUMP_ESCALATE_HOURS:.0f}h. Those templates are drifting behind the runtime; "
+            f"see the per-repo blocking contexts above."
+        )
     return rc
 
 
