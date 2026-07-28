@@ -29,6 +29,8 @@ UA="curl/8.4.0"
 # contracts/ (mcp-plugin-delivery, mirrored from the SDK's contracts/mcp/).
 declare -A MAP=(
   [molecule_runtime/contracts/plugin-manifest.schema.json]="contracts/plugin-manifest/plugin-manifest.schema.json"
+  [molecule_runtime/contracts/plugin-state.schema.json]="contracts/plugin-state/plugin-state.schema.json"
+  [molecule_runtime/contracts/plugin-state.contract.json]="contracts/plugin-state/plugin-state.contract.json"
   [molecule_runtime/contracts/idle-prompt.schema.json]="contracts/idle-prompt/idle-prompt.schema.json"
   [molecule_runtime/contracts/idle-prompt.contract.json]="contracts/idle-prompt/idle-prompt.contract.json"
   [molecule_runtime/contracts/workspace-data.contract.json]="contracts/workspace-data/workspace-data.contract.json"
