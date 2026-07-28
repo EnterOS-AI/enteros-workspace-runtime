@@ -1289,6 +1289,56 @@ def _resolve_mcp_secret_refs(spec: dict, lookup=None) -> dict:
     return out
 
 
+def _resolve_mcp_config_refs(spec: dict, plugin_root: str) -> dict:
+    """Resolve ``${config:key}`` bindings in an MCP spec's ``env`` map.
+
+    D5 — the same seam as ``${secret:NAME}`` above, one function over, and the
+    same sigil the trigger daemons already use (``plugin_daemons`` →
+    ``plugin_settings.interpolate``). An MCP server is just another subprocess a
+    plugin declares, so an install-time setting should reach its env the same way
+    it reaches a daemon's.
+
+    IDENTITY: settings are keyed on the INSTALL DIRECTORY name — the
+    ``/configs/plugins/<name>/`` dir, which core derives from the plugin source
+    repo and uses as the settings filename. NOT ``plugin.yaml``'s own ``name:``,
+    which for the scheduler is ``molecule-scheduler`` while the directory is
+    ``molecule-ai-plugin-scheduler``. Keying on the manifest name would read a
+    file nothing writes, and a missing settings file is a clean no-op, so the
+    failure would be SILENT.
+
+    Unresolved references render EMPTY rather than dropping the key or passing
+    the literal — deliberately identical to the daemon path. A sigil that
+    behaves differently in two places is worse than either behaviour.
+
+    Returns a NEW spec; the input is not mutated. Fail-soft: any error leaves
+    the spec untouched, because a settings problem must not block an install.
+    """
+    env = spec.get("env")
+    if not isinstance(env, dict):
+        return spec
+    if not any(isinstance(v, str) and "${config:" in v for v in env.values()):
+        return spec  # nothing to do — byte-identical for every existing plugin
+    try:
+        from molecule_runtime import plugin_settings
+        from molecule_runtime.plugins import load_plugin_manifest
+
+        install_name = os.path.basename(os.path.normpath(plugin_root))
+        manifest = load_plugin_manifest(plugin_root)
+        settings = plugin_settings.resolve(install_name, manifest.contributes)
+    except Exception as exc:  # noqa: BLE001 — never block an install on settings
+        print(f"mcp config refs: {plugin_root}: {exc} (leaving env unresolved)", flush=True)
+        return spec
+
+    resolved = {}
+    for key, value in env.items():
+        resolved[key] = (
+            plugin_settings.interpolate(value, settings) if isinstance(value, str) else value
+        )
+    out = dict(spec)
+    out["env"] = resolved
+    return out
+
+
 class MCPServerAdaptor:
     """Sub-type adaptor for plugins that wrap an MCP server.
 
@@ -1388,7 +1438,10 @@ class MCPServerAdaptor:
         for name, spec in descriptor.items():
             try:
                 resolved_spec = _resolve_mcp_secret_refs(
-                    _resolve_plugin_local_mcp_paths(ctx.plugin_root, spec)
+                    _resolve_mcp_config_refs(
+                        _resolve_plugin_local_mcp_paths(ctx.plugin_root, spec),
+                        ctx.plugin_root,
+                    )
                 )
                 ctx.register_mcp_server(name, resolved_spec)
                 ctx.logger.info("%s: wired MCP server %r via register_mcp_server (runtime=%s)",
