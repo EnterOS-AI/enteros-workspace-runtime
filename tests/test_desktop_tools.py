@@ -114,6 +114,41 @@ def test_desktop_open_url_pauses_when_human_holds_control(monkeypatch):
     assert "human currently holds desktop control" in out
 
 
+# ── wait_for_control: poll until a human releases control ────────────────────
+def test_desktop_wait_for_control_returns_when_free(monkeypatch):
+    async def free():
+        return {"human_in_control": False, "agent_can_control": True}
+
+    monkeypatch.setattr(desktop, "_desktop_control_status", free)
+    out = asyncio.run(desktop.tool_desktop_wait_for_control(10))
+    assert '"ok": true' in out
+    assert '"control": "available"' in out
+
+
+def test_desktop_wait_for_control_times_out_while_human_holds(monkeypatch):
+    async def held():
+        return {"human_in_control": True}
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(desktop, "_desktop_control_status", held)
+    monkeypatch.setattr(desktop.asyncio, "sleep", no_sleep)  # don't actually wait
+    out = asyncio.run(desktop.tool_desktop_wait_for_control(4))
+    assert '"ok": false' in out
+    assert '"control": "human"' in out
+
+
+def test_desktop_wait_for_control_reports_error(monkeypatch):
+    async def boom():
+        raise RuntimeError("gateway down")
+
+    monkeypatch.setattr(desktop, "_desktop_control_status", boom)
+    out = asyncio.run(desktop.tool_desktop_wait_for_control(4))
+    assert '"ok": false' in out
+    assert "gateway down" in out
+
+
 # ── png dimension parsing (unchanged) ───────────────────────────────────────
 def test_png_dimensions_parses_ihdr(tmp_path):
     shot = tmp_path / "shot.png"
