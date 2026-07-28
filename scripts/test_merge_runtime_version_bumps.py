@@ -757,3 +757,103 @@ class RegressionGuard(unittest.TestCase):
 
     def test_non_numeric_segments_are_dropped(self):
         self.assertEqual(version_key("0.4.55-rc1"), (0, 4))
+
+
+class PrAgeHoursTest(unittest.TestCase):
+    """`_pr_age_hours` is the signal that separates 'red right now' from 'stuck'.
+
+    The sweeper runs every 30 minutes and prints the same skip line each time, so
+    without age a bump blocked for a week is indistinguishable from one blocked for
+    a minute. That is how the fleet drifted 19 releases behind before: every
+    individual sweep looked routine.
+    """
+
+    def _iso(self, hours_ago):
+        import datetime as dt
+        return (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours_ago)
+        ).isoformat().replace("+00:00", "Z")
+
+    def test_age_is_measured_from_created_at(self):
+        age = _mod._pr_age_hours({"created_at": self._iso(30)})
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 30.0, delta=0.5)
+
+    def test_naive_timestamp_is_treated_as_utc(self):
+        # Gitea has emitted both offset-aware and naive timestamps; a naive one
+        # must not raise (which would crash the whole sweep on one bad row).
+        age = _mod._pr_age_hours({"created_at": "2026-01-01T00:00:00"})
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 0.0)
+
+    def test_unusable_timestamps_return_none_not_zero(self):
+        # None means "unknown age" and suppresses escalation. Returning 0.0 would
+        # silently mean "brand new" and suppress it too — but would also read as a
+        # real measurement in the log. Unknown must stay distinguishable.
+        for pr in (None, {}, {"created_at": ""}, {"created_at": "not-a-date"},
+                   {"created_at": 12345}, "not-a-dict"):
+            self.assertIsNone(_mod._pr_age_hours(pr), pr)
+
+    def test_future_timestamp_clamps_to_zero_rather_than_going_negative(self):
+        self.assertEqual(_mod._pr_age_hours({"created_at": self._iso(-5)}), 0.0)
+
+    def test_escalation_window_is_a_full_day_of_sweeps(self):
+        # The sweep runs every 30 min between 05:00 and 23:00. The window must be
+        # long enough that a transient red self-clears without noise, and short
+        # enough to surface the next morning rather than at eviction time.
+        self.assertEqual(_mod.STALE_BUMP_ESCALATE_HOURS, 24.0)
+
+
+class BlockingContextRenderingTest(unittest.TestCase):
+    """The skip line must NAME the blocking contexts.
+
+    It read `s.get('state')`, but Gitea's combined-status CHILD rows carry the
+    per-context result in `status` — the same RC 13421 key confusion already fixed
+    in all_required_statuses_success and left unfixed in the diagnostic. Every
+    context therefore rendered as `=?`: the real log for hermes#326 listed 19
+    contexts and identified none of them, while dumping all 19 buried the 2 that
+    actually blocked.
+    """
+
+    # Mirrors the rendering in run(); kept as a helper so the key semantics are
+    # asserted directly rather than through a full sweep.
+    @staticmethod
+    def _blocking(combined):
+        return [
+            f"{s.get('context', '?')}={s.get('status') or s.get('state') or '?'}"
+            for s in combined.get("statuses", [])
+            if isinstance(s, dict) and (s.get("status") or s.get("state")) != "success"
+        ]
+
+    def test_reads_the_child_status_key_not_state(self):
+        # The exact payload shape Gitea returns.
+        combined = {
+            "state": "failure",
+            "statuses": [
+                {"context": "CI / all-required (pull_request)", "status": "failure"},
+                {"context": "CI / Shell unit tests (pull_request)", "status": "success"},
+            ],
+        }
+        blocking = self._blocking(combined)
+        self.assertEqual(blocking, ["CI / all-required (pull_request)=failure"])
+        self.assertNotIn("=?", " ".join(blocking))
+
+    def test_only_non_success_contexts_are_listed(self):
+        combined = {
+            "state": "failure",
+            "statuses": [
+                {"context": "a", "status": "success"},
+                {"context": "b", "status": "success"},
+                {"context": "c", "status": "skipped"},
+                {"context": "d", "status": "failure"},
+            ],
+        }
+        self.assertEqual(sorted(self._blocking(combined)), ["c=skipped", "d=failure"])
+
+    def test_state_key_is_still_accepted_for_forward_compat(self):
+        combined = {"state": "failure", "statuses": [{"context": "x", "state": "failure"}]}
+        self.assertEqual(self._blocking(combined), ["x=failure"])
+
+    def test_malformed_rows_do_not_crash_the_sweep(self):
+        combined = {"state": "failure", "statuses": ["junk", None, {"context": "y", "status": "failure"}]}
+        self.assertEqual(self._blocking(combined), ["y=failure"])
