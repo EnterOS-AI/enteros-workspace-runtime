@@ -55,6 +55,7 @@ import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from molecule_runtime import plugin_settings
 
@@ -71,6 +72,11 @@ class DaemonSpec:
     kind: str = ""  # owning manifest kind; "channel" + "trigger" get a local A2A lane
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
+    # Parsed ``contributes.state`` (RFC sdk#181). None == the plugin declared no
+    # durable state. Deliberately NOT kind-gated: a skill plugin may keep state
+    # just as a channel plugin does. All of a plugin's daemons share ONE
+    # directory — they are one plugin and one trust domain.
+    state: dict | None = None
 
     @property
     def key(self) -> str:
@@ -86,6 +92,7 @@ def daemon_specs_from_manifest(
     plugin_kind: str = "",
     settings: dict | None = None,
     settings_file: str | None = None,
+    raw_state: object = None,
 ) -> list[DaemonSpec]:
     """Parse a manifest's ``contributes.daemons`` value into specs.
 
@@ -94,6 +101,7 @@ def daemon_specs_from_manifest(
     daemon declaration must not take down boot (the plugin's other
     contributions already loaded normally).
     """
+    state = _normalize_state(plugin_name, raw_state)
     if raw_daemons is None:
         return []
     if not isinstance(raw_daemons, list):
@@ -139,9 +147,32 @@ def daemon_specs_from_manifest(
                     else {k: str(v) for k, v in (entry.get("env") or {}).items()}
                 ),
                 cwd=cwd,
+                state=state,
             )
         )
     return specs
+
+
+def _normalize_state(plugin_name: str, raw_state: object) -> dict | None:
+    """Coerce a manifest's ``contributes.state`` into a spec-ready mapping.
+
+    Skip-not-reject, exactly like :func:`_entry_problem`: a non-mapping value is
+    still a DECLARATION that the plugin keeps durable state, so it is coerced to
+    the default posture and logged rather than dropped or raised on. Dropping it
+    would silently deny the plugin a state dir over a typo — the same class of
+    silent failure #360 was about — and raising would fail manifest validation,
+    which the contract forbids (``never_fail_manifest_validation``).
+    """
+    if raw_state is None:
+        return None
+    if isinstance(raw_state, dict):
+        return raw_state
+    logger.warning(
+        "plugin %s: contributes.state is %s, expected a mapping — treating it "
+        "as a bare declaration (durability=required)",
+        plugin_name, type(raw_state).__name__,
+    )
+    return {"durability": "required"}
 
 
 def _entry_problem(entry: object) -> str | None:
@@ -217,6 +248,13 @@ def discover_daemon_specs(
             plugin_kind=plugin.manifest.kind,
             settings=resolved,
             settings_file=resolved_file,
+            # Kind-agnostic BY DESIGN — read straight off contributes, with no
+            # `kind in {channel, trigger}` gate. Gating it would rebuild exactly
+            # the trigger-only limitation this contract generalises away.
+            # `daemon_owner` is the same validated-manifest-name identity the
+            # channel-provenance path uses, which is the contract's
+            # `identity_source` — so there is no second identity convention.
+            raw_state=plugin.manifest.contributes.get("state"),
         )
         if plugin_specs and plugin.manifest.kind == "channel":
             prior_path = channel_identity_paths.get(daemon_owner)
@@ -422,6 +460,7 @@ class DaemonSupervisor:
             TRIGGER_API_VERSION_ENV,
             TRIGGER_PLUGIN_ID_ENV,
         )
+        from molecule_runtime import plugin_state
 
         child_env = dict(os.environ)
         for reserved in (
@@ -429,9 +468,32 @@ class DaemonSupervisor:
             CHANNEL_A2A_TOKEN_ENV, CHANNEL_PLUGIN_ID_ENV,
             TRIGGER_API_VERSION_ENV, TRIGGER_A2A_SOCKET_ENV,
             TRIGGER_A2A_TOKEN_ENV, TRIGGER_PLUGIN_ID_ENV,
+            # The per-plugin state dir + its honest durability flag are
+            # runtime-issued, exactly like the A2A socket above. Stripping them
+            # from the inherited environment is what stops a stale or
+            # operator-supplied value reaching a daemon we did not resolve one
+            # for. Names come from the contract, never re-typed here.
+            *plugin_state.reserved_env_names(),
         ):
             child_env.pop(reserved, None)
         child_env.update(spec.env)
+        # AFTER the manifest's own env map, deliberately: a plugin must not be
+        # able to name, forge or redirect its own state dir. `contributes.state`
+        # has no path field and this overwrite is what enforces that — the
+        # directory is keyed on the validated manifest name, and the untrusted
+        # side gets no say in it.
+        if spec.state is not None:
+            state_env = plugin_state.state_env_for(spec.plugin or spec.name)
+            child_env.update(state_env)
+            if state_env:
+                resolved_dir = state_env.get(plugin_state.STATE_DIR_ENV or "", "")
+                plugin_state.log_degradation(
+                    spec.plugin or spec.name,
+                    state_env.get(plugin_state.DURABLE_ENV or "")
+                    == plugin_state.DURABLE_TRUE,
+                    Path(resolved_dir),
+                    spec.state,
+                )
         try:
             proc = subprocess.Popen(
                 spec.command,
