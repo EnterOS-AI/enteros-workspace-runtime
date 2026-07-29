@@ -29,6 +29,53 @@ This package provides the core machinery every Molecule AI workspace container n
   process serve N workspaces concurrently (introduced in the multi-WS PR
   series, finalised in 0.2.0)
 
+## Calling the platform: `platform_auth.platform_headers()` is mandatory
+
+Every request this runtime sends to `PLATFORM_URL` must build its headers with
+`molecule_runtime.platform_auth.platform_headers(workspace_id)` — including
+plugins and daemons that talk to the platform on their own.
+
+```python
+from molecule_runtime.platform_auth import platform_headers
+
+resp = await client.post(
+    f"{PLATFORM_URL}/workspaces/{peer_id}/a2a",
+    headers=platform_headers(my_workspace_id, source=True),
+    json=payload,
+)
+```
+
+The platform's `TenantGuard` middleware is registered on the **root engine**, so
+it runs **before authentication**. A request carrying neither
+`X-Molecule-Org-Id` nor `Fly-Replay-Src` is rejected outright:
+
+```
+400 {"code":"TENANT_ORG_HEADER_REQUIRED",
+     "error":"missing tenant routing header",
+     "required_header":"X-Molecule-Org-Id"}
+```
+
+A valid workspace token does not help — measured on a live tenant, a bogus
+bearer and a real bearer return byte-identical 400s. `/workspaces/:id/a2a` is in
+no exemption list, so **workspace-to-workspace A2A is 100% dead** on any tenant
+whose platform process has `MOLECULE_ORG_ID` set if the header is missing. The
+guard is a passthrough when the platform's own `MOLECULE_ORG_ID` is empty, which
+is why a self-host deployment never sees this and why the defect stayed latent.
+
+`platform_headers()` reads `MOLECULE_ORG_ID` from the container environment and
+**omits the header when it cannot resolve one** — it never defaults or derives a
+value, because an org id is a routing claim the runtime has no standing to
+invent, and the platform's own 400 is a better failure than a fabricated header.
+For the same reason, a workspace registered with its own `platform_url` (the
+multi-tenant `MOLECULE_WORKSPACES` bridge, below) gets no org header at all:
+this process's env describes at most one of those tenants.
+
+`tests/test_platform_headers_ssot.py` enforces this structurally — it walks the
+AST of the package and fails if any platform-bound request builds headers by
+another route. If it fails on your change, the fix is to use the builder, not to
+extend the allowlist (every entry on that allowlist is separately asserted to
+emit the tenant header). Background: runtime#373, incident runtime#360.
+
 ## Plugin local A2A transport (channel + trigger lanes)
 
 A plugin whose `plugin.yaml` declares `kind: channel` or `kind: trigger` can

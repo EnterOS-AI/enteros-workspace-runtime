@@ -16,7 +16,10 @@ import httpx
 # Issue #537.
 from molecule_runtime.a2a_client import build_message_send_params
 from molecule_runtime._sanitize_a2a import sanitize_a2a_result
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+from molecule_runtime.platform_auth import (
+    get_workspace_id as _get_workspace_id,
+    platform_headers,
+)
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
 # Validate WORKSPACE_ID (CWE-20, issue #14) — interpolated into
@@ -36,7 +39,10 @@ async def list_peers() -> list[dict]:
     """Get this workspace's peers from the platform registry."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            resp = await client.get(f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers")
+            resp = await client.get(
+                f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers",
+                headers=platform_headers(WORKSPACE_ID),
+            )
             if resp.status_code == 200:
                 return resp.json()
             return []
@@ -73,7 +79,7 @@ async def delegate_task(workspace_id: str, task: str) -> str:
         try:
             resp = await client.get(
                 f"{PLATFORM_URL}/registry/discover/{workspace_id}",
-                headers={"X-Workspace-ID": WORKSPACE_ID},
+                headers=platform_headers(WORKSPACE_ID, source=True),
             )
             if resp.status_code != 200:
                 return f"Error: cannot reach workspace {workspace_id} (status {resp.status_code})"

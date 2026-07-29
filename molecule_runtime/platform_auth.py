@@ -387,11 +387,162 @@ def list_registered_workspaces() -> list[str]:
         return list(_WORKSPACE_TOKENS.keys())
 
 
+# --------------------------------------------------------------------------
+# Tenant routing (issue #373)
+# --------------------------------------------------------------------------
+# The SaaS platform's TenantGuard middleware
+# (molecule-core/workspace-server/internal/middleware/tenant_guard.go) is
+# registered on the ROOT gin engine, so it runs BEFORE authentication. Any
+# request that carries neither ``X-Molecule-Org-Id`` nor ``Fly-Replay-Src``
+# is rejected with:
+#
+#     400 {"code":"TENANT_ORG_HEADER_REQUIRED",
+#          "error":"missing tenant routing header",
+#          "required_header":"X-Molecule-Org-Id"}
+#
+# A valid bearer token cannot save the call — measured on a live tenant, a
+# bogus token and a real token return byte-identical 400s. ``/workspaces/:id/a2a``
+# is in no exemption list, so workspace→workspace A2A over PLATFORM_URL is
+# 100% dead on any tenant whose platform process has MOLECULE_ORG_ID set.
+#
+# The guard is a total passthrough when the platform's own MOLECULE_ORG_ID is
+# empty (self-host), which is why this was latent for so long rather than
+# constantly on fire.
+_ORG_ID_HEADER = "X-Molecule-Org-Id"
+
+# Source env keys, in precedence order. Mirrors
+# ``privileged_mcp_env._SELF_ORG_ID_SOURCE_KEYS`` — the strict key plus the
+# one legacy alias the mcp-server surface also accepts. The contract
+# (contracts/credentials.contract.json, id "org-id") makes MOLECULE_ORG_ID
+# canonical.
+_ORG_ID_ENV_KEYS: tuple[str, ...] = ("MOLECULE_ORG_ID", "MOLECULE_ORGANIZATION_ID")
+
+# An org id is interpolated straight into an HTTP header value, so it gets
+# the same fail-closed treatment WORKSPACE_ID gets before it reaches
+# ``X-Workspace-ID`` (CWE-20 / header injection): printable ASCII only, no
+# spaces, no control characters, no CR/LF.
+_ORG_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
+
+
+def get_org_id() -> str | None:
+    """Return this workspace's tenant org id, or ``None`` when unset.
+
+    Resolution is env-only and deliberately dumb: whichever of
+    ``MOLECULE_ORG_ID`` / ``MOLECULE_ORGANIZATION_ID`` is non-empty first.
+    There is no default and no derivation — see :func:`tenant_headers` for
+    why forging a value is worse than omitting it.
+
+    Returns ``None`` (with one warning log) if the value present in the
+    environment cannot be safely placed in a header value.
+    """
+    for key in _ORG_ID_ENV_KEYS:
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        if not _ORG_ID_RE.match(raw):
+            logger.warning(
+                "%s is set but is not a valid HTTP header value — omitting the "
+                "%s tenant-routing header. Platform calls will be rejected with "
+                "400 TENANT_ORG_HEADER_REQUIRED on a SaaS tenant.",
+                key,
+                _ORG_ID_HEADER,
+            )
+            return None
+        return raw
+    return None
+
+
+def tenant_headers() -> dict[str, str]:
+    """Return the platform's tenant-routing headers — ``{}`` when unset.
+
+    ``{"X-Molecule-Org-Id": <org id>}`` when ``MOLECULE_ORG_ID`` resolves,
+    otherwise an empty dict.
+
+    OMIT rather than forge (issue #373): the org id is an authorization-
+    adjacent routing claim the runtime has no standing to invent. A
+    fabricated value would route the request at some *other* tenant or be
+    rejected further in with a much worse error; the platform's own
+    ``400 TENANT_ORG_HEADER_REQUIRED`` is the better, more diagnosable
+    failure. On self-host (no org id anywhere) the platform's guard is a
+    passthrough, so an absent header is also the correct wire shape.
+    """
+    org_id = get_org_id()
+    return {_ORG_ID_HEADER: org_id} if org_id else {}
+
+
+def platform_headers(
+    workspace_id: str | None = None,
+    *,
+    source: bool = False,
+) -> dict[str, str]:
+    """THE header builder for every request this runtime sends to the
+    platform. If you are about to hand-roll a dict for a ``PLATFORM_URL``
+    call, use this instead.
+
+    Returns, in one dict:
+
+    * ``X-Molecule-Org-Id`` — tenant routing (:func:`tenant_headers`),
+      omitted when unresolvable.
+    * ``Origin``           — the tenant edge WAF requires same-origin.
+    * ``Authorization``    — ``Bearer <workspace token>`` when one exists.
+    * ``X-Workspace-ID``   — only when ``source=True``; identifies this
+      workspace as the SOURCE of the request (see
+      :func:`self_source_headers`).
+
+    Merge extra headers at the call site — ``{**platform_headers(ws),
+    "Content-Type": "application/json"}`` — rather than growing kwargs
+    here.
+
+    Why a single builder, enforced structurally: this repo has now been
+    bitten twice by two call sites that had to agree about a header and
+    didn't. ``tests/test_platform_headers_ssot.py`` walks the AST of the
+    whole package and fails if ANY platform-bound request builds its
+    headers by another route, and separately asserts that every builder on
+    its allowlist emits the tenant header — so an author cannot silence the
+    structural gate by adding a new hand-rolled builder to the allowlist.
+    """
+    headers: dict[str, str] = {}
+    ws_url: str | None = None
+    if workspace_id:
+        ws_url = get_workspace_platform_url(workspace_id)
+    if ws_url:
+        headers["Origin"] = ws_url
+        # A per-workspace platform_url override means the multi-workspace
+        # external bridge (MOLECULE_WORKSPACES): this one local process talks
+        # to SEVERAL tenants, and the tenant is selected by platform_url —
+        # see README "Multiple External Workspaces", which states outright
+        # that org_id is not part of that config. This process's env
+        # MOLECULE_ORG_ID describes at most ONE of those tenants, so stamping
+        # it on a request bound for another one would be exactly the forging
+        # this fix refuses to do. Omit; the entry's own token and URL carry
+        # the routing.
+    else:
+        platform_url = os.environ.get("PLATFORM_URL", "").strip()
+        if platform_url:
+            headers["Origin"] = platform_url
+        headers.update(tenant_headers())
+    tok: str | None = None
+    if workspace_id:
+        tok = get_workspace_token(workspace_id)
+    if tok is None:
+        tok = get_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    if source:
+        if not workspace_id:
+            raise ValueError("platform_headers(source=True) requires workspace_id")
+        headers["X-Workspace-ID"] = workspace_id
+    return headers
+
+
 def auth_headers(workspace_id: str | None = None) -> dict[str, str]:
     """Return a header dict to merge into httpx calls. Empty if no token
     is available yet — callers send the request as-is and the platform's
     heartbeat handler grandfathers pre-token workspaces through until
     their next /registry/register issues one.
+
+    Thin alias for :func:`platform_headers` — the name most of the runtime
+    already imports. New code should prefer ``platform_headers``.
 
     Always sets ``Origin`` to ``PLATFORM_URL`` when that env var is set.
     On hosted SaaS deployments the tenant's edge WAF requires a same-
@@ -423,25 +574,13 @@ def auth_headers(workspace_id: str | None = None) -> dict[str, str]:
         2. Module-level ``PLATFORM_URL`` env var — the pre-RFC#601
            default, still wins for entries without a per-workspace
            override AND for the entire single-workspace path.
+
+    Tenant routing (#373): also carries ``X-Molecule-Org-Id`` when
+    ``MOLECULE_ORG_ID`` resolves. Every caller of this function was firing
+    at a platform endpoint sitting behind TenantGuard, so the header
+    belongs here rather than at ~50 individual call sites.
     """
-    headers: dict[str, str] = {}
-    ws_url: str | None = None
-    if workspace_id:
-        ws_url = get_workspace_platform_url(workspace_id)
-    if ws_url:
-        headers["Origin"] = ws_url
-    else:
-        platform_url = os.environ.get("PLATFORM_URL", "").strip()
-        if platform_url:
-            headers["Origin"] = platform_url
-    tok: str | None = None
-    if workspace_id:
-        tok = get_workspace_token(workspace_id)
-    if tok is None:
-        tok = get_token()
-    if tok:
-        headers["Authorization"] = f"Bearer {tok}"
-    return headers
+    return platform_headers(workspace_id)
 
 
 def self_source_headers(workspace_id: str) -> dict[str, str]:
@@ -461,12 +600,12 @@ def self_source_headers(workspace_id: str) -> dict[str, str]:
     correlation ID) only touches one place — and so that any
     workspace→A2A POST that doesn't use this helper stands out in
     review as a probable bug."""
-    # Pass workspace_id through to auth_headers so the bearer token
+    # Pass workspace_id through to platform_headers so the bearer token
     # comes from the per-workspace registry when set — otherwise a
     # multi-workspace operator's source-tagged POST authenticates with
     # the legacy single token (or none) and the platform rejects with
     # 401, or worse silently logs the wrong source.
-    return {**auth_headers(workspace_id), "X-Workspace-ID": workspace_id}
+    return platform_headers(workspace_id, source=True)
 
 
 def clear_cache() -> None:

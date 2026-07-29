@@ -51,7 +51,10 @@ import httpx
 from langchain_core.tools import tool
 
 from molecule_runtime.builtin_tools.audit import check_permission, get_workspace_roles, log_event
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+from molecule_runtime.platform_auth import (
+    get_workspace_id as _get_workspace_id,
+    platform_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,7 @@ async def _create_approval_request(action: str, reason: str) -> dict:
             resp = await client.post(
                 f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/approvals",
                 json={"action": action, "reason": reason},
+                headers=platform_headers(WORKSPACE_ID),
             )
             if resp.status_code != 201:
                 return {"error": f"Failed to create request: {resp.status_code}"}
@@ -132,7 +136,11 @@ async def _wait_websocket(approval_id: str, timeout: float) -> dict:
         PLATFORM_URL.replace("http://", "ws://").replace("https://", "wss://")
         + "/ws"
     )
-    headers = {"X-Workspace-ID": WORKSPACE_ID}
+    # The /ws upgrade traverses the same TenantGuard as the REST routes
+    # (it is registered on the root engine), so it needs the tenant-routing
+    # header too — a websocket handshake rejected at 400 is every bit as
+    # silent as a rejected POST.
+    headers = platform_headers(WORKSPACE_ID, source=True)
 
     logger.debug("Approval %s: waiting via WebSocket %s", approval_id, ws_url)
 
@@ -178,6 +186,7 @@ async def _wait_polling(approval_id: str, timeout: float) -> dict:
             try:
                 resp = await client.get(
                     f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/approvals",
+                    headers=platform_headers(WORKSPACE_ID),
                 )
                 if resp.status_code == 200:
                     for a in resp.json():

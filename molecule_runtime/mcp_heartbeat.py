@@ -24,6 +24,8 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from molecule_runtime.platform_auth import platform_headers
+
 if TYPE_CHECKING:
     # SSOT typed payloads (molecule-contracts / RFC molecule-core#3285),
     # published as `molecule-ai-contracts` on the gitea PyPI registry. Imported
@@ -141,6 +143,9 @@ def platform_register(platform_url: str, workspace_id: str, token: str) -> None:
         "delivery_mode": "poll",
     }
     headers = {
+        **platform_headers(workspace_id),
+        # explicit token/origin win: this path is handed its credentials by
+        # the operator's MOLECULE_WORKSPACES entry, not by the container.
         "Authorization": f"Bearer {token}",
         "Origin": platform_url,
         "Content-Type": "application/json",
@@ -209,6 +214,7 @@ def heartbeat_loop(
             "uptime_seconds": int(time.time() - start_time),
         }
         headers = {
+            **platform_headers(workspace_id),
             "Authorization": f"Bearer {token}",
             "Origin": platform_url,
             "Content-Type": "application/json",

@@ -29,7 +29,10 @@ from molecule_runtime.builtin_tools.telemetry import (
     get_tracer,
     inject_trace_headers,
 )
-from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
+from molecule_runtime.platform_auth import (
+    get_workspace_id as _get_workspace_id,
+    platform_headers,
+)
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
 # CWE-20 (issue #14): validate WORKSPACE_ID before it lands in
@@ -105,6 +108,7 @@ async def _notify_completion(task_id: str, target_workspace_id: str, status: str
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/notify",
+                headers=platform_headers(WORKSPACE_ID),
                 json={
                     "type": "delegation_complete",
                     "task_id": task_id,
@@ -128,6 +132,7 @@ async def _record_delegation_on_platform(task_id: str, target_workspace_id: str,
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations/record",
+                headers=platform_headers(WORKSPACE_ID),
                 json={
                     "target_id": target_workspace_id,
                     "task": task,
@@ -159,7 +164,7 @@ async def _refresh_queued_from_platform(task_id: str) -> bool:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations",
-                headers={},
+                headers=platform_headers(WORKSPACE_ID),
             )
             if resp.status_code != 200:
                 return False
@@ -211,6 +216,7 @@ async def _update_delegation_on_platform(task_id: str, status: str, error: str =
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/delegations/{task_id}/update",
+                headers=platform_headers(WORKSPACE_ID),
                 json={
                     "status": status,
                     "error": error,
@@ -243,7 +249,7 @@ async def _execute_delegation(task_id: str, workspace_id: str, task: str):
             try:
                 discover_resp = await client.get(
                     f"{PLATFORM_URL}/registry/discover/{workspace_id}",
-                    headers={"X-Workspace-ID": WORKSPACE_ID},
+                    headers=platform_headers(WORKSPACE_ID, source=True),
                 )
                 if discover_resp.status_code != 200:
                     delegation.status = DelegationStatus.FAILED

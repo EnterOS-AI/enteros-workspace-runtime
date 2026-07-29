@@ -12,6 +12,8 @@ from pathlib import Path
 
 import httpx
 
+from molecule_runtime.platform_auth import platform_headers
+
 logger = logging.getLogger(__name__)
 
 DEBOUNCE_SECONDS = 2.0
@@ -79,6 +81,7 @@ class ConfigWatcher:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.post(
                     f"{self.platform_url}/registry/update-card",
+                    headers=platform_headers(self.workspace_id),
                     json={
                         "workspace_id": self.workspace_id,
                         "agent_card": agent_card,

@@ -106,6 +106,25 @@ jobs:
         # backlog; a restart does not re-deliver.
         run: pytest -v -rs tests/test_heartbeat_harvest_active_await.py tests/test_heartbeat_notify_routing.py
 
+      - name: Run platform tenant-routing header gate
+        # Loud, merge-blocking gate for runtime#373 (spun out of the #360
+        # two-day-dark incident): the platform's TenantGuard rejects any
+        # request without X-Molecule-Org-Id at 400 BEFORE authentication, and
+        # send_a2a_message turns that 400 into a RETURNED string — no raise, no
+        # log, no health signal. Every message was thrown away while five
+        # independent signals read green.
+        #
+        # Two arms, both required:
+        #   - the structural gate walks the package AST and fails if ANY
+        #     platform-bound request builds headers outside platform_auth
+        #     (naming the header instead is exactly how the gmail plugin's
+        #     hand-rolled dict passed its own header test while missing this);
+        #   - the invisibility gate pins the silence mechanism itself, so
+        #     nobody reintroduces a swallowed 400.
+        #
+        # -rs so a mis-collect is visible: an inert gate must not read green.
+        run: pytest -v -rs tests/test_platform_headers_ssot.py tests/test_a2a_tenant_guard_invisibility.py
+
       - name: Run session-continuity convergence gate
         # Loud, merge-blocking gate for the user expectation (2026-07-24):
         # "across any reason a workspace restarts or a plugin is installed, the

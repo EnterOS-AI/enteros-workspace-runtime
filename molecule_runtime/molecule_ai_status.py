@@ -35,8 +35,8 @@ def set_status(task: str):
     """Push current_task to platform via heartbeat."""
     try:
         try:
-            from molecule_runtime.platform_auth import auth_headers as _auth
-            _headers = _auth()
+            from molecule_runtime.platform_auth import platform_headers as _platform_headers
+            _headers = _platform_headers(WORKSPACE_ID)
         except Exception:
             _headers = {}
         httpx.post(
@@ -56,6 +56,7 @@ def set_status(task: str):
             # Also log as activity for traceability
             httpx.post(
                 f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/activity",
+                headers=_headers,
                 json={
                     "activity_type": "task_update",
                     "source_id": WORKSPACE_ID,

@@ -459,13 +459,20 @@ async def _maybe_log_skill_promotion(content: str, scope: str, memory_result: di
     }
 
     try:
+        try:
+            from molecule_runtime.platform_auth import platform_headers as _platform_headers
+            _headers = _platform_headers(workspace_id)
+        except Exception:
+            _headers = {}
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(
                 f"{platform_url}/workspaces/{workspace_id}/activity",
                 json=payload,
+                headers=_headers,
             )
             await client.post(
                 f"{platform_url}/registry/heartbeat",
+                headers=_headers,
                 json={
                     "workspace_id": workspace_id,
                     "error_rate": 0,

@@ -12,6 +12,7 @@ from molecule_runtime.executor_helpers import (
 )
 from molecule_runtime.skill_loader.loader import LoadedSkill
 from molecule_runtime.shared_runtime import build_peer_section
+from molecule_runtime.platform_auth import platform_headers
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ async def get_peer_capabilities(platform_url: str, workspace_id: str) -> list[di
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"{platform_url}/registry/{workspace_id}/peers",
-                headers={"X-Workspace-ID": workspace_id},
+                headers=platform_headers(workspace_id, source=True),
             )
             if resp.status_code == 200:
                 return resp.json()
@@ -64,10 +65,10 @@ async def get_platform_instructions(platform_url: str, workspace_id: str) -> str
     try:
         import httpx
 
-        token = os.environ.get("MOLECULE_WORKSPACE_TOKEN", "")
-        headers = {"X-Workspace-ID": workspace_id}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        # platform_headers resolves the same MOLECULE_WORKSPACE_TOKEN through
+        # platform_auth.get_token(), and adds the tenant-routing header this
+        # endpoint is rejected without on a SaaS tenant (#373).
+        headers = platform_headers(workspace_id, source=True)
 
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(
