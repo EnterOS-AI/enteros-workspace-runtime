@@ -536,6 +536,29 @@ def test_env_is_read_live_not_frozen_at_import(monkeypatch):
     assert platform_auth.platform_headers()[ORG_HEADER] == "org-appeared-later"
 
 
+def test_multi_tenant_bridge_does_not_stamp_this_process_org_id(monkeypatch):
+    """A workspace with its OWN platform_url belongs to a tenant this
+    process's MOLECULE_ORG_ID does not describe.
+
+    ``molecule-mcp`` can serve workspaces in several orgs from one laptop
+    (MOLECULE_WORKSPACES); README "Multiple External Workspaces" states that
+    the tenant is selected by ``platform_url`` and that org_id is
+    deliberately not part of that config. Stamping this process's org id on
+    a request bound for a different tenant is the forging this fix refuses.
+    """
+    monkeypatch.setenv("MOLECULE_ORG_ID", "org-of-this-process")
+    platform_auth.clear_cache()
+    platform_auth.register_workspace_platform_url("ws-other-tenant", "https://other.moleculesai.app")
+    try:
+        headers = platform_auth.platform_headers("ws-other-tenant")
+        assert headers["Origin"] == "https://other.moleculesai.app"
+        assert ORG_HEADER not in headers
+        # ...while a workspace with no override is this process's own tenant
+        assert platform_auth.platform_headers("ws-local")[ORG_HEADER] == "org-of-this-process"
+    finally:
+        platform_auth.clear_cache()
+
+
 def test_org_id_is_not_read_from_the_workspace_id(monkeypatch):
     """Guard against the tempting 'derive it from something we have' fix."""
     monkeypatch.delenv("MOLECULE_ORG_ID", raising=False)

@@ -507,11 +507,20 @@ def platform_headers(
         ws_url = get_workspace_platform_url(workspace_id)
     if ws_url:
         headers["Origin"] = ws_url
+        # A per-workspace platform_url override means the multi-workspace
+        # external bridge (MOLECULE_WORKSPACES): this one local process talks
+        # to SEVERAL tenants, and the tenant is selected by platform_url —
+        # see README "Multiple External Workspaces", which states outright
+        # that org_id is not part of that config. This process's env
+        # MOLECULE_ORG_ID describes at most ONE of those tenants, so stamping
+        # it on a request bound for another one would be exactly the forging
+        # this fix refuses to do. Omit; the entry's own token and URL carry
+        # the routing.
     else:
         platform_url = os.environ.get("PLATFORM_URL", "").strip()
         if platform_url:
             headers["Origin"] = platform_url
-    headers.update(tenant_headers())
+        headers.update(tenant_headers())
     tok: str | None = None
     if workspace_id:
         tok = get_workspace_token(workspace_id)
