@@ -27,6 +27,7 @@ from molecule_runtime.a2a_client import build_message_send_params
 # /registry/{WORKSPACE_ID}/peers + /workspaces/{WORKSPACE_ID} URL paths
 # and the X-Workspace-ID header below.
 from molecule_runtime.platform_auth import (
+    platform_headers,
     validate_workspace_id as _validate_workspace_id,
 )
 _WORKSPACE_ID_raw = os.environ.get("WORKSPACE_ID")
@@ -47,7 +48,7 @@ async def discover(target_id: str) -> dict | None:
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             f"{PLATFORM_URL}/registry/discover/{target_id}",
-            headers={"X-Workspace-ID": WORKSPACE_ID},
+            headers=platform_headers(WORKSPACE_ID, source=True),
         )
         if resp.status_code == 200:
             return resp.json()
@@ -213,7 +214,10 @@ async def check_status(target_id: str, task_id: str):
 async def peers():
     """List available peers."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers")
+        resp = await client.get(
+            f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers",
+            headers=platform_headers(WORKSPACE_ID),
+        )
         if resp.status_code != 200:
             print("Error: could not fetch peers", file=sys.stderr)
             sys.exit(1)
@@ -226,7 +230,10 @@ async def peers():
 async def info():
     """Get this workspace's info."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}")
+        resp = await client.get(
+            f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}",
+            headers=platform_headers(WORKSPACE_ID),
+        )
         if resp.status_code == 200:
             d = resp.json()
             print(f"ID:     {d['id']}")

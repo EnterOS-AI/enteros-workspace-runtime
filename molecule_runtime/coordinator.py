@@ -19,7 +19,10 @@ import httpx
 from langchain_core.tools import tool
 from molecule_runtime.shared_runtime import build_peer_section
 from molecule_runtime.policies.routing import build_team_routing_payload
-from molecule_runtime.platform_auth import validate_workspace_id as _validate_workspace_id
+from molecule_runtime.platform_auth import (
+    platform_headers,
+    validate_workspace_id as _validate_workspace_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +49,7 @@ async def get_children() -> list[dict]:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"{PLATFORM_URL}/registry/{WORKSPACE_ID}/peers",
-                headers={"X-Workspace-ID": WORKSPACE_ID},
+                headers=platform_headers(WORKSPACE_ID, source=True),
             )
             if resp.status_code == 200:
                 peers = resp.json()
