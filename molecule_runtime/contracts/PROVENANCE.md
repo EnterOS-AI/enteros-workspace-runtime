@@ -16,6 +16,20 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-07-30 — sdk main `3fdcfe6e` (sdk#188)
+
+- `native-plugins.registry.json` re-fetched — `molecule-scheduler` source pin
+  `#v0.2.0` → **`#v0.2.1`**. Sole change; every other entry byte-identical.
+
+This is a FUNCTIONAL re-vendor, not housekeeping: this registry is what
+`declareDefaultNativePlugins` / `ensureSchedulerPluginDeclared` resolve the
+scheduler source from, so the pin decides which scheduler version a workspace
+installs. Landed on its own rather than folded into an unrelated PR for exactly
+that reason — the schema-sync gate had been red on this since sdk#188 merged, and
+bundling it would have hidden a version bump inside someone else's diff.
+
+---
+
 ## Re-vendor 2026-07-28 — sdk main `dea2155` (sdk#182 / RFC sdk#181)
 
 Paired with the merge of **molecule-ai-sdk#182**
