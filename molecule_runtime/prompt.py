@@ -8,6 +8,7 @@ import molecule_runtime.mailbox_dir as mailbox_dir
 from molecule_runtime.executor_helpers import (
     get_a2a_instructions,
     get_capabilities_preamble,
+    get_display_instructions,
     get_hma_instructions,
 )
 from molecule_runtime.skill_loader.loader import LoadedSkill
@@ -378,6 +379,27 @@ def build_system_prompt(
     # MCP-capable majority; CLI-only adapters override at the call site.
     _seg("a2a_instructions", get_a2a_instructions(mcp=a2a_mcp))
     _seg("hma_instructions", get_hma_instructions())
+
+    # Desktop display control (computer-use). Default-on: every workspace can spin
+    # a per-workspace desktop sidecar up on demand through the gateway, so any
+    # action-capable agent is told it has a screen it can drive — no per-workspace
+    # display opt-in. Gated on the display.control RBAC action so genuinely
+    # read-only agents (which lack it) are not told about tools they cannot use;
+    # the tools' own desktop_status probe reports live availability at call time.
+    # (Previously get_display_instructions was defined but never wired into the
+    # prod prompt, so agents reported themselves as "a server-side agent without a
+    # display" even though the sidecar/gateway were available.)
+    try:
+        from molecule_runtime.builtin_tools.audit import (
+            check_permission,
+            get_workspace_roles,
+        )
+
+        _roles, _custom = get_workspace_roles()
+        if check_permission("display.control", _roles, _custom):
+            _seg("display_instructions", get_display_instructions())
+    except Exception:  # never let prompt assembly fail on the optional section
+        logger.debug("display-control prompt section skipped", exc_info=True)
 
     # Add peer capabilities with a single shared renderer.
     peer_section = build_peer_section(peers)
