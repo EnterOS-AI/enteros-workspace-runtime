@@ -16,11 +16,12 @@
     "failed": "failed",
     "swapped": "swapped"
   },
-  "outcome_rule": "live iff declared && swapped && failed == []",
+  "outcome_rule": "live iff declared && swapped",
+  "degraded_rule": "degraded iff live && failed != []",
   "producers": [
     "molecule-ai-workspace-runtime: molecule_runtime/plugin_install_report.py (report_install_outcome, called from main.py right after install_declared_plugins)"
   ],
   "consumers": [
-    "molecule-core: workspace-server/internal/handlers/plugin_install_report.go (PluginInstallReportHandler.Report — persists the latest report per workspace and surfaces it on the workspace read)"
+    "molecule-core: workspace-server/internal/handlers/plugin_install_report.go (PluginInstallReportHandler) — POST /workspaces/{workspace_id}/plugin-install-report persists the latest report per workspace (Report); GET /workspaces/{workspace_id}/plugin-install-report reads it back with live+degraded derived (Get). Both are registered on the wsAuth group at workspace-server/internal/router/router.go:581-582. The report is NOT embedded in the workspace read — there is no plugin_install_report field on GET /workspaces/{id}, and no handler issues the fleet query the migration's partial index serves; a consumer that needs either must add it."
   ]
 }

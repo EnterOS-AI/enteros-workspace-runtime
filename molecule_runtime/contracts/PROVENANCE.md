@@ -16,6 +16,32 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-07-30 — sdk main `a8f4cb82` (sdk#190)
+
+`plugin-install-report.contract.json` re-fetched. Two semantic corrections, not
+housekeeping:
+
+- `outcome_rule` — was `live iff declared && swapped && failed == []`, now
+  **`live iff declared && swapped`**, plus a new
+  `degraded_rule: degraded iff live && failed != []`.
+- `consumers` — corrected to name the two endpoints that actually exist. The old
+  text promised the report was "surfaced on the workspace read"; nothing
+  implements that.
+
+Why the rule was wrong: `install_declared_plugins` promotes a PARTIAL build on
+purpose — when some sources fail but at least one installed it carries the
+previous dirs forward, logs "promoting the N that succeeded", and sets
+`swapped=True` with `failed` non-empty ("A failed source fails THAT SOURCE — not
+the whole tree", after the 2026-07-13 test5 incident). The old rule therefore
+reported a healthy workspace with one flaky source as NOT LIVE — a false alarm,
+the inverse of the blind spot the contract was created to close.
+
+`outcome_rule` is read by no runtime code and no test here; this repo only
+mirrors it. The behavioural fix landed in molecule-core#4972. The stale
+`InstallReport.swapped` docstring in `plugin_sources.py` — which asserted the
+same false "we never promote a partial build" claim and is the likely origin of
+it — was corrected in #379.
+
 ## Re-vendor 2026-07-30 — sdk main `3e0acb3c` (sdk#189)
 
 Paired with the merge of **molecule-ai-sdk#189**, which added the plugin
