@@ -306,3 +306,62 @@ def test_degraded_window_memory_beats_param_rendered_root_copy(_legacy_state):
     # legacy/MEMORY.md (the template baseline) already exists via the fixture
     assert mailbox_dir.migrate_legacy_state() is True
     assert (base / "memory" / "MEMORY.md").read_text() == "agent memory from degraded window"
+
+
+def test_first_boot_records_seed_provenance_for_root_configs_copies(_legacy_state):
+    """The memory copies made from the /configs ROOT are param-rendered role
+    files, not agent memory. Record their sha256+size so prompt.py can later
+    tell a frozen first-boot SNAPSHOT of role file v1 apart from memory a writer
+    produced — without provenance the two are indistinguishable once /configs
+    has been re-rendered to v2, and the stale v1 gets injected forever.
+    """
+    import hashlib
+    import json
+
+    legacy, base, queue = _legacy_state
+    assert mailbox_dir.migrate_legacy_state() is True
+
+    manifest = json.loads(
+        (base / "memory" / mailbox_dir._SEED_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    for name in ("MEMORY.md", "CLAUDE.md"):  # both seeded by the fixture
+        raw = (legacy / name).read_bytes()
+        assert manifest[name] == {
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size": len(raw),
+        }
+    assert mailbox_dir.seed_manifest()["MEMORY.md"]["size"] == len(
+        (legacy / "MEMORY.md").read_bytes()
+    )
+    # 0600: the seed digests describe files that may be relay-delivered 0600.
+    assert (base / "memory" / mailbox_dir._SEED_MANIFEST_NAME).stat().st_mode & 0o777 == 0o600
+
+
+def test_degraded_window_memory_is_never_recorded_as_a_seed(_legacy_state):
+    """A <configs>/memory/<name> source really IS agent memory. Recording it as
+    a role-file seed would let prompt.py subtract it, deleting the agent's own
+    memory — so only the ROOT copy is ever recorded."""
+    import json
+
+    legacy, base, queue = _legacy_state
+    (legacy / "memory").mkdir()
+    (legacy / "memory" / "MEMORY.md").write_text("agent memory from degraded window", encoding="utf-8")
+    assert mailbox_dir.migrate_legacy_state() is True
+
+    manifest = json.loads(
+        (base / "memory" / mailbox_dir._SEED_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert "MEMORY.md" not in manifest, (
+        "the degraded-window copy won the destination — it is agent memory and "
+        "must carry no seed provenance"
+    )
+    assert "CLAUDE.md" in manifest, "the root-sourced copy is still recorded"
+
+
+def test_seed_manifest_empty_without_kernel_or_file(_legacy_state, monkeypatch):
+    legacy, base, queue = _legacy_state
+    assert mailbox_dir.seed_manifest() == {}  # no migration has run yet
+    mailbox_dir.migrate_legacy_state()
+    assert mailbox_dir.seed_manifest()
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "0")
+    assert mailbox_dir.seed_manifest() == {}, "kernel OFF reads no mailbox provenance"

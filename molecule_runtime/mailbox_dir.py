@@ -54,6 +54,7 @@ lifetime so every caller agrees on one base — tests use per-test tmp bases
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -442,15 +443,56 @@ _LEGACY_MEMORY_BASENAMES = (
     "SOUL.md",
 )
 
+#: Memory basenames a RUNTIME WRITER actually accumulates agent-authored
+#: content into, under ``<mailbox>/memory``. This is the *writer inventory*,
+#: not a taste call — every literal ``memory_file("<name>")`` call site in the
+#: tree is one of these:
+#:
+#:   * ``MEMORY.md``  — ``consolidation._mirror_consolidated_to_mailbox``
+#:   * ``AGENTS.md``  — ``agents_md.generate_agents_md`` (AAIF discovery card)
+#:   * ``CLAUDE.md``  — ``BaseAdapter.memory_filename()`` default, the target of
+#:                      ``BaseAdapter.append_to_memory`` and of a plugin's
+#:                      ``memory.filename`` when it does not override it
+#:                      (``plugins_registry.protocol.DEFAULT_MEMORY_FILENAME``)
+#:
+#: ``SOUL.md`` and ``USER.md`` have NO writer: with the kernel on, their
+#: ``<mailbox>/memory`` copies can only be the first-boot seed of the
+#: param-rendered ``/configs`` role file made by :func:`migrate_legacy_state`.
+#: ``prompt.py`` uses that fact to tell a stale ROLE SNAPSHOT apart from
+#: genuine evolved MEMORY. Pinned against the real call sites by
+#: ``tests/test_accumulating_memory_basenames_matches_writers.py`` — adding a
+#: writer for a new basename fails that test until this tuple is updated.
+ACCUMULATING_MEMORY_BASENAMES = (
+    "MEMORY.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+)
 
-def _copy_0600(src: Path, dst: Path, migrated: list[str]) -> None:
+#: Provenance manifest, written INSIDE ``<mailbox>/memory``. Maps a memory
+#: basename to the sha256 + byte length of the param-rendered ``/configs``
+#: file it was SEEDED from on the first kernel-on boot. It is the only durable
+#: evidence of which bytes in a mailbox memory file are a role-file snapshot
+#: rather than agent-authored memory — without it, a first-boot seed of role
+#: file v1 is indistinguishable from an agent that rewrote the file, and
+#: ``prompt.py`` would have to keep injecting the frozen v1 forever alongside
+#: the freshly re-rendered v2. Leading dot: it is metadata, never a snapshot,
+#: and ``prompt.py`` only ever reads the fixed ``DEFAULT_MEMORY_SNAPSHOT_FILES``
+#: basenames out of this dir.
+_SEED_MANIFEST_NAME = ".configs_seed.json"
+
+
+def _copy_0600(src: Path, dst: Path, migrated: list[str]) -> bool:
     """Atomic 0600 copy of ``src`` to ``dst`` unless ``dst`` already exists.
 
     0600 via os.open (not umask-default write_bytes): the sources include
     relay-delivered 0600 files; migrated copies must not come out looser.
+
+    Returns True when this call actually created ``dst`` (the caller uses that
+    to record seed provenance for the copy it made, and only that one — under
+    never-clobber ordering at most one source per destination ever wins).
     """
     if not src.is_file() or dst.exists():
-        return
+        return False
     tmp = dst.with_name(dst.name + ".migrating")
     data = src.read_bytes()
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -460,6 +502,53 @@ def _copy_0600(src: Path, dst: Path, migrated: list[str]) -> None:
         os.close(fd)
     os.replace(tmp, dst)
     migrated.append(src.name)
+    return True
+
+
+def _write_seed_manifest(base: Path, seeds: dict[str, dict]) -> None:
+    """Persist (0600, atomically) the seed provenance recorded this migration.
+
+    Merges into whatever is already on disk: a later boot can seed a basename
+    whose ``/configs`` copy had not been materialized yet on the first pass
+    (the asset-fetcher window the marker rule already accounts for).
+    """
+    if not seeds:
+        return
+    path = base / "memory" / _SEED_MANIFEST_NAME
+    merged: dict[str, dict] = {}
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            merged.update({k: v for k, v in existing.items() if isinstance(v, dict)})
+    except (OSError, ValueError):
+        pass
+    merged.update(seeds)
+    tmp = path.with_name(path.name + ".migrating")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, json.dumps(merged, sort_keys=True).encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def seed_manifest() -> dict[str, dict]:
+    """Seed provenance for ``<mailbox>/memory`` — ``{}`` when absent/unreadable.
+
+    Read by ``prompt.py`` to subtract a first-boot role-file snapshot from a
+    durable memory file, keeping only what a writer actually added. Fail-open
+    by design: a missing manifest degrades to the conservative content-based
+    rules, it never breaks prompt construction.
+    """
+    if not kernel_enabled():
+        return {}
+    try:
+        data = json.loads((resolve() / "memory" / _SEED_MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
 
 
 def _is_cursor_family(name: str) -> bool:
@@ -592,8 +681,27 @@ def migrate_legacy_state() -> bool:
             for src, _ in pairs
             if os.path.normpath(str(src)).startswith(legacy_str)
         )
+        # Record seed PROVENANCE for every memory file we copy out of the
+        # /configs ROOT. That source is the param-rendered role file, so the
+        # copy we just made is a SNAPSHOT, not agent memory — prompt.py needs
+        # to know that later, when /configs has been re-rendered to v2 and the
+        # snapshot of v1 is otherwise indistinguishable from evolved memory.
+        # The <configs>/memory/<name> source is deliberately NOT recorded: that
+        # one really is agent memory (written during a degraded-kernel window)
+        # and none of it may ever be subtracted.
+        seeds: dict[str, dict] = {}
         for src, dst in pairs:
-            _copy_0600(src, dst, migrated)
+            copied = _copy_0600(src, dst, migrated)
+            if copied and dst.parent.name == "memory" and src.parent == legacy:
+                try:
+                    data = dst.read_bytes()
+                except OSError:
+                    continue
+                seeds[dst.name] = {
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "size": len(data),
+                }
+        _write_seed_manifest(base, seeds)
 
         if not configs_had_any:
             # Nothing migratable existed — either a genuinely fresh workspace

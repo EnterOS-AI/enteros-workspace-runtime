@@ -502,16 +502,41 @@ def test_recorded_components_cover_all_real_sections(tmp_path):
         assert lbl in labels, f"missing component label {lbl}; got {labels}"
 
 
-def test_memory_snapshot_named_in_prompt_files_labeled_memory_not_role(tmp_path):
-    """A MEMORY.md/USER.md listed directly in prompt_files must be traced under
-    'memory_snapshots', not 'role_prompt_files' — otherwise /traces misattributes
-    durable memory to the role prompt. (Regression: PR #313 follow-up.)"""
+def test_memory_snapshot_named_in_prompt_files_labeled_by_its_SOURCE(tmp_path, monkeypatch):
+    """AMENDED (was ``..._labeled_memory_not_role``, PR #313 follow-up).
+
+    #313 labeled a memory basename NAMED in prompt_files as ``memory_snapshots``
+    because RC #203 resolved it to its durable mailbox copy — so it really was
+    memory. That resolution is what froze the openclaw persona (see
+    tests/test_declared_role_file_not_frozen_by_mailbox_memory.py) and is now
+    reverted: a DECLARED basename is served from ``/configs``, which is
+    provisioner-authored and re-rendered every provision. Labeling THAT as
+    ``memory_snapshots`` is the misattribution now — an operator auditing
+    injected memory in /traces would be shown the role persona.
+
+    #313's actual guarantee is unchanged and still pinned below: durable memory
+    is never traced as the role prompt. The label now follows the SOURCE the
+    text was read from rather than the basename.
+    """
+    import molecule_runtime.mailbox_dir as mailbox_dir
     from molecule_runtime import prompt as rt_prompt
 
-    (tmp_path / "system-prompt.md").write_text("You are the Org Concierge.")
-    (tmp_path / "MEMORY.md").write_text("- MEM_NAMED_SENTINEL: prefer lean increments.")
+    base = tmp_path / "workspace" / ".molecule"
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "1")
+    monkeypatch.setenv(mailbox_dir.MAILBOX_DIR_ENV, str(base))
+    (base / "memory").mkdir(parents=True)
+    cfg = tmp_path / "configs"
+    cfg.mkdir()
+
+    (cfg / "system-prompt.md").write_text("You are the Org Concierge.")
+    (cfg / "MEMORY.md").write_text("- ROLE_NAMED_SENTINEL: provisioner-authored baseline.")
+    # Durable memory a WRITER produced, on top of that baseline.
+    (base / "memory" / "MEMORY.md").write_text(
+        "- ROLE_NAMED_SENTINEL: provisioner-authored baseline.\n"
+        "- MEM_NAMED_SENTINEL: prefer lean increments."
+    )
     full = rt_prompt.build_system_prompt(
-        config_path=str(tmp_path), workspace_id="ws-memnamed",
+        config_path=str(cfg), workspace_id="ws-memnamed",
         loaded_skills=[], peers=[],
         prompt_files=["system-prompt.md", "MEMORY.md"],  # MEMORY.md NAMED here
     )
@@ -519,7 +544,42 @@ def test_memory_snapshot_named_in_prompt_files_labeled_memory_not_role(tmp_path)
     mem_text = "\n".join(c["text"] for c in comps if c["label"] == "memory_snapshots")
     role_text = "\n".join(c["text"] for c in comps if c["label"] == "role_prompt_files")
     assert "MEM_NAMED_SENTINEL" in full, "fixture wrong"
-    assert "MEM_NAMED_SENTINEL" in mem_text, "named MEMORY.md not traced under memory_snapshots"
-    assert "MEM_NAMED_SENTINEL" not in role_text, "named MEMORY.md mislabeled as role_prompt_files"
+    # #313's load-bearing property, intact: durable memory is traced as memory.
+    assert "MEM_NAMED_SENTINEL" in mem_text, "durable memory not traced under memory_snapshots"
+    assert "MEM_NAMED_SENTINEL" not in role_text, "durable memory mislabeled as role_prompt_files"
+    # New: the /configs-served declared copy is the ROLE slot and is labeled so.
+    assert "ROLE_NAMED_SENTINEL" in role_text, "the /configs role copy must be traced as role"
+    assert "ROLE_NAMED_SENTINEL" not in mem_text, (
+        "the param-rendered /configs copy is a role file — tracing it as "
+        "memory_snapshots shows an operator the persona when they audit memory"
+    )
     # role file is still its own labeled component
     assert "Org Concierge" in role_text
+
+
+def test_declared_memory_basename_served_from_mailbox_is_labeled_memory(tmp_path, monkeypatch):
+    """The mailbox FALLBACK arm: /configs has no copy of a declared memory
+    basename, so the durable copy occupies the role slot. That text really is
+    durable memory and must be traced as such."""
+    import molecule_runtime.mailbox_dir as mailbox_dir
+    from molecule_runtime import prompt as rt_prompt
+
+    base = tmp_path / "workspace" / ".molecule"
+    monkeypatch.setenv(mailbox_dir.KERNEL_FLAG_ENV, "1")
+    monkeypatch.setenv(mailbox_dir.MAILBOX_DIR_ENV, str(base))
+    (base / "memory").mkdir(parents=True)
+    cfg = tmp_path / "configs"
+    cfg.mkdir()
+    (cfg / "system-prompt.md").write_text("You are the Org Concierge.")
+    (base / "memory" / "MEMORY.md").write_text("- MAILBOX_ONLY_SENTINEL: durable.")
+
+    rt_prompt.build_system_prompt(
+        config_path=str(cfg), workspace_id="ws-memfallback",
+        loaded_skills=[], peers=[],
+        prompt_files=["system-prompt.md", "MEMORY.md"],
+    )
+    comps = tracing._system_components.get("ws-memfallback", [])
+    mem_text = "\n".join(c["text"] for c in comps if c["label"] == "memory_snapshots")
+    role_text = "\n".join(c["text"] for c in comps if c["label"] == "role_prompt_files")
+    assert "MAILBOX_ONLY_SENTINEL" in mem_text
+    assert "MAILBOX_ONLY_SENTINEL" not in role_text

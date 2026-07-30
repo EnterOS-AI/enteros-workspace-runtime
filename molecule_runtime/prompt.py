@@ -1,5 +1,6 @@
 """Build the system prompt for the workspace agent."""
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -18,8 +19,10 @@ from molecule_runtime.platform_auth import platform_headers
 logger = logging.getLogger(__name__)
 
 # Durable memory-snapshot files auto-loaded into the system prompt every
-# session if present in config_path (loaded only when they exist, and skipped
-# when already listed in prompt_files to avoid duplication). MEMORY.md/USER.md
+# session if present (loaded only when they exist, and skipped when the SAME
+# resolved FILE was already loaded by the prompt_files loop, to avoid
+# duplication — a basename declared in prompt_files whose durable mailbox copy
+# is a DIFFERENT file is still auto-loaded here). MEMORY.md/USER.md
 # are the platform-agnostic canonical store the persistence discipline writes
 # to; the rest are each framework's NATIVE durable-context convention so an
 # agent that writes its framework's file (claude-code → CLAUDE.md; codex /
@@ -36,6 +39,70 @@ DEFAULT_MEMORY_SNAPSHOT_FILES = (
     "AGENTS.md",
     "SOUL.md",
 )
+
+
+def _evolved_memory_residue(
+    mem_path: Path,
+    role_text: str,
+    filename: str,
+    seeds: dict[str, dict] | None = None,
+) -> str:
+    """What is in the durable mailbox copy that is NOT a snapshot of the role file.
+
+    A memory basename DECLARED in ``prompt_files`` occupies TWO slots that the
+    kernel migration accidentally welded together:
+
+    * the ROLE slot — ``/configs/<name>``, param-rendered fresh on every
+      provision, authoritative, must always be what the model reads as its role;
+    * the MEMORY slot — ``<mailbox>/memory/<name>``, durable, but SEEDED as a
+      byte-copy of the role file on the first kernel-on boot
+      (``mailbox_dir._legacy_pairs``: ``(legacy/<name>) -> (base/memory/<name>)``).
+
+    Because of that seeding the two paths normally hold the SAME BYTES, so a
+    path-keyed dedup cannot see the duplication and injects the persona twice —
+    and once ``/configs`` is re-rendered to v2, the frozen v1 snapshot trails
+    the live persona forever. Both are settled by asking one question of the
+    mailbox copy: *which of your bytes did a WRITER put there?* Only those are
+    memory; the rest is a stale photocopy of the role file and is dropped.
+
+    The answer, in decreasing order of evidence strength:
+
+    1. identical to the CURRENT role file -> pure snapshot, nothing to keep;
+    2. current role file + a tail -> the tail is what a writer appended;
+    3. a recorded first-boot seed + a tail (``mailbox_dir.seed_manifest()``)
+       -> the tail is what a writer appended on top of an OLDER role version.
+       An exact seed match is this case with an empty tail: nothing to keep;
+    4. diverged from a recorded seed with no shared prefix -> a writer rewrote
+       the whole file (``agents_md`` force-writes ``AGENTS.md`` every boot);
+       keep all of it;
+    5. no provenance recorded at all (workspace seeded before this shipped) ->
+       fall back to the writer inventory: keep the file when some writer can
+       target that basename, drop it when none can
+       (``mailbox_dir.ACCUMULATING_MEMORY_BASENAMES``).
+
+    Never raises and never guesses in the losing direction: every ambiguous
+    case keeps the content.
+    """
+    try:
+        raw = mem_path.read_bytes()
+        mem = raw.decode("utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    role = role_text.strip()
+    if not mem:
+        return ""
+    if mem == role:
+        return ""  # (1)
+    if role and mem.startswith(role):
+        return mem[len(role) :].strip()  # (2)
+    seed = (mailbox_dir.seed_manifest() if seeds is None else seeds).get(filename)
+    if isinstance(seed, dict):
+        size, digest = seed.get("size"), seed.get("sha256")
+        if isinstance(size, int) and isinstance(digest, str) and 0 <= size <= len(raw):
+            if hashlib.sha256(raw[:size]).hexdigest() == digest:
+                return raw[size:].decode("utf-8", "replace").strip()  # (3)
+        return mem  # (4)
+    return mem if filename in mailbox_dir.ACCUMULATING_MEMORY_BASENAMES else ""  # (5)
 
 
 async def get_peer_capabilities(platform_url: str, workspace_id: str) -> list[dict]:
@@ -240,7 +307,28 @@ def build_system_prompt(
         # Backwards compatible: fall back to system-prompt.md
         files_to_load = ["system-prompt.md"]
 
-    seen_files = set(files_to_load)
+    # Resolved paths already injected by the prompt_files loop. The auto-load
+    # memory leg below dedups against THIS (not against the declared NAMES) so
+    # that a declared memory basename and its durable mailbox copy — two
+    # documents that merely share a basename — can both be considered, while
+    # the SAME file is never injected twice (kernel OFF, where memory_source IS
+    # config_path, stays byte-identical).
+    _loaded_sources: set[str] = set()
+
+    # basename -> the ROLE text just injected from /configs for a DECLARED
+    # memory basename. The auto-load leg subtracts that text from the durable
+    # mailbox copy (``_evolved_memory_residue``) instead of injecting the copy
+    # whole, so the first-boot SNAPSHOT of the role file is never injected a
+    # second time and never trails the freshly re-rendered role. Only populated
+    # when the role text really came from /configs — never from the mailbox
+    # fallback, where there is nothing to subtract.
+    _declared_role_text: dict[str, str] = {}
+
+    def _key(p: Path) -> str:
+        try:
+            return str(p.resolve())
+        except OSError:
+            return os.path.normpath(str(p))
 
     # Durable memory-snapshot READ source. Kernel ON -> the mailbox memory dir
     # every writer (agents_md, append-to-memory hook, consolidation) now targets;
@@ -270,28 +358,55 @@ def build_system_prompt(
             _run_label = None
 
     for filename in files_to_load:
-        # MUST-FIX (RC #203, SSOT): a memory-snapshot file NAMED in prompt_files
-        # must resolve to its DURABLE mailbox copy when the kernel is on and that
-        # copy exists — otherwise the param-rendered /configs copy loaded here
-        # (and added to seen_files) SHADOWS fresh mailbox memory, contradicting
-        # the memory-write-path SSOT. Only memory-snapshot NAMES are redirected,
-        # and only when a mailbox copy is present; every other prompt file keeps
-        # its /configs source. Kernel OFF => memory_source IS config_path, so
-        # this is byte-identical.
+        # A memory-basename NAMED in prompt_files is a DECLARED ROLE FILE, not
+        # durable memory: ``/configs`` is provisioner-authored and re-rendered
+        # from the template on EVERY provision, so it MUST stay authoritative
+        # for that slot.
+        #
+        # This is a deliberate PARTIAL revert of RC #203, which redirected a
+        # declared memory-basename to its mailbox copy whenever that copy
+        # existed. RC #203 assumed a memory basename in prompt_files is always
+        # durable memory. That is false: the shipped openclaw template declares
+        # SOUL.md / AGENTS.md / USER.md in prompt_files as its ROLE files. The
+        # mailbox copy under /workspace/.molecule/memory is written
+        # skip-if-exists (mailbox_dir._copy_0600) and the reconcile arm
+        # deliberately skips the memory dir, so once /workspace is DURABLE on
+        # every backend (cp#672 / molecule-controlplane #2777) that redirect
+        # PINS the persona to its first-boot content forever — no re-provision,
+        # template change, or param re-render could ever land again.
+        #
+        # RC #203's actual goal (fresh mailbox memory must never be SHADOWED by
+        # a stale /configs copy) is preserved in full: the auto-load leg below
+        # still injects the durable copy — but only the part of it a WRITER
+        # produced (``_evolved_memory_residue``), never the first-boot snapshot
+        # of the role file that the migrator seeded it with.
+        #
+        # The mailbox copy remains the FALLBACK when /configs has no copy at
+        # all, so a declared section is never silently dropped.
+        # Kernel OFF => memory_source IS config_path, so this is byte-identical.
         is_mem = filename in DEFAULT_MEMORY_SNAPSHOT_FILES
-        file_path = Path(config_path) / filename
-        if is_mem:
+        configs_path = Path(config_path) / filename
+        file_path = configs_path
+        if is_mem and not file_path.exists():
             mailbox_copy = memory_source / filename
             if mailbox_copy.exists():
                 file_path = mailbox_copy
         if file_path.exists():
             content = file_path.read_text().strip()
             if content:
-                label = "memory_snapshots" if is_mem else "role_prompt_files"
+                # A declared basename served from /configs is a provisioner-
+                # authored ROLE file, so label it as one (N-R1): only the
+                # mailbox-FALLBACK case is genuinely durable memory occupying
+                # the role slot, and only that case may be traced as memory.
+                from_mailbox = file_path != configs_path
+                label = "memory_snapshots" if (is_mem and from_mailbox) else "role_prompt_files"
                 if _run_parts and label != _run_label:
                     _flush_run()
                 _run_label = label
                 _run_parts.append(content)
+                _loaded_sources.add(_key(file_path))
+                if is_mem and not from_mailbox:
+                    _declared_role_text[filename] = content
         else:
             print(f"Warning: prompt file not found: {file_path}")
     _flush_run()
@@ -307,15 +422,28 @@ def build_system_prompt(
     # a param-rendered /configs copy is NEVER read here in kernel mode, a STALE
     # /configs/MEMORY.md can never SHADOW a fresh mailbox copy. The /configs
     # dir stays authoritative only for the param-rendered NON-memory system-prompt
-    # files loaded above; a memory-snapshot filename listed in prompt_files is
-    # redirected to its fresh mailbox copy IN the loop above (RC #203), so the
-    # SSOT holds whether or not the file is named in prompt_files.
-    # Kernel OFF => read from config_path exactly as before (byte-identical).
+    # files loaded above.
+    #
+    # Two dedup rules, and they are different questions:
+    #
+    #  * SAME FILE — resolved-path identity (kernel OFF, or kernel ON with no
+    #    mailbox copy so the role loop already fell back to /configs). Skip;
+    #    nothing double-loads. Kernel OFF stays byte-identical.
+    #  * SAME BYTES — a basename DECLARED in prompt_files loaded its /configs
+    #    role copy above, and its mailbox copy is a different PATH holding a
+    #    first-boot SNAPSHOT of those same bytes. Path identity cannot see
+    #    that, so subtract the role text and inject only the writer-produced
+    #    residue (``_evolved_memory_residue``). That keeps RC #203's anti-shadow
+    #    guarantee — everything a writer put in the durable copy still reaches
+    #    the prompt, layered after the role — without injecting the persona
+    #    twice or letting a frozen v1 trail the re-rendered v2.
+    #
     # ``memory_source`` was resolved above (shared with the prompt_files loop).
     _mem_parts = []
+    # Read the seed provenance ONCE per build: the prompt is re-derived on
+    # every turn's hot-reload (claude_sdk_executor), not just at boot.
+    _seeds = mailbox_dir.seed_manifest() if _declared_role_text else {}
     for filename in DEFAULT_MEMORY_SNAPSHOT_FILES:
-        if filename in seen_files:
-            continue
         file_path = memory_source / filename
         if not file_path.exists() and mailbox_dir.kernel_enabled():
             # Mirror the prompt_files redirect rule in the other direction:
@@ -329,8 +457,15 @@ def build_system_prompt(
             legacy_copy = Path(config_path) / filename
             if legacy_copy.exists():
                 file_path = legacy_copy
+        if _key(file_path) in _loaded_sources:
+            continue  # same FILE already injected by the prompt_files loop
         if file_path.exists():
-            content = file_path.read_text().strip()
+            role_text = _declared_role_text.get(filename)
+            if role_text is None:
+                content = file_path.read_text().strip()
+            else:
+                # Same BYTES risk: subtract the role snapshot, keep the rest.
+                content = _evolved_memory_residue(file_path, role_text, filename, _seeds)
             if content:
                 _mem_parts.append(content)
     # Durable memory snapshots (MEMORY.md/USER.md) are part of what the model

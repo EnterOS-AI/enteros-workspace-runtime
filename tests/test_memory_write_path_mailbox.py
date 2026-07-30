@@ -71,14 +71,28 @@ def test_stale_configs_never_shadows_fresh_mailbox_memory(tmp_path, monkeypatch)
 
 
 def test_prompt_files_memory_snapshot_uses_mailbox_not_configs(tmp_path, monkeypatch):
-    """RC #203: even when MEMORY.md is NAMED in prompt_files (so the /configs
-    copy is loaded in the prompt_files loop and marked seen), the fresh mailbox
-    copy MUST win — the stale /configs copy must never appear. This is the
-    prompt_files case the existing 'stale never shadows' test missed."""
+    """RC #203, AMENDED for durable /workspace (cp#672 / controlplane #2777).
+
+    RC #203 originally REDIRECTED a memory basename named in prompt_files to its
+    mailbox copy and asserted the /configs copy never appears. That assumed a
+    memory basename in prompt_files is always durable memory — false for
+    openclaw, whose ROLE files are literally named SOUL.md / AGENTS.md / USER.md.
+    Once /workspace is durable, the never-refreshed mailbox copy
+    (``_copy_0600`` is skip-if-exists; reconcile skips the memory dir) FROZE the
+    persona at first boot forever. See
+    tests/test_declared_role_file_not_frozen_by_mailbox_memory.py.
+
+    RC #203's LOAD-BEARING property is unchanged and still pinned here: fresh
+    mailbox memory must ALWAYS reach the prompt and can never be suppressed by
+    the presence of a /configs copy. What changed is that the declared /configs
+    copy is now ALSO injected, in the ROLE slot ahead of it — the two are
+    different documents that merely share a basename, so neither is dropped and
+    the durable memory still layers last (wins on recency).
+    """
     configs = tmp_path / "configs"
     configs.mkdir()
     (configs / "system-prompt.md").write_text("BASE-ROLE", encoding="utf-8")
-    # Stale copy in the provisioner-owned /configs dir, explicitly listed.
+    # Provisioner-authored copy in /configs, explicitly DECLARED in prompt_files.
     (configs / "MEMORY.md").write_text(STALE, encoding="utf-8")
 
     base = _enable_kernel(monkeypatch, tmp_path)
@@ -95,9 +109,20 @@ def test_prompt_files_memory_snapshot_uses_mailbox_not_configs(tmp_path, monkeyp
     )
 
     assert "BASE-ROLE" in out, "non-memory prompt files still load from /configs"
-    assert FRESH in out, "the fresh mailbox MEMORY.md must win even when named in prompt_files"
-    assert STALE not in out, "a stale /configs MEMORY.md must NEVER shadow, even via prompt_files"
+    assert FRESH in out, (
+        "RC #203 core property: fresh mailbox memory must ALWAYS reach the "
+        "prompt, even when the basename is declared in prompt_files"
+    )
     assert out.count(FRESH) == 1, "the memory snapshot must appear exactly once (no double-load)"
+    # The declared /configs copy is the ROLE slot and is re-rendered every
+    # provision, so it must land AND must be positioned before durable memory.
+    assert STALE in out, (
+        "the DECLARED /configs copy is a provisioner-authored role file and must "
+        "still land — suppressing it is what froze the openclaw persona"
+    )
+    assert out.index(STALE) < out.index(FRESH), (
+        "durable memory layers AFTER the role slot so it still wins on recency"
+    )
 
 
 def test_prompt_files_memory_falls_back_to_configs_when_no_mailbox_copy(tmp_path, monkeypatch):
