@@ -671,8 +671,20 @@ async def main(prepare_only: bool = False):  # pragma: no cover
     _BOOT_TOTAL = 8
     emit_boot_step("PLG", "Install plugins", "running", step=1, total=_BOOT_TOTAL)
     try:
-        print(install_declared_plugins().summary(), flush=True)
+        _plugin_install_report = install_declared_plugins()
+        print(_plugin_install_report.summary(), flush=True)
         emit_boot_step("PLG", "Install plugins", "ok", step=1, total=_BOOT_TOTAL)
+        # Report the outcome to the platform. The summary above goes to stdout,
+        # which boot_step_emit itself notes is invisible on locked-down prod boxes,
+        # and the BOOT_STEP beside it is CONCIERGE-GATED — so before this call the
+        # platform could not answer "did boot-install work on this workspace" for
+        # any ordinary workspace. That is what left molecule-core#4953 with three
+        # proposed-and-retracted explanations. NOT gated on kind (SDK contract
+        # plugin-install-report, concierge_gated:false) and fail-soft: it returns a
+        # bool and raises nothing, and we deliberately do not branch on it.
+        from molecule_runtime.plugin_install_report import report_install_outcome
+
+        report_install_outcome(_plugin_install_report)
     except Exception as e:  # noqa: BLE001 — boot-install must never block boot
         print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
         emit_boot_step(

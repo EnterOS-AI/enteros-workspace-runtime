@@ -1,0 +1,26 @@
+{
+  "report": {
+    "method": "POST",
+    "path_template": "/workspaces/{workspace_id}/plugin-install-report",
+    "auth": "Authorization: Bearer <workspace scoped token>",
+    "success_status": 204
+  },
+  "concierge_gated": false,
+  "fail_soft": true,
+  "durable": true,
+  "fields": {
+    "declared": "declared",
+    "plugins_dir": "plugins_dir",
+    "installed": "installed",
+    "skipped": "skipped",
+    "failed": "failed",
+    "swapped": "swapped"
+  },
+  "outcome_rule": "live iff declared && swapped && failed == []",
+  "producers": [
+    "molecule-ai-workspace-runtime: molecule_runtime/plugin_install_report.py (report_install_outcome, called from main.py right after install_declared_plugins)"
+  ],
+  "consumers": [
+    "molecule-core: workspace-server/internal/handlers/plugin_install_report.go (PluginInstallReportHandler.Report — persists the latest report per workspace and surfaces it on the workspace read)"
+  ]
+}

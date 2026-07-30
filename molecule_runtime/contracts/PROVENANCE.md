@@ -16,6 +16,27 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-07-30 — sdk main `3e0acb3c` (sdk#189)
+
+Paired with the merge of **molecule-ai-sdk#189**, which added the plugin
+boot-install report contract.
+
+- `plugin-install-report.contract.json` — **new**. Consumed as *executable
+  constants* (like `plugin-state.contract.json`, not as a validation schema) by
+  `molecule_runtime/plugin_install_report.py`: the endpoint template, method,
+  success status, the wire field names, and the two invariants that are the reason
+  the contract exists — `concierge_gated: false` and `durable: true`.
+
+Why it was needed: `install_declared_plugins()` already produced the answer on
+every boot and `main.py` printed it to a stdout that is invisible on locked-down
+prod boxes, while the `BOOT_STEP` beside it is concierge-gated and core's
+`/boot-event` is BroadcastOnly. So the platform could not tell whether an ordinary
+workspace's plugins had installed — which left molecule-core#4953 with three
+proposed-and-retracted explanations for a symptom nobody could measure.
+
+Added to `scripts/check-schemas-in-sync.sh` in the same commit: a vendored file
+absent from that map is a mirror nothing checks, which is how a mirror silently
+becomes a fork.
 ## Re-vendor 2026-07-30 — sdk main `3fdcfe6e` (sdk#188)
 
 - `native-plugins.registry.json` re-fetched — `molecule-scheduler` source pin

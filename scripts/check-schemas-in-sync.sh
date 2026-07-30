@@ -41,6 +41,7 @@ declare -A MAP=(
   [molecule_runtime/contracts/agent-trace.schema.json]="contracts/workspace-comms/agent-trace.schema.json"
   [molecule_runtime/contracts/agent-trace.contract.json]="contracts/workspace-comms/agent-trace.contract.json"
   [molecule_runtime/contracts/native-plugins.registry.json]="contracts/plugin/native-plugins.registry.json"
+  [molecule_runtime/contracts/plugin-install-report.contract.json]="contracts/plugin-install-report/plugin-install-report.contract.json"
   [contracts/mcp-plugin-delivery.contract.json]="contracts/mcp/mcp-plugin-delivery.contract.json"
 )
 
