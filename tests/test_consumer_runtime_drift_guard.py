@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -579,3 +580,86 @@ def test_main_pin_lag_stuck_is_red(monkeypatch: pytest.MonkeyPatch, capsys, tmp_
     err = capsys.readouterr().err
     assert rc == 1, "stuck consumer (lag + no bump PR) must stay red"
     assert "STUCK" in err
+
+
+def test_clone_timeout_is_retried_not_a_hard_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A slow clone must take the RETRY path, not crash the gate.
+
+    `_git_clone_with_token` used to let `subprocess.TimeoutExpired` propagate,
+    but `clone_consumers`' 3-attempt retry loop only ever inspected
+    `result.returncode`. So the single failure mode the retry exists for — a
+    slow or stalled network clone — was the one mode it could not cover, and one
+    slow clone of `molecule-core` was an unconditional hard red on every runtime
+    PR (observed twice consecutively on runs/593042).
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def slow_then_ok(argv, *args: object, **kwargs: object):  # noqa: ANN001
+        calls.append(list(argv))
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=kwargs["timeout"])
+        return subprocess.CompletedProcess(args=list(argv), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", slow_then_ok)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    import check_consumer_runtime_drift as guard
+
+    guard.clone_consumers(
+        workdir,
+        ("molecule-core",),
+        gitea_url="https://git.moleculesai.app",
+        token="fake-token",
+    )
+    assert len(calls) == 2, f"timeout was not retried: {len(calls)} attempt(s)"
+
+
+def test_exhausted_clone_timeouts_fail_with_a_named_budget_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Retries are bounded: after 3 timeouts the gate reds with the budget named.
+
+    Retrying a timeout must not become an unbounded wait, and the operator must
+    be told it was a budget exhaustion rather than a generic clone failure.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def always_slow(argv, *args: object, **kwargs: object):  # noqa: ANN001
+        calls.append(list(argv))
+        raise subprocess.TimeoutExpired(cmd=list(argv), timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", always_slow)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    import check_consumer_runtime_drift as guard
+
+    with pytest.raises(RuntimeError) as excinfo:
+        guard.clone_consumers(
+            workdir,
+            ("molecule-core",),
+            gitea_url="https://git.moleculesai.app",
+            token="fake-token",
+        )
+    assert "after 3 attempts" in str(excinfo.value)
+    assert "clone budget" in str(excinfo.value)
+    assert len(calls) == 3
+
+
+def test_clone_budget_leaves_headroom_over_the_real_largest_consumer(tmp_path: Path) -> None:
+    """The budget is a liveness bound, not a performance assertion.
+
+    30s was below the real cost of `molecule-core` (~39 MB at depth 1) on a
+    contended self-hosted runner. Pin a floor so nobody tightens it back into
+    the range where a normal clone reds the gate.
+    """
+    import check_consumer_runtime_drift as guard
+
+    assert guard._CLONE_TIMEOUT_SEC >= 120

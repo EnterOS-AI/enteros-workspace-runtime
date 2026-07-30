@@ -488,6 +488,23 @@ def classify_pin_drift(
     return blocking, advisory
 
 
+#: Wall-clock budget for ONE `git clone --depth 1` of a consumer repo.
+#:
+#: This was 30s, which is below the real cost of the largest consumer on a
+#: contended self-hosted runner: `molecule-core` is ~39 MB at depth 1 and clones
+#: in ~6s from an idle client, so 30s left almost no headroom and the gate died
+#: on a `subprocess.TimeoutExpired` in two consecutive runs on runner
+#: `runs/593042` — deterministically, not as contention noise. This is a
+#: liveness bound to stop a hung `git` from wedging the job, not a performance
+#: assertion, so it should be generous; the retry loop below bounds total time.
+_CLONE_TIMEOUT_SEC = 180
+
+#: Synthetic returncode used to report a clone that exceeded the budget. 124 is
+#: the conventional `timeout(1)` exit status. It exists so a timeout takes the
+#: SAME retry path as any other clone failure (see `_git_clone_with_token`).
+_CLONE_TIMEOUT_RC = 124
+
+
 def _git_clone_with_token(dest: Path, url: str, token: str) -> subprocess.CompletedProcess[str]:
     """Clone using GIT_ASKPASS so the token never appears in argv or remote URL.
 
@@ -505,15 +522,34 @@ def _git_clone_with_token(dest: Path, url: str, token: str) -> subprocess.Comple
         askpass = f.name
     os.chmod(askpass, 0o700)
     try:
-        return subprocess.run(
-            ["git", "clone", "--depth", "1", url, str(dest)],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30,
-            env={**os.environ, "GIT_ASKPASS": askpass},
-        )
+        try:
+            return subprocess.run(
+                ["git", "clone", "--depth", "1", url, str(dest)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=_CLONE_TIMEOUT_SEC,
+                env={**os.environ, "GIT_ASKPASS": askpass},
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A TIMEOUT IS A RETRIABLE CLONE FAILURE, not a crash. Previously
+            # this exception propagated straight out of `clone_consumers`, whose
+            # retry loop only ever inspected `result.returncode` — so the one
+            # failure mode the retry exists for (a slow/stalled network clone)
+            # was the one mode it could not cover, and a single slow clone was
+            # an unconditional hard red on every runtime PR. Report it as a
+            # normal non-zero result so the existing loop retries it and, if all
+            # attempts are exhausted, names it in the raised error.
+            return subprocess.CompletedProcess(
+                args=exc.cmd,
+                returncode=_CLONE_TIMEOUT_RC,
+                stdout="",
+                stderr=(
+                    f"git clone exceeded the {_CLONE_TIMEOUT_SEC}s clone budget "
+                    f"(no output within the window)"
+                ),
+            )
     finally:
         os.unlink(askpass)
 
@@ -537,6 +573,11 @@ def clone_consumers(
         dest = workdir / repo
         clone_url = f"{base_url}/molecule-ai/{repo}.git"
         for attempt in range(1, 4):
+            # A killed clone can leave a partial destination behind, and `git
+            # clone` refuses a non-empty existing path — which would turn every
+            # retry after a timeout into an instant, differently-worded failure.
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
             result = _git_clone_with_token(dest, clone_url, token)
             if result.returncode == 0:
                 paths[repo] = dest
