@@ -239,10 +239,37 @@ class InstallReport:
     skipped: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
     # True once the freshly-built staging tree was atomically swapped into the
-    # live ``plugins_dir``. False means the existing tree was left intact — either
+    # live ``plugins_dir``. ``installed`` lists sources that materialized into
+    # STAGING; they only went LIVE when ``swapped`` is True.
+    #
+    # A PARTIAL PROMOTION IS STILL A PROMOTION.
+    #
+    # This comment used to say False meant the tree was left intact "either
     # because a source failed (we never promote a partial build) or the swap
-    # rename itself failed. ``installed`` lists sources that materialized into
-    # staging; they only went LIVE when ``swapped`` is True.
+    # rename itself failed". The first half stopped being true at the test5 fix
+    # (2026-07-13, see the long note at the swap site below): "a failed source
+    # fails THAT SOURCE — not the whole tree". A boot with a failed source now
+    # carries every live dir the successful sources are not replacing into
+    # staging, logs "promoting the N that succeeded", swaps, and sets
+    # ``swapped = True`` with ``failed`` NON-EMPTY. The stale wording outlived
+    # the behaviour by a year and propagated a wrong liveness rule
+    # (``declared && swapped && failed == []``) into the SDK contract, core's
+    # receiver and a migration comment, where it read healthy partially-degraded
+    # workspaces as NOT LIVE. Corrected in molecule-ai-sdk#190 +
+    # molecule-core#4972 to:
+    #
+    #     live     iff declared && swapped        (the tree was promoted)
+    #     degraded iff live && failed != []       (…but not everything is in it)
+    #
+    # So ``swapped`` answers exactly one question — was the staging tree promoted
+    # — and ``failed`` is a separate axis. False means the LIVE TREE WAS NOT
+    # TOUCHED, which happens in exactly three places, none of them "some source
+    # failed":
+    #
+    #   * every source failed, so there was nothing to promote;
+    #   * carrying an already-installed dir forward failed, so promoting staging
+    #     would have DELETED a working plugin;
+    #   * the atomic rename itself raised.
     swapped: bool = False
 
     def summary(self) -> str:

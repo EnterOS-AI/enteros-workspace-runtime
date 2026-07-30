@@ -10,8 +10,11 @@
 # molecule-ci's schema-sync gate (itself modelled on this repo's #196
 # vendored workspace-comms schemas). See molecule_runtime/contracts/PROVENANCE.md.
 #
-# Soft-skips (exit 2) on a fetch failure so a transient git.* TLS stall does
-# not paint PRs red; a real byte difference (exit 1) always fails.
+# Soft-skips (exit 2) on a TRANSPORT failure so a transient git.* TLS stall does
+# not paint PRs red. A real byte difference fails (exit 1) — and so, since
+# runtime#379, does an HTTP 4xx: a mapped SDK path that no longer resolves means
+# the mirror is UNCHECKED, which the old `curl -fsS` reported as a soft skip and
+# therefore as green. See the classifier table in the script's header.
 
 name: Schema Sync
 
@@ -19,6 +22,11 @@ on:
   pull_request:
     paths:
       - "molecule_runtime/contracts/**"
+      # The gate's MAP spans BOTH vendored roots; this one was mapped but not
+      # triggered on, so editing contracts/mcp-plugin-delivery.contract.json in a
+      # PR ran no drift check at all — the same unchecked-mirror hole as the 404
+      # soft-skip, arrived at through the trigger instead of the fetch.
+      - "contracts/**"
       - "scripts/check-schemas-in-sync.sh"
       - ".gitea/workflows/schema-sync.yml"
   push:
@@ -41,8 +49,9 @@ jobs:
           bash scripts/check-schemas-in-sync.sh
           rc=$?
           set -e
-          # rc 2 = fetch could not complete (network/infra). Soft-skip so a
-          # transient git.* stall isn't a false red; rc 1 (real drift) fails.
+          # rc 2 = TRANSPORT failure / forge 5xx. Soft-skip so a transient git.*
+          # stall isn't a false red; rc 1 (real drift, or a 4xx meaning the mapped
+          # SDK path does not resolve) fails.
           if [ "$rc" -eq 2 ]; then
             echo "::warning::schema-sync soft-skipped (could not fetch molecule-ai-sdk contracts main)."
             exit 0

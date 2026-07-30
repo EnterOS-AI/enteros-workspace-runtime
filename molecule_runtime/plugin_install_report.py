@@ -116,6 +116,12 @@ def field_names() -> dict[str, str]:
     return dict(_load_contract()["fields"])
 
 
+# Sentinel for "the report object has no such attribute at all", which is a
+# different fact from "the attribute is there and is None". Only the former is
+# drift; the latter is a legitimate value the coercions below normalise.
+_ABSENT = object()
+
+
 def report_payload(report: "InstallReport") -> dict[str, Any]:
     """Project an InstallReport onto the contract's wire shape.
 
@@ -124,13 +130,46 @@ def report_payload(report: "InstallReport") -> dict[str, Any]:
     core ignores. A dataclass attribute the contract does not name is NOT sent —
     the contract is the wire, not the dataclass.
 
-    The three list fields are normalised to lists (never ``None``): the receiver
-    must not have to tell "reported no failures" from "reported nothing about
-    failures", and core stores ``[]`` rather than ``null`` for the same reason.
+    ABSENT IS NOT FALSE
+    -------------------
+
+    An attribute the report object does not have is **omitted from the payload**,
+    never coerced. This is the whole reason core declares ``declared`` and
+    ``swapped`` as ``*bool`` rather than ``bool``
+    (``workspace-server/internal/handlers/plugin_install_report.go``)::
+
+        if body.Declared == nil || body.Swapped == nil {
+            // "absent is not the same as false"
+            400
+        }
+
+    Coercing a missing attribute with ``bool()`` — which is what this function did
+    until runtime#379 — hands core a definitive ``declared:false``, which core
+    accepts, persists, and renders to an operator as *"core never asked for a
+    plugin"*: the wrong repo, and precisely the mis-diagnosis the field exists to
+    prevent. Omitting the key instead makes core answer 400 with the reason in the
+    body, and core's request log is readable where this box's stdout is not (see
+    the module docstring) — a 400 an operator can see beats a persisted lie.
+
+    So the drift is loud on the receiver, and it costs nothing here: the producer
+    is fail-soft by contract, so a 400 cannot break a boot. A local ``warning`` is
+    emitted too, but it is the belt, not the braces — stdout invisibility is the
+    premise of this whole module.
+
+    The three list fields are still normalised to lists when PRESENT (never
+    ``None``): the receiver must not have to tell "reported no failures" from
+    "reported nothing about failures", and core stores ``[]`` rather than ``null``
+    for the same reason.
     """
     payload: dict[str, Any] = {}
+    missing: list[str] = []
     for attr, wire in field_names().items():
-        value = getattr(report, attr, None)
+        value = getattr(report, attr, _ABSENT)
+        if value is _ABSENT:
+            # Do NOT invent a value. See the docstring: core distinguishes
+            # absent from false on purpose, and this is the producer half of it.
+            missing.append(attr)
+            continue
         if attr in ("installed", "skipped", "failed"):
             value = list(value or [])
         elif attr == "plugins_dir":
@@ -138,6 +177,13 @@ def report_payload(report: "InstallReport") -> dict[str, Any]:
         else:
             value = bool(value)
         payload[wire] = value
+    if missing:
+        logger.warning(
+            "plugin-install-report: report object is missing %s — omitting from the "
+            "payload rather than sending false; the platform will refuse it (400) so "
+            "the drift is visible instead of persisted as a definitive answer",
+            ", ".join(sorted(missing)),
+        )
     return payload
 
 
@@ -187,6 +233,17 @@ def report_install_outcome(
         if resp.status_code == success_status() or 200 <= resp.status_code < 300:
             logger.debug("plugin-install-report: accepted (%s)", resp.status_code)
             return True
+        if resp.status_code == 400:
+            # 400 means WE sent a malformed report — in practice, a required
+            # field omitted because InstallReport drifted (see report_payload).
+            # That is a runtime bug and the one non-2xx worth a warning; the
+            # authoritative copy is core's own request log, which is readable.
+            logger.warning(
+                "plugin-install-report: platform REFUSED the report (400) — the "
+                "payload is malformed, most likely an InstallReport field that no "
+                "longer exists; nothing was recorded for this workspace"
+            )
+            return False
         # A 404 is the expected shape against a platform that predates core's
         # handler. Debug, not warning: it is not actionable from inside the box,
         # and boot_step_emit's note about invisible stdout applies here too.
