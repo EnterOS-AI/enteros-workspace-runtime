@@ -8,3 +8,21 @@
 molecule_runtime/contracts/*.schema.json text eol=lf
 tests/fixtures/workspace_comms/*.schema.json text eol=lf
 scripts/check-schemas-in-sync.sh text eol=lf
+
+# The SAME byte-exact gate covers more than *.schema.json. The MAP in
+# scripts/check-schemas-in-sync.sh fetches the molecule-ai-sdk original for each
+# vendored path and runs a RAW `diff -u "$local_file" "$tmp/$slug"`. The rule
+# above only reaches the five *.schema.json mirrors; these ten mapped paths are
+# gated identically but were left unpinned, so a core.autocrlf=true checkout can
+# still smudge them to CRLF and red the gate on newlines alone.
+molecule_runtime/contracts/*.contract.json text eol=lf
+molecule_runtime/contracts/*.fixtures.json text eol=lf
+molecule_runtime/contracts/native-plugins.registry.json text eol=lf
+contracts/mcp-plugin-delivery.contract.json text eol=lf
+
+# The vendored A2A CHANNEL CLIENT is gated the same way and is a .py, so no rule
+# above reaches it. scripts/check-channel-sdk-vendor.sh is a literal byte compare
+# against the SDK original (molecule_plugin/channel.py):
+#     if cmp -s "$SOURCE" "$VENDORED"; then ...
+#     echo "::error::molecule_runtime/channel_sdk.py has drifted from $SOURCE"
+molecule_runtime/channel_sdk.py text eol=lf
