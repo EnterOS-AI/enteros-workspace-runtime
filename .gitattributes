@@ -19,3 +19,10 @@ molecule_runtime/contracts/*.contract.json text eol=lf
 molecule_runtime/contracts/*.fixtures.json text eol=lf
 molecule_runtime/contracts/native-plugins.registry.json text eol=lf
 contracts/mcp-plugin-delivery.contract.json text eol=lf
+
+# The vendored A2A CHANNEL CLIENT is gated the same way and is a .py, so no rule
+# above reaches it. scripts/check-channel-sdk-vendor.sh is a literal byte compare
+# against the SDK original (molecule_plugin/channel.py):
+#     if cmp -s "$SOURCE" "$VENDORED"; then ...
+#     echo "::error::molecule_runtime/channel_sdk.py has drifted from $SOURCE"
+molecule_runtime/channel_sdk.py text eol=lf
