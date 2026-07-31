@@ -109,6 +109,7 @@ template repo) before the shell can be treated as consistent with this module.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -476,6 +477,46 @@ def _is_within(base: Path, target: Path) -> bool:
     return target_r == base_r or base_r in target_r.parents
 
 
+def _tree_fingerprint(root: Path) -> dict[str, str]:
+    """``relative posix path -> sha256`` for every regular file under ``root``.
+
+    Content-addressed on purpose: mtimes change on every build (the tree is
+    re-cloned), so only hashes can answer "did anything actually change".
+    Symlinks are recorded by their TARGET rather than followed — a retarget is
+    a real change, and following one could wander outside the tree.
+    """
+    out: dict[str, str] = {}
+    if not root.is_dir():
+        return out
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        try:
+            if path.is_symlink():
+                out[rel] = "symlink:" + os.readlink(path)
+                continue
+            if not path.is_file():
+                continue
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            out[rel] = h.hexdigest()
+        except OSError as exc:  # unreadable/racing file — treat as "changed"
+            out[rel] = f"unreadable:{exc.__class__.__name__}"
+    return out
+
+
+def _changed_plugin_names(
+    staged: dict[str, str], live: dict[str, str]
+) -> list[str]:
+    """Top-level plugin directories that differ between the two fingerprints."""
+    names: set[str] = set()
+    for rel in set(staged) | set(live):
+        if staged.get(rel) != live.get(rel):
+            names.add(rel.split("/", 1)[0])
+    return sorted(names)
+
+
 def _atomic_swap_dir(staging_dir: Path, target_dir: Path) -> None:
     """Replace ``target_dir`` with ``staging_dir`` as atomically as the platform
     permits.
@@ -727,6 +768,36 @@ def _git_fetch_tree(
                 _redact_log_text(stderr2, token, ref)[:500],
             )
             return None
+
+    # Record WHICH COMMIT we actually got, while ``.git`` still exists.
+    #
+    # core#5009 / core#5007: the runtime used to clone and never write down the
+    # resolved commit, so when a box served unexpected behaviour there was no
+    # way — from the box — to tell what it had installed. The control plane's
+    # `installed_sha` is a claim by the control plane, not an observation of the
+    # box, so the two can disagree silently and did. One line per plugin closes
+    # that for a human reading `docker logs`, with no protocol change.
+    #
+    # A moving ref (``#main``) resolves to a different commit over time, which
+    # is exactly why the ref alone is not enough to identify a tree.
+    #
+    # FAIL-OPEN: observability must never become a new way to fail a boot, so a
+    # rev-parse that errors, times out, or prints nothing logs "unknown" and the
+    # install proceeds.
+    head_sha = "unknown"
+    try:
+        _rev = subprocess.run(
+            _git("-C", str(clone_dir), "rev-parse", "HEAD"),
+            check=True, capture_output=True, text=True,
+            timeout=timeout, env=child_env,
+        )
+        head_sha = (_rev.stdout or "").strip() or "unknown"
+    except (subprocess.SubprocessError, OSError):
+        pass
+    log.info(
+        "[plugins] fetched %s at commit %s (ref %s)",
+        _source_log_label(raw), head_sha, _redact_log_text(ref, token),
+    )
 
     # Strip VCS metadata so the installed tree matches the old archive semantics
     # (a tarball of the tree carried no ``.git``) and the plugins dir never holds
@@ -1153,7 +1224,53 @@ def install_declared_plugins(
                 len(report.failed), len(sources), len(report.installed),
             )
 
+        # ------------------------------------------------------------------
+        # core#5009: DO NOT swap a tree that did not change.
+        #
+        # _atomic_swap_dir is an os.replace, i.e. a directory RENAME: the live
+        # path survives but points at a NEW inode and the old directory is
+        # unlinked. A process that already imported modules out of the old
+        # directory keeps executing that old code for its whole lifetime, and
+        # nothing on disk reveals it — the live files hash equal to upstream
+        # while the serving process answers from the replaced tree.
+        #
+        # boot-install runs TWICE per boot (the `prepare` pass that
+        # pre-materializes config before the gateway launches, then the real
+        # serve), and hermes spawns each plugin's MCP server BETWEEN them. The
+        # second pass rebuilds an IDENTICAL tree, so its swap buys nothing and
+        # costs every already-spawned MCP server its module identity. Measured
+        # on a live tenant: gateway 22:53:53, MCP server 22:53:56, second-pass
+        # swap 22:54:01.
+        #
+        # Comparing content first makes the no-change rebuild a true no-op.
+        # `swapped` stays True because it answers "is the staged tree now
+        # live" — which it is, precisely because it already was.
+        staged_fp = _tree_fingerprint(staging_dir)
+        live_fp = _tree_fingerprint(target_dir) if target_dir.exists() else None
+        if live_fp is not None and staged_fp == live_fp:
+            log.info(
+                "[plugins] live tree already matches the staged build (%d file(s), "
+                "%d plugin(s)) — skipping the swap so running MCP servers keep "
+                "their imported modules (core#5009)",
+                len(staged_fp), len(list(_iter_dirs(target_dir))),
+            )
+            report.swapped = True
+            return report
+
         try:
+            if live_fp is not None:
+                # The genuinely dangerous case, and the one that was silent.
+                # A code-only change does not alter the `mcp_servers` mapping,
+                # so mcp-reconcile-watch.sh (a STRUCTURAL compare) will not
+                # restart the gateway: any MCP server already running keeps
+                # serving the previous code until something restarts it.
+                log.warning(
+                    "[plugins] live tree REPLACED: %s changed — an MCP server "
+                    "already running from the previous tree will keep serving "
+                    "the OLD code until the workspace restarts (core#5009); "
+                    "config-only reconcilers do not detect a code-only change",
+                    ", ".join(_changed_plugin_names(staged_fp, live_fp)) or "(content)",
+                )
             _atomic_swap_dir(staging_dir, target_dir)
             report.swapped = True
         except OSError as exc:
