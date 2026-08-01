@@ -534,7 +534,11 @@ def _tree_fingerprint(root: Path) -> tuple[dict[str, str], bool]:
     out: dict[str, str] = {}
     readable = True
     if not root.is_dir():
-        return out, readable
+        # Exists but is not a directory (a stray file, a broken symlink): we
+        # cannot enumerate it, so we cannot prove anything matches. Returning
+        # readable=True here let an empty staging tree compare EQUAL to it and
+        # report a promoted tree while /configs/plugins was not a directory.
+        return out, not root.exists()
 
     def _onerror(exc: OSError) -> None:
         nonlocal readable
@@ -550,8 +554,6 @@ def _tree_fingerprint(root: Path) -> tuple[dict[str, str], bool]:
         for name in sorted(dirnames) + sorted(filenames):
             path = base / name
             rel = path.relative_to(root).as_posix()
-            if _is_generated_bytecode(rel):
-                continue
             try:
                 if path.is_symlink():
                     out[rel] = "symlink:" + os.readlink(path)
@@ -901,9 +903,14 @@ def _git_fetch_tree(
         head_sha = (_rev.stdout or "").strip() or "unknown"
     except (subprocess.SubprocessError, OSError):
         pass
+    # Deliberately NOT logging the ref: _source_log_label emits "#<ref>" rather
+    # than the fragment, and both fetch-failure paths pass `ref` INTO
+    # _redact_log_text as a value to STRIP. Printing it here would reverse this
+    # module's own policy for every plugin on every boot, into logs that ship to
+    # the obs stack. The resolved commit is the identifying fact we needed.
     log.info(
-        "[plugins] fetched %s at commit %s (ref %s)",
-        _source_log_label(raw), head_sha, _redact_log_text(ref, token),
+        "[plugins] fetched %s at commit %s",
+        _source_log_label(raw), head_sha,
     )
 
     # Strip VCS metadata so the installed tree matches the old archive semantics
@@ -1214,8 +1221,16 @@ def install_declared_plugins(
                 try:
                     shutil.copytree(content_dir, dest, dirs_exist_ok=True)
                 except OSError as exc:
+                    # Discard the PARTIAL copy. Leaving it behind makes this
+                    # source look staged: the carry-forward below skips any name
+                    # already present in staging, so the plugin's intact live
+                    # copy is dropped and a truncated tree is promoted over it —
+                    # the exact opposite of the "a transient blip cannot delete
+                    # an already-installed plugin" invariant this path claims.
+                    shutil.rmtree(dest, ignore_errors=True)
                     log.warning(
-                        "[plugins] copy failed: %s (%s)",
+                        "[plugins] copy failed: %s (%s) — discarded the partial "
+                        "staging copy so the existing plugin is carried forward",
                         _source_log_label(source.raw),
                         exc,
                     )
@@ -1246,6 +1261,13 @@ def install_declared_plugins(
                     len(violations),
                     "; ".join(violations),
                 )
+                # Remove the rejected tree from staging. It was copied in
+                # BEFORE the manifest check ran, so leaving it means the swap
+                # promotes the very plugin the gate rejected — and blocks the
+                # carry-forward that would have preserved the last valid copy.
+                # The gate reported enforcement while enforcing nothing whenever
+                # a sibling source succeeded.
+                shutil.rmtree(staging_dir / source.name, ignore_errors=True)
                 report.failed.append(source.raw)
                 continue
             log.info(
@@ -1352,14 +1374,37 @@ def install_declared_plugins(
         # Comparing content first makes the no-change rebuild a true no-op.
         # `swapped` stays True because it answers "is the staged tree now
         # live" — which it is, precisely because it already was.
-        staged_fp, staged_ok = _tree_fingerprint(staging_dir)
-        if target_dir.exists():
-            live_fp, live_ok = _tree_fingerprint(target_dir)
-        else:
-            live_fp, live_ok = None, True
+        # The two walks are the only unguarded filesystem work left in this
+        # otherwise fail-soft function: an OSError escaping them would abort
+        # install_declared_plugins entirely, skipping report_install_outcome and
+        # leaving the platform with NO install report for the boot. Degrade to
+        # "cannot prove a match" and let the swap proceed, as every other step
+        # here degrades.
+        try:
+            staged_fp, staged_ok = _tree_fingerprint(staging_dir)
+            if target_dir.exists():
+                live_fp, live_ok = _tree_fingerprint(target_dir)
+            else:
+                live_fp, live_ok = None, True
+        except OSError as exc:
+            log.warning(
+                "[plugins] could not fingerprint the plugin trees (%s) — "
+                "proceeding with the swap rather than assuming a match", exc,
+            )
+            staged_fp, staged_ok, live_fp, live_ok = {}, False, {}, False
         # Equality is only meaningful when BOTH trees were fully readable.
         # Skipping on an unproven match is worse than an unnecessary swap: the
         # update silently never lands and no future boot can repair it.
+        if live_fp is not None:
+            # Drop LOCALLY GENERATED bytecode only — a path that is bytecode AND
+            # absent from the staged tree. Excluding bytecode from both sides
+            # unconditionally would remove it from the definition of content, so
+            # a plugin shipping .pyc (a vendor distributing compiled modules)
+            # could change and never be promoted.
+            live_fp = {
+                rel: dig for rel, dig in live_fp.items()
+                if not (_is_generated_bytecode(rel) and rel not in staged_fp)
+            }
         if live_fp is not None and staged_ok and live_ok and staged_fp == live_fp:
             log.info(
                 "[plugins] live tree already matches the staged build (%d file(s), "
@@ -1371,6 +1416,8 @@ def install_declared_plugins(
             return report
 
         try:
+            _atomic_swap_dir(staging_dir, target_dir)
+            report.swapped = True
             if live_fp is not None:
                 # The genuinely dangerous case, and the one that was silent.
                 # A code-only change does not alter the `mcp_servers` mapping,
@@ -1386,8 +1433,6 @@ def install_declared_plugins(
                     ", ".join(_changed_plugin_names(staged_fp, live_fp)) or "(content)",
                     _changed_file_summary(staged_fp, live_fp),
                 )
-            _atomic_swap_dir(staging_dir, target_dir)
-            report.swapped = True
         except OSError as exc:
             log.warning(
                 "[plugins] atomic swap into %s failed (%s) — existing tree left intact",

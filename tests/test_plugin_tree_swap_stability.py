@@ -414,3 +414,68 @@ def test_unreadable_file_never_reports_a_match(monkeypatch, tmp_path, caplog):
     assert any(
         "could not be read" in r.getMessage() for r in caplog.records
     ), f"the reason for forcing the swap must be logged; got {[r.getMessage() for r in caplog.records]}"
+
+
+def test_shipped_bytecode_change_is_still_promoted(monkeypatch, tmp_path):
+    """Ignoring bytecode must mean "locally generated", not "not content".
+
+    A vendor may ship .pyc without sources. Excluding bytecode from BOTH
+    fingerprints removed those paths from the definition of tree content, so
+    such a plugin could change and never be promoted while the platform recorded
+    the new installed_sha as delivered.
+    """
+    body = {"v": b"\x00compiled-v1\x00"}
+    _patch_git(
+        monkeypatch,
+        lambda url, ref, cmd, env: _make_repo(
+            {"plugin.yaml": _MANIFEST, "mcp/__pycache__/vendor.cpython-311.pyc": body["v"]}
+        ),
+    )
+    plugins_dir = tmp_path / "plugins"
+    _install(plugins_dir)
+    live = plugins_dir / "repo"
+    before = _inode(live)
+
+    body["v"] = b"\x00compiled-v2\x00"   # the vendor ships new bytecode
+    report = _install(plugins_dir)
+
+    assert report.swapped is True
+    assert _inode(live) != before, (
+        "a plugin whose SHIPPED bytecode changed was never promoted — the "
+        "exclusion removed it from the definition of content"
+    )
+    assert (live / "mcp" / "__pycache__" / "vendor.cpython-311.pyc").read_bytes() \
+        == b"\x00compiled-v2\x00"
+
+
+def test_replaced_warning_is_not_logged_when_the_swap_fails(monkeypatch, tmp_path, caplog):
+    """A failed swap must not log a replacement that never happened.
+
+    REPLACED is the string this change added for humans (and alerts) to grep, so
+    emitting it before the rename means an operator concludes the new code went
+    live while the box still serves the old tree.
+    """
+    body = {"v": b"print('v1')\n"}
+    _patch_git(
+        monkeypatch,
+        lambda url, ref, cmd, env: _make_repo(
+            {"plugin.yaml": _MANIFEST, "mcp/server.py": body["v"]}
+        ),
+    )
+    plugins_dir = tmp_path / "plugins"
+    _install(plugins_dir)
+
+    body["v"] = b"print('v2')\n"
+    def boom(staging_dir, target_dir):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(ps, "_atomic_swap_dir", boom)
+
+    with caplog.at_level(logging.WARNING, logger="molecule_runtime.plugin_sources"):
+        report = _install(plugins_dir)
+
+    assert report.swapped is False
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("atomic swap into" in m for m in msgs), "the failure must be logged"
+    assert not any("REPLACED" in m for m in msgs), (
+        f"logged a replacement that never happened; got {msgs}"
+    )
