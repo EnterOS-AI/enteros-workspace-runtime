@@ -500,35 +500,80 @@ def _is_generated_bytecode(rel: str) -> bool:
     return "__pycache__" in parts or rel.endswith((".pyc", ".pyo"))
 
 
-def _tree_fingerprint(root: Path) -> dict[str, str]:
-    """``relative posix path -> sha256`` for every regular file under ``root``.
+def _tree_fingerprint(root: Path) -> tuple[dict[str, str], bool]:
+    """``(relative posix path -> content+mode digest, fully_readable)``.
 
     Content-addressed on purpose: mtimes change on every build (the tree is
     re-cloned), so only hashes can answer "did anything actually change".
-    Symlinks are recorded by their TARGET rather than followed — a retarget is
-    a real change, and following one could wander outside the tree.
+
+    THE EXEC BIT IS PART OF THE ANSWER. git tracks 100644 vs 100755, so a
+    "forgot chmod +x" fix upstream is a real update whose blob is byte-identical.
+    Hashing content alone reported that as unchanged, skipped the swap, and left
+    the entrypoint non-executable while the install report claimed the tree was
+    live and correct — and no later boot could repair it, because the difference
+    can never become a content difference. Only the exec bit is compared, not
+    the full mode: the control plane chowns delivered trees and umask differs
+    between the clone and the live copy, so comparing every permission bit would
+    swap on noise and reintroduce the core#5009 orphaning it exists to prevent.
+
+    Symlinks are recorded by TARGET rather than followed — a retarget is a real
+    change, and following one could wander outside the tree.
+
+    ``fully_readable`` is False when any file or directory could not be read.
+    Callers MUST NOT treat two fingerprints as equal in that case: "I could not
+    read this" is not evidence of equality, and the previous symmetric
+    ``unreadable:<class>`` sentinel made two identically-unreadable files
+    compare EQUAL — so a genuine change to a file the runtime cannot read was
+    silently never promoted, on that boot and every future one. Worse,
+    ``Path.rglob`` swallows permission errors while descending, so an unreadable
+    SUBDIRECTORY contributed zero entries to both sides and an entire subtree
+    could change while the comparison still reported "unchanged". ``os.walk``
+    with ``onerror`` is used so a directory we cannot descend is observed
+    instead of silently skipped.
     """
     out: dict[str, str] = {}
+    readable = True
     if not root.is_dir():
-        return out
-    for path in sorted(root.rglob("*")):
-        rel = path.relative_to(root).as_posix()
-        if _is_generated_bytecode(rel):
-            continue
-        try:
-            if path.is_symlink():
-                out[rel] = "symlink:" + os.readlink(path)
+        return out, readable
+
+    def _onerror(exc: OSError) -> None:
+        nonlocal readable
+        readable = False
+        log.warning(
+            "[plugins] fingerprint: %s could not be read (%s) — cannot prove the "
+            "live tree matches, so the swap will not be skipped",
+            getattr(exc, "filename", "?"), exc.__class__.__name__,
+        )
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_onerror, followlinks=False):
+        base = Path(dirpath)
+        for name in sorted(dirnames) + sorted(filenames):
+            path = base / name
+            rel = path.relative_to(root).as_posix()
+            if _is_generated_bytecode(rel):
                 continue
-            if not path.is_file():
-                continue
-            h = hashlib.sha256()
-            with open(path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 20), b""):
-                    h.update(chunk)
-            out[rel] = h.hexdigest()
-        except OSError as exc:  # unreadable/racing file — treat as "changed"
-            out[rel] = f"unreadable:{exc.__class__.__name__}"
-    return out
+            try:
+                if path.is_symlink():
+                    out[rel] = "symlink:" + os.readlink(path)
+                    continue
+                if name in dirnames or not path.is_file():
+                    continue
+                st = path.stat()
+                h = hashlib.sha256()
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                mode = "x" if (st.st_mode & 0o111) else "-"
+                out[rel] = f"{h.hexdigest()}:{mode}"
+            except OSError as exc:
+                readable = False
+                out[rel] = f"unreadable:{exc.__class__.__name__}"
+                log.warning(
+                    "[plugins] fingerprint: %s could not be read (%s) — cannot "
+                    "prove the live tree matches, so the swap will not be skipped",
+                    rel, exc.__class__.__name__,
+                )
+    return out, readable
 
 
 def _changed_plugin_names(
@@ -1307,9 +1352,15 @@ def install_declared_plugins(
         # Comparing content first makes the no-change rebuild a true no-op.
         # `swapped` stays True because it answers "is the staged tree now
         # live" — which it is, precisely because it already was.
-        staged_fp = _tree_fingerprint(staging_dir)
-        live_fp = _tree_fingerprint(target_dir) if target_dir.exists() else None
-        if live_fp is not None and staged_fp == live_fp:
+        staged_fp, staged_ok = _tree_fingerprint(staging_dir)
+        if target_dir.exists():
+            live_fp, live_ok = _tree_fingerprint(target_dir)
+        else:
+            live_fp, live_ok = None, True
+        # Equality is only meaningful when BOTH trees were fully readable.
+        # Skipping on an unproven match is worse than an unnecessary swap: the
+        # update silently never lands and no future boot can repair it.
+        if live_fp is not None and staged_ok and live_ok and staged_fp == live_fp:
             log.info(
                 "[plugins] live tree already matches the staged build (%d file(s), "
                 "%d plugin(s)) — skipping the swap so running MCP servers keep "

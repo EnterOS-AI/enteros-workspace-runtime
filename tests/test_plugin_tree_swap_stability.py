@@ -316,3 +316,101 @@ def test_real_source_change_still_swaps_even_with_bytecode_present(
     assert report.swapped is True
     assert _inode(live) != before, "a real source change must still be promoted"
     assert (live / "mcp" / "server.py").read_bytes() == b"print('v2')\n"
+
+
+# ---------------------------------------------------------------------------
+# What the CONTENT fingerprint cannot see (code-review findings, 2026-08-01)
+#
+# Both of these produce a FALSE "already matches" skip, which is strictly worse
+# than the bug this file exists to fix: the swap is skipped, `swapped=True` is
+# reported, and the real update never lands — silently, and self-sustainingly,
+# because the difference can never appear as a content difference on any future
+# boot either.
+# ---------------------------------------------------------------------------
+import os
+import pytest
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX exec bit is not modelled on Windows")
+def test_exec_bit_only_change_is_promoted(monkeypatch, tmp_path):
+    """git tracks 100644 vs 100755. A `chmod +x` fix is a real update.
+
+    Without the mode in the fingerprint this skips forever: the MCP server keeps
+    failing to spawn with EACCES while the install report says the tree is live
+    and correct, and no later boot can repair it.
+    """
+    mode = {"m": 0o644}
+    def repo(url, ref, cmd, env):
+        return _make_repo({"plugin.yaml": _MANIFEST, "run.sh": b"#!/bin/sh\necho hi\n"})
+    _patch_git(monkeypatch, repo)
+    plugins_dir = tmp_path / "plugins"
+    _install(plugins_dir)
+    live_script = plugins_dir / "repo" / "run.sh"
+    os.chmod(live_script, 0o644)
+    before = _inode(plugins_dir / "repo")
+
+    # Upstream lands the exec bit; content byte-identical.
+    orig = ps._make_repo_mode if hasattr(ps, "_make_repo_mode") else None
+    real_copy = ps.shutil.copytree
+    def copy_with_exec(src, dst, **kw):
+        r = real_copy(src, dst, **kw)
+        p = os.path.join(dst, "run.sh")
+        if os.path.exists(p):
+            os.chmod(p, 0o755)
+        return r
+    monkeypatch.setattr(ps.shutil, "copytree", copy_with_exec)
+
+    _install(plugins_dir)
+
+    assert _inode(plugins_dir / "repo") != before, (
+        "an exec-bit-only upstream change was never promoted — the plugin's "
+        "entrypoint stays non-executable forever and no future boot repairs it"
+    )
+    assert os.stat(plugins_dir / "repo" / "run.sh").st_mode & 0o111, "exec bit not live"
+
+
+def test_unreadable_file_never_reports_a_match(monkeypatch, tmp_path, caplog):
+    """Two identically-unreadable files must NOT compare equal.
+
+    The sentinel was symmetric, so a file the runtime cannot read hashed the
+    same on both sides and a genuine change to it was silently never promoted.
+    "I could not read this" is not evidence of equality.
+    """
+    _patch_git(
+        monkeypatch,
+        lambda url, ref, cmd, env: _make_repo(
+            {"plugin.yaml": _MANIFEST, "mcp/server.py": b"print('v1')\n"}
+        ),
+    )
+    plugins_dir = tmp_path / "plugins"
+    _install(plugins_dir)
+    before = _inode(plugins_dir / "repo")
+
+    # The real scenario is a file shipped mode 000: it is unreadable in BOTH
+    # the staged copy and the live copy, so the symmetric sentinel made them
+    # compare EQUAL. Making only one side unreadable would pass for the wrong
+    # reason — the sides would simply differ. (Proved: with only the live side
+    # patched, removing the readability gate did NOT fail this test.)
+    #
+    # Reads only: shutil.copytree opens the destination for WRITING, and reads
+    # its source from the clone dir, so neither is affected.
+    real_open = open
+    def refuse(path, *a, **kw):
+        mode = a[0] if a else kw.get("mode", "r")
+        p = str(path).replace("\\", "/")
+        if "r" in str(mode) and "molecule-plugin-" not in p and p.endswith("repo/mcp/server.py"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **kw)
+    monkeypatch.setattr("builtins.open", refuse)
+
+    with caplog.at_level(logging.WARNING, logger="molecule_runtime.plugin_sources"):
+        report = _install(plugins_dir)
+
+    assert report.swapped is True
+    assert _inode(plugins_dir / "repo") != before, (
+        "an unreadable file compared EQUAL to itself, so the tree was reported "
+        "as already matching and a real change to it could never be promoted"
+    )
+    assert any(
+        "could not be read" in r.getMessage() for r in caplog.records
+    ), f"the reason for forcing the swap must be logged; got {[r.getMessage() for r in caplog.records]}"
