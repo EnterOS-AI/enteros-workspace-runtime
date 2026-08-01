@@ -236,6 +236,13 @@ class InstallReport:
 
     declared: bool = False
     plugins_dir: str | None = None
+    # Declared SOURCE -> the commit this box actually resolved and installed.
+    # core#5007: installed_sha on the control plane is a claim BY the control
+    # plane; this is the box's own answer. A source whose HEAD could not be
+    # resolved is OMITTED rather than recorded as "unknown" — a consumer must be
+    # able to trust that a PRESENT value is a real commit, or every unresolvable
+    # fetch reads as drift.
+    installed_refs: dict[str, str] = field(default_factory=dict)
     installed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
@@ -498,6 +505,14 @@ def _is_generated_bytecode(rel: str) -> bool:
     """
     parts = rel.split("/")
     return "__pycache__" in parts or rel.endswith((".pyc", ".pyo"))
+
+
+# Declared SOURCE -> resolved commit for the CURRENT install run. Populated by
+# _git_fetch_tree (which already resolves it) and drained by
+# install_declared_plugins, so the provider seam keeps its signature. Reset at
+# the top of every run: a stale entry from a previous boot would report a commit
+# this box is not running, which is the exact failure core#5007 exists to end.
+_RESOLVED_REFS: dict[str, str] = {}
 
 
 def _tree_fingerprint(root: Path) -> tuple[dict[str, str], bool]:
@@ -955,6 +970,8 @@ def _git_fetch_tree(
     # _redact_log_text as a value to STRIP. Printing it here would reverse this
     # module's own policy for every plugin on every boot, into logs that ship to
     # the obs stack. The resolved commit is the identifying fact we needed.
+    if head_sha != "unknown":
+        _RESOLVED_REFS[raw] = head_sha
     log.info(
         "[plugins] fetched %s at commit %s",
         _source_log_label(raw), head_sha,
@@ -1154,6 +1171,7 @@ def install_declared_plugins(
     per-source FETCH mechanism changed. Fail-soft: never raises into the caller —
     the runtime starting matters more than any one plugin landing.
     """
+    _RESOLVED_REFS.clear()
     if env is None:
         env = os.environ
     report = InstallReport()
@@ -1323,7 +1341,8 @@ def install_declared_plugins(
                 _source_log_label(source.raw),
             )
             report.installed.append(source.raw)
-
+            if source.raw in _RESOLVED_REFS:
+                report.installed_refs[source.raw] = _RESOLVED_REFS[source.raw]
         # A failed source fails THAT SOURCE — not the whole tree.
         #
         # This used to abort the swap entirely whenever any source failed, to

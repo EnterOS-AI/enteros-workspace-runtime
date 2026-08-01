@@ -58,6 +58,8 @@ class _Report:
     skipped: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
     swapped: bool = False
+    # core#5007: declared source -> the commit the box actually installed.
+    installed_refs: dict = field(default_factory=dict)
 
 
 def _report_missing(*attrs: str) -> object:
@@ -73,6 +75,7 @@ def _report_missing(*attrs: str) -> object:
         "plugins_dir": "/configs/plugins",
         "installed": ["gitea://o/r#v1"],
         "skipped": ["local-thing"],
+        "installed_refs": {"gitea://o/r#v1": "a"*40},
         "failed": [],
         "swapped": True,
     }
@@ -422,6 +425,10 @@ def test_vendored_contract_names_exactly_the_install_report_fields():
         "skipped",
         "failed",
         "swapped",
+        # core#5007 — OPTIONAL on the wire (absent from the schema's `required`)
+        # but NAMED by the contract, so the producer must project it. Absent
+        # means "this box cannot tell me", never "nothing installed".
+        "installed_refs",
     }
 
 

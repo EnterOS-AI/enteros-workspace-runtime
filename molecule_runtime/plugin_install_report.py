@@ -174,6 +174,14 @@ def report_payload(report: "InstallReport") -> dict[str, Any]:
             value = list(value or [])
         elif attr == "plugins_dir":
             value = "" if value is None else str(value)
+        elif attr == "installed_refs":
+            # A MAPPING, not a flag. The else-branch below coerces with bool(),
+            # which would send `true` for a populated dict and `false` for an
+            # empty one — a plausible-looking payload carrying no commits at
+            # all, which is worse than omitting the field. Normalised to
+            # str->str so the wire shape cannot depend on what the resolver
+            # happened to return.
+            value = {str(k): str(v) for k, v in dict(value or {}).items()}
         else:
             value = bool(value)
         payload[wire] = value
