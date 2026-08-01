@@ -96,7 +96,7 @@ def test_pinned_version_satisfies_the_launch_range(lock):
     # Guard D stays true through the pin: what we bake must satisfy what the
     # concierge launches.
     major = pai.MANAGEMENT_MCP_PINNED_VERSION.split(".")[0]
-    assert pai.MANAGEMENT_MCP_COMPATIBLE_RANGE.lstrip("^~") .split(".")[0] == major
+    assert pai.MANAGEMENT_MCP_COMPATIBLE_RANGE.lstrip("^~").split(".")[0] == major
 
 
 def test_every_lock_entry_resolves_to_our_mirror(lock):
@@ -109,7 +109,9 @@ def test_every_lock_entry_resolves_to_our_mirror(lock):
         if entry.get("resolved")
         and not entry["resolved"].startswith(pai.MANAGEMENT_MCP_REGISTRY)
     ]
-    assert offenders == [], f"{len(offenders)} entries resolve off-mirror: {offenders[:3]}"
+    assert offenders == [], (
+        f"{len(offenders)} entries resolve off-mirror: {offenders[:3]}"
+    )
 
 
 def test_lock_never_mentions_the_upstream_registry(lock):
@@ -155,20 +157,26 @@ _STUB = """#!/bin/sh
 # npm: `ci` may be told to fail (mirror-miss simulation); everything else is a
 # no-op success. npx: emits a tools/list containing the required tool unless the
 # test asks it to emit nothing.
-_NPM_STUB = _STUB + """
+_NPM_STUB = (
+    _STUB
+    + """
 case "$1" in
   ci) [ -n "${MOLECULE_STUB_NPM_CI_FAILS:-}" ] && { echo "npm error 404 Not Found - GET ${npm_config_registry}not-mirrored" >&2; exit 1; } ;;
 esac
 exit 0
 """
+)
 
-_NPX_STUB = _STUB + """
+_NPX_STUB = (
+    _STUB
+    + """
 [ -n "${MOLECULE_STUB_NPX_SILENT:-}" ] && exit 0
 cat <<'JSON'
 {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"__TOOL__"}]}}
 JSON
 exit 0
 """
+)
 
 
 def _write_stub(path: Path, body: str) -> None:
@@ -197,7 +205,9 @@ def harness(tmp_path: Path):
     home = tmp_path / "home"
     home.mkdir()
 
-    def run(*, lock_files: dict[str, str] | None = None, env: dict[str, str] | None = None):
+    def run(
+        *, lock_files: dict[str, str] | None = None, env: dict[str, str] | None = None
+    ):
         real_node = Path(shutil.which("node")).parent
         pythonpath = str(REPO_ROOT)
         if lock_files is not None:
@@ -216,7 +226,9 @@ def harness(tmp_path: Path):
         environ = {
             **os.environ,
             "HOME": str(home),
-            "PATH": os.pathsep.join([str(bindir), str(real_node), os.environ.get("PATH", "")]),
+            "PATH": os.pathsep.join(
+                [str(bindir), str(real_node), os.environ.get("PATH", "")]
+            ),
             "MOLECULE_STUB_LOG": str(log),
             "MOLECULE_RUNTIME_PYTHON": _python(),
             "PYTHONPATH": pythonpath,
@@ -240,7 +252,12 @@ def _bash_works() -> bool:
     if shutil.which("bash") is None:
         return False
     try:
-        return subprocess.run(["bash", "-c", "exit 0"], capture_output=True, timeout=30).returncode == 0
+        return (
+            subprocess.run(
+                ["bash", "-c", "exit 0"], capture_output=True, timeout=30
+            ).returncode
+            == 0
+        )
     except OSError:  # pragma: no cover - platform guard
         return False
 
@@ -319,7 +336,8 @@ def test_agent_npmrc_stays_scoped_only(harness):
     harness()
     npmrc = (harness.home / ".npmrc").read_text()
     assert (
-        f"{pai.MANAGEMENT_MCP_REGISTRY_SCOPE}:registry={pai.MANAGEMENT_MCP_REGISTRY}" in npmrc
+        f"{pai.MANAGEMENT_MCP_REGISTRY_SCOPE}:registry={pai.MANAGEMENT_MCP_REGISTRY}"
+        in npmrc
     )
     assert not any(
         line.strip().startswith("registry=") for line in npmrc.splitlines()
@@ -331,8 +349,12 @@ def test_prebake_warms_packuments_for_the_locked_tree(harness):
     resolves a RANGE — which needs a packument. Without this warm the image
     builds green and the concierge ETARGETs at boot (#1027)."""
     harness()
-    added = [c for c in _calls(harness.log) if c[0].startswith("npm") and c[1] == "cache"]
-    specs = {arg for c in added for arg in c[3:] if "@" in arg and not arg.startswith("-")}
+    added = [
+        c for c in _calls(harness.log) if c[0].startswith("npm") and c[1] == "cache"
+    ]
+    specs = {
+        arg for c in added for arg in c[3:] if "@" in arg and not arg.startswith("-")
+    }
     lock = json.loads((LOCK_DIR / "package-lock.json").read_text())
     want = {
         (e.get("name") or p.rsplit("node_modules/", 1)[-1]) + "@" + e["version"]
@@ -396,7 +418,9 @@ def test_lock_referencing_upstream_fails_the_build(harness):
     """Belt and braces for the one thing a .npmrc cannot override: a `resolved`
     URL pointing at npmjs.org."""
     lock = json.loads((LOCK_DIR / "package-lock.json").read_text())
-    lock["packages"]["node_modules/zod"]["resolved"] = f"https://{UPSTREAM}/zod/-/zod-3.25.76.tgz"
+    lock["packages"]["node_modules/zod"]["resolved"] = (
+        f"https://{UPSTREAM}/zod/-/zod-3.25.76.tgz"
+    )
     proc = harness(
         lock_files={
             "package.json": (LOCK_DIR / "package.json").read_text(),

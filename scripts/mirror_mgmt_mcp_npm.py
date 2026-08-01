@@ -98,6 +98,16 @@ def _fetch(url: str, *, headers: dict[str, str] | None = None) -> bytes:
         return resp.read()
 
 
+def _write_lf(path: Path, text: str) -> None:
+    """Write LF + utf-8 explicitly.
+
+    The emitted files are read by ``grep``/``npm ci`` inside the image and are
+    .gitattributes-pinned to LF, so a Windows-default CRLF write would churn all
+    ~120 entries on line endings alone every time this regenerates.
+    """
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
 def _quoted(name: str) -> str:
     """npm registry path form: the scope separator is percent-encoded."""
     return name.replace("/", "%2f")
@@ -130,14 +140,23 @@ def resolve_tree(spec: str, workdir: Path) -> dict[str, Any]:
                 "version": "0.0.0",
                 "private": True,
                 # EXACT, not a range: this file is the pin.
-                "dependencies": {MANAGEMENT_MCP_NPM_PACKAGE: MANAGEMENT_MCP_PINNED_VERSION},
+                "dependencies": {
+                    MANAGEMENT_MCP_NPM_PACKAGE: MANAGEMENT_MCP_PINNED_VERSION
+                },
             },
             indent=2,
         )
         + "\n"
     )
     subprocess.run(
-        ["npm", "install", "--package-lock-only", "--no-audit", "--no-fund", "--loglevel=error"],
+        [
+            "npm",
+            "install",
+            "--package-lock-only",
+            "--no-audit",
+            "--no-fund",
+            "--loglevel=error",
+        ],
         cwd=workdir,
         check=True,
         shell=(os.name == "nt"),
@@ -156,7 +175,12 @@ def mirrored_versions(read_base: str, name: str) -> dict[str, Any]:
 
 
 def publish(
-    publish_base: str, name: str, version: str, manifest: dict[str, Any], tgz: bytes, auth: str
+    publish_base: str,
+    name: str,
+    version: str,
+    manifest: dict[str, Any],
+    tgz: bytes,
+    auth: str,
 ) -> None:
     filename = f"{name.split('/')[-1]}-{version}.tgz"
     payload = {
@@ -201,11 +225,21 @@ def main() -> int:
         default=MANAGEMENT_MCP_REGISTRY,
         help="registry base to PUT to (use http://127.0.0.1:3200/... on the box; CF blocks PUT)",
     )
-    ap.add_argument("--read-base", default=MANAGEMENT_MCP_REGISTRY, help="registry base for the lock URLs")
-    ap.add_argument("--dry-run", action="store_true", help="resolve + report, publish nothing")
+    ap.add_argument(
+        "--read-base",
+        default=MANAGEMENT_MCP_REGISTRY,
+        help="registry base for the lock URLs",
+    )
+    ap.add_argument(
+        "--dry-run", action="store_true", help="resolve + report, publish nothing"
+    )
     args = ap.parse_args()
 
-    publish_base = args.publish_base.rstrip("/") + "/api/packages/molecule-ai/npm/" if "/api/" not in args.publish_base else args.publish_base
+    publish_base = (
+        args.publish_base.rstrip("/") + "/api/packages/molecule-ai/npm/"
+        if "/api/" not in args.publish_base
+        else args.publish_base
+    )
     if not publish_base.endswith("/"):
         publish_base += "/"
     read_base = args.read_base if args.read_base.endswith("/") else args.read_base + "/"
@@ -219,7 +253,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode() if user else ""
+    auth = (
+        "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+        if user
+        else ""
+    )
 
     spec = f"{MANAGEMENT_MCP_NPM_PACKAGE}@{MANAGEMENT_MCP_PINNED_VERSION}"
     tmp = Path(tempfile.mkdtemp(prefix="mgmt-mcp-mirror-"))
@@ -239,7 +277,10 @@ def main() -> int:
                 for path, entry in packages.items()
                 if path != "" and "resolved" in entry
             },
-            key=lambda nv: (nv[0], tuple(int(p) if p.isdigit() else 0 for p in nv[1].split("."))),
+            key=lambda nv: (
+                nv[0],
+                tuple(int(p) if p.isdigit() else 0 for p in nv[1].split(".")),
+            ),
         )
         print(f"mirror: {len(wanted)} distinct packages in the tree")
 
@@ -284,18 +325,16 @@ def main() -> int:
         packages[""]["version"] = "0.0.0"
 
         leftover = [
-            e["resolved"] for e in packages.values() if e.get("resolved", "").startswith(UPSTREAM)
+            e["resolved"]
+            for e in packages.values()
+            if e.get("resolved", "").startswith(UPSTREAM)
         ]
         if leftover:  # pragma: no cover - defensive
             raise RuntimeError(f"lock still references upstream: {leftover[:3]}")
 
         LOCK_DIR.mkdir(parents=True, exist_ok=True)
-        # LF + utf-8 explicitly: these files are read by `grep`/`npm ci` inside
-        # the image and are .gitattributes-pinned to LF, so a Windows-default
-        # CRLF write would churn the diff on every regeneration.
-        _write = lambda path, text: path.write_text(text, encoding="utf-8", newline="
-")  # noqa: E731
-        _write(LOCK_DIR / "package.json", (
+        _write_lf(
+            LOCK_DIR / "package.json",
             json.dumps(
                 {
                     "name": "molecule-mgmt-mcp-bake",
@@ -311,9 +350,9 @@ def main() -> int:
                 },
                 indent=2,
             )
-            + "\n"
+            + "\n",
         )
-        (LOCK_DIR / "package-lock.json").write_text(json.dumps(lock, indent=2) + "\n")
+        _write_lf(LOCK_DIR / "package-lock.json", json.dumps(lock, indent=2) + "\n")
         print(f"mirror: wrote pin to {LOCK_DIR}")
         return 0
     finally:
