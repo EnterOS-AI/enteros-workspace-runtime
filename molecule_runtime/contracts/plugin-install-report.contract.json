@@ -14,7 +14,8 @@
     "installed": "installed",
     "skipped": "skipped",
     "failed": "failed",
-    "swapped": "swapped"
+    "swapped": "swapped",
+    "installed_refs": "installed_refs"
   },
   "outcome_rule": "live iff declared && swapped",
   "degraded_rule": "degraded iff live && failed != []",
