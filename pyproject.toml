@@ -109,7 +109,16 @@ include = ["molecule_runtime*", "plugins_registry*"]
 # contracts/* ships the vendored plugin-manifest SSOT schema (+ PROVENANCE.md)
 # that manifest_ssot.py loads via importlib.resources — it must be IN the wheel
 # for the advisory gate (molecule-core#3383) to run offline in workspaces.
-"molecule_runtime" = ["py.typed", "scripts/*.sh", "contracts/*.json", "contracts/*.md"]
+# scripts/mgmt-mcp-lock/*.json is the vendored npm PIN the image prebake
+# `npm ci`s from our own registry mirror (#393). It MUST be in the wheel -- a
+# wheel without it makes prebake-mgmt-mcp.sh fail the image build by design.
+"molecule_runtime" = [
+    "py.typed",
+    "scripts/*.sh",
+    "scripts/mgmt-mcp-lock/*.json",
+    "contracts/*.json",
+    "contracts/*.md",
+]
 "plugins_registry" = ["py.typed"]
 
 [tool.ruff.lint.per-file-ignores]

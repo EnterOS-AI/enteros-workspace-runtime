@@ -109,6 +109,36 @@ MANAGEMENT_MCP_COMPATIBLE_RANGE = "^1.8.0"
 MANAGEMENT_MCP_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
 MANAGEMENT_MCP_REGISTRY_SCOPE = "@molecule-ai"
 
+# The vendored npm PIN the image prebake installs from, relative to this
+# package directory (ships in the wheel via ``[tool.setuptools.package-data]``
+# ``scripts/mgmt-mcp-lock/*.json``). Regenerated ONLY by
+# ``scripts/mirror_mgmt_mcp_npm.py``.
+#
+# WHY IT EXISTS (#393). ``MANAGEMENT_MCP_REGISTRY`` used to be applied as a
+# SCOPED registry only, so ``@molecule-ai/mcp-server`` came from us but its
+# TRANSITIVE tree (@modelcontextprotocol/sdk, pino, zod, express, ...) was
+# pulled LIVE from registry.npmjs.org during every template image build. An
+# npmjs.org timeout therefore blocked producing a workspace image at all
+# (2026-08-01 CI outage), and the tree floated: `@modelcontextprotocol/sdk`
+# resolves from a `^1.12.0` range, so two builds of the same template commit
+# were not guaranteed to contain the same MCP server.
+#
+# The fix is the npm analogue of ``MOLECULE_RUNTIME_INDEX`` for pip: the whole
+# tree is mirrored into our registry, ``MANAGEMENT_MCP_REGISTRY`` becomes the
+# DEFAULT registry (not just the scope), and the prebake ``npm ci``s this
+# lockfile. Every ``resolved`` URL in it points at our host -- which is what
+# actually forecloses the upstream fetch, because a lockfile ``resolved`` URL
+# OVERRIDES the configured registry. A package missing from the mirror is a
+# hard 404 and fails the build LOUDLY rather than falling through to npmjs.org
+# (the dependency-confusion surface we already closed on the PyPI side).
+MANAGEMENT_MCP_LOCK_DIR = "scripts/mgmt-mcp-lock"
+
+# The upstream registry the bake must NEVER reach. ONE literal shared by the
+# prebake's lock assertion, the mirror tool, and the tests, so "no npmjs.org"
+# is checked against the same string everywhere instead of three copies that
+# can drift apart.
+MANAGEMENT_MCP_UPSTREAM_REGISTRY_HOST = "registry.npmjs.org"
+
 # Env marker baked into the platform-agent image (Dockerfile.platform-agent
 # ``ENV MOLECULE_PLATFORM_AGENT_IMAGE_BAKED=1``). When set, this container IS
 # the org-management concierge image: it bakes the ``@molecule-ai/mcp-server``
