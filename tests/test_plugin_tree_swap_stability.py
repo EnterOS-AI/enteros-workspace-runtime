@@ -209,3 +209,39 @@ def test_unresolvable_head_does_not_break_the_install(monkeypatch, tmp_path, cap
         report = _install(tmp_path / "plugins")
     assert report.swapped is True, "a failed rev-parse must not fail the install"
     assert report.installed, "the plugin must still be installed"
+
+
+def test_replacement_warning_names_the_changed_FILES(monkeypatch, tmp_path, caplog):
+    """Naming the plugin is not enough to diagnose a repeating replacement.
+
+    Deployed to production, the plugin-level warning fired on every boot for one
+    plugin and left the obvious question unanswered: WHICH file keeps differing?
+    Without that, the next step is guesswork (bytecode? a delivery marker? a
+    carry-forward path?) — each of which costs a full release cycle to test.
+    The changed paths are already computed to decide the swap, so logging them
+    is free.
+    """
+    body = {"v": b"print('v1')\n"}
+    _patch_git(
+        monkeypatch,
+        lambda url, ref, cmd, env: _make_repo({
+            "plugin.yaml": _MANIFEST,
+            "mcp/server.py": body["v"],
+            "stable.txt": b"unchanged\n",
+        }),
+    )
+    plugins_dir = tmp_path / "plugins"
+    _install(plugins_dir)
+
+    body["v"] = b"print('v2')\n"
+    with caplog.at_level(logging.WARNING, logger="molecule_runtime.plugin_sources"):
+        _install(plugins_dir)
+
+    warns = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    joined = "\n".join(warns)
+    assert "repo/mcp/server.py" in joined, (
+        f"the warning must name the file that changed; got {warns}"
+    )
+    assert "stable.txt" not in joined, (
+        "only CHANGED files may be listed — dumping the whole tree buries the signal"
+    )
