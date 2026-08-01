@@ -346,9 +346,17 @@ def test_prebake_seeds_the_npx_cache_for_the_launch_range(harness):
     """The launch runs `npx <pkg>@<range>`; its _npx entry is keyed by the RANGE
     string, a different key from the exact spec."""
     harness()
-    npx_specs = {c[-3] for c in _calls(harness.log) if c[0].startswith("npx")}
-    assert f"{pai.MANAGEMENT_MCP_NPM_PACKAGE}@{pai.MANAGEMENT_MCP_COMPATIBLE_RANGE}" in npx_specs
-    assert f"{pai.MANAGEMENT_MCP_NPM_PACKAGE}@{pai.MANAGEMENT_MCP_PINNED_VERSION}" in npx_specs
+    # Only `--prefer-offline` invocations SEED (they may fetch); the `--offline`
+    # ones are the self-checks, and counting them made this pass vacuously for a
+    # script that seeded the exact spec alone.
+    seeded = {
+        call[call.index("--prefer-offline") + 1]
+        for call in _calls(harness.log)
+        if call[0].startswith("npx") and "--prefer-offline" in call
+    }
+    pkg = pai.MANAGEMENT_MCP_NPM_PACKAGE
+    assert f"{pkg}@{pai.MANAGEMENT_MCP_COMPATIBLE_RANGE}" in seeded, seeded
+    assert f"{pkg}@{pai.MANAGEMENT_MCP_PINNED_VERSION}" in seeded, seeded
 
 
 # --- fail-loud arms -------------------------------------------------------
