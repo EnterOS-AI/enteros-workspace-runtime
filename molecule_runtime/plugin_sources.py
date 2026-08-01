@@ -500,35 +500,82 @@ def _is_generated_bytecode(rel: str) -> bool:
     return "__pycache__" in parts or rel.endswith((".pyc", ".pyo"))
 
 
-def _tree_fingerprint(root: Path) -> dict[str, str]:
-    """``relative posix path -> sha256`` for every regular file under ``root``.
+def _tree_fingerprint(root: Path) -> tuple[dict[str, str], bool]:
+    """``(relative posix path -> content+mode digest, fully_readable)``.
 
     Content-addressed on purpose: mtimes change on every build (the tree is
     re-cloned), so only hashes can answer "did anything actually change".
-    Symlinks are recorded by their TARGET rather than followed — a retarget is
-    a real change, and following one could wander outside the tree.
+
+    THE EXEC BIT IS PART OF THE ANSWER. git tracks 100644 vs 100755, so a
+    "forgot chmod +x" fix upstream is a real update whose blob is byte-identical.
+    Hashing content alone reported that as unchanged, skipped the swap, and left
+    the entrypoint non-executable while the install report claimed the tree was
+    live and correct — and no later boot could repair it, because the difference
+    can never become a content difference. Only the exec bit is compared, not
+    the full mode: the control plane chowns delivered trees and umask differs
+    between the clone and the live copy, so comparing every permission bit would
+    swap on noise and reintroduce the core#5009 orphaning it exists to prevent.
+
+    Symlinks are recorded by TARGET rather than followed — a retarget is a real
+    change, and following one could wander outside the tree.
+
+    ``fully_readable`` is False when any file or directory could not be read.
+    Callers MUST NOT treat two fingerprints as equal in that case: "I could not
+    read this" is not evidence of equality, and the previous symmetric
+    ``unreadable:<class>`` sentinel made two identically-unreadable files
+    compare EQUAL — so a genuine change to a file the runtime cannot read was
+    silently never promoted, on that boot and every future one. Worse,
+    ``Path.rglob`` swallows permission errors while descending, so an unreadable
+    SUBDIRECTORY contributed zero entries to both sides and an entire subtree
+    could change while the comparison still reported "unchanged". ``os.walk``
+    with ``onerror`` is used so a directory we cannot descend is observed
+    instead of silently skipped.
     """
     out: dict[str, str] = {}
+    readable = True
     if not root.is_dir():
-        return out
-    for path in sorted(root.rglob("*")):
-        rel = path.relative_to(root).as_posix()
-        if _is_generated_bytecode(rel):
-            continue
-        try:
-            if path.is_symlink():
-                out[rel] = "symlink:" + os.readlink(path)
-                continue
-            if not path.is_file():
-                continue
-            h = hashlib.sha256()
-            with open(path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 20), b""):
-                    h.update(chunk)
-            out[rel] = h.hexdigest()
-        except OSError as exc:  # unreadable/racing file — treat as "changed"
-            out[rel] = f"unreadable:{exc.__class__.__name__}"
-    return out
+        # Exists but is not a directory (a stray file, a broken symlink): we
+        # cannot enumerate it, so we cannot prove anything matches. Returning
+        # readable=True here let an empty staging tree compare EQUAL to it and
+        # report a promoted tree while /configs/plugins was not a directory.
+        return out, not root.exists()
+
+    def _onerror(exc: OSError) -> None:
+        nonlocal readable
+        readable = False
+        log.warning(
+            "[plugins] fingerprint: %s could not be read (%s) — cannot prove the "
+            "live tree matches, so the swap will not be skipped",
+            getattr(exc, "filename", "?"), exc.__class__.__name__,
+        )
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_onerror, followlinks=False):
+        base = Path(dirpath)
+        for name in sorted(dirnames) + sorted(filenames):
+            path = base / name
+            rel = path.relative_to(root).as_posix()
+            try:
+                if path.is_symlink():
+                    out[rel] = "symlink:" + os.readlink(path)
+                    continue
+                if name in dirnames or not path.is_file():
+                    continue
+                st = path.stat()
+                h = hashlib.sha256()
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                mode = "x" if (st.st_mode & 0o111) else "-"
+                out[rel] = f"{h.hexdigest()}:{mode}"
+            except OSError as exc:
+                readable = False
+                out[rel] = f"unreadable:{exc.__class__.__name__}"
+                log.warning(
+                    "[plugins] fingerprint: %s could not be read (%s) — cannot "
+                    "prove the live tree matches, so the swap will not be skipped",
+                    rel, exc.__class__.__name__,
+                )
+    return out, readable
 
 
 def _changed_plugin_names(
@@ -856,9 +903,14 @@ def _git_fetch_tree(
         head_sha = (_rev.stdout or "").strip() or "unknown"
     except (subprocess.SubprocessError, OSError):
         pass
+    # Deliberately NOT logging the ref: _source_log_label emits "#<ref>" rather
+    # than the fragment, and both fetch-failure paths pass `ref` INTO
+    # _redact_log_text as a value to STRIP. Printing it here would reverse this
+    # module's own policy for every plugin on every boot, into logs that ship to
+    # the obs stack. The resolved commit is the identifying fact we needed.
     log.info(
-        "[plugins] fetched %s at commit %s (ref %s)",
-        _source_log_label(raw), head_sha, _redact_log_text(ref, token),
+        "[plugins] fetched %s at commit %s",
+        _source_log_label(raw), head_sha,
     )
 
     # Strip VCS metadata so the installed tree matches the old archive semantics
@@ -1169,8 +1221,16 @@ def install_declared_plugins(
                 try:
                     shutil.copytree(content_dir, dest, dirs_exist_ok=True)
                 except OSError as exc:
+                    # Discard the PARTIAL copy. Leaving it behind makes this
+                    # source look staged: the carry-forward below skips any name
+                    # already present in staging, so the plugin's intact live
+                    # copy is dropped and a truncated tree is promoted over it —
+                    # the exact opposite of the "a transient blip cannot delete
+                    # an already-installed plugin" invariant this path claims.
+                    shutil.rmtree(dest, ignore_errors=True)
                     log.warning(
-                        "[plugins] copy failed: %s (%s)",
+                        "[plugins] copy failed: %s (%s) — discarded the partial "
+                        "staging copy so the existing plugin is carried forward",
                         _source_log_label(source.raw),
                         exc,
                     )
@@ -1201,6 +1261,13 @@ def install_declared_plugins(
                     len(violations),
                     "; ".join(violations),
                 )
+                # Remove the rejected tree from staging. It was copied in
+                # BEFORE the manifest check ran, so leaving it means the swap
+                # promotes the very plugin the gate rejected — and blocks the
+                # carry-forward that would have preserved the last valid copy.
+                # The gate reported enforcement while enforcing nothing whenever
+                # a sibling source succeeded.
+                shutil.rmtree(staging_dir / source.name, ignore_errors=True)
                 report.failed.append(source.raw)
                 continue
             log.info(
@@ -1307,9 +1374,38 @@ def install_declared_plugins(
         # Comparing content first makes the no-change rebuild a true no-op.
         # `swapped` stays True because it answers "is the staged tree now
         # live" — which it is, precisely because it already was.
-        staged_fp = _tree_fingerprint(staging_dir)
-        live_fp = _tree_fingerprint(target_dir) if target_dir.exists() else None
-        if live_fp is not None and staged_fp == live_fp:
+        # The two walks are the only unguarded filesystem work left in this
+        # otherwise fail-soft function: an OSError escaping them would abort
+        # install_declared_plugins entirely, skipping report_install_outcome and
+        # leaving the platform with NO install report for the boot. Degrade to
+        # "cannot prove a match" and let the swap proceed, as every other step
+        # here degrades.
+        try:
+            staged_fp, staged_ok = _tree_fingerprint(staging_dir)
+            if target_dir.exists():
+                live_fp, live_ok = _tree_fingerprint(target_dir)
+            else:
+                live_fp, live_ok = None, True
+        except OSError as exc:
+            log.warning(
+                "[plugins] could not fingerprint the plugin trees (%s) — "
+                "proceeding with the swap rather than assuming a match", exc,
+            )
+            staged_fp, staged_ok, live_fp, live_ok = {}, False, {}, False
+        # Equality is only meaningful when BOTH trees were fully readable.
+        # Skipping on an unproven match is worse than an unnecessary swap: the
+        # update silently never lands and no future boot can repair it.
+        if live_fp is not None:
+            # Drop LOCALLY GENERATED bytecode only — a path that is bytecode AND
+            # absent from the staged tree. Excluding bytecode from both sides
+            # unconditionally would remove it from the definition of content, so
+            # a plugin shipping .pyc (a vendor distributing compiled modules)
+            # could change and never be promoted.
+            live_fp = {
+                rel: dig for rel, dig in live_fp.items()
+                if not (_is_generated_bytecode(rel) and rel not in staged_fp)
+            }
+        if live_fp is not None and staged_ok and live_ok and staged_fp == live_fp:
             log.info(
                 "[plugins] live tree already matches the staged build (%d file(s), "
                 "%d plugin(s)) — skipping the swap so running MCP servers keep "
@@ -1320,6 +1416,8 @@ def install_declared_plugins(
             return report
 
         try:
+            _atomic_swap_dir(staging_dir, target_dir)
+            report.swapped = True
             if live_fp is not None:
                 # The genuinely dangerous case, and the one that was silent.
                 # A code-only change does not alter the `mcp_servers` mapping,
@@ -1335,8 +1433,6 @@ def install_declared_plugins(
                     ", ".join(_changed_plugin_names(staged_fp, live_fp)) or "(content)",
                     _changed_file_summary(staged_fp, live_fp),
                 )
-            _atomic_swap_dir(staging_dir, target_dir)
-            report.swapped = True
         except OSError as exc:
             log.warning(
                 "[plugins] atomic swap into %s failed (%s) — existing tree left intact",
