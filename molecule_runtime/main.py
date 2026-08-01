@@ -388,6 +388,60 @@ async def register_with_platform(
     return False
 
 
+def _send_plugin_install_report(report) -> bool:
+    """POST the declared-plugin boot-install outcome to the platform. Never raises.
+
+    MUST be called AFTER :func:`register_with_platform` (runtime#390).
+    ``POST /workspaces/:id/plugin-install-report`` is registered under ``wsAuth``
+    in molecule-core (``workspace-server/internal/router/router.go:581``), i.e.
+    ``middleware.WorkspaceAuth`` — it REQUIRES this workspace's bearer token.
+    That token does not exist until ``register_with_platform`` receives it on the
+    first successful ``/registry/register`` and ``platform_auth.save_token``
+    writes ``<configs>/.auth_token``.
+
+    Reporting used to happen inline with the boot-install itself, ~620 lines
+    earlier, so on a FIRST boot ``platform_auth.auth_headers()`` had no token to
+    return, the POST went out with no ``Authorization`` header at all, and core
+    refused it 401. Fail-soft then swallowed the 401 and no row was ever written
+    — the reporting chain was structurally incapable of reporting on the exact
+    boot it was built to describe. (``auth_headers``' docstring says a pre-token
+    request is safe because "the platform's heartbeat handler grandfathers
+    pre-token workspaces through"; that grandfathering belongs to the HEARTBEAT
+    route and this one never had it.)
+
+    The report object is the one ``install_declared_plugins()`` produced at step
+    0.2c — the install that actually happened. Nothing between the two sites
+    mutates it and nothing recomputes it, so moving the SEND does not move the
+    MEASUREMENT.
+
+    Fail-soft is unchanged and load-bearing: ``report_install_outcome`` returns a
+    bool and raises nothing, the boot path does not branch on the result, and the
+    belt-and-braces ``except`` here means even an import failure at this late boot
+    site cannot turn observability into a boot dependency. Exactly ONE POST per
+    serve, no retry loop: a workspace that legitimately never gets a token makes a
+    single attempt, logs the refusal at ``warning`` (runtime#389), and boots on.
+    """
+    if report is None:
+        # install_declared_plugins() raised, so there is no outcome to describe.
+        # The boot-install except arm already printed and emitted the failed
+        # BOOT_STEP. Synthesising an empty report here would post a definitive
+        # "nothing was declared" — exactly the persisted-lie that
+        # plugin_install_report.report_payload's absent-is-not-false rule exists
+        # to prevent.
+        return False
+    try:
+        from molecule_runtime.plugin_install_report import report_install_outcome
+
+        return report_install_outcome(report)
+    except Exception as exc:  # noqa: BLE001 — reporting must never block boot
+        print(
+            f"plugin-install-report: send failed (non-fatal): "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+
+
 # ---------------------------------------------------------------------------
 # E1 — poll-mode inbound delivery (opt-in; default is push).
 # ---------------------------------------------------------------------------
@@ -669,22 +723,19 @@ async def main(prepare_only: bool = False):  # pragma: no cover
     # telemetry: no control-flow, timing, or behavior change to the boot itself.
     from molecule_runtime.boot_step_emit import emit_boot_step
     _BOOT_TOTAL = 8
+    # The boot-install outcome. It is NOT reported to the platform here — the
+    # POST goes out at step 8a, immediately after register_with_platform mints
+    # this workspace's auth token (runtime#390; see the reporting site for the
+    # full rationale). Bound to None BEFORE the try so the later reporting site
+    # is reachable on every path: if install_declared_plugins() raises, the
+    # except arm below runs and the name would otherwise stay unbound, turning
+    # step 8a into a NameError inside the boot path.
+    _plugin_install_report = None
     emit_boot_step("PLG", "Install plugins", "running", step=1, total=_BOOT_TOTAL)
     try:
         _plugin_install_report = install_declared_plugins()
         print(_plugin_install_report.summary(), flush=True)
         emit_boot_step("PLG", "Install plugins", "ok", step=1, total=_BOOT_TOTAL)
-        # Report the outcome to the platform. The summary above goes to stdout,
-        # which boot_step_emit itself notes is invisible on locked-down prod boxes,
-        # and the BOOT_STEP beside it is CONCIERGE-GATED — so before this call the
-        # platform could not answer "did boot-install work on this workspace" for
-        # any ordinary workspace. That is what left molecule-core#4953 with three
-        # proposed-and-retracted explanations. NOT gated on kind (SDK contract
-        # plugin-install-report, concierge_gated:false) and fail-soft: it returns a
-        # bool and raises nothing, and we deliberately do not branch on it.
-        from molecule_runtime.plugin_install_report import report_install_outcome
-
-        report_install_outcome(_plugin_install_report)
     except Exception as e:  # noqa: BLE001 — boot-install must never block boot
         print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
         emit_boot_step(
@@ -1325,6 +1376,36 @@ async def main(prepare_only: bool = False):  # pragma: no cover
             "NET", "Register", "failed", step=7, total=_BOOT_TOTAL,
             message="registration retries exhausted — heartbeat backfill is the recovery path",
         )
+
+    # 8a. Report the step-0.2c declared-plugin boot-install to the platform.
+    #
+    # WHY IT REPORTS: report.summary() went to stdout, which boot_step_emit
+    # itself notes is invisible on locked-down prod boxes, and the BOOT_STEP
+    # beside it is CONCIERGE-GATED — so without this POST the platform could not
+    # answer "did boot-install work on this workspace" for any ordinary
+    # workspace. That is what left molecule-core#4953 with three
+    # proposed-and-retracted explanations. NOT gated on kind (SDK contract
+    # plugin-install-report, concierge_gated:false), and fail-soft: it returns a
+    # bool and raises nothing, and we deliberately do not branch on it.
+    #
+    # WHY HERE AND NOT AT STEP 0.2c (runtime#390): core registers this route
+    # under wsAuth (router.go:581), so it requires the workspace bearer that
+    # register_with_platform above has just minted. Firing it back at 0.2c meant
+    # a first boot POSTed with NO Authorization header and was 401'd, silently,
+    # forever. Placed on the far side of registration and BEFORE heartbeat.start()
+    # so it is still a boot-phase event, still exactly one POST, and now
+    # authenticated. Register having FAILED does not skip the send: a restart
+    # still has the token on the /configs volume, and a genuinely token-less
+    # workspace makes one attempt and moves on (no retry, no spin).
+    #
+    # SIDE EFFECT, intended: prepare mode returns at step 6 and so no longer
+    # reports at all. It never could — it exits before registration, hence
+    # before any token exists. Templates that run `molecule-runtime-prepare`
+    # before the serve (hermes start.sh) were therefore firing TWO 401'd POSTs
+    # per first boot, one per process; now the serve sends exactly one, and it
+    # is authenticated. Both processes run the same install_declared_plugins(),
+    # so the surviving report describes the same tree.
+    _send_plugin_install_report(_plugin_install_report)
 
     heartbeat.agent_card = agent_card_dict
 

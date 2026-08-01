@@ -74,8 +74,32 @@ So the drop arms are now graded by whether an operator can ACT on them:
 
 What did NOT change: the function still returns a bool, still raises nothing, and
 ``main.py`` still does not branch on it. Raising a log level cannot alter control
-flow. There is at most ONE such line per boot — this runs once, after
-``install_declared_plugins()``, not once per boot phase.
+flow. There is at most ONE such line per boot — this runs once per serve, not
+once per boot phase.
+
+WHERE THE CALL SITE IS, AND WHY IT MOVED (runtime#390)
+------------------------------------------------------
+
+``main.py`` sends this AFTER ``register_with_platform``, not inline with
+``install_declared_plugins()``. The contract declares the auth this route takes —
+``"auth": "Authorization: Bearer <workspace scoped token>"`` — and core registers
+it under ``wsAuth``/``middleware.WorkspaceAuth``
+(``workspace-server/internal/router/router.go:581``). That bearer is issued by the
+first successful ``/registry/register`` and persisted by
+``platform_auth.save_token``, so a call made before registration has no token to
+send: ``auth_headers()`` returns an EMPTY dict, the POST goes out with no
+``Authorization`` header, and core refuses it 401. Fail-soft swallowed that 401,
+so on a FIRST boot this module reported nothing, for every workspace, silently.
+
+``auth_headers()``' own docstring is what made the old placement look safe — it
+says a pre-token request is fine because *"the platform's heartbeat handler
+grandfathers pre-token workspaces through"*. True, and irrelevant here: that
+grandfathering is a property of the HEARTBEAT route. Any future caller of
+``auth_headers()`` that fires before registration inherits the same trap.
+
+The MEASUREMENT is still taken at boot-install time — main.py holds the
+``InstallReport`` object install_declared_plugins() returned and hands that exact
+object over later. Only the SEND moved.
 
 The resolved URL is safe to log: it is the platform base plus the workspace id
 (already in every other log line). Credentials live in headers and are never
