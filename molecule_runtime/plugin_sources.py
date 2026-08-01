@@ -517,6 +517,43 @@ def _changed_plugin_names(
     return sorted(names)
 
 
+# How many changed paths to name before truncating. Enough to diagnose a
+# repeating replacement, small enough that a legitimately large update does not
+# bury the rest of the boot log.
+_CHANGED_FILES_LOG_LIMIT = 12
+
+
+def _changed_file_summary(
+    staged: dict[str, str], live: dict[str, str]
+) -> str:
+    """``path (added|removed|modified)`` for each differing file, truncated.
+
+    Naming only the PLUGIN is not enough to diagnose a replacement that repeats
+    every boot: it says something differs, never what. Deployed to production
+    this fired on each boot for one plugin and left the next step to guesswork —
+    stale bytecode, a delivery marker, a carry-forward path — each costing a
+    release cycle to test. The set is already computed to decide the swap, so
+    reporting it is free.
+    """
+    rows: list[str] = []
+    for rel in sorted(set(staged) | set(live)):
+        s, l = staged.get(rel), live.get(rel)
+        if s == l:
+            continue
+        if l is None:
+            rows.append(f"{rel} (added)")
+        elif s is None:
+            rows.append(f"{rel} (removed)")
+        else:
+            rows.append(f"{rel} (modified)")
+    if not rows:
+        return "(no file-level difference — check permissions/symlinks)"
+    shown = rows[:_CHANGED_FILES_LOG_LIMIT]
+    if len(rows) > _CHANGED_FILES_LOG_LIMIT:
+        shown.append(f"... and {len(rows) - _CHANGED_FILES_LOG_LIMIT} more")
+    return "; ".join(shown)
+
+
 def _atomic_swap_dir(staging_dir: Path, target_dir: Path) -> None:
     """Replace ``target_dir`` with ``staging_dir`` as atomically as the platform
     permits.
@@ -1268,8 +1305,10 @@ def install_declared_plugins(
                     "[plugins] live tree REPLACED: %s changed — an MCP server "
                     "already running from the previous tree will keep serving "
                     "the OLD code until the workspace restarts (core#5009); "
-                    "config-only reconcilers do not detect a code-only change",
+                    "config-only reconcilers do not detect a code-only change. "
+                    "Changed: %s",
                     ", ".join(_changed_plugin_names(staged_fp, live_fp)) or "(content)",
+                    _changed_file_summary(staged_fp, live_fp),
                 )
             _atomic_swap_dir(staging_dir, target_dir)
             report.swapped = True
