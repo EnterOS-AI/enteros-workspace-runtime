@@ -20,7 +20,7 @@
   "outcome_rule": "live iff declared && swapped",
   "degraded_rule": "degraded iff live && failed != []",
   "producers": [
-    "molecule-ai-workspace-runtime: molecule_runtime/plugin_install_report.py (report_install_outcome, called from main.py right after install_declared_plugins)"
+    "molecule-ai-workspace-runtime: molecule_runtime/plugin_install_report.py (report_install_outcome, called from main.py AFTER register_with_platform mints the workspace token \u2014 NOT next to install_declared_plugins, whose report object it forwards. The send must follow registration because this endpoint is wsAuth-scoped: auth_headers() returns an empty dict before the token exists, so an earlier send is 401'd and silently dropped by the fail-soft path. See runtime#390/#391.)"
   ],
   "consumers": [
     "molecule-core: workspace-server/internal/handlers/plugin_install_report.go (PluginInstallReportHandler) — POST /workspaces/{workspace_id}/plugin-install-report persists the latest report per workspace (Report); GET /workspaces/{workspace_id}/plugin-install-report reads it back with live+degraded derived (Get). Both are registered on the wsAuth group at workspace-server/internal/router/router.go:581-582. The report is NOT embedded in the workspace read — there is no plugin_install_report field on GET /workspaces/{id}, and no handler issues the fleet query the migration's partial index serves; a consumer that needs either must add it."

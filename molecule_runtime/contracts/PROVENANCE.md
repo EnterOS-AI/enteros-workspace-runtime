@@ -16,6 +16,25 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-08-01 — sdk main `b732851d` (sdk#194)
+
+`plugin-install-report.contract.json` re-fetched. `producers` corrected: it said
+`report_install_outcome` is *"called from main.py right after
+install_declared_plugins"*. That placement WAS the bug (#390): this endpoint is
+`wsAuth`-scoped, `auth_headers()` returns an empty dict before the workspace
+token exists, and registration mints it ~620 lines later — so a send next to the
+install went out unauthenticated, was 401'd, and was silently dropped by the
+fail-soft path. No row was ever written.
+
+The contract already declared `auth: "Authorization: Bearer <workspace scoped
+token>"`, so the old `producers` text contradicted its own auth line. They now
+agree, and the reason is recorded so the ordering is not "simplified" back.
+
+Fixed here in #391. SaaS-only: core's `issueAndInjectToken` pre-writes
+`/configs/.auth_token` on the Docker/self-host path but returns early in
+`saasMode()`, so a self-hosted first boot has a token and reports fine — which
+is why every E2E lane (all Docker-provisioner) missed it.
+
 ## Re-vendor 2026-07-30 — sdk main `a8f4cb82` (sdk#190)
 
 `plugin-install-report.contract.json` re-fetched. Two semantic corrections, not
