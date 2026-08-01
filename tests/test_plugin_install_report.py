@@ -198,6 +198,259 @@ def test_malformed_workspace_id_is_not_interpolated(monkeypatch):
         assert ".." not in call["url"], f"path traversal reached the URL: {call['url']}"
 
 
+# --- 2b. fail-soft is not the same as SILENT --------------------------------
+#
+# The arms below all already returned False and already did not raise, and the
+# tests above proved exactly that — which is why they passed just as happily when
+# every drop was invisible. A workspace that never reported was indistinguishable
+# from one that reported fine, and that is the same blind spot this module was
+# written to close, one level up.
+#
+# So these tests pin the LEVEL and the CONTENT of each arm, and are paired with
+# negative controls (a 2xx and a 404 must NOT warn) so "warn about everything"
+# cannot pass either.
+
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _run_and_capture(caplog, monkeypatch, rec, report=None):
+    """Drive one report_install_outcome and return its WARNING lines."""
+    _install(monkeypatch, rec)
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=pir.__name__):
+        result = pir.report_install_outcome(report or _Report(declared=True, swapped=True))
+    return result, _warnings(caplog)
+
+
+# The actionable arms: each must produce exactly one WARNING that names WHY.
+_ACTIONABLE_ARMS = [
+    pytest.param(
+        lambda: _Recorder(raises=httpx.ConnectError("no route to host")),
+        ["could not reach", "ConnectError"],
+        id="transport-error",
+    ),
+    pytest.param(
+        lambda: _Recorder(raises=httpx.ReadTimeout("slow")),
+        ["could not reach", "ReadTimeout"],
+        id="timeout",
+    ),
+    pytest.param(
+        lambda: _Recorder(response=httpx.Response(401)),
+        ["401", "credentials"],
+        id="401-unauthorized",
+    ),
+    pytest.param(
+        lambda: _Recorder(response=httpx.Response(403)),
+        ["403", "credentials"],
+        id="403-forbidden",
+    ),
+    pytest.param(
+        lambda: _Recorder(response=httpx.Response(500)),
+        ["500"],
+        id="500-server-error",
+    ),
+    pytest.param(
+        lambda: _Recorder(response=httpx.Response(502)),
+        ["502"],
+        id="502-bad-gateway",
+    ),
+]
+
+
+@pytest.mark.parametrize("make_rec,expected_fragments", _ACTIONABLE_ARMS)
+def test_an_actionable_drop_warns(caplog, monkeypatch, make_rec, expected_fragments):
+    """Each actionable drop arm must be visible at WARNING, not whispered at DEBUG."""
+    result, warns = _run_and_capture(caplog, monkeypatch, make_rec())
+    assert result is False
+    assert len(warns) == 1, f"expected exactly one WARNING per boot, got {warns}"
+    for fragment in expected_fragments:
+        assert fragment in warns[0], (
+            f"the warning must say WHY it dropped; {fragment!r} missing from {warns[0]!r}"
+        )
+
+
+@pytest.mark.parametrize("make_rec,_frags", _ACTIONABLE_ARMS)
+def test_an_actionable_drop_names_the_resolved_url(caplog, monkeypatch, make_rec, _frags):
+    """"It dropped" is not actionable; "it dropped talking to X" is.
+
+    The resolved URL is the one thing that separates "pointed at the wrong
+    platform" from "pointed at the right platform and refused".
+    """
+    _result, warns = _run_and_capture(caplog, monkeypatch, make_rec())
+    assert "http://platform.test:8080" in warns[0], (
+        f"the resolved platform URL must appear in the warning: {warns[0]!r}"
+    )
+
+
+def test_a_401_is_not_reported_as_a_version_skew(caplog, monkeypatch):
+    """The distinction that makes the 404 carve-out safe.
+
+    A 404 is a rollout artefact that fixes itself; a 401 never does. If the
+    warning blurs them, an operator waits for a deploy that will not help.
+    """
+    _result, warns = _run_and_capture(
+        caplog, monkeypatch, _Recorder(response=httpx.Response(401))
+    )
+    assert "not a platform-version skew" in warns[0]
+
+
+# --- negative controls: the arms that must STAY quiet ------------------------
+
+
+def test_404_from_an_older_platform_does_not_warn(caplog, monkeypatch):
+    """NEGATIVE CONTROL for the whole section.
+
+    A platform that predates core's handler answers 404 by construction. During a
+    rollout that is correct behaviour, it is not actionable from inside the box,
+    and warning about it trains an operator to ignore this logger — which would
+    cost exactly the visibility the rest of this section buys.
+    """
+    result, warns = _run_and_capture(
+        caplog, monkeypatch, _Recorder(response=httpx.Response(404))
+    )
+    assert result is False
+    assert warns == [], f"a 404 must not warn, got {warns}"
+
+
+def test_404_is_still_logged_somewhere(caplog, monkeypatch):
+    """Quiet-ish, not silent: it must still be greppable at DEBUG, with the URL."""
+    _install(monkeypatch, _Recorder(response=httpx.Response(404)))
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=pir.__name__):
+        pir.report_install_outcome(_Report(declared=True, swapped=True))
+    assert "404" in caplog.text
+    assert "http://platform.test:8080" in caplog.text
+
+
+def test_an_accepted_report_does_not_warn(caplog, monkeypatch):
+    """NEGATIVE CONTROL: the happy path must be silent at WARNING.
+
+    Without this, "log every arm at warning" passes the whole section and every
+    healthy boot emits a warning.
+    """
+    result, warns = _run_and_capture(caplog, monkeypatch, _Recorder(httpx.Response(204)))
+    assert result is True
+    assert warns == [], f"an accepted report must not warn, got {warns}"
+
+
+@pytest.mark.parametrize("code", [200, 201, 202, 204])
+def test_no_2xx_warns(caplog, monkeypatch, code):
+    _result, warns = _run_and_capture(caplog, monkeypatch, _Recorder(httpx.Response(code)))
+    assert warns == [], f"{code} must not warn, got {warns}"
+
+
+# --- the resolution arm ------------------------------------------------------
+
+
+def test_an_unresolvable_workspace_id_warns(caplog, monkeypatch):
+    """The arm that fires on a misprovisioned box, and the likeliest real cause of
+    a silent non-reporter. At debug it looked exactly like a healthy boot."""
+    monkeypatch.setenv("WORKSPACE_ID", "")
+    result, warns = _run_and_capture(caplog, monkeypatch, _Recorder())
+    assert result is False
+    assert len(warns) == 1, f"expected exactly one WARNING, got {warns}"
+    assert "workspace id" in warns[0]
+    assert "WORKSPACE_ID" in warns[0], "the warning must name the env var to fix"
+
+
+def test_a_malformed_workspace_id_warns_rather_than_vanishing(caplog, monkeypatch):
+    """A WORKSPACE_ID that fails the CWE-20 gate resolves to "" and drops. Refusing
+    to interpolate it is right; doing so silently is what made it invisible."""
+    monkeypatch.setenv("WORKSPACE_ID", "../../etc/passwd")
+    result, warns = _run_and_capture(caplog, monkeypatch, _Recorder())
+    assert result is False
+    assert len(warns) == 1, f"expected exactly one WARNING, got {warns}"
+    assert "workspace id" in warns[0]
+
+
+def test_the_resolution_warning_does_not_claim_the_url_was_reached(caplog, monkeypatch):
+    """It dropped BEFORE sending. Saying otherwise sends an operator to the
+    receiver's logs to look for a request that was never made."""
+    monkeypatch.setenv("WORKSPACE_ID", "")
+    _result, warns = _run_and_capture(caplog, monkeypatch, _Recorder())
+    assert "before sending" in warns[0]
+
+
+def test_nothing_is_sent_when_resolution_fails(monkeypatch):
+    """Raising the log level must not have turned a no-op into a request."""
+    monkeypatch.setenv("WORKSPACE_ID", "")
+    rec = _install(monkeypatch, _Recorder())
+    pir.report_install_outcome(_Report(declared=True))
+    assert rec.calls == []
+
+
+# --- the properties raising the level must NOT have changed ------------------
+
+
+_ALL_DROP_ARMS = [
+    pytest.param(lambda: _Recorder(raises=httpx.ConnectError("x")), id="transport"),
+    pytest.param(lambda: _Recorder(raises=httpx.ReadTimeout("x")), id="timeout"),
+    pytest.param(lambda: _Recorder(raises=RuntimeError("unexpected")), id="unexpected-exception"),
+    pytest.param(lambda: _Recorder(response=httpx.Response(400)), id="400"),
+    pytest.param(lambda: _Recorder(response=httpx.Response(401)), id="401"),
+    pytest.param(lambda: _Recorder(response=httpx.Response(403)), id="403"),
+    pytest.param(lambda: _Recorder(response=httpx.Response(404)), id="404"),
+    pytest.param(lambda: _Recorder(response=httpx.Response(500)), id="500"),
+]
+
+
+@pytest.mark.parametrize("make_rec", _ALL_DROP_ARMS)
+def test_every_drop_arm_is_still_fail_soft(monkeypatch, make_rec):
+    """The invariant the whole module rests on, restated across every arm.
+
+    A log level cannot change control flow — but this is cheap, and the boot path
+    calls this function without branching on it, so "returns a bool and raises
+    nothing" is the property that keeps a network blip from stopping a boot.
+    """
+    _install(monkeypatch, make_rec())
+    assert pir.report_install_outcome(_Report(declared=True, swapped=True)) is False
+
+
+@pytest.mark.parametrize("make_rec", _ALL_DROP_ARMS)
+def test_no_drop_arm_logs_more_than_one_line_per_boot(caplog, monkeypatch, make_rec):
+    """This runs ONCE per boot, after install_declared_plugins — not once per
+    phase. One line is a signal; a burst is noise an operator filters out."""
+    _result, warns = _run_and_capture(caplog, monkeypatch, make_rec())
+    assert len(warns) <= 1, f"more than one warning for a single boot: {warns}"
+
+
+@pytest.mark.parametrize("make_rec", _ALL_DROP_ARMS)
+def test_no_drop_arm_leaks_the_workspace_token(caplog, monkeypatch, make_rec):
+    """The resolved URL is safe to log; the Authorization header is not."""
+    _install(monkeypatch, make_rec())
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=pir.__name__):
+        pir.report_install_outcome(_Report(declared=True, swapped=True))
+    assert "tok-xyz" not in caplog.text, "the workspace token reached the log"
+
+
+def test_an_unexpected_exception_still_warns_with_its_type(caplog, monkeypatch):
+    """Not just httpx errors — a bug in report_payload or platform_auth lands here
+    too, and naming the exception type is what makes it triageable."""
+    _result, warns = _run_and_capture(
+        caplog, monkeypatch, _Recorder(raises=RuntimeError("auth_headers blew up"))
+    )
+    assert len(warns) == 1
+    assert "RuntimeError" in warns[0]
+    assert "auth_headers blew up" in warns[0]
+
+
+def test_a_pre_url_failure_says_the_url_was_unresolved(caplog, monkeypatch):
+    """An exception raised before the URL exists must not print a half-built one."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("resolver exploded")
+
+    monkeypatch.setattr(pir, "path_template", _boom)
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=pir.__name__):
+        assert pir.report_install_outcome(_Report(declared=True)) is False
+    warns = _warnings(caplog)
+    assert len(warns) == 1
+    assert "unresolved" in warns[0]
+
+
 # --- 3. the payload is contract-driven --------------------------------------
 
 

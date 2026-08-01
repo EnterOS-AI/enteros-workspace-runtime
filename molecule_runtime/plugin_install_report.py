@@ -51,6 +51,35 @@ the 404 that occurs on a platform older than core's handler. Observability must
 never become a boot dependency: a workspace that cannot report its plugin state
 must still boot with the plugins it has. This module therefore returns a bool and
 raises nothing, and the call site does not branch on it.
+
+FAIL-SOFT IS NOT THE SAME AS SILENT
+-----------------------------------
+
+Fail-soft was originally implemented as *fail-quiet*: every drop arm logged at
+``debug``, so a workspace that never reported looked exactly like a workspace that
+reported fine. That turned this module — whose entire purpose is to answer "did
+boot-install work here?" — into something that could itself fail invisibly, which
+is the same blind spot one level up.
+
+So the drop arms are now graded by whether an operator can ACT on them:
+
+* ``warning`` — **resolution failure** (no platform URL or no workspace id: the box
+  is misconfigured), **401/403** (the receiver rejected our credentials), **400**
+  (we sent a malformed payload — see ``report_payload``), any **other non-2xx**,
+  and any **transport exception**. Each names the arm, the reason, the resolved
+  URL, and the status code where there is one.
+* ``debug`` — **404**. A platform that predates core's handler answers 404 by
+  construction; it is expected during a rollout, not a misconfiguration, and it is
+  not actionable from inside the box.
+
+What did NOT change: the function still returns a bool, still raises nothing, and
+``main.py`` still does not branch on it. Raising a log level cannot alter control
+flow. There is at most ONE such line per boot — this runs once, after
+``install_declared_plugins()``, not once per boot phase.
+
+The resolved URL is safe to log: it is the platform base plus the workspace id
+(already in every other log line). Credentials live in headers and are never
+logged.
 """
 
 from __future__ import annotations
@@ -204,9 +233,19 @@ def report_install_outcome(
 ) -> bool:
     """POST the boot-install outcome. Returns True iff the platform accepted it.
 
-    Never raises. The return value is for tests and for a debug log line — the
-    boot path deliberately ignores it.
+    Never raises. The return value is for tests and for a log line — the boot path
+    deliberately ignores it.
+
+    Every drop is logged. Actionable drops (resolution failure, 401/403, 400, any
+    other non-2xx, transport error) log at ``warning`` and name the arm, the
+    reason, the resolved URL and the status code; an expected 404 from a platform
+    older than core's handler stays at ``debug``. See the module docstring.
     """
+    # Tracked outside the try so the transport-exception arm can name the URL it
+    # was talking to. "" until resolution succeeds — an exception raised during
+    # resolution genuinely has no URL to report, and saying so is more honest than
+    # printing a half-built one.
+    url = ""
     try:
         # Reuse boot_step_emit's resolvers rather than re-deriving them: the
         # Docker-aware PLATFORM_URL fallback and the CWE-20 workspace-id
@@ -220,8 +259,25 @@ def report_install_outcome(
         base = (platform_url or _resolve_platform_url() or "").rstrip("/")
         wsid = workspace_id or _resolve_workspace_id()
         if not base or not wsid:
-            logger.debug(
-                "plugin-install-report: no platform url or workspace id — not reporting"
+            # Actionable: the box cannot address the platform at all. In practice
+            # this is the workspace id — _resolve_platform_url() falls back to a
+            # Docker/localhost default and so effectively never returns "" —
+            # meaning WORKSPACE_ID is unset, or set to something
+            # validate_workspace_id rejects. Either is a provisioning bug an
+            # operator fixes, and at debug it was indistinguishable from success.
+            unresolved = ", ".join(
+                name
+                for name, ok in (("platform url", bool(base)), ("workspace id", bool(wsid)))
+                if not ok
+            )
+            logger.warning(
+                "plugin-install-report: DROPPED before sending — could not resolve %s "
+                "(platform url=%r, workspace id=%r). Nothing was recorded for this "
+                "workspace; check PLATFORM_URL / WORKSPACE_ID in the container "
+                "environment (a WORKSPACE_ID that fails validation resolves to empty)",
+                unresolved,
+                base,
+                wsid,
             )
             return False
 
@@ -244,21 +300,56 @@ def report_install_outcome(
         if resp.status_code == 400:
             # 400 means WE sent a malformed report — in practice, a required
             # field omitted because InstallReport drifted (see report_payload).
-            # That is a runtime bug and the one non-2xx worth a warning; the
-            # authoritative copy is core's own request log, which is readable.
+            # That is a runtime bug; the authoritative copy is core's own request
+            # log, which is readable where this box's stdout is not.
             logger.warning(
-                "plugin-install-report: platform REFUSED the report (400) — the "
-                "payload is malformed, most likely an InstallReport field that no "
-                "longer exists; nothing was recorded for this workspace"
+                "plugin-install-report: DROPPED — platform REFUSED the report (400) "
+                "at POST %s. The payload is malformed, most likely an InstallReport "
+                "field that no longer exists (see the omission warning above); "
+                "nothing was recorded for this workspace",
+                url,
             )
             return False
-        # A 404 is the expected shape against a platform that predates core's
-        # handler. Debug, not warning: it is not actionable from inside the box,
-        # and boot_step_emit's note about invisible stdout applies here too.
-        logger.debug(
-            "plugin-install-report: platform returned %s — dropped", resp.status_code
+        if resp.status_code == 404:
+            # The expected shape against a platform that predates core's handler.
+            # Debug, not warning: during a rollout this is correct behaviour, not
+            # a misconfiguration, and it is not actionable from inside the box.
+            logger.debug(
+                "plugin-install-report: platform has no handler at %s (404) — "
+                "dropped; expected on a platform older than core's "
+                "plugin-install-report handler",
+                url,
+            )
+            return False
+        if resp.status_code in (401, 403):
+            # Actionable and NOT self-healing: the box is talking to the right
+            # place and being refused. Distinct from 404 — a rollout does not fix
+            # this, an operator does.
+            logger.warning(
+                "plugin-install-report: DROPPED — platform REJECTED our credentials "
+                "(%s) at POST %s. This is a workspace-token/auth misconfiguration, "
+                "not a platform-version skew; nothing was recorded for this "
+                "workspace",
+                resp.status_code,
+                url,
+            )
+            return False
+        logger.warning(
+            "plugin-install-report: DROPPED — platform returned %s at POST %s; "
+            "nothing was recorded for this workspace",
+            resp.status_code,
+            url,
         )
         return False
     except Exception as exc:  # noqa: BLE001 — reporting must never break boot
-        logger.debug("plugin-install-report: not reported (%s)", exc)
+        # Connection refused, DNS failure, timeout, TLS error — or a failure in
+        # resolution/import before the URL existed. All actionable: the report
+        # never reached the platform and no row will appear for this workspace.
+        logger.warning(
+            "plugin-install-report: DROPPED — could not reach the platform at %s: "
+            "%s: %s. Nothing was recorded for this workspace",
+            url or "<url unresolved>",
+            type(exc).__name__,
+            exc,
+        )
         return False
