@@ -479,3 +479,78 @@ def test_replaced_warning_is_not_logged_when_the_swap_fails(monkeypatch, tmp_pat
     assert not any("REPLACED" in m for m in msgs), (
         f"logged a replacement that never happened; got {msgs}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Live-only plugin directories (code-review finding, 2026-08-01)
+#
+# install_declared_plugins runs at boot step 0.2c; the plugin REGISTRY later
+# raw-drops non-declared plugins straight into the LIVE tree. On the second
+# boot-install pass live is then a superset of staging, the fingerprints differ,
+# and the swap runs — orphaning every MCP server hermes spawned between the two
+# passes. That is the core#5009 symptom, still reaching those workspaces.
+#
+# The fix must NOT simply ignore every live-only directory: full-replace exists
+# so a DE-DECLARED plugin stops lingering. The two cases look identical to a set
+# difference, so the declared set is recorded in the tree itself.
+# ---------------------------------------------------------------------------
+def test_raw_dropped_plugin_does_not_force_a_swap(monkeypatch, tmp_path, caplog):
+    """A plugin the registry dropped in must not trigger a swap of everything else."""
+    _patch_git(
+        monkeypatch,
+        lambda url, ref, cmd, env: _make_repo(
+            {"plugin.yaml": _MANIFEST, "mcp/server.py": b"print('v1')\n"}
+        ),
+    )
+    plugins_dir = tmp_path / "plugins"
+    _install(plugins_dir)
+    live = plugins_dir / "repo"
+    before = _inode(live)
+
+    # Exactly what plugins_registry/raw_drop.py does, after boot-install.
+    raw = plugins_dir / "some-raw-dropped-plugin"
+    (raw / "sub").mkdir(parents=True)
+    (raw / "sub" / "tool.py").write_bytes(b"print('raw')\n")
+
+    with caplog.at_level(logging.INFO, logger="molecule_runtime.plugin_sources"):
+        report = _install(plugins_dir)
+
+    assert report.swapped is True
+    assert _inode(live) == before, (
+        "a raw-dropped plugin made live a superset of staging, so the whole tree "
+        "was swapped and every MCP server spawned since boot-install was orphaned"
+    )
+    assert (raw / "sub" / "tool.py").exists(), "the raw-dropped plugin was deleted"
+
+
+def test_de_declared_plugin_is_still_removed(monkeypatch, tmp_path):
+    """Full-replace must still drop a plugin that is no longer declared.
+
+    This is the property that makes 'ignore every live-only directory' wrong,
+    so it is pinned explicitly.
+    """
+    both = {"a": True}
+    def repo(url, ref, cmd, env):
+        name = url.rstrip("/").rsplit("/", 1)[-1].replace(".git", "")
+        return _make_repo({
+            "plugin.yaml": b"name: %s\ndescription: d\nversion: 0.1.0\n" % name.encode(),
+            "f.txt": b"x\n",
+        })
+    _patch_git(monkeypatch, repo)
+    plugins_dir = tmp_path / "plugins"
+    ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/keep,gitea://owner/drop"},
+    )
+    assert (plugins_dir / "keep").is_dir() and (plugins_dir / "drop").is_dir()
+
+    # `drop` is de-declared.
+    report = ps.install_declared_plugins(
+        plugins_dir=plugins_dir,
+        env={"MOLECULE_DECLARED_PLUGINS": "gitea://owner/keep"},
+    )
+    assert report.swapped is True
+    assert (plugins_dir / "keep").is_dir()
+    assert not (plugins_dir / "drop").exists(), (
+        "a de-declared plugin lingered — full-replace semantics were lost"
+    )
