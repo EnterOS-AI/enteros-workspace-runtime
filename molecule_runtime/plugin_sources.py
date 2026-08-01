@@ -578,6 +578,53 @@ def _tree_fingerprint(root: Path) -> tuple[dict[str, str], bool]:
     return out, readable
 
 
+# Records which plugin names boot-install DECLARED at the last promotion. It
+# lives inside the plugins tree so it shares that tree's exact lifetime: a disk
+# wipe drops both together and we can never reason from stale history.
+#
+# It exists to tell two live-only directories apart, which a set difference
+# cannot:
+#   * DE-DECLARED — installed from a declared source before, no longer declared.
+#     Full-replace must still remove it.
+#   * FOREIGN — never declared; the plugin registry raw-drops these straight
+#     into the LIVE tree AFTER boot-install (plugins_registry/raw_drop.py). On
+#     the second boot-install pass live is then a superset of staging, so the
+#     fingerprints differ and the swap runs — orphaning every MCP server hermes
+#     spawned between the two passes. That is the core#5009 symptom still
+#     reaching those workspaces, and treating foreign dirs as a difference is
+#     what caused it.
+_DECLARED_MARKER = ".molecule-declared.json"
+
+
+def _read_declared_marker(root: Path) -> set[str] | None:
+    """Declared names at the last promotion, or None when unknown."""
+    try:
+        raw = (root / _DECLARED_MARKER).read_text(encoding="utf-8")
+        names = json.loads(raw).get("declared")
+        return set(names) if isinstance(names, list) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_declared_marker(root: Path, names) -> None:
+    try:
+        (root / _DECLARED_MARKER).write_text(
+            json.dumps({"declared": sorted(set(names))}), encoding="utf-8"
+        )
+    except OSError as exc:  # never fail a boot over metadata
+        log.warning("[plugins] could not write %s (%s)", _DECLARED_MARKER, exc)
+
+
+def _top_level(rel: str) -> str:
+    return rel.split("/", 1)[0]
+
+
+def _managed_only(fp: dict[str, str], managed: set[str]) -> dict[str, str]:
+    """The fingerprint restricted to directories staging actually manages."""
+    return {k: v for k, v in fp.items()
+            if _top_level(k) in managed and _top_level(k) != _DECLARED_MARKER}
+
+
 def _changed_plugin_names(
     staged: dict[str, str], live: dict[str, str]
 ) -> list[str]:
@@ -1405,7 +1452,41 @@ def install_declared_plugins(
                 rel: dig for rel, dig in live_fp.items()
                 if not (_is_generated_bytecode(rel) and rel not in staged_fp)
             }
-        if live_fp is not None and staged_ok and live_ok and staged_fp == live_fp:
+        # Restrict the comparison to what staging MANAGES. A live-only
+        # directory is either de-declared (must still be removed by
+        # full-replace) or foreign (raw-dropped by the plugin registry after
+        # boot-install, and must not drag the whole tree through a swap that
+        # orphans every MCP server spawned since). The marker written at the
+        # last promotion is what tells those apart.
+        managed = {p.name for p in _iter_dirs(staging_dir)}
+        live_only = (
+            {p.name for p in _iter_dirs(target_dir)} - managed
+            if target_dir.is_dir() else set()
+        )
+        prev_declared = _read_declared_marker(target_dir)
+        # Unknown history (first boot on this version, wiped disk) is treated
+        # conservatively: every live-only dir counts, i.e. today's behaviour.
+        de_declared = live_only if prev_declared is None else (live_only & prev_declared)
+        if de_declared:
+            log.info(
+                "[plugins] %s no longer declared — promoting so full-replace "
+                "removes %s", ", ".join(sorted(de_declared)), "it" if len(de_declared) == 1 else "them",
+            )
+        elif live_only:
+            log.info(
+                "[plugins] ignoring %d live-only plugin dir(s) not managed by "
+                "boot-install (%s) — they were never declared, so they do not "
+                "justify a swap that would orphan running MCP servers",
+                len(live_only), ", ".join(sorted(live_only)),
+            )
+        _write_declared_marker(staging_dir, managed)
+        if (
+            live_fp is not None
+            and staged_ok
+            and live_ok
+            and not de_declared
+            and _managed_only(staged_fp, managed) == _managed_only(live_fp, managed)
+        ):
             log.info(
                 "[plugins] live tree already matches the staged build (%d file(s), "
                 "%d plugin(s)) — skipping the swap so running MCP servers keep "
