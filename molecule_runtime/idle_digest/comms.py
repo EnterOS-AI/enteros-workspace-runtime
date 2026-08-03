@@ -23,7 +23,7 @@ imports are byte-behaviour-identical.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Optional, Protocol
 
 #: Default no-reply age (seconds) beyond which a sent delegation is flagged
 #: "target agent may have an issue" (matches the server default and the
@@ -49,6 +49,19 @@ class MailSummary:
 
     received_unread: int = 0
     replies_unread: int = 0
+    #: core#5028 — per-message IDENTITY for the same unread set the two counts
+    #: above aggregate: a capped, NEWEST-FIRST tuple of dicts carrying ``id``
+    #: (always present, the server row id), ``message_id`` (the a2a messageId
+    #: when the sender supplied one), ``sender_id`` and ``method``. Ids only —
+    #: never bodies; the D5 "counts + a pull instruction" rule is unchanged.
+    #:
+    #: ``None`` vs ``()`` IS LOAD-BEARING, do not collapse it:
+    #:   None  the server did not project the field — an OLD server. The
+    #:         inbound provider degrades to a count-only identity and LOGS a
+    #:         warning, because a silent permanent fallback is exactly how
+    #:         ``overdue_count`` looked fixed for a month while it wasn't.
+    #:   ()    an upgraded server with nothing unread. A fact, not a skew.
+    received: Optional[tuple] = None  # of dict: id, message_id, sender_id, method
     sent_awaiting_reply: int = 0
     #: a SAMPLE of the overdue sends, capped server-side for naming offenders.
     overdue: tuple = ()  # of dict: delegation_id, target_workspace_id, age_seconds

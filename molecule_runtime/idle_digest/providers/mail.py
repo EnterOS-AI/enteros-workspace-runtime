@@ -19,21 +19,34 @@ When the comms layer becomes a plugin, its implementation replaces the binding
 in one place — the providers, their contract envelopes (tiers 2/3, reserved
 ids), and their tests do not move.
 
-Delta hygiene: counts and overdue delegation-id sets ARE the signal — they go
-into ``item_ids`` so the digest re-fires when mail state actually changes and
-stays silent otherwise. Ages appear ONLY as :class:`AgeBand` enums (assembler
-rule: raw ages resurrect the steady-state nag loop).
+Delta hygiene: counts AND per-item identity sets are the signal — both go into
+``item_ids`` so the digest re-fires when mail state actually changes and stays
+silent otherwise. Ages appear ONLY as :class:`AgeBand` enums (assembler rule:
+raw ages resurrect the steady-state nag loop).
+
+A COUNT IS NOT AN IDENTITY (core#5028). ``item_ids`` feeds the assembler's
+content hash, so whatever is in that tuple is what the digest can tell apart.
+The inbound provider used to put ONLY counts there, which made the change
+detector a hash of a number: if the agent reads one message and one new one
+arrives between two ticks, the count is unchanged, the hash is unchanged, and a
+brand-new inbound is NEVER surfaced. The sent provider already carried real
+per-delegation ids beside its count for exactly this reason; both halves now do.
+Counts stay in the tuple — they catch a change the server-capped id sample can
+miss — but they are no longer the whole identity.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
 from ..contract import AgeBand, Band, Contribution, PullInstruction, Urgency
+
+logger = logging.getLogger(__name__)
 
 # D3 mail-plugin seam precursor: the stable comms contract now lives in
 # ``molecule_runtime.idle_digest.comms`` so the mail plugin (which owns the
@@ -128,12 +141,24 @@ class PlatformMailSummarySource:
                 summary = MailSummary(
                     received_unread=int(data.get("received_unread", 0) or 0),
                     replies_unread=int(data.get("replies_unread", 0) or 0),
+                    # core#5028: ABSENT (old server) must stay None; PRESENT but
+                    # empty must become (). `data.get("received") or ()` would
+                    # collapse both to () and make the skew undetectable — which
+                    # is precisely the shape of mistake that let the
+                    # overdue_count fallback run silently forever.
+                    received=(
+                        tuple(data["received"] or ())
+                        if isinstance(data.get("received"), list)
+                        else None
+                    ),
                     sent_awaiting_reply=int(data.get("sent_awaiting_reply", 0) or 0),
                     overdue=tuple(data.get("overdue") or ()),
                     overdue_count=int(
                         # The TRUE uncapped total. Falls back to the list length
                         # only for a server that predates the field — rendering
                         # len(list) is what under-reported 25 overdue as "10".
+                        # The server DOES emit it as of core#5028; before that
+                        # this fallback was permanent, not vestigial.
                         data.get("overdue_count", len(data.get("overdue") or ()))
                         or 0
                     ),
@@ -167,9 +192,41 @@ def _age_band_for_seconds(age: int) -> AgeBand:
     return AgeBand.OVER_1D
 
 
+#: The item_ids marker emitted when the server did not project per-message
+#: identities. It rides the delta hash ON PURPOSE: it is a real change in what
+#: the digest can see, and when the server is finally upgraded the marker
+#: disappearing re-fires the digest once — which is correct, the section's
+#: information content just changed.
+_RECV_IDENTITY_UNAVAILABLE = "recv-identity:UNAVAILABLE"
+
+
+def _received_item_ids(received: tuple) -> list[str]:
+    """The per-message identity half of the inbound delta signal (core#5028).
+
+    Prefers the a2a ``message_id`` (the id a tenant-side reconciler correlates
+    against its own ledger) and falls back to the server row ``id``, which is
+    ALWAYS present. Falling back to the count for an id-less message would
+    reintroduce the defect for exactly those messages. SORTED, so the server's
+    newest-first ordering is not itself a change signal.
+    """
+    ids = []
+    for m in received:
+        if not isinstance(m, dict):
+            continue
+        ident = str(m.get("message_id") or m.get("id") or "").strip()
+        if ident:
+            ids.append(f"msg:{ident}")
+    return sorted(set(ids))
+
+
 @dataclass
 class InboundMailProvider:
-    """``inbound-a2a`` (tier 3): unread received + unread replies, as counts."""
+    """``inbound-a2a`` (tier 3): unread received + unread replies.
+
+    The digest LINE is counts (D5, unchanged). The digest's change-detection
+    IDENTITY is per-message ids (core#5028) — those are different jobs and
+    conflating them is the bug this provider used to have.
+    """
 
     source: CommsSummarySource
     provider_id: str = field(default=INBOUND_PROVIDER_ID, init=False)
@@ -192,6 +249,33 @@ class InboundMailProvider:
             "You have " + " and ".join(parts) + ". "
             "Use the Molecules AI workspace communication MCP to see detail."
         )
+        # THE core#5028 FIX. The counts stay in item_ids — they catch a change
+        # the server-capped id sample can miss — but they are no longer the
+        # WHOLE identity. A count alone made the digest's change-detection hash
+        # a hash of a number: read one message, receive one new one between two
+        # ticks, and the count (so the hash) is unchanged and a brand-new
+        # inbound is NEVER surfaced. This mirrors the sent side below, which has
+        # carried real per-item ids next to its count for exactly this reason.
+        count_ids = [f"recv:{s.received_unread}", f"replies:{s.replies_unread}"]
+        received = getattr(s, "received", None)
+        if received is None:
+            # VERSION SKEW: the server did not project identities at all. Fall
+            # back to today's count-only behaviour rather than crashing — but
+            # LOUDLY. `overdue_count` is the cautionary tale: the runtime has
+            # carried a "only for a server that predates the field" fallback
+            # since #4308, the server never emitted the field, and the silent
+            # permanent fallback let everyone believe the bug was fixed while
+            # it was still live. A degraded mode nobody can see is not a
+            # degraded mode, it is an undetected outage.
+            logger.warning(
+                "idle-digest inbound-a2a: mail summary carries NO per-message "
+                "identities (`received` absent) — falling back to COUNT-ONLY "
+                "change detection. A read + a new arrival between ticks will "
+                "not re-fire the digest (core#5028). Upgrade workspace-server."
+            )
+            item_ids = tuple(count_ids + [_RECV_IDENTITY_UNAVAILABLE])
+        else:
+            item_ids = tuple(count_ids + _received_item_ids(received))
         return [
             Contribution(
                 provider_id=self.provider_id,
@@ -201,9 +285,7 @@ class InboundMailProvider:
                 count=s.received_unread + s.replies_unread,
                 summary=summary,
                 age_band=AgeBand.NONE,
-                # counts ARE the delta signal: a change re-fires the digest,
-                # steady state stays silent.
-                item_ids=(f"recv:{s.received_unread}", f"replies:{s.replies_unread}"),
+                item_ids=item_ids,
                 pull=PullInstruction(
                     tool="inbox_peek",
                     instruction="Peek the unread inbox (received messages + delegation replies) before acting.",
