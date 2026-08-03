@@ -94,14 +94,40 @@ capability, and the platform's central scheduler defers for this workspace
 ## Durable state: one directory, two writers
 
 The schedule grid, poke queue, run history, and health heartbeat all live in
-**one per-workspace directory on the persisted config volume**, resolved by
+**one per-workspace directory on a durable volume**, resolved by
 `molecule_runtime.trigger_state.resolve_trigger_state_dir()`:
 
 - `MOLECULE_TRIGGER_STATE_DIR` wins when set — this is also the env var the
   runtime injects into the trigger daemon subprocess, so the daemon resolves
   exactly the directory the API resolved;
-- otherwise it is `<configs_dir>/schedules` (`/configs/schedules` in a
-  managed container).
+- otherwise it is `<plugin-state root>/.trigger-state`, on the durable
+  plugin-state volume the provisioner declares via
+  `MOLECULE_PLUGIN_STATE_ROOT` (`/home/agent/.molecule/plugin-state/.trigger-state`
+  in a managed container). The `.trigger-state` name is RESERVED and is
+  deliberately not a plugin name: this grid belongs to the WORKSPACE, not to
+  whichever `kind: trigger` plugin happens to be installed, so keying it on a
+  manifest name would orphan every schedule the day that plugin is swapped;
+- otherwise — no durable root declared, or the durability probe refutes the
+  declaration — it falls back to the legacy `<configs_dir>/schedules`
+  (`/configs/schedules`), so a control plane predating the plugin-state
+  contract behaves exactly as before.
+
+**Why not `/configs` any more** (molecule-ai-workspace-runtime#370,
+molecule-ai/molecule-core#5036): `workspaceTeardownVolumes` in the control
+plane's local-docker provisioner removes the `/configs` and `/workspace` named
+volumes on *every* teardown, including a plain restart — only `mol-ws-pstate-*`
+and `mol-ws-rtstate-*` survive. A grid rooted on `/configs` was therefore
+destroyed on every restart, taking user-created `source='runtime'` schedules,
+the last-fire watermark (so survivors miss or double-fire), the poke queue and
+the run history with it, silently. A `config_dir: existing-volume` restart
+response does not contradict this — it only means core selected no template,
+not that the provisioner preserved the volume.
+
+On first resolve after upgrading, a grid still sitting at the legacy
+`/configs/schedules` is **copied** onto the durable root (never moved, and never
+over an existing destination file — `/configs` is re-seeded from the org
+template on every provision, so a stale copy can reappear and must not revert
+later edits).
 
 Files in that directory (names from `molecule_runtime.trigger_state` and
 `molecule_runtime.internal_schedules`):
