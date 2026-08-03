@@ -828,15 +828,138 @@ _TRANSIENT_HTTP_ERRORS: tuple[type[Exception], ...] = (
 # Retry budget. Up to 5 attempts (1 initial + 4 retries) with
 # exponential backoff (1, 2, 4, 8 seconds), each backoff jittered ±25%
 # to prevent synchronized retry storms across siblings if a peer flaps.
-# _DELEGATE_TOTAL_BUDGET_S caps cumulative wall-clock so a string of
+# The total budget caps cumulative wall-clock so a string of
 # ReadTimeouts can't make the caller wait 25 minutes — once the
 # deadline elapses we stop retrying even if attempts remain. 600s = 10
 # minutes is the agreed worst case the caller can tolerate before
 # falling back to "peer unavailable" handling in tool_delegate_task.
-_DELEGATE_MAX_ATTEMPTS = 5
+#
+# core#5029: these were hardcoded, so an operator watching long
+# multi-tool-call turns die on the ceiling could not widen it without a
+# code change and a redeploy. They are now env-tunable, following the
+# same read-with-default convention as builtin_tools/delegation.py's
+# DELEGATION_TIMEOUT / a2a_tools_delegation.py's _SYNC_POLL_BUDGET_S.
+#
+# The DEFAULTS below are exactly the pre-#5029 hardcoded values —
+# nothing changes for an operator who sets nothing. The names are
+# A2A_DELEGATE_*-scoped rather than reusing the DELEGATION_* family
+# because DELEGATION_TIMEOUT already governs a DIFFERENT mechanism
+# (builtin_tools.delegation's per-task timeout and the inbox-poll
+# budget); one env var silently retuning two unrelated ceilings is the
+# kind of coupling that makes an incident unreadable.
+_DELEGATE_MAX_ATTEMPTS_DEFAULT = 5
 _DELEGATE_BACKOFF_BASE_S = 1.0
 _DELEGATE_BACKOFF_CAP_S = 16.0
-_DELEGATE_TOTAL_BUDGET_S = 600.0
+_DELEGATE_TOTAL_BUDGET_S_DEFAULT = 600.0
+# Per-attempt patience for the peer's first response byte. This is the
+# ceiling a single long reasoning turn actually hits first: with the
+# defaults, a turn that needs >300s of upstream think time burns a whole
+# attempt on a ReadTimeout, and two of those exhaust the 600s budget.
+_DELEGATE_READ_TIMEOUT_S_DEFAULT = 300.0
+# Connect/write/pool are deliberately NOT tunable: a peer that cannot
+# complete a TCP handshake in 30s is down, not slow, and widening that
+# only delays the diagnosis.
+_DELEGATE_CONNECT_TIMEOUT_S = 30.0
+
+_ENV_DELEGATE_MAX_ATTEMPTS = "A2A_DELEGATE_MAX_ATTEMPTS"
+_ENV_DELEGATE_TOTAL_BUDGET = "A2A_DELEGATE_TOTAL_BUDGET"
+_ENV_DELEGATE_READ_TIMEOUT = "A2A_DELEGATE_READ_TIMEOUT"
+
+
+def _env_positive_number(name: str, default: float, *, cast=float):
+    """Read a positive numeric env var, degrading to ``default``.
+
+    Read lazily (per call, not at import) so an operator can set the
+    knob in the workspace env without depending on import ordering, and
+    so the DEFAULT path — the one production runs — is directly
+    testable with the variable unset rather than only via an injected
+    override.
+
+    A missing, blank, unparseable or non-positive value falls back to
+    the documented default and logs once at WARNING. Silently accepting
+    ``A2A_DELEGATE_TOTAL_BUDGET=0`` would collapse the budget and turn
+    every delegation into an instant failure — a typo must not be a
+    more aggressive ceiling than the default.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = cast(raw.strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a number — falling back to the default %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if value <= 0:
+        logger.warning(
+            "%s=%r must be positive — falling back to the default %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
+def _delegate_max_attempts() -> int:
+    """Effective retry attempt cap (1 initial + N-1 retries)."""
+    return _env_positive_number(
+        _ENV_DELEGATE_MAX_ATTEMPTS, _DELEGATE_MAX_ATTEMPTS_DEFAULT, cast=int
+    )
+
+
+def _delegate_total_budget_s() -> float:
+    """Effective cumulative wall-clock budget across all attempts."""
+    return _env_positive_number(
+        _ENV_DELEGATE_TOTAL_BUDGET, _DELEGATE_TOTAL_BUDGET_S_DEFAULT
+    )
+
+
+def _delegate_read_timeout_s() -> float:
+    """Effective per-attempt read (first-byte) timeout."""
+    return _env_positive_number(
+        _ENV_DELEGATE_READ_TIMEOUT, _DELEGATE_READ_TIMEOUT_S_DEFAULT
+    )
+
+
+def _http_status_cause(status_code: int) -> str:
+    """Name the operator-actionable cause behind a non-2xx proxy status.
+
+    core#5029: "provider failure after retries" is unresolvable from
+    the outside precisely because rate-limiting, an upstream timeout
+    and a generic upstream error all rendered as the same string. The
+    remedies differ (raise quota / widen the ceiling / read the peer's
+    logs), so the terminal message must say which one happened.
+    """
+    if status_code == 429:
+        return "upstream_rate_limited"
+    if status_code in (408, 504, 524, 598):
+        return "upstream_timeout"
+    if status_code == 503:
+        return "upstream_unavailable"
+    if 400 <= status_code < 500:
+        return "upstream_client_error"
+    return "upstream_error"
+
+
+def _proxy_status_annotation(resp, elapsed_s: float, max_attempts: int) -> str:
+    """Build the ``(cause=... elapsed=... attempts=...)`` fragment that
+    makes a non-2xx A2A proxy response diagnosable."""
+    cause = _http_status_cause(resp.status_code)
+    parts = [f"cause={cause}"]
+    try:
+        retry_after = resp.headers.get("retry-after")
+    except Exception:  # pragma: no cover - defensive, headers is a mapping
+        retry_after = None
+    if retry_after:
+        parts.append(f"retry_after={retry_after}")
+    parts.append(f"elapsed={elapsed_s:.1f}s")
+    parts.append(f"attempts=1/{max_attempts}")
+    return " ".join(parts)
 
 
 def _delegate_backoff_seconds(attempt_zero_indexed: int) -> float:
@@ -894,12 +1017,17 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
     operators pass it explicitly so each registered workspace's peers
     are reached via their own auth chain.
 
-    Auto-retries up to _DELEGATE_MAX_ATTEMPTS times on transient
-    transport-layer errors (RemoteProtocolError, ConnectError,
+    Auto-retries up to A2A_DELEGATE_MAX_ATTEMPTS (default 5) times on
+    transient transport-layer errors (RemoteProtocolError, ConnectError,
     ReadTimeout, etc.) with exponential-backoff + jitter, capped by
-    _DELEGATE_TOTAL_BUDGET_S. Application-level failures (HTTP 4xx,
-    JSON-RPC error response, malformed JSON) are NOT retried — they
-    indicate a deterministic problem retry won't fix.
+    A2A_DELEGATE_TOTAL_BUDGET (default 600s). Application-level failures
+    (HTTP 4xx, JSON-RPC error response, malformed JSON) are NOT retried
+    — they indicate a deterministic problem retry won't fix.
+
+    core#5029: every terminal failure carries a ``cause=`` discriminator
+    plus elapsed wall-clock and the attempt count, so an operator can
+    tell rate-limiting from an upstream timeout from local retry-budget
+    exhaustion without gateway access.
     """
     safe_id = _validate_peer_id(peer_id)
     if safe_id is None:
@@ -910,11 +1038,25 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
     # Fix F (Cycle 5 / H2 — flagged 5 consecutive audits): timeout=None allowed
     # a hung upstream to block the agent indefinitely. Use a generous but bounded
     # timeout: 30s connect + 300s read (long enough for slow LLM responses).
-    timeout_cfg = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
-    deadline = time.monotonic() + _DELEGATE_TOTAL_BUDGET_S
+    # core#5029: the read budget is now env-tunable (default unchanged).
+    # Snapshot the knobs ONCE per send so every log line, retry decision
+    # and terminal message in this call describes the same ceiling.
+    max_attempts = _delegate_max_attempts()
+    total_budget_s = _delegate_total_budget_s()
+    read_timeout_s = _delegate_read_timeout_s()
+    timeout_cfg = httpx.Timeout(
+        connect=_DELEGATE_CONNECT_TIMEOUT_S,
+        read=read_timeout_s,
+        write=_DELEGATE_CONNECT_TIMEOUT_S,
+        pool=_DELEGATE_CONNECT_TIMEOUT_S,
+    )
+    started = time.monotonic()
+    deadline = started + total_budget_s
     last_exc: BaseException | None = None
+    attempts_made = 0
 
-    for attempt in range(_DELEGATE_MAX_ATTEMPTS):
+    for attempt in range(max_attempts):
+        attempts_made = attempt + 1
         async with httpx.AsyncClient(timeout=timeout_cfg) as client:
             try:
                 # self_source_headers() includes X-Workspace-ID so the
@@ -946,9 +1088,24 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
                 # transient; a 5xx may even have delivered the message).
                 if resp.status_code < 200 or resp.status_code >= 300:
                     body = resp.text[:200]
+                    # core#5029: annotate with the discriminating cause.
+                    # A 429 (quota) and a 504 (upstream timeout) demand
+                    # completely different operator action; before this
+                    # they rendered as the same sentence.
+                    annotation = _proxy_status_annotation(
+                        resp, time.monotonic() - started, max_attempts
+                    )
+                    logger.warning(
+                        "send_a2a_message: proxy HTTP %d (%s) target=%s body=%.200s",
+                        resp.status_code,
+                        annotation,
+                        target_url,
+                        body,
+                    )
                     return (
                         f"{_A2A_ERROR_PREFIX}A2A proxy returned HTTP "
-                        f"{resp.status_code} (message may have been delivered); "
+                        f"{resp.status_code} ({annotation}) "
+                        f"(message may have been delivered); "
                         f"body={body!r} [target={target_url}]"
                     )
                 content_type = resp.headers.get("content-type", "")
@@ -1041,7 +1198,7 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
                 )
             except _TRANSIENT_HTTP_ERRORS as e:
                 last_exc = e
-                attempts_remaining = _DELEGATE_MAX_ATTEMPTS - (attempt + 1)
+                attempts_remaining = max_attempts - (attempt + 1)
                 if attempts_remaining <= 0 or time.monotonic() >= deadline:
                     # Out of attempts OR out of total budget — surface
                     # the last error to the caller.
@@ -1055,7 +1212,7 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
                     "send_a2a_message: transient %s on attempt %d/%d, retrying in %.1fs (target=%s)",
                     type(e).__name__,
                     attempt + 1,
-                    _DELEGATE_MAX_ATTEMPTS,
+                    max_attempts,
                     delay,
                     target_url,
                 )
@@ -1067,7 +1224,38 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
     # Retries exhausted (or budget elapsed). last_exc must be set
     # because we only break out of the loop after assigning it.
     assert last_exc is not None  # noqa: S101
-    return _format_a2a_error(last_exc, target_url)
+    elapsed = time.monotonic() - started
+    # core#5029: name WHICH ceiling terminated the delegation. Without
+    # this the caller sees only the last httpx exception, which is the
+    # same string whether the operator should widen the wall-clock
+    # budget, widen the per-attempt read timeout, or go look at why the
+    # peer is dead. Budget wins the tie: if the deadline elapsed, adding
+    # attempts would not have helped.
+    cause = (
+        "total_budget_exhausted"
+        if time.monotonic() >= deadline
+        else "attempts_exhausted"
+    )
+    diagnostics = (
+        f"cause={cause} attempts={attempts_made}/{max_attempts} "
+        f"elapsed={elapsed:.1f}s budget={total_budget_s}s "
+        f"read_timeout={read_timeout_s}s"
+    )
+    logger.warning(
+        "send_a2a_message: delegation failed (%s last_error=%s: %s target=%s)",
+        diagnostics,
+        type(last_exc).__name__,
+        last_exc,
+        target_url,
+    )
+    detail = _format_a2a_error(last_exc, target_url)
+    # _format_a2a_error already carries the exception type + target;
+    # prepend the ceiling diagnostics so the FIRST thing an operator
+    # reads is which limit fired, not which socket error it fired on.
+    return (
+        f"{_A2A_ERROR_PREFIX}delegation failed ({diagnostics}) last_error="
+        f"{detail[len(_A2A_ERROR_PREFIX):]}"
+    )
 
 
 async def get_peers_with_diagnostic(source_workspace_id: str | None = None) -> tuple[list[dict], str | None]:

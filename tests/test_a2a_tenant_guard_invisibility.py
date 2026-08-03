@@ -11,11 +11,18 @@ tenant_guard.go`` that were MEASURED on a live tenant:
 and one property of the runtime that made the resulting outage undiagnosable:
 
   3. ``send_a2a_message`` converts a non-2xx into a RETURNED string. It does
-     not raise, does not log, and does not touch any health signal — so a
-     caller with a per-message ``except`` (every channel daemon we ship)
-     drops the message into a hole while five health signals read green.
-     That is the two-day-dark incident (#360), and it is what
+     not raise and does not touch any health signal — so a caller with a
+     per-message ``except`` (every channel daemon we ship) drops the message
+     into a hole while five health signals read green. That is the two-day-
+     dark incident (#360), and it is what
      ``test_the_400_is_invisible_to_a_per_message_except`` pins.
+
+core#5029 amends property 3 in ONE respect: a non-2xx now emits a WARNING
+carrying the discriminating cause (rate-limit vs upstream timeout vs
+generic upstream error). The silent-to-the-caller hole is unchanged and
+still pinned below — but the log-based-alert leg of the invisibility is
+closed, so this file now asserts the WARNING is present rather than
+absent.
 """
 from __future__ import annotations
 
@@ -114,11 +121,17 @@ async def test_the_400_is_invisible_to_a_per_message_except(platform, monkeypatc
 
       * does NOT raise, so ``try/except Exception`` around a per-message
         relay catches nothing;
-      * does NOT log at WARNING or above, so no log-based alert fires;
       * RETURNS a string that a caller must remember to inspect.
 
     A channel daemon that treats "no exception" as "delivered" therefore
     advances its commit frontier over a message the platform never accepted.
+
+    core#5029: the third leg of the original finding — "does NOT log at
+    WARNING or above, so no log-based alert fires" — is now FIXED, and
+    this test asserts the fix instead of the defect. The WARNING must
+    carry the status AND a ``cause=`` discriminator; a log line that
+    just says "it failed" would restore the undiagnosable state this
+    file exists to prevent.
     """
     monkeypatch.setenv("MOLECULE_ORG_ID", ORG_ID)
     # revert the fix at its single seam
@@ -137,7 +150,12 @@ async def test_the_400_is_invisible_to_a_per_message_except(platform, monkeypatc
     assert TENANT_ORG_HEADER not in sent.headers, "fix was not actually reverted"
 
     assert raised is None, "a raise would have made this outage visible"
-    assert caplog.records == [], "a WARNING+ log would have made this outage visible"
+    # core#5029: a WARNING+ log now fires, and it names the cause.
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "core#5029: a non-2xx A2A response must emit a WARNING"
+    logged = "\n".join(r.getMessage() for r in warnings)
+    assert "400" in logged, "the WARNING must carry the upstream status"
+    assert "cause=" in logged, "the WARNING must carry a discriminating cause"
     assert result.startswith("[A2A_ERROR]")
     assert "400" in result
     # the platform's diagnosis is IN the returned string, and was discarded
