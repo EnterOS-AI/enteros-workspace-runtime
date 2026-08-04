@@ -59,6 +59,7 @@ import importlib.util
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -255,7 +256,37 @@ def _resolve_entrypoint(plugin_root: Path, entrypoint: str):
         if spec is None or spec.loader is None:
             return None
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # PUBLISH BEFORE EXEC. ``module_from_spec`` does NOT put the module in
+        # ``sys.modules`` — the import system normally does that in a separate
+        # step, and a by-path loader calling ``exec_module`` itself must do it
+        # too. A module's own body may legitimately need to find itself at
+        # ``sys.modules[__name__]``, and CPython's ``dataclasses`` does exactly
+        # that with an UNGUARDED lookup while resolving *string* annotations
+        # (``_is_type``: ``sys.modules.get(cls.__module__).__dict__``). Under
+        # ``from __future__ import annotations`` every annotation is a string,
+        # so any ``@dataclass`` in an unpublished module died with
+        # ``AttributeError: 'NoneType' object has no attribute '__dict__'``.
+        # All four first-party digest plugins are that shape, so this made the
+        # ENTIRE plugin-provider path a no-op in production (import-fail=5,
+        # loaded=0) while the suite stayed green — its shims were thin wrappers
+        # that declared no dataclass of their own. Same class of defect as
+        # ``plugins_registry`` issue #296.
+        #
+        # The name is namespaced by plugin dir (above), so publishing cannot
+        # collide across plugins; the restore below keeps this total even so.
+        previous = sys.modules.get(mod_name)
+        sys.modules[mod_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            # Never leave a half-initialised module behind: the next importer
+            # (this loader, another plugin, or the module itself on retry)
+            # would get a silently incomplete namespace instead of an error.
+            if previous is not None:
+                sys.modules[mod_name] = previous
+            else:
+                sys.modules.pop(mod_name, None)
+            raise
     except Exception as exc:  # noqa: BLE001 — any import-time failure is skip-not-crash
         logger.warning("digest-provider: failed importing %s from %s: %s", entrypoint, file, exc)
         return None
