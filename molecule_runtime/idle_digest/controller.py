@@ -281,15 +281,13 @@ def build_default_providers(
 
     PLUGIN DISCOVERY (D1, RFC molecule-core#4413): providers contributed by
     installed plugins (plugin-manifest ``contributes.digestProviders``) are
-    discovered and appended BY DEFAULT, for **native** (native-plugins-registry)
-    plugins. ``MOLECULE_DIGEST_PROVIDER_PLUGINS`` is the operator control, and
-    it is now a kill switch rather than an opt-in: set explicitly falsy
-    (``0``/``false``/``no``/``off``) it suppresses discovery entirely and the
-    roster is byte-identical to the hardcoded one below; set explicitly truthy
-    it ALSO admits third-party (non-native) plugins, whose providers are
-    otherwise not loaded — nor even imported. The assembler sorts by
-    contribution tier, so append order does not affect render order.
-    ``loaded_plugins`` is the already-scanned
+    discovered and merged in ALWAYS — native or third-party, no env var. The
+    platform is provider-agnostic; ``native`` marks where a capability came
+    from, not whether it is allowed to run, so a customer's own plugin works by
+    default. (What a non-native plugin still may NOT do is claim a RESERVED
+    provider id or self-grant ``official`` — see ``plugin_loader``.) The
+    assembler sorts by contribution tier, so append order does not affect render
+    order. ``loaded_plugins`` is the already-scanned
     :class:`~molecule_runtime.plugins.LoadedPlugins`; when the caller does not
     have it, discovery lazily re-scans.
     """
@@ -324,42 +322,41 @@ def build_default_providers(
         providers.append(InboundMailProvider(source=source))
     providers.append(GoalStateProvider())
 
-    # D1: append plugin-contributed providers. Default ON (native plugins only);
-    # MOLECULE_DIGEST_PROVIDER_PLUGINS set falsy is the kill switch.
-    from .plugin_loader import digest_provider_plugins_enabled
+    # D1: merge plugin-contributed providers. UNCONDITIONAL — every declared
+    # digest provider loads, native or not. The try/except is the remaining
+    # safety net and is the important one: discovery must never break the baked
+    # roster, and per-provider isolation lives inside the loader.
+    try:
+        from .plugin_loader import (
+            DigestProviderContext,
+            load_digest_provider_plugins,
+            native_plugin_names,
+        )
 
-    if digest_provider_plugins_enabled():
-        try:
-            from .plugin_loader import (
-                DigestProviderContext,
-                load_digest_provider_plugins,
-                native_plugin_names,
-            )
+        plugins = loaded_plugins
+        if plugins is None:
+            from ..plugins import load_plugins
 
-            plugins = loaded_plugins
-            if plugins is None:
-                from ..plugins import load_plugins
-
-                plugins = load_plugins()
-            ctx = DigestProviderContext(
-                config_path=config_path,
-                prompt_files=tuple(prompt_files),
-                workspace_name=workspace_name,
-                runtime_kind=runtime_kind,
-                comms_source=source,
-                platform_url=platform_url,
-                workspace_id=workspace_id,
-            )
-            providers = _merge_plugin_providers(
-                providers,
-                load_digest_provider_plugins(
-                    plugins, ctx, native_plugin_names=native_plugin_names()
-                ),
-            )
-        except Exception as exc:  # discovery must never break the baked roster
-            logger.warning(
-                "digest-provider: plugin discovery failed, using baked roster only: %s", exc
-            )
+            plugins = load_plugins()
+        ctx = DigestProviderContext(
+            config_path=config_path,
+            prompt_files=tuple(prompt_files),
+            workspace_name=workspace_name,
+            runtime_kind=runtime_kind,
+            comms_source=source,
+            platform_url=platform_url,
+            workspace_id=workspace_id,
+        )
+        providers = _merge_plugin_providers(
+            providers,
+            load_digest_provider_plugins(
+                plugins, ctx, native_plugin_names=native_plugin_names()
+            ),
+        )
+    except Exception as exc:  # discovery must never break the baked roster
+        logger.warning(
+            "digest-provider: plugin discovery failed, using baked roster only: %s", exc
+        )
     return providers
 
 
@@ -382,14 +379,19 @@ def _merge_plugin_providers(baked, contributed):
     (tests/test_idle_provider_plugin_loader.py) prove the shipped shims render
     byte-identically to their baked twins, so supersession is output-neutral
     today, and it makes D3 a pure deletion rather than another behavior change.
-    Only a NATIVE plugin can claim a reserved id at all (the load-time trust
-    gate), so nothing third-party can displace an official section this way.
+    Only a NATIVE plugin can claim a reserved id at all (the loader's
+    name-ownership rule), so nothing third-party can displace an official
+    section this way — every id the baked roster builds is a reserved id.
 
     Supersession is once-only: a second plugin claiming an id another plugin
     already contributed is DROPPED, not appended — otherwise plugin-vs-plugin
-    collisions would reintroduce exactly the duplication this prevents. A
-    contributed provider with a genuinely new id is appended as before (the
-    assembler sorts by tier, so position does not affect render order).
+    collisions would reintroduce exactly the duplication this prevents. FIRST
+    WINS, deterministic in plugin scan order. That arm is now reachable for
+    third-party ids too (two customer plugins both contributing ``vendor-x``),
+    which is precisely why it stays: it is what keeps "each provider id appears
+    exactly once" total rather than true only of the native set. A contributed
+    provider with a genuinely new id is appended as before (the assembler sorts
+    by tier, so position does not affect render order).
     """
     if not contributed:
         return baked
