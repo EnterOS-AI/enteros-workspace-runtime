@@ -16,6 +16,41 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-08-04 — sdk main `ac6c0d67` (sdk#201)
+
+`plugin-manifest.schema.json` re-fetched; contract-version 0.6.0 → **0.7.0**.
+Paired with the merge of **molecule-ai-sdk#201**, which corrects the
+`contributes.digestProviders` prose. An SDK contract merge reds this repo's
+schema-sync gate immediately, so the re-vendor is part of that merge, not a
+follow-up — it landed in the same PR that made the runtime match (#402).
+
+This is a SEMANTIC correction, not housekeeping. The contract asserted that
+`kind: digest-provider` plugins are *"delivered native-only (native-plugins
+registry)"* and that *"their trust is gated at LOAD time"*. Both are now false:
+the platform is provider-agnostic, `native` is a capability-ORIGIN marker rather
+than a trust boundary, and the runtime loads EVERY declared digest provider with
+no env gate (`MOLECULE_DIGEST_PROVIDER_PLUGINS` deleted in #402).
+
+Why the old claim did not hold, and why it mattered here: the runtime this
+schema describes already executed third-party plugin code with no flag anywhere
+else — `plugin_daemons.py` Popens manifest-declared subprocesses and
+`plugins_registry/__init__.py::_instantiate` imports adaptor modules
+IN-PROCESS, neither with a native check. So the native-only rule bought no
+isolation while blocking every customer-shipped provider; a paying client's own
+reconciler was refused in production by exactly it.
+
+What the contract says instead is the half with teeth, and the runtime enforces
+the same rule: NAME OWNERSHIP — a non-native plugin may not claim a reserved
+`provider_id` nor self-declare `official: true`, refused PER-PROVIDER so the
+plugin's siblings still load. `$defs/digestProviderContribution.provider_id` and
+`.entrypoint` were corrected to match. The document SHAPE is untouched (no
+property added, removed or constrained), which is why 0.6.0 → 0.7.0 is a MINOR
+loosening and nothing that validated before stops validating.
+
+Editing the vendored copy alone was never an option: the SDK is SSOT and this
+mirror is drift-gated, so the sdk PR merged FIRST and this re-vendor followed —
+the order that keeps a mirror a mirror.
+
 ## Re-vendor 2026-08-01 — sdk main `b732851d` (sdk#194)
 
 `plugin-install-report.contract.json` re-fetched. `producers` corrected: it said
