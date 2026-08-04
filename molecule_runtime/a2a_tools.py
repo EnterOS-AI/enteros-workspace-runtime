@@ -114,9 +114,9 @@ async def report_activity(
 # reference ``a2a_tools.tool_delegate_task`` /
 # ``a2a_tools._delegate_sync_via_polling`` keep resolving identically.
 from molecule_runtime.a2a_tools_delegation import (  # noqa: E402  (import after the from-a2a_client block)
-    _SYNC_POLL_BUDGET_S,
     _SYNC_POLL_INTERVAL_S,
     _delegate_sync_via_polling,
+    _sync_poll_budget_s,
     tool_check_task_status,
     tool_delegate_task,
     tool_delegate_task_async,
