@@ -279,14 +279,19 @@ def build_default_providers(
     hands its source in via ``comms_source`` and this function stays the one
     line that changes.
 
-    PLUGIN DISCOVERY (D1, RFC molecule-core#4413): when
-    ``MOLECULE_DIGEST_PROVIDER_PLUGINS`` is enabled, providers contributed by
+    PLUGIN DISCOVERY (D1, RFC molecule-core#4413): providers contributed by
     installed plugins (plugin-manifest ``contributes.digestProviders``) are
-    discovered and appended. Flag-off (default) is byte-identical to the
-    hardcoded roster below. The assembler sorts by contribution tier, so
-    append order does not affect render order. ``loaded_plugins`` is the
-    already-scanned :class:`~molecule_runtime.plugins.LoadedPlugins`; when the
-    caller does not have it, discovery lazily re-scans.
+    discovered and appended BY DEFAULT, for **native** (native-plugins-registry)
+    plugins. ``MOLECULE_DIGEST_PROVIDER_PLUGINS`` is the operator control, and
+    it is now a kill switch rather than an opt-in: set explicitly falsy
+    (``0``/``false``/``no``/``off``) it suppresses discovery entirely and the
+    roster is byte-identical to the hardcoded one below; set explicitly truthy
+    it ALSO admits third-party (non-native) plugins, whose providers are
+    otherwise not loaded — nor even imported. The assembler sorts by
+    contribution tier, so append order does not affect render order.
+    ``loaded_plugins`` is the already-scanned
+    :class:`~molecule_runtime.plugins.LoadedPlugins`; when the caller does not
+    have it, discovery lazily re-scans.
     """
     from .providers import (
         GoalStateProvider,
@@ -319,7 +324,8 @@ def build_default_providers(
         providers.append(InboundMailProvider(source=source))
     providers.append(GoalStateProvider())
 
-    # D1: append plugin-contributed providers (flag-gated; default off = byte-identical).
+    # D1: append plugin-contributed providers. Default ON (native plugins only);
+    # MOLECULE_DIGEST_PROVIDER_PLUGINS set falsy is the kill switch.
     from .plugin_loader import digest_provider_plugins_enabled
 
     if digest_provider_plugins_enabled():
@@ -344,16 +350,76 @@ def build_default_providers(
                 platform_url=platform_url,
                 workspace_id=workspace_id,
             )
-            providers.extend(
+            providers = _merge_plugin_providers(
+                providers,
                 load_digest_provider_plugins(
                     plugins, ctx, native_plugin_names=native_plugin_names()
-                )
+                ),
             )
         except Exception as exc:  # discovery must never break the baked roster
             logger.warning(
                 "digest-provider: plugin discovery failed, using baked roster only: %s", exc
             )
     return providers
+
+
+def _merge_plugin_providers(baked, contributed):
+    """Merge plugin-contributed providers into the baked roster BY PROVIDER ID.
+
+    A plugin-contributed provider whose id the baked roster already builds
+    SUPERSEDES it; it never sits alongside it. This is not a nicety — it is the
+    difference between working and doubled. The native ``kind: digest-provider``
+    plugins are ``install: "default"`` in the native-plugins registry, so in
+    production all four are installed on every workspace, and each contributes
+    one of the RESERVED ids (``identity-capabilities``/``task-queue``/
+    ``sent-folder``/``inbound-a2a``/``goal-state``) that the hardcoded roster
+    above also builds. Discovery used to plain-``extend``, and the RFC's D3 half
+    — deleting the hardcoded roster once the plugins carry it — was never
+    written. Appending would therefore have rendered EVERY section twice on
+    every idle tick, on every workspace.
+
+    Direction: the PLUGIN instance wins. The per-provider parity goldens
+    (tests/test_idle_provider_plugin_loader.py) prove the shipped shims render
+    byte-identically to their baked twins, so supersession is output-neutral
+    today, and it makes D3 a pure deletion rather than another behavior change.
+    Only a NATIVE plugin can claim a reserved id at all (the load-time trust
+    gate), so nothing third-party can displace an official section this way.
+
+    Supersession is once-only: a second plugin claiming an id another plugin
+    already contributed is DROPPED, not appended — otherwise plugin-vs-plugin
+    collisions would reintroduce exactly the duplication this prevents. A
+    contributed provider with a genuinely new id is appended as before (the
+    assembler sorts by tier, so position does not affect render order).
+    """
+    if not contributed:
+        return baked
+    out = list(baked)
+    index = {getattr(p, "provider_id", "") or "": i for i, p in enumerate(out)}
+    from_plugin: set[str] = set()
+    for provider in contributed:
+        pid = getattr(provider, "provider_id", "") or ""
+        at = index.get(pid)
+        if at is None:
+            index[pid] = len(out)
+            from_plugin.add(pid)
+            out.append(provider)
+            continue
+        if pid in from_plugin:
+            logger.warning(
+                "digest-provider: %r was already contributed by an earlier plugin — "
+                "this second contribution is dropped (no duplicate sections)", pid,
+            )
+            continue
+        from_plugin.add(pid)
+        out[at] = provider
+        # Same stdout reason as the "loaded" line: the workspace process never
+        # configures logging, so this must print to be visible in docker logs.
+        print(
+            f"digest-provider: {pid!r} — plugin-contributed provider SUPERSEDES "
+            f"the built-in one (no duplicate section)",
+            flush=True,
+        )
+    return out
 
 
 def _sig_of(contributions) -> tuple[tuple[str, str], ...]:

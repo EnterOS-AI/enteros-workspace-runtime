@@ -6,8 +6,13 @@ manifest ``contributes.digestProviders`` surface (SDK plugin-manifest contract,
 D0); this module reads those declarations off the already-loaded plugins,
 imports each provider IN-PROCESS, trust-gates it, and hands the live
 :class:`~molecule_runtime.idle_digest.provider.DigestProvider` objects back to
-``build_default_providers`` to append to the roster. The assembler sorts by the
-contribution's tier, so append order does not affect render order.
+``build_default_providers``, which MERGES them into the roster by provider id
+(``_merge_plugin_providers``): a contributed provider SUPERSEDES the built-in
+one with the same id and is appended only when the id is new — appending
+unconditionally would double every section, since the native digest plugins are
+installed by default and contribute the ids the baked roster already builds. The
+assembler sorts by the contribution's tier, so position does not affect render
+order.
 
 Design invariants (mirrors ``plugin_daemons`` + the idle-prompt failurePolicy):
 
@@ -23,11 +28,26 @@ Design invariants (mirrors ``plugin_daemons`` + the idle-prompt failurePolicy):
   **native** plugin (one delivered through the native-plugins registry). A
   third-party plugin shipping such a class is refused at load — it can never get
   its official/reserved code running in-process. The native set is injected
-  (fail-safe default: empty → nothing official loads), sourced today from
-  ``MOLECULE_NATIVE_PLUGIN_NAMES``; D2 wires the vendored native-plugins
-  registry as the SSOT source.
-* **Flag-gated (D1).** Off by default (``MOLECULE_DIGEST_PROVIDER_PLUGINS``);
-  flag-off is byte-identical to the hardcoded roster.
+  (fail-safe default: empty → nothing official loads). Its SSOT source is the
+  **vendored native-plugins registry** (D2, landed — see
+  ``contracts/PROVENANCE.md``); ``MOLECULE_NATIVE_PLUGIN_NAMES`` is no longer
+  the primary source and survives only as an operator escape-hatch that can
+  EXTEND the registry set (union, never subtraction) for a self-host private
+  native plugin or to control the set in a test.
+* **Default ON for NATIVE plugins; ``MOLECULE_DIGEST_PROVIDER_PLUGINS`` is now
+  a kill switch, not an opt-in.** Discovery runs unless the var is set
+  explicitly falsy (``0``/``false``/``no``/``off``), which restores the
+  byte-identical hardcoded roster with no redeploy. It shipped off-by-default
+  as the D1 rollout flag; because no tenant ever set it, NO plugin-shipped
+  digest provider had loaded anywhere — including the first-party ones a
+  template ships, which is exactly what D2/D3 built. Default-on is scoped to
+  **native** (registry-listed) plugins: a THIRD-PARTY plugin's provider is
+  in-process code in the wake path, and the SDK plugin-manifest contract's own
+  position is that ``kind: digest-provider`` plugins are "delivered native-only
+  … their trust is gated at LOAD time". So a non-native plugin's provider still
+  requires the explicit operator opt-in — setting the same var truthy
+  (``1``/``true``/``yes``/``on``), which reproduces the previous flag-on
+  semantics exactly. Its module is not even IMPORTED without that opt-in.
 * **Manifest is untrusted.** The trust decision keys on the *loaded* object's
   ``provider_id``/``official``, never the manifest's self-declared values; a
   manifest whose declared ``provider_id`` disagrees with the loaded class is
@@ -48,8 +68,21 @@ from .provider import DigestProvider
 
 logger = logging.getLogger(__name__)
 
+#: Operator control for plugin digest-provider discovery. Tri-state, and the
+#: three states are deliberate:
+#:
+#:   UNSET (production)      -> discovery ON, NATIVE plugins only
+#:   explicitly falsy        -> discovery OFF entirely (the kill switch)
+#:   explicitly truthy       -> discovery ON, native AND third-party plugins
+#:                              (the pre-flip flag-on semantics, unchanged)
 FLAG_ENV = "MOLECULE_DIGEST_PROVIDER_PLUGINS"
 NATIVE_NAMES_ENV = "MOLECULE_NATIVE_PLUGIN_NAMES"
+
+#: Same vocabulary as the mailbox kernel's default-ON flag
+#: (:func:`molecule_runtime.mailbox_dir.kernel_enabled`) so operators do not
+#: have to remember two spellings of "off".
+_FALSY = frozenset({"0", "false", "no", "off"})
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # The vendored native-plugins registry (SSOT mirror of molecule-ai-sdk
 # contracts/plugin/native-plugins.registry.json — see contracts/PROVENANCE.md +
@@ -79,8 +112,26 @@ class DigestProviderContext:
 
 
 def digest_provider_plugins_enabled() -> bool:
-    """D1 flag. Off (byte-identical hardcoded roster) unless explicitly enabled."""
-    return os.environ.get(FLAG_ENV, "0").strip().lower() not in ("", "0", "false", "no")
+    """True unless ``MOLECULE_DIGEST_PROVIDER_PLUGINS`` is set explicitly falsy.
+
+    Plugin-shipped digest providers are NATIVE runtime behavior; the env var
+    survives only as the operator kill switch (``0``/``false``/``no``/``off``),
+    which is byte-identical to the hardcoded roster and needs no redeploy. Read
+    live (not cached) so a test toggling the env between cases sees the change.
+    """
+    return os.environ.get(FLAG_ENV, "").strip().lower() not in _FALSY
+
+
+def third_party_digest_providers_enabled() -> bool:
+    """True only when ``MOLECULE_DIGEST_PROVIDER_PLUGINS`` is explicitly truthy.
+
+    The trust half of the tri-state. Default-on covers NATIVE (registry-listed)
+    plugins; a provider from a non-native plugin is live Python executed in the
+    wake path, so it stays behind an EXPLICIT operator opt-in — which is exactly
+    the pre-flip flag-on behavior, so nothing an operator had already enabled
+    changes. Fail-safe: anything other than an explicit truthy value is False.
+    """
+    return os.environ.get(FLAG_ENV, "").strip().lower() in _TRUTHY
 
 
 def native_plugin_names_from_env() -> frozenset[str]:
@@ -243,13 +294,22 @@ def load_digest_provider_plugins(
     *,
     native_plugin_names: frozenset[str],
     reserved_ids: frozenset[str] = RESERVED_PROVIDER_IDS,
+    allow_third_party: Optional[bool] = None,
 ) -> list[DigestProvider]:
     """Return the live digest providers contributed by installed plugins.
 
     Never raises. ``loaded_plugins`` is a
     :class:`~molecule_runtime.plugins.LoadedPlugins`; each plugin's
     ``manifest.contributes['digestProviders']`` is read defensively.
+
+    ``allow_third_party`` governs whether a NON-native plugin's provider may be
+    imported and loaded at all. It defaults to ``None`` meaning "ask the
+    environment" (:func:`third_party_digest_providers_enabled`) — deliberately
+    NOT ``False``, so the production default is exercised whenever a caller does
+    not pass the argument, rather than only when a test injects a value.
     """
+    if allow_third_party is None:
+        allow_third_party = third_party_digest_providers_enabled()
     out: list[DigestProvider] = []
     try:
         plugins = list(getattr(loaded_plugins, "plugins", None) or [])
@@ -260,7 +320,8 @@ def load_digest_provider_plugins(
     for plugin in plugins:
         try:
             contributions_seen += _collect_from_plugin(
-                plugin, context, native_plugin_names, reserved_ids, out
+                plugin, context, native_plugin_names, reserved_ids, out,
+                allow_third_party=allow_third_party,
             )
         except Exception as exc:  # noqa: BLE001 — defense in depth; never raise per plugin
             logger.warning(
@@ -281,7 +342,9 @@ def load_digest_provider_plugins(
     return out
 
 
-def _collect_from_plugin(plugin, context, native_plugin_names, reserved_ids, out) -> int:
+def _collect_from_plugin(
+    plugin, context, native_plugin_names, reserved_ids, out, *, allow_third_party: bool
+) -> int:
     """Load every well-formed, trust-passing provider a single plugin contributes,
     appending to ``out``. Extracted so the top-level loop can guard each plugin.
 
@@ -298,6 +361,18 @@ def _collect_from_plugin(plugin, context, native_plugin_names, reserved_ids, out
         return 1  # a (malformed) contribution surface was declared — not "nothing found"
     plugin_root = Path(getattr(plugin, "path", "") or ".")
     is_native = name in native_plugin_names
+    if not is_native and not allow_third_party:
+        # THIRD-PARTY OPT-IN GATE. Refuse BEFORE _resolve_entrypoint, so a
+        # non-native plugin's provider module is never even IMPORTED: the
+        # import itself is arbitrary in-process code execution in the wake
+        # path, and refusing after the fact would already have run it.
+        logger.warning(
+            "digest-provider: %s is not a native plugin — its %d digestProviders "
+            "contribution(s) are not loaded (set %s=1 to opt in to third-party "
+            "digest providers)",
+            name, len(entries), FLAG_ENV,
+        )
+        return len(entries)
     for entry in entries:
         # Guard each entry so one raising entry never skips a plugin's siblings.
         try:
