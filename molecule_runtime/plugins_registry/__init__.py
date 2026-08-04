@@ -82,11 +82,35 @@ def _load_module_from_path(module_name: str, path: Path):
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
+    # Publish the module ITSELF before executing it. The #296 fix above only
+    # registered the ``plugins_registry.*`` package aliases the adapter imports
+    # FROM; the adapter's own module stayed absent from sys.modules while its
+    # body ran, which is a second, independent failure mode: CPython's
+    # ``dataclasses`` resolves string annotations via an unguarded
+    # ``sys.modules.get(cls.__module__).__dict__``, so any ``@dataclass`` in an
+    # adapter using ``from __future__ import annotations`` raised
+    # ``AttributeError: 'NoneType' object has no attribute '__dict__'`` — and
+    # this loader swallows that into a warning + None, i.e. a silently
+    # unwired plugin. (Same defect the digest plugin_loader shipped to prod.)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
+        # Do not leave a half-initialised module (or a clobbered pre-existing
+        # one) behind for the next resolve() to pick up.
+        if previous is not None:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
         logger.warning("Failed to load adaptor module %s: %s", path, exc)
         return None
+    except BaseException:
+        if previous is not None:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
+        raise
     return module
 
 
