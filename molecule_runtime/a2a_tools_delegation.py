@@ -15,8 +15,59 @@ Internal:
 
 * ``_delegate_sync_via_polling`` — durable async + poll for terminal
   status (RFC #2829 PR-5 cutover path; toggled by
-  ``DELEGATION_SYNC_VIA_INBOX=1``).
-* ``_SYNC_POLL_INTERVAL_S`` / ``_SYNC_POLL_BUDGET_S`` constants.
+  ``DELEGATION_SYNC_VIA_INBOX=1``, still DEFAULT OFF — see below).
+* ``_SYNC_POLL_INTERVAL_S`` constant / ``_sync_poll_budget_s()`` resolver.
+
+WHY ``DELEGATION_SYNC_VIA_INBOX`` IS STILL DEFAULT-OFF (2026-08-03)
+------------------------------------------------------------------
+The flag has been dark in every environment since 2026-05-20. Its
+original flip-precondition — recorded at the gate below — was
+"``DELEGATION_RESULT_INBOX_PUSH`` on for ≥1 week". That precondition was
+WRONG about this code path, and the real blocker is elsewhere. Both were
+established by reading the platform, not by reading comments:
+
+1. THE DURABLE PATH DOES NOT DEPEND ON ``DELEGATION_RESULT_INBOX_PUSH``.
+   That flag (molecule-core ``workspace-server/internal/handlers/
+   delegation.go:38``) gates ``pushDelegationResultToInbox`` ONLY — the
+   extra ``activity_type='a2a_receive'`` INBOX row. ``_delegate_sync_via_polling``
+   never reads the inbox: it reads ``GET /workspaces/<src>/delegations``.
+   Everything that path needs is written UNCONDITIONALLY today —
+   ``insertDelegationRow`` writes the ``method='delegate'`` row with
+   ``delegation_id`` in both request_body and response_body;
+   ``executeDelegation`` writes the ``method='delegate_result'`` row at
+   ``status='completed'``; ``finalizeNonDispatchedDelegation`` writes it
+   at ``status='failed'``; and ``ListDelegations`` falls back to
+   ``listDelegationsFromActivityLogs`` whenever the (still-dark) durable
+   ledger returns no rows. So core#4338 is NOT what blocks this flag.
+
+2. WHAT ACTUALLY BLOCKS IT: THE RESULT IS TRUNCATED TO 300 BYTES.
+   The ONLY field this path can read a peer's answer from is
+   ``response_preview``, and BOTH arms of ``ListDelegations`` emit it as
+   ``textutil.TruncateBytes(..., 300)`` (delegation.go:1273 for the
+   ledger arm, :1382 for the activity_logs arm). There is no
+   single-delegation GET and no full-result parameter — the router
+   exposes exactly ``POST /delegate``, ``GET /delegations``,
+   ``POST /delegations/record`` and ``POST /delegations/:id/update``.
+   The path this would replace, ``send_a2a_message``, returns the peer's
+   FULL text. Flipping the default would therefore silently truncate
+   EVERY delegation reply to 300 bytes — trading a visible timeout for
+   invisible data loss, which is the worse failure. It stays off until
+   the platform exposes a full-result read.
+
+   (Corollary, already true in production: the poll-mode fallback at the
+   bottom of ``tool_delegate_task`` reaches this same helper, so
+   external-runtime-to-external-runtime delegation replies are ALREADY
+   capped at 300 bytes today. That is a platform-side defect this module
+   cannot fix.)
+
+3. SECONDARY HAZARD: ``ListDelegations`` is ``ORDER BY created_at DESC
+   LIMIT 50`` with no ``delegation_id`` predicate. Two rows per
+   delegation means a workspace delegating heavily in parallel can push
+   an in-flight delegation's terminal row out of the window, and the
+   poller then burns its whole budget on a delegation that finished.
+
+Do NOT flip the gate on the strength of the old comment. Re-check (2)
+against molecule-core first.
 
 Circular-import note: this module calls ``report_activity`` from
 ``a2a_tools`` to emit activity rows around the delegate dispatch.
@@ -38,6 +89,8 @@ from molecule_runtime.a2a_client import (
     _resolve_workspace_id,
     _A2A_ERROR_PREFIX,
     _A2A_QUEUED_PREFIX,
+    _delegate_total_budget_s,
+    _env_positive_number,
     _peer_names,
     _peer_to_source,
     _resolve_platform_url,
@@ -57,14 +110,78 @@ logger = logging.getLogger(__name__)
 # Backwards-compat: tests monkeypatch this attribute.
 WORKSPACE_ID = None
 
-# RFC #2829 PR-5 cutover constants. The poll cadence + timeout are
-# intentionally generous: 3s gives the platform's executeDelegation
-# goroutine room to dispatch + the callee to respond + the result to
-# write to activity_logs without thrashing the platform with rapid
-# polls; the budget matches the legacy DELEGATION_TIMEOUT (300s) so
-# operators don't see behavior change beyond "no more 600s timeouts".
+# RFC #2829 PR-5 cutover constants. 3s gives the platform's
+# executeDelegation goroutine room to dispatch + the callee to respond +
+# the result to write to activity_logs without thrashing the platform
+# with rapid polls.
 _SYNC_POLL_INTERVAL_S = 3.0
-_SYNC_POLL_BUDGET_S = float(os.environ.get("DELEGATION_TIMEOUT", "300.0"))
+
+# The poll budget's OWN name. Distinct from DELEGATION_TIMEOUT on purpose
+# (a2a_client.py:846 — "one env var silently retuning two unrelated
+# ceilings is the kind of coupling that makes an incident unreadable").
+# DELEGATION_TIMEOUT also drives builtin_tools/delegation.py's per-task
+# httpx client timeout, so an operator who widened the poll budget was
+# also, invisibly, widening an unrelated HTTP timeout. It is still read
+# as a deprecated fallback so this change is a strict no-op for anyone
+# who already set it.
+_ENV_POLL_BUDGET = "DELEGATION_POLL_BUDGET_S"
+_ENV_POLL_BUDGET_LEGACY = "DELEGATION_TIMEOUT"
+
+_legacy_poll_budget_warned = False
+
+
+def _sync_poll_budget_s() -> float:
+    """Effective wall-clock budget for the durable-delegation poll loop.
+
+    THE DEFAULT IS DERIVED, NOT LITERAL. It is whatever the proxy path's
+    own cumulative ceiling (``A2A_DELEGATE_TOTAL_BUDGET``, default 600s)
+    resolves to. Two reasons:
+
+    * The old default was ``DELEGATION_TIMEOUT`` or 300s — HALF the 600s
+      of the path this one exists to escape. A delegation that switched
+      to the durable path would have failed SOONER, which inverts the
+      whole point of the mechanism.
+    * A delegation has ONE ceiling from the operator's point of view.
+      Deriving it means an operator who has already declared their
+      tolerance (reno-stars runs ``A2A_DELEGATE_TOTAL_BUDGET=1800``) does
+      not have to discover a second knob for the two to agree, and the
+      two can never drift apart.
+
+    The derived value also cannot outrun the server: molecule-core's
+    ``executeDelegation`` runs under a 30-minute context and the a2a
+    proxy's forward ceiling is the same 30 minutes, so 1800s is both the
+    largest useful budget and where the platform itself gives up.
+
+    Read lazily per call (not at import) and validated: the previous
+    bare ``float(os.environ.get(...))`` ran at MODULE IMPORT, and
+    ``a2a_tools`` imports this module at load — so ``DELEGATION_TIMEOUT=5m``
+    was BOOT-FATAL, and ``DELEGATION_TIMEOUT=0`` silently collapsed the
+    budget so every durable delegation timed out instantly. A typo must
+    not be a tighter ceiling than the default. Same
+    ``_env_positive_number`` convention as core#5029.
+    """
+    global _legacy_poll_budget_warned
+
+    default = _delegate_total_budget_s()
+
+    raw = os.environ.get(_ENV_POLL_BUDGET)
+    if raw is not None and raw.strip():
+        return _env_positive_number(_ENV_POLL_BUDGET, default)
+
+    raw_legacy = os.environ.get(_ENV_POLL_BUDGET_LEGACY)
+    if raw_legacy is not None and raw_legacy.strip():
+        if not _legacy_poll_budget_warned:
+            _legacy_poll_budget_warned = True
+            logger.warning(
+                "%s is deprecated for the delegation poll budget because it ALSO "
+                "retunes builtin_tools/delegation.py's per-task HTTP timeout. "
+                "Set %s instead — it governs the poll budget and nothing else.",
+                _ENV_POLL_BUDGET_LEGACY,
+                _ENV_POLL_BUDGET,
+            )
+        return _env_positive_number(_ENV_POLL_BUDGET_LEGACY, default)
+
+    return default
 
 
 async def _delegate_sync_via_polling(
@@ -127,7 +244,12 @@ async def _delegate_sync_via_polling(
 
     # 2. Poll for terminal status with a deadline. Each poll is a cheap
     # /delegations GET — bounded by the platform's existing rate limit.
-    deadline = time.monotonic() + _SYNC_POLL_BUDGET_S
+    # Snapshot the budget ONCE per delegation so the deadline and the
+    # ceiling named in the terminal message can never describe different
+    # numbers (an operator changing the env mid-poll must not produce a
+    # timeout string that contradicts the deadline that fired).
+    budget_s = _sync_poll_budget_s()
+    deadline = time.monotonic() + budget_s
     last_status = "unknown"
     while time.monotonic() < deadline:
         try:
@@ -198,7 +320,7 @@ async def _delegate_sync_via_polling(
     # lost — it'll complete eventually and a future check_task_status
     # will surface the result.
     return (
-        f"{_A2A_ERROR_PREFIX}polling timeout after {_SYNC_POLL_BUDGET_S}s "
+        f"{_A2A_ERROR_PREFIX}polling timeout after {budget_s}s "
         f"(delegation_id={delegation_id}, last_status={last_status}); "
         f"the platform is still working on it — call check_task_status('{delegation_id}') to retrieve later"
     )
@@ -269,9 +391,15 @@ async def tool_delegate_task(
     # This sidesteps the 600s message/send timeout class that broke
     # iteration-14/90-style long-running delegations on 2026-05-05.
     #
-    # Default off — staging-canary first, flip default after PR-2's
-    # result-push flag (DELEGATION_RESULT_INBOX_PUSH) has been on for
-    # ≥1 week without incident.
+    # STILL DEFAULT OFF. The precondition that used to be written here —
+    # "flip after DELEGATION_RESULT_INBOX_PUSH has been on ≥1 week" — was
+    # never a real dependency of this path AND was never satisfiable: that
+    # variable appeared nowhere in this repository except in this comment.
+    # A precondition naming a variable the codebase does not know is not a
+    # gate, it is a note. The actual, code-proven blocker is the 300-byte
+    # `response_preview` truncation on GET /delegations; the full argument
+    # (with the molecule-core line numbers that prove both halves) is in
+    # this module's docstring. Read it before touching this branch.
     if os.environ.get("DELEGATION_SYNC_VIA_INBOX") == "1":
         result = await _delegate_sync_via_polling(workspace_id, task, src or _resolve_workspace_id())
     else:

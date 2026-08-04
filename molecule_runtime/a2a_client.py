@@ -838,7 +838,13 @@ _TRANSIENT_HTTP_ERRORS: tuple[type[Exception], ...] = (
 # multi-tool-call turns die on the ceiling could not widen it without a
 # code change and a redeploy. They are now env-tunable, following the
 # same read-with-default convention as builtin_tools/delegation.py's
-# DELEGATION_TIMEOUT / a2a_tools_delegation.py's _SYNC_POLL_BUDGET_S.
+# DELEGATION_TIMEOUT / a2a_tools_delegation.py's _sync_poll_budget_s().
+#
+# _sync_poll_budget_s() has since adopted BOTH halves of this pattern:
+# it validates via _env_positive_number below, and it DERIVES its
+# default from _delegate_total_budget_s() so the durable-delegation
+# poll budget and this proxy budget are one operator-visible ceiling
+# rather than two that silently disagree.
 #
 # The DEFAULTS below are exactly the pre-#5029 hardcoded values —
 # nothing changes for an operator who sets nothing. The names are
