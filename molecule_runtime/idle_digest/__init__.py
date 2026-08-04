@@ -60,6 +60,7 @@ from .plugin_loader import (
     native_plugin_names,
     native_plugin_names_from_env,
     native_plugin_names_from_registry,
+    third_party_digest_providers_enabled,
 )
 
 __all__ = [
@@ -80,6 +81,7 @@ __all__ = [
     "native_plugin_names",
     "native_plugin_names_from_env",
     "native_plugin_names_from_registry",
+    "third_party_digest_providers_enabled",
     "SKIPPED",
     "SLEEP",
     "UNCHANGED",
