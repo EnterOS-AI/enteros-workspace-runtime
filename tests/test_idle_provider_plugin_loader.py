@@ -1,8 +1,9 @@
 """D1 — runtime digest-provider plugin loader (RFC molecule-core#4413).
 
 Proves the loader discovers `contributes.digestProviders` off installed plugins,
-imports each provider IN-PROCESS, applies the LOAD-TIME trust gate (only native
-plugins may load official/reserved providers), and degrades safely (every
+imports each provider IN-PROCESS regardless of native status (there is no env
+gate), applies the load-time NAME-OWNERSHIP rule (only a native plugin may claim
+a reserved provider id or `official`), and degrades safely (every
 malformed/broken case is skipped, never raised). The parity tests prove each
 provider loaded via its native plugin renders byte-identically to the hardcoded
 one — the pre-D3 cutover gate (RFC §8: byte-identical digest output PER
@@ -26,14 +27,12 @@ from molecule_runtime.idle_digest import (
     PreviewItem,
     Urgency,
     build_default_providers,
-    digest_provider_plugins_enabled,
     load_digest_provider_plugins,
     native_plugin_names,
     native_plugin_names_from_env,
     native_plugin_names_from_registry,
-    third_party_digest_providers_enabled,
 )
-from molecule_runtime.idle_digest.plugin_loader import FLAG_ENV, NATIVE_NAMES_ENV
+from molecule_runtime.idle_digest.plugin_loader import NATIVE_NAMES_ENV
 from molecule_runtime.idle_digest.providers.goal import GoalStateProvider
 from molecule_runtime.idle_digest.providers.identity import IdentityCapabilitiesProvider
 from molecule_runtime.idle_digest.providers.mail import MailSummary, SentMailProvider
@@ -155,7 +154,7 @@ ROGUE_OFFICIAL = textwrap.dedent(
 )
 
 # A rogue third-party provider claiming official=True with a NON-reserved id —
-# isolates the `official` disjunct of the trust gate (no reserved-id involved).
+# isolates the `official` disjunct of the ownership rule (no reserved id involved).
 OFFICIAL_NONRESERVED = textwrap.dedent(
     """
     class VendorOfficialProvider:
@@ -215,41 +214,7 @@ def _loaded(*plugins) -> LoadedPlugins:
     return lp
 
 
-# --- flag -------------------------------------------------------------------
-
-
-def test_flag_default_on_when_env_is_UNSET(monkeypatch):
-    """THE PRODUCTION CASE. No tenant sets this var, so UNSET is the only value
-    that ever runs in production — while the flag defaulted OFF, no plugin-shipped
-    digest provider had ever loaded anywhere, including first-party ones.
-    Asserted on the UNSET environment specifically (not merely on an injected
-    "1"), because injecting the value proves the mechanism, never the default."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
-    assert digest_provider_plugins_enabled() is True
-
-
-def test_flag_kill_switch_and_truthy_values(monkeypatch):
-    for on in ("1", "true", "yes", "on", "", "  "):
-        monkeypatch.setenv(FLAG_ENV, on)
-        assert digest_provider_plugins_enabled() is True, on
-    # The kill switch operators keep: explicit falsy still disables, no redeploy.
-    for off in ("0", "false", "no", "off", " OFF ", "False"):
-        monkeypatch.setenv(FLAG_ENV, off)
-        assert digest_provider_plugins_enabled() is False, off
-
-
-def test_third_party_opt_in_stays_off_by_default(monkeypatch):
-    """The trust boundary preserved by the default flip: loading a NON-native
-    plugin's provider in-process still needs an EXPLICIT opt-in. Default (UNSET)
-    is native-only."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
-    assert third_party_digest_providers_enabled() is False
-    for off in ("0", "false", "no", "off", "", "  "):
-        monkeypatch.setenv(FLAG_ENV, off)
-        assert third_party_digest_providers_enabled() is False, off
-    for on in ("1", "true", "yes", "on", " TRUE "):
-        monkeypatch.setenv(FLAG_ENV, on)
-        assert third_party_digest_providers_enabled() is True, on
+# --- the native allow-list --------------------------------------------------
 
 
 def test_native_names_from_env(monkeypatch):
@@ -259,7 +224,7 @@ def test_native_names_from_env(monkeypatch):
     assert native_plugin_names_from_env() == frozenset({"a", "b", "c"})
 
 
-# --- loading + trust gate ---------------------------------------------------
+# --- loading + name-ownership refusals --------------------------------------
 
 
 def test_loads_third_party_non_reserved_provider(tmp_path):
@@ -267,52 +232,18 @@ def test_loads_third_party_non_reserved_provider(tmp_path):
         tmp_path, "vendor-notes-plugin", THIRD_PARTY,
         [{"provider_id": "vendor-notes", "entrypoint": "prov:NotesProvider"}],
     )
-    # allow_third_party is the explicit operator opt-in (MOLECULE_DIGEST_PROVIDER_PLUGINS
-    # set truthy); without it a non-native plugin's provider is not loaded at all.
+    # No opt-in, no env var, not in the native set: a customer's provider loads.
     got = load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(),
-        native_plugin_names=frozenset(), allow_third_party=True,
+        native_plugin_names=frozenset(),
     )
     assert [p.provider_id for p in got] == ["vendor-notes"]
 
 
-def test_default_does_not_load_third_party_and_never_imports_it(tmp_path, monkeypatch):
-    """THE PRESERVED TRUST BOUNDARY. With the flag UNSET (the default that now
-    means ON), a NON-native plugin's digest provider must not merely be absent
-    from the roster — its module must never be IMPORTED, i.e. none of its code
-    runs in the wake path. The second half is the non-vacuity control: with the
-    explicit opt-in the very same fixture DOES load and DOES import, so the
-    first half cannot be passing because the fixture is inert."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
-    marker = tmp_path / "import-marker.txt"
-    monkeypatch.setenv("DIGEST_IMPORT_MARKER", str(marker))
-    plugin = _make_plugin(
-        tmp_path, "vendor-notes-plugin", THIRD_PARTY_SIDE_EFFECT,
-        [{"provider_id": "vendor-notes", "entrypoint": "prov:NotesProvider"}],
-    )
 
-    # DEFAULT (env unset, no allow_third_party argument): refused, not imported.
-    got = load_digest_provider_plugins(
-        _loaded(plugin), DigestProviderContext(), native_plugin_names=frozenset()
-    )
-    assert got == []
-    assert not marker.exists(), "third-party provider module was IMPORTED without an opt-in"
-
-    # CONTROL: the same fixture, with the explicit opt-in, loads AND imports.
-    monkeypatch.setenv(FLAG_ENV, "1")
-    got = load_digest_provider_plugins(
-        _loaded(plugin), DigestProviderContext(), native_plugin_names=frozenset()
-    )
-    assert [p.provider_id for p in got] == ["vendor-notes"]
-    assert marker.exists()
-
-
-def test_native_provider_loads_with_flag_UNSET(tmp_path, monkeypatch):
-    """THE DEFECT THIS PR FIXES, at the loader seam: with the env var UNSET and
-    NO injected override — native set resolved from the vendored registry the
-    way production resolves it, allow_third_party left to its default — a
-    first-party plugin's provider LOADS."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
+def test_native_provider_loads_with_the_registry_sourced_set(tmp_path, monkeypatch):
+    """A first-party plugin's provider LOADS with no injected override — native
+    set resolved from the vendored registry the way production resolves it."""
     monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
     plugin = _make_plugin(
         tmp_path, "molecule-ai-plugin-digest-mail", MAIL_SHIM,
@@ -325,31 +256,32 @@ def test_native_provider_loads_with_flag_UNSET(tmp_path, monkeypatch):
     assert [p.provider_id for p in got] == ["sent-folder"]
 
 
-def test_trust_gate_refuses_nonnative_official_reserved(tmp_path):
+def test_nonnative_may_not_claim_a_reserved_id(tmp_path):
+    """NAME OWNERSHIP, the one thing `native` still decides. Loading is not
+    gated — this plugin's module IS imported — but its claim on the reserved
+    `goal-state` id is refused, so it cannot spoof a platform section."""
     plugin = _make_plugin(
         tmp_path, "rogue-plugin", ROGUE_OFFICIAL,
         [{"provider_id": "goal-state", "entrypoint": "prov:RogueProvider"}],
     )
-    # not in the native set -> refused despite the class asserting official=True.
-    # allow_third_party=True so the refusal proved here is the OFFICIAL/RESERVED
-    # gate and not the (coarser) third-party opt-in gate in front of it.
     got = load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(),
-        native_plugin_names=frozenset(), allow_third_party=True,
+        native_plugin_names=frozenset(),
     )
     assert got == []
 
 
-def test_trust_gate_refuses_nonnative_official_nonreserved(tmp_path):
+def test_nonnative_may_not_self_grant_official(tmp_path):
     # Left disjunct in isolation: official=True alone (non-reserved id) from a
-    # non-native plugin must still be refused — official is not self-grantable.
+    # non-native plugin is still refused — `official` is the sole input to the
+    # assembler's check_reserved_id, so it is not self-grantable.
     plugin = _make_plugin(
         tmp_path, "vendor-plugin", OFFICIAL_NONRESERVED,
         [{"provider_id": "vendor-notes", "entrypoint": "prov:VendorOfficialProvider"}],
     )
     got = load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(),
-        native_plugin_names=frozenset(), allow_third_party=True,
+        native_plugin_names=frozenset(),
     )
     assert got == []
 
@@ -357,14 +289,13 @@ def test_trust_gate_refuses_nonnative_official_nonreserved(tmp_path):
 @pytest.mark.parametrize("entrypoint", ["..:X", "../evil:X", "/etc/passwd:X", "a/b:X", "pkg..mod:X"])
 def test_entrypoint_path_traversal_rejected(tmp_path, entrypoint):
     # A crafted entrypoint must never resolve a module outside the plugin dir.
-    # allow_third_party=True so this proves the PATH check, not the opt-in gate.
     plugin = _make_plugin(
         tmp_path, "p", THIRD_PARTY,
         [{"provider_id": "vendor-notes", "entrypoint": entrypoint}],
     )
     assert load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(),
-        native_plugin_names=frozenset(), allow_third_party=True,
+        native_plugin_names=frozenset(),
     ) == []
 
 
@@ -409,7 +340,7 @@ async def test_parity_mail_provider_via_plugin(tmp_path):
 
 def _load_one_native(tmp_path, repo: str, shim: str, provider_id: str, ctx):
     """Load exactly one provider the way the runtime does: through the manifest
-    entry + trust gate + entrypoint import, from a plugin named as its repo."""
+    entry + ownership check + entrypoint import, from a plugin named as its repo."""
     plugin = _make_plugin(
         tmp_path, repo, shim,
         [{"provider_id": provider_id, "entrypoint": "prov:get_provider"}],
@@ -567,10 +498,11 @@ async def test_parity_comparison_sensitive_to_every_field(tmp_path):
 
 
 # --- skip-not-reject semantics ---------------------------------------------
-# NOTE every case below passes allow_third_party=True. These fixtures are all
-# non-native plugins, so without the opt-in they would be refused by the coarse
-# third-party gate BEFORE the specific defect under test was ever reached — each
-# assert would then hold VACUOUSLY and stop proving skip-not-reject at all.
+# Every fixture below is a NON-NATIVE plugin, and every one is now genuinely
+# reached: with the gate removed there is no coarse refusal in front of these
+# cases, so each assert exercises the specific defect it names rather than
+# holding vacuously behind an opt-in that was never granted. Isolation — not
+# admission control — is what keeps a broken customer provider cheap.
 
 
 @pytest.mark.parametrize(
@@ -589,7 +521,7 @@ def test_malformed_entries_skipped(tmp_path, entries):
     plugin = _make_plugin(tmp_path, "p", THIRD_PARTY, entries)
     assert load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(),
-        native_plugin_names=frozenset(), allow_third_party=True,
+        native_plugin_names=frozenset(),
     ) == []
 
 
@@ -600,7 +532,7 @@ def test_import_error_skipped(tmp_path):
     )
     assert load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(),
-        native_plugin_names=frozenset(), allow_third_party=True,
+        native_plugin_names=frozenset(),
     ) == []
 
 
@@ -611,7 +543,7 @@ def test_non_provider_result_skipped(tmp_path):
     )
     assert load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(),
-        native_plugin_names=frozenset(), allow_third_party=True,
+        native_plugin_names=frozenset(),
     ) == []
 
 
@@ -622,7 +554,7 @@ def test_declared_id_mismatch_skipped(tmp_path):
     )
     assert load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(),
-        native_plugin_names=frozenset(), allow_third_party=True,
+        native_plugin_names=frozenset(),
     ) == []
 
 
@@ -642,20 +574,16 @@ def test_discovery_never_raises_on_broken_input():
 def _baseline_len() -> int:
     # identity + task-queue + goal-state (no mail source in unit ctx) = 3.
     # An EMPTY LoadedPlugins is passed explicitly so the baseline can never
-    # depend on whatever a real load_plugins() scan finds on the host — with
-    # discovery now default-ON, the no-arg form would lazily re-scan.
+    # depend on whatever a real load_plugins() scan finds on the host —
+    # discovery is unconditional, so the no-arg form would lazily re-scan.
     return len(build_default_providers(loaded_plugins=_loaded()))
 
 
-def test_build_default_providers_appends_native_provider_with_flag_UNSET(tmp_path, monkeypatch):
-    """THE DEFECT THIS PR FIXES, at the PRODUCTION call path. build_default_providers
-    is what boot calls; it reads the env itself and passes NOTHING through. With
-    MOLECULE_DIGEST_PROVIDER_PLUGINS UNSET — the value every tenant actually has —
-    a native plugin's provider must now be on the roster. This assertion was RED
-    before the default flip; it is the load-bearing test of this change."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
+def test_build_default_providers_appends_native_provider(tmp_path, monkeypatch):
+    """PRODUCTION call path. build_default_providers is what boot calls and it
+    passes NOTHING through: a native plugin's provider is on the roster."""
     # Native via the documented operator escape-hatch, which only EXTENDS the
-    # registry-sourced set. The DEFAULT under test here is FLAG_ENV's, not this one.
+    # registry-sourced set.
     monkeypatch.setenv(NATIVE_NAMES_ENV, "vendor-notes-plugin")
     plugin = _make_plugin(
         tmp_path, "vendor-notes-plugin", THIRD_PARTY,
@@ -667,31 +595,6 @@ def test_build_default_providers_appends_native_provider_with_flag_UNSET(tmp_pat
     assert len(providers) == _baseline_len() + 1
 
 
-def test_build_default_providers_flag_UNSET_still_refuses_third_party(tmp_path, monkeypatch):
-    """Default-on is NATIVE-ONLY: same fixture, same unset env, but the plugin is
-    not in the native set — so it stays off the roster until an operator opts in."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
-    monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
-    plugin = _make_plugin(
-        tmp_path, "vendor-notes-plugin", THIRD_PARTY,
-        [{"provider_id": "vendor-notes", "entrypoint": "prov:NotesProvider"}],
-    )
-    providers = build_default_providers(loaded_plugins=_loaded(plugin))
-    assert "vendor-notes" not in [p.provider_id for p in providers]
-    assert len(providers) == _baseline_len()
-
-
-def test_build_default_providers_flag_on_appends_third_party(tmp_path, monkeypatch):
-    monkeypatch.setenv(FLAG_ENV, "1")
-    monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
-    plugin = _make_plugin(
-        tmp_path, "vendor-notes-plugin", THIRD_PARTY,
-        [{"provider_id": "vendor-notes", "entrypoint": "prov:NotesProvider"}],
-    )
-    providers = build_default_providers(loaded_plugins=_loaded(plugin))
-    ids = [p.provider_id for p in providers]
-    assert "vendor-notes" in ids
-    assert len(providers) == _baseline_len() + 1
 
 
 # --- supersession: a plugin provider REPLACES its baked twin, never doubles it -
@@ -723,9 +626,8 @@ def _native_digest_plugins(tmp_path):
 
 
 def test_native_plugins_supersede_baked_roster_no_duplicate_providers(tmp_path, monkeypatch):
-    """PRODUCTION SCENARIO. Flag UNSET, the registry's install:"default" digest
-    plugins installed: the roster must contain each provider id exactly ONCE."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
+    """PRODUCTION SCENARIO. The registry's install:"default" digest plugins
+    installed: the roster must contain each provider id exactly ONCE."""
     monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
     plugins = _native_digest_plugins(tmp_path)
     providers = build_default_providers(loaded_plugins=_loaded(*plugins))
@@ -743,7 +645,6 @@ def test_supersession_keeps_the_plugin_instance_not_the_baked_one(tmp_path, monk
     (The parity goldens above prove those shims render byte-identically to the
     baked providers, so this is safe; it is also what makes the plugin path
     actually live rather than merely loaded and discarded.)"""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
     monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
     plugins = [
         _make_plugin(
@@ -764,7 +665,6 @@ async def test_assembled_digest_has_no_duplicated_section(tmp_path, monkeypatch)
     production roster must emit the pinned identity section EXACTLY ONCE."""
     from molecule_runtime.idle_digest import Policy, ProviderRunner, assemble
 
-    monkeypatch.delenv(FLAG_ENV, raising=False)
     monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
     providers = build_default_providers(loaded_plugins=_loaded(*_native_digest_plugins(tmp_path)))
     policy = Policy.default()
@@ -783,7 +683,6 @@ def test_second_plugin_claiming_a_taken_id_does_not_supersede_the_first(tmp_path
     """Supersession happens ONCE: a plugin replaces its BAKED twin, never
     another plugin's provider. The second claimant is dropped, not appended
     (dropping it is what keeps the no-duplicates invariant total)."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
     monkeypatch.setenv(NATIVE_NAMES_ENV, "second-goal-plugin")
     plugins = _native_digest_plugins(tmp_path) + [
         _make_plugin(
@@ -796,20 +695,6 @@ def test_second_plugin_claiming_a_taken_id_does_not_supersede_the_first(tmp_path
     assert ids.count("goal-state") == 1, ids
     assert len(ids) == len(set(ids)) == _baseline_len()
 
-
-def test_build_default_providers_kill_switch_is_baseline(tmp_path, monkeypatch):
-    """The operator kill switch, end to end: an explicitly falsy flag suppresses
-    discovery entirely — even for a NATIVE plugin — restoring the byte-identical
-    hardcoded roster with no redeploy."""
-    monkeypatch.setenv(FLAG_ENV, "0")
-    monkeypatch.setenv(NATIVE_NAMES_ENV, "vendor-notes-plugin")
-    plugin = _make_plugin(
-        tmp_path, "vendor-notes-plugin", THIRD_PARTY,
-        [{"provider_id": "vendor-notes", "entrypoint": "prov:NotesProvider"}],
-    )
-    providers = build_default_providers(loaded_plugins=_loaded(plugin))
-    assert "vendor-notes" not in [p.provider_id for p in providers]
-    assert len(providers) == _baseline_len()
 
 
 # --- gate-probed evidence lines (stdout — staging e2e sub-step 10e) ----------
@@ -848,7 +733,6 @@ def test_refused_plugin_prints_no_native_true_on_stdout(tmp_path, monkeypatch, c
     "(native=True)", so the gate's grep can never false-positive on a refused
     plugin. The scan-complete line must not print either: a refused
     contribution was FOUND, not nothing."""
-    monkeypatch.setenv(FLAG_ENV, "1")  # as in the armed gate run
     plugin = _make_plugin(
         tmp_path, "rogue-plugin", ROGUE_OFFICIAL,
         [{"provider_id": "goal-state", "entrypoint": "prov:RogueProvider"}],
@@ -856,7 +740,7 @@ def test_refused_plugin_prints_no_native_true_on_stdout(tmp_path, monkeypatch, c
     got = load_digest_provider_plugins(
         _loaded(plugin), DigestProviderContext(), native_plugin_names=frozenset()
     )
-    assert got == []  # refused by the trust gate
+    assert got == []  # its reserved-id claim was refused
     out = capsys.readouterr().out
     assert "(native=True)" not in out
     assert "scan complete" not in out
@@ -866,11 +750,10 @@ def _plugin_with_no_contributions(name: str) -> Plugin:
     return Plugin(name=name, path=".", manifest=PluginManifest(name=name, contributes={}))
 
 
-def test_scan_complete_line_when_flag_on_and_zero_contributions(monkeypatch, capsys):
+def test_scan_complete_line_on_zero_contributions(monkeypatch, capsys):
     """'Ran and found nothing' must be distinguishable from 'never invoked'
-    (in run 527665 they were not): flag on + zero digestProviders contributions
-    across the installed plugins -> one scan-complete evidence line on stdout."""
-    monkeypatch.setenv(FLAG_ENV, "1")
+    (in run 527665 they were not): zero digestProviders contributions across the
+    installed plugins -> one scan-complete evidence line on stdout."""
     plugins = [
         _plugin_with_no_contributions("plugin-a"),
         _plugin_with_no_contributions("plugin-b"),
@@ -885,16 +768,6 @@ def test_scan_complete_line_when_flag_on_and_zero_contributions(monkeypatch, cap
     ) in capsys.readouterr().out
 
 
-def test_scan_complete_line_absent_when_flag_off(monkeypatch, capsys):
-    monkeypatch.setenv(FLAG_ENV, "0")  # the kill switch — UNSET now means ON
-    got = load_digest_provider_plugins(
-        _loaded(_plugin_with_no_contributions("plugin-a")),
-        DigestProviderContext(),
-        native_plugin_names=frozenset(),
-    )
-    assert got == []
-    assert "scan complete" not in capsys.readouterr().out
-
 
 # --- native allow-list sourced from the vendored registry (D-trust) ---------
 
@@ -902,7 +775,7 @@ def test_scan_complete_line_absent_when_flag_off(monkeypatch, capsys):
 def test_native_plugin_names_from_registry_are_install_names(monkeypatch):
     """The registry-sourced native set is derived from each entry's SOURCE (the
     on-disk install name), NOT its `name` field. The four digest plugin repos
-    must be present (the trust gate governs digest providers), and the scheduler
+    must be present (the ownership rule governs digest providers), and the scheduler
     resolves to its REPO name `molecule-ai-plugin-scheduler` — proving we key on
     the source, since its registry `name` is the different `molecule-scheduler`."""
     monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)

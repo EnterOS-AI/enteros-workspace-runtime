@@ -52,7 +52,7 @@ from molecule_runtime.idle_digest import (
     build_default_providers,
     load_digest_provider_plugins,
 )
-from molecule_runtime.idle_digest.plugin_loader import FLAG_ENV, NATIVE_NAMES_ENV
+from molecule_runtime.idle_digest.plugin_loader import NATIVE_NAMES_ENV
 from molecule_runtime.plugins import LoadedPlugins, Plugin, PluginManifest
 from molecule_runtime.plugins_registry import _load_module_from_path
 
@@ -245,7 +245,6 @@ def test_dataclass_provider_imports_through_the_real_digest_loader(tmp_path, cap
             _loaded(plugin),
             DigestProviderContext(),
             native_plugin_names=frozenset(),
-            allow_third_party=True,
         )
 
     assert "object has no attribute '__dict__'" not in caplog.text, caplog.text
@@ -271,7 +270,6 @@ def test_digest_loader_publishes_the_module_in_sys_modules(tmp_path):
         _loaded(plugin),
         DigestProviderContext(),
         native_plugin_names=frozenset(),
-        allow_third_party=True,
     )
 
     assert providers, "provider must load"
@@ -295,7 +293,6 @@ def test_failed_module_body_leaves_no_entry_in_sys_modules(tmp_path):
         _loaded(plugin),
         DigestProviderContext(),
         native_plugin_names=frozenset(),
-        allow_third_party=True,
     )
 
     assert providers == []  # skip-not-crash still holds
@@ -322,7 +319,6 @@ def test_failed_module_body_restores_a_pre_existing_entry(tmp_path):
         _loaded(plugin),
         DigestProviderContext(),
         native_plugin_names=frozenset(),
-        allow_third_party=True,
     )
 
     assert sys.modules.get(name) is sentinel
@@ -349,7 +345,6 @@ def test_two_plugins_shipping_prov_py_stay_isolated(tmp_path):
         _loaded(a, b),
         DigestProviderContext(),
         native_plugin_names=frozenset(),
-        allow_third_party=True,
     )
 
     assert sorted(p.provider_id for p in providers) == ["vendor-a-notes", "vendor-b-notes"]
@@ -385,11 +380,10 @@ def _native_dataclass_plugins(tmp_path):
 
 
 def test_dataclass_native_plugins_supersede_exactly_once(tmp_path, monkeypatch):
-    """PRODUCTION SCENARIO, now actually reachable. Flag UNSET, the registry's
+    """PRODUCTION SCENARIO, now actually reachable. The registry's
     install:"default" digest plugins installed and IMPORTING: each provider id
     appears exactly once — the plugin supersedes its baked twin, never doubles
     it."""
-    monkeypatch.delenv(FLAG_ENV, raising=False)
     monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
 
     baseline = [p.provider_id for p in build_default_providers(loaded_plugins=_loaded())]
@@ -421,7 +415,6 @@ async def test_assembled_digest_has_no_duplicate_envelope_with_dataclass_plugins
     """End to end over the production roster: one envelope per provider id."""
     from molecule_runtime.idle_digest import Policy, ProviderRunner, assemble
 
-    monkeypatch.delenv(FLAG_ENV, raising=False)
     monkeypatch.delenv(NATIVE_NAMES_ENV, raising=False)
 
     providers = build_default_providers(

@@ -55,12 +55,10 @@ from .contract import (
 from .provider import DigestProvider, GatherResult, ProviderRunner
 from .plugin_loader import (
     DigestProviderContext,
-    digest_provider_plugins_enabled,
     load_digest_provider_plugins,
     native_plugin_names,
     native_plugin_names_from_env,
     native_plugin_names_from_registry,
-    third_party_digest_providers_enabled,
 )
 
 __all__ = [
@@ -76,12 +74,10 @@ __all__ = [
     "DigestProviderContext",
     "FIRED",
     "IdleDigestController",
-    "digest_provider_plugins_enabled",
     "load_digest_provider_plugins",
     "native_plugin_names",
     "native_plugin_names_from_env",
     "native_plugin_names_from_registry",
-    "third_party_digest_providers_enabled",
     "SKIPPED",
     "SLEEP",
     "UNCHANGED",
