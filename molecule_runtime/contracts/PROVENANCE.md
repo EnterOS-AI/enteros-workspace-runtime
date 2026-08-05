@@ -16,6 +16,48 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-08-05 — sdk main `e88388bc` (sdk#209)
+
+- `native-plugins.registry.json` re-fetched — `molecule-scheduler` source pin
+  `#v0.2.2` → **`#v0.2.3`**. Sole change; every other entry byte-identical.
+
+FUNCTIONAL, and a live-incident fix rather than a version bump. `v0.2.2` — the
+pin the entry immediately below installed — shipped a REGRESSION in the
+activity-aware delivery watchdog it was cut for.
+
+The watchdog cancels a delivery when this runtime's turn-lease snapshot reports
+`idle_expired`. But the lease is **workspace-global**: `kernel.install()` creates
+one at container boot and the executor re-arms it per turn, so `idle_seconds`
+measures time since the workspace's last **tool call** — not since the delivery
+began. On any workspace quiet for longer than the 900s idle TTL (`TurnLease`
+default, pinned to `A2A_COMPLETION_IDLE_TIMEOUT_SECONDS`) the lease is therefore
+**already** `idle_expired` at the instant a delivery starts. The watchdog's first
+30s probe cancelled it, the fire re-queued as retryable, durable state never
+advanced, and the schedule sat in a permanent 30s cancel/retry loop. Observed on
+a live client workspace as 24 consecutive `status: timeout` / `cause: idle`
+history entries, exactly 30s apart, all for one `11:30:00` slot, with
+`schedule-state.json` pinned. The single tick that succeeded that hour survived
+only because the container had just booted, so the lease was younger than the
+TTL.
+
+`v0.2.3` (plugin #11, regenerated from the sdk 0.6.1 trigger scaffold) honours a
+lease only when it was armed AFTER the delivery it is being read about
+(`turn_age_seconds < elapsed`). The gate covers the whole snapshot rather than
+just `idle_expired`, because `absolute_cap_exceeded` is measured from the same
+lease's own turn start and is judged first — gating only idleness would have
+reproduced the identical loop under `cause: absolute_cap` once a stale lease aged
+past its own cap. An unattributable lease takes the `no_liveness_signal` path:
+wait to the absolute ceiling, never cancel on a stale verdict.
+
+Note for this runtime: nothing here changes. `turn_liveness_snapshot()` already
+reports `turn_age_seconds` alongside `idle_seconds` — the daemon simply stopped
+ignoring it. `molecule_runtime/channel_sdk.py` is likewise unchanged (this hotfix
+is entirely in the SDK's trigger scaffold, not in `channel.py`), so the
+commit-pinned vendor gate in `ci.yml` still passes without a pin bump; verified
+against both the pinned commit `aaa3a834` and sdk `main`.
+
+---
+
 ## Re-vendor 2026-08-05 — sdk main `7afa7eb4` (sdk#206)
 
 - `native-plugins.registry.json` re-fetched — `molecule-scheduler` source pin
@@ -475,9 +517,9 @@ reads the same registry to know which plugins are NATIVE.
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin/native-plugins.registry.json
-Source commit:        `7afa7eb4091311022eeb4868246bce6ec0b445c8` (sdk#206 — pin molecule-scheduler #v0.2.1 → #v0.2.2)
-Vendored at sdk HEAD: `7afa7eb4091311022eeb4868246bce6ec0b445c8` (branch `main`, MERGED)
-Content sha256:       `b5f7f9aa74eba75eb36b67351bbedc1894947b69865f24afd7e01ae95c5a14cf`
+Source commit:        `e88388bcf2af54f5e7aa4ed7cdb1e9af2cda9be0` (sdk#209 — pin molecule-scheduler #v0.2.2 → #v0.2.3)
+Vendored at sdk HEAD: `e88388bcf2af54f5e7aa4ed7cdb1e9af2cda9be0` (branch `main`, MERGED)
+Content sha256:       `6bbefbff772ddb95cff60757298441ff06a5ec3fb157df915ee75c93d691916e`
 
 Both SHAs above are on sdk `main`, so `check-schemas-in-sync.sh` (which fetches
 `raw/branch/main`) is green against this copy. The previous revision of this
