@@ -49,6 +49,7 @@ from molecule_runtime.channel_sdk import (
     TRIGGER_A2A_SOCKET_ENV,
     TRIGGER_A2A_TOKEN_ENV,
     TRIGGER_API_VERSION_ENV,
+    TRIGGER_LIVENESS_PATH,
     TRIGGER_PLUGIN_ID_ENV,
     ChannelCapabilityUnavailable,
     ChannelDeliveryUnknown,
@@ -77,6 +78,7 @@ __all__ = [
     "CHANNEL_API_VERSION_ENV",
     "CHANNEL_CAPABILITY_HEADER",
     "CHANNEL_PLUGIN_ID_ENV",
+    "TRIGGER_LIVENESS_PATH",
     "ChannelCapabilityUnavailable",
     "ChannelDeliveryUnknown",
     "ChannelEventDeliveryUnknown",
@@ -89,6 +91,7 @@ __all__ = [
     "build_channel_message_send_request",
     "channel_message_response_text",
     "send_channel_message",
+    "turn_liveness_snapshot",
 ]
 
 # Match molecule-core's public A2A proxy request ceiling.  The local fast path
@@ -114,6 +117,59 @@ TRIGGER_ALLOWED_SOURCE_TYPES = frozenset({"self-scheduler"})
 TRIGGER_DEFAULT_SOURCE_TYPE = "self-scheduler"
 
 
+def turn_liveness_snapshot() -> dict[str, Any]:
+    """Serialize the runtime's in-flight turn lease for a trigger daemon.
+
+    A trigger daemon fires a self-turn and then has to answer one question while
+    it waits: is the agent WORKING, or is it wedged? Elapsed wall-clock cannot
+    answer that — a three-hour productive turn and a dead socket look identical
+    on a stopwatch — which is exactly why a fixed delivery deadline abandons real
+    work and records an indeterminate outcome.
+
+    The runtime already owns the honest answer and must not grow a second one:
+    :class:`~molecule_runtime.turn_lease.TurnLease` is touched on EVERY tool call,
+    expires only after an idle TTL with no touch, and carries an un-bypassable
+    absolute cap measured from turn start. This function reports THAT object —
+    it computes nothing of its own — so the daemon's verdict and the executor's
+    verdict cannot drift apart.
+
+    The activity file is fed first, exactly as
+    :func:`turn_lease.turn_is_alive_despite_idle` does, so the snapshot never
+    depends on when the background watcher last polled.
+
+    Returns ``{"lease": False, "reason": ...}`` when no lease is installed (the
+    mailbox kernel is off): "no signal" is a real state the caller must handle by
+    falling back to its own ceiling, and reporting it as "dead" would recreate
+    the wall-clock kill.
+    """
+    from molecule_runtime import turn_lease
+
+    lease = turn_lease.current()
+    if lease is None:
+        return {
+            "lease": False,
+            "reason": "no turn lease is installed (mailbox kernel off)",
+        }
+    try:
+        from molecule_runtime.executor_helpers import tool_activity_file
+
+        lease.feed_from_activity_file(tool_activity_file())
+    except Exception:  # noqa: BLE001 - a liveness READ must never perturb the turn
+        pass
+    idle_expired = lease.expired()
+    cap_exceeded = lease.absolute_cap_exceeded()
+    return {
+        "lease": True,
+        "idle_seconds": lease.age(),
+        "ttl_seconds": lease.ttl_seconds,
+        "turn_age_seconds": lease.turn_age(),
+        "absolute_cap_seconds": lease.absolute_cap_seconds,
+        "idle_expired": idle_expired,
+        "absolute_cap_exceeded": cap_exceeded,
+        "alive": not idle_expired and not cap_exceeded,
+    }
+
+
 class RuntimeStampedChannelProvenance:
     """ASGI wrapper that stamps the runtime-owned channel plugin identity."""
 
@@ -125,6 +181,7 @@ class RuntimeStampedChannelProvenance:
         *,
         max_request_bytes: int = MAX_A2A_REQUEST_BYTES,
         stamp: "Any | None" = None,
+        serves_turn_liveness: bool = False,
     ) -> None:
         identity = plugin_id.strip()
         if not identity:
@@ -142,8 +199,44 @@ class RuntimeStampedChannelProvenance:
         # _stamp_trigger_source). Defaulted here rather than in the signature so
         # the module-level function need not exist at class-definition time.
         self._stamp = stamp if stamp is not None else _stamp_source
+        # Only the trigger lane serves the turn-liveness read. A channel plugin
+        # bridges an EXTERNAL party and has no business inspecting the agent's
+        # in-flight turn, so the channel lane's surface is unchanged.
+        self._serves_turn_liveness = bool(serves_turn_liveness)
+
+    def _capability_ok(self, scope) -> bool:
+        """Constant-time check of this binding's ephemeral capability header."""
+        provided = [
+            value
+            for key, value in scope.get("headers", [])
+            if key.lower() == _CAPABILITY_HEADER
+        ]
+        return len(provided) == 1 and secrets.compare_digest(
+            provided[0], self._capability_token
+        )
 
     async def __call__(self, scope, receive, send) -> None:
+        if (
+            self._serves_turn_liveness
+            and scope.get("type") == "http"
+            and scope.get("method") == "GET"
+            and scope.get("path") == TRIGGER_LIVENESS_PATH
+        ):
+            # Same capability gate as a send: a daemon that cannot fire a turn
+            # cannot inspect one either. This is a pure READ of an in-memory
+            # lease — it never touches, arms or ends a turn.
+            if not self._capability_ok(scope):
+                await _jsonrpc_error(
+                    send,
+                    request_id=None,
+                    status=401,
+                    code=-32001,
+                    message="invalid local channel capability",
+                )
+                return
+            await _json_response(send, status=200, payload=turn_liveness_snapshot())
+            return
+
         if not (
             scope.get("type") == "http"
             and scope.get("method") == "POST"
@@ -152,14 +245,7 @@ class RuntimeStampedChannelProvenance:
             await self.app(scope, receive, send)
             return
 
-        provided = [
-            value
-            for key, value in scope.get("headers", [])
-            if key.lower() == _CAPABILITY_HEADER
-        ]
-        if len(provided) != 1 or not secrets.compare_digest(
-            provided[0], self._capability_token
-        ):
+        if not self._capability_ok(scope):
             await _jsonrpc_error(
                 send,
                 request_id=None,
@@ -339,22 +425,8 @@ _STAMP_BY_KIND = {
 }
 
 
-async def _jsonrpc_error(
-    send,
-    *,
-    status: int,
-    request_id: object,
-    code: int,
-    message: str,
-) -> None:
-    body = json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": code, "message": message},
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+async def _json_response(send, *, status: int, payload: object) -> None:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     await send(
         {
             "type": "http.response.start",
@@ -366,6 +438,25 @@ async def _jsonrpc_error(
         }
     )
     await send({"type": "http.response.body", "body": body})
+
+
+async def _jsonrpc_error(
+    send,
+    *,
+    status: int,
+    request_id: object,
+    code: int,
+    message: str,
+) -> None:
+    await _json_response(
+        send,
+        status=status,
+        payload={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": code, "message": message},
+        },
+    )
 
 
 class _LocalUvicornServer(uvicorn.Server):
@@ -424,9 +515,11 @@ class ChannelEventSocketManager:
                 token = secrets.token_urlsafe(32)
                 path = socket_dir / _socket_name(plugin_id)
                 self._prepare_socket_path(path)
+                kind = self._kinds.get(plugin_id, "channel")
                 wrapped_app = RuntimeStampedChannelProvenance(
                     self.app, plugin_id, token,
-                    stamp=_STAMP_BY_KIND[self._kinds.get(plugin_id, "channel")],
+                    stamp=_STAMP_BY_KIND[kind],
+                    serves_turn_liveness=(kind == "trigger"),
                 )
                 config = uvicorn.Config(
                     wrapped_app,
@@ -512,9 +605,11 @@ class ChannelEventSocketManager:
                 token = secrets.token_urlsafe(32)
                 path = socket_dir / _socket_name(plugin_id)
                 self._prepare_socket_path(path)
+                kind = self._kinds.get(plugin_id, "channel")
                 wrapped_app = RuntimeStampedChannelProvenance(
                     self.app, plugin_id, token,
-                    stamp=_STAMP_BY_KIND[self._kinds.get(plugin_id, "channel")],
+                    stamp=_STAMP_BY_KIND[kind],
+                    serves_turn_liveness=(kind == "trigger"),
                 )
                 config = uvicorn.Config(
                     wrapped_app,

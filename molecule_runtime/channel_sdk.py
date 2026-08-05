@@ -7,8 +7,10 @@ adapters, routes, credentials, or provider-specific configuration contract.
 
 The module deliberately has no ``molecule_runtime`` import.  It is also safe to
 vendor byte-for-byte into a plugin artifact when the host does not install the
-authoring SDK.  Only :func:`send_channel_message` needs the optional ``httpx``
-dependency supplied by the workspace runtime (or ``molecule-ai-sdk[channel]``).
+authoring SDK.  Only the network calls (:func:`send_channel_message`,
+:func:`send_trigger_message`, :func:`probe_trigger_liveness`) need the optional
+``httpx`` dependency supplied by the workspace runtime (or
+``molecule-ai-sdk[channel]``).
 """
 
 from __future__ import annotations
@@ -62,6 +64,41 @@ TRIGGER_DEFAULT_SOURCE_TYPE = "self-scheduler"
 
 The host re-validates this against its own allow-list and stamps the runtime-owned
 ``source`` provenance; a client cannot widen the grant by asserting another value.
+"""
+
+TRIGGER_LIVENESS_PATH = "/turn-liveness"
+"""Capability-gated GET on the trigger lane returning the runtime's turn-lease snapshot.
+
+The runtime already owns exactly ONE honest liveness signal for an in-flight
+turn — the turn lease, which is *touched* on every tool call and expires only
+after an idle TTL with no touch, under an un-bypassable absolute wall-clock cap.
+This path exposes that same object (never a second, drifting mechanism) to the
+trigger daemon that fired the turn, so the daemon can distinguish "working" from
+"wedged" instead of guessing from elapsed wall time.
+
+Response body (``application/json``):
+
+``{"lease": false, "reason": str}``
+    No lease is installed (the mailbox kernel is off). The caller has NO liveness
+    signal and must fall back to its own absolute ceiling.
+
+``{"lease": true, "idle_seconds": float, "ttl_seconds": float,
+   "turn_age_seconds": float, "absolute_cap_seconds": float,
+   "idle_expired": bool, "absolute_cap_exceeded": bool, "alive": bool}``
+    ``alive`` is ``not idle_expired and not absolute_cap_exceeded`` — the single
+    verdict; the components are reported so a caller can name the CAUSE of a
+    stall rather than record an indeterminate outcome.
+
+A host that predates this contract answers 404, which
+:func:`probe_trigger_liveness` reports as "no signal" rather than an error.
+"""
+
+TRIGGER_LIVENESS_PROBE_TIMEOUT_SECONDS = 5.0
+"""Wall-clock bound for the liveness probe itself.
+
+The probe is a cheap local read of an in-memory object. Unlike the turn it
+reports on, it MUST be bounded: an unbounded probe against a wedged host would
+be the very failure the probe exists to detect.
 """
 
 
@@ -202,7 +239,7 @@ async def send_channel_message(
     socket_path: str | PathLike[str] | None = None,
     capability_token: str | None = None,
     api_version: str | None = None,
-    timeout_seconds: float = 600.0,
+    timeout_seconds: float | None = 600.0,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Send one inbound turn through the runtime's authenticated local host.
@@ -287,7 +324,7 @@ async def send_trigger_message(
     socket_path: str | PathLike[str] | None = None,
     capability_token: str | None = None,
     api_version: str | None = None,
-    timeout_seconds: float = 600.0,
+    timeout_seconds: float | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Fire one autonomous self-turn through the runtime's authenticated host.
@@ -297,6 +334,19 @@ async def send_trigger_message(
     the boundary any failure raises :class:`ChannelDeliveryUnknown` and must not
     be replayed.  A trigger daemon should therefore treat an unknown outcome as
     "possibly fired" and advance its schedule state rather than retry.
+
+    ``timeout_seconds`` defaults to ``None`` — NO read deadline.  A self-turn
+    returns only when the agent's turn completes, and how long that legitimately
+    takes is a property of the WORK, not of the transport.  A flat HTTP read
+    timeout here is a wall-clock turn-duration policy wearing a transport
+    costume: it fires on a genuinely-working agent, and because the request had
+    already crossed the boundary it can only be reported as
+    :class:`ChannelDeliveryUnknown` — an outcome nobody can act on.  Liveness is
+    instead judged by the runtime's turn lease via
+    :func:`probe_trigger_liveness`, which resets on tool activity and therefore
+    tells "working" apart from "wedged".  The connect phase stays bounded (a
+    socket that will not accept a connection is a genuine transport failure), and
+    a caller that wants a deadline may still pass one explicitly.
     """
     request = build_trigger_message_send_request(
         text,
@@ -319,8 +369,7 @@ async def send_trigger_message(
     )
 
 
-async def _post_local_a2a(
-    request: dict[str, Any],
+def _resolve_capability(
     *,
     lane: str,
     socket_env: str,
@@ -329,15 +378,13 @@ async def _post_local_a2a(
     socket_path: str | PathLike[str] | None,
     capability_token: str | None,
     api_version: str | None,
-    timeout_seconds: float,
     environ: Mapping[str, str] | None,
-) -> dict[str, Any]:
-    """Resolve the per-lane capability and POST one request over the Unix socket.
+) -> tuple[str, str]:
+    """Resolve ``(socket_path, capability_token)`` for one lane, or refuse.
 
-    Shared transport for both the channel and trigger clients; ``lane`` only
-    labels the human-readable error text.  Capability absence raises
-    :class:`ChannelCapabilityUnavailable` before any send; once a send is
-    attempted, every failure raises :class:`ChannelDeliveryUnknown`.
+    Absence or a version mismatch raises :class:`ChannelCapabilityUnavailable`
+    BEFORE any I/O, which is the known-safe classification every caller relies on
+    (the request never crossed the boundary).
     """
     env = os.environ if environ is None else environ
     resolved_version = (api_version or env.get(version_env, "")).strip()
@@ -358,6 +405,117 @@ async def _post_local_a2a(
     resolved_token = (capability_token or "").strip() or env.get(token_env, "").strip()
     if not resolved_token:
         raise ChannelCapabilityUnavailable(f"{token_env} is absent")
+    return resolved_path, resolved_token
+
+
+def _lane_timeout(timeout_seconds: float | None) -> Any:
+    """Build the httpx timeout for a lane request.
+
+    ``None`` means NO read/write/pool deadline — the caller (not the transport)
+    owns any duration policy — while the CONNECT phase stays bounded, because a
+    socket that will not accept a connection is a genuine transport failure and
+    not a long-running turn.
+    """
+    import httpx
+
+    connect = 5.0 if timeout_seconds is None else min(timeout_seconds, 5.0)
+    return httpx.Timeout(timeout_seconds, connect=connect)
+
+
+async def probe_trigger_liveness(
+    *,
+    socket_path: str | PathLike[str] | None = None,
+    capability_token: str | None = None,
+    api_version: str | None = None,
+    timeout_seconds: float = TRIGGER_LIVENESS_PROBE_TIMEOUT_SECONDS,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Read the runtime's turn-lease snapshot over the trigger lane.
+
+    Returns the ``{"lease": true, ...}`` snapshot documented on
+    :data:`TRIGGER_LIVENESS_PATH` when the host has a lease installed, and
+    ``None`` when there is NO liveness signal to be had — the host predates the
+    contract (404), no lease is installed (kernel off), or the probe itself
+    failed.  ``None`` is deliberately not an error: "I could not learn whether
+    the turn is alive" is a real state a caller must handle by falling back to
+    its own absolute ceiling, and conflating it with "the turn is dead" would
+    reintroduce the wall-clock kill this contract exists to remove.
+
+    Capability absence still raises :class:`ChannelCapabilityUnavailable`,
+    matching :func:`send_trigger_message`: a daemon with no capability has no
+    business probing.  This call is a READ and never mutates turn state, so
+    unlike a delivery it is safe to retry and is always time-bounded.
+    """
+    resolved_path, resolved_token = _resolve_capability(
+        lane="trigger",
+        socket_env=TRIGGER_A2A_SOCKET_ENV,
+        token_env=TRIGGER_A2A_TOKEN_ENV,
+        version_env=TRIGGER_API_VERSION_ENV,
+        socket_path=socket_path,
+        capability_token=capability_token,
+        api_version=api_version,
+        environ=environ,
+    )
+    try:
+        import httpx
+    except ImportError as error:  # pragma: no cover - packaging guard
+        raise ChannelCapabilityUnavailable(
+            "trigger client requires httpx; install molecule-ai-sdk[channel]"
+        ) from error
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=resolved_path),
+            base_url="http://molecule.local",
+            timeout=_lane_timeout(timeout_seconds),
+        ) as client:
+            response = await client.get(
+                TRIGGER_LIVENESS_PATH,
+                headers={CHANNEL_CAPABILITY_HEADER: resolved_token},
+            )
+    except Exception:  # noqa: BLE001 - a failed probe is "no signal", never fatal
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or payload.get("lease") is not True:
+        return None
+    return payload
+
+
+async def _post_local_a2a(
+    request: dict[str, Any],
+    *,
+    lane: str,
+    socket_env: str,
+    token_env: str,
+    version_env: str,
+    socket_path: str | PathLike[str] | None,
+    capability_token: str | None,
+    api_version: str | None,
+    timeout_seconds: float | None,
+    environ: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """Resolve the per-lane capability and POST one request over the Unix socket.
+
+    Shared transport for both the channel and trigger clients; ``lane`` only
+    labels the human-readable error text.  Capability absence raises
+    :class:`ChannelCapabilityUnavailable` before any send; once a send is
+    attempted, every failure raises :class:`ChannelDeliveryUnknown`.
+    """
+    resolved_path, resolved_token = _resolve_capability(
+        lane=lane,
+        socket_env=socket_env,
+        token_env=token_env,
+        version_env=version_env,
+        socket_path=socket_path,
+        capability_token=capability_token,
+        api_version=api_version,
+        environ=environ,
+    )
 
     try:
         import httpx
@@ -367,7 +525,7 @@ async def _post_local_a2a(
         ) from error
 
     transport = httpx.AsyncHTTPTransport(uds=resolved_path)
-    timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 5.0))
+    timeout = _lane_timeout(timeout_seconds)
     send_attempted = False
     try:
         async with httpx.AsyncClient(
@@ -417,6 +575,8 @@ __all__ = [
     "TRIGGER_A2A_TOKEN_ENV",
     "TRIGGER_API_VERSION_ENV",
     "TRIGGER_DEFAULT_SOURCE_TYPE",
+    "TRIGGER_LIVENESS_PATH",
+    "TRIGGER_LIVENESS_PROBE_TIMEOUT_SECONDS",
     "TRIGGER_PLUGIN_ID_ENV",
     "ChannelCapabilityUnavailable",
     "ChannelDeliveryUnknown",
@@ -425,6 +585,7 @@ __all__ = [
     "build_channel_message_send_request",
     "build_trigger_message_send_request",
     "channel_message_response_text",
+    "probe_trigger_liveness",
     "send_channel_message",
     "send_trigger_message",
 ]
