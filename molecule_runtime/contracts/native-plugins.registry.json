@@ -4,7 +4,7 @@
   "plugins": {
     "molecule-scheduler": {
       "name": "molecule-scheduler",
-      "source": "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.1",
+      "source": "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.2",
       "kind": "trigger",
       "install": "default",
       "description": "Per-workspace scheduler (scheduler-as-trigger-plugin RFC + plugin-mcp-audience-contract self-schedule v1). Ships BOTH halves of self-scheduling: the trigger daemon that fires self-scheduler turns from the workspace's schedule grid, AND a self-audience MCP surface (molecule-self) giving the workspace's own agent the create/list/update/delete/run/history schedule tools scoped to its own :id. Installed on every workspace (core declares it unconditionally at provision). The org/cross-workspace schedule management stays on the concierge management MCP (install:concierge), not here."

@@ -16,6 +16,41 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-08-05 — sdk main `7afa7eb4` (sdk#206)
+
+- `native-plugins.registry.json` re-fetched — `molecule-scheduler` source pin
+  `#v0.2.1` → **`#v0.2.2`**. Sole change; every other entry byte-identical.
+
+FUNCTIONAL, not housekeeping. This registry is what
+`declareDefaultNativePlugins` / `ensureSchedulerPluginDeclared` resolve the
+scheduler source from, and what `idle_digest/plugin_loader.py` sources its
+native-plugin trust allow-list from — so the pin decides which scheduler
+version a workspace installs.
+
+`v0.2.2` carries the activity-aware delivery watchdog (plugin #9, regenerated
+from the SDK 0.6.0 trigger scaffold). `v0.2.1` ships the 0.5.6-era daemon whose
+delivery is bounded by a fixed 600s httpx read timeout, which abandons a turn
+that is still legitimately working and — the request having already crossed the
+boundary — can only record it as `ChannelDeliveryUnknown`. Measured on a live
+client SEO agent: ~40% of scheduled ticks logged `status: unknown`, every one
+clustered at 622-628s, while every successful fire sat at 33-60s.
+
+`v0.2.2` replaces that wall with a probe of this runtime's own turn lease
+(`GET /turn-liveness`, served since `runtime-v0.4.85` / #404): an `alive` turn
+is never cancelled however long it runs; idle / absolute-cap / no-signal cancel
+AND re-queue, so at-least-once holds.
+
+Worth noting the tag was not merely stale — `v0.2.1` pointed at `cbc92e5`, the
+PRE-#9 main, so the merged fix was unreachable by any consumer until `v0.2.2`
+was tagged at `1a338959`.
+
+Landed on its own rather than folded into an unrelated PR: sdk#206 merged as
+`7afa7eb4` and reds this repo's schema-sync gate immediately (the gate fetches
+`raw/branch/main`, not a tag or a wheel), and bundling a version bump inside
+someone else's diff hides it.
+
+---
+
 ## Re-vendor 2026-08-04 — sdk main `ac6c0d67` (sdk#201)
 
 `plugin-manifest.schema.json` re-fetched; contract-version 0.6.0 → **0.7.0**.
@@ -440,15 +475,15 @@ reads the same registry to know which plugins are NATIVE.
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin/native-plugins.registry.json
-Source commit:        `40d58387951f74084a3f2c420a81a988ccf67c87` (sdk d3/registry-digest-v0.2.0 — bump digest plugins #v0.1.0 → #v0.2.0, D3 source-move)
-Vendored at sdk HEAD: `40d58387951f74084a3f2c420a81a988ccf67c87` (branch d3/registry-digest-v0.2.0, PENDING MERGE)
+Source commit:        `7afa7eb4091311022eeb4868246bce6ec0b445c8` (sdk#206 — pin molecule-scheduler #v0.2.1 → #v0.2.2)
+Vendored at sdk HEAD: `7afa7eb4091311022eeb4868246bce6ec0b445c8` (branch `main`, MERGED)
+Content sha256:       `b5f7f9aa74eba75eb36b67351bbedc1894947b69865f24afd7e01ae95c5a14cf`
 
-GATED (D3 source-move): the SDK bump above is a HELD draft and not yet on
-sdk `main`. Re-vendored byte-for-byte from that branch (content sha256
-`bffb835fd9c4afc9390db8c24dbace453ec3cab148f571a945596bce8585a4e3`). When
-the SDK bump merges, reconcile the two SHAs above to the sdk `main` merge
-commit; the file content is unchanged so `check-schemas-in-sync.sh` goes
-green against sdk main the moment the SDK bump lands.
+Both SHAs above are on sdk `main`, so `check-schemas-in-sync.sh` (which fetches
+`raw/branch/main`) is green against this copy. The previous revision of this
+block was left pointing at `40d58387` on the unmerged draft branch
+`d3/registry-digest-v0.2.0` and was never reconciled after that work landed —
+it had been stale across at least the sdk#188 re-vendor. Reconciled here.
 
 Why vendored: `molecule_runtime/idle_digest/plugin_loader.py` sources the
 D1 load-time TRUST allow-list (which plugin names may load an `official`/reserved
