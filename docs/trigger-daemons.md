@@ -238,3 +238,50 @@ turn drops rather than queues behind an in-flight turn, and its output runs
 through the autonomous-loop replay guard
 (`molecule_runtime/autonomous_loop_guard.py`) — a runaway self-fire loop
 trips the breaker instead of burning tokens.
+
+## Turn liveness: `GET /turn-liveness` (trigger lane only)
+
+`message/send` on this lane blocks until the agent's turn completes, and how
+long that legitimately takes is a property of the **work**, not the transport.
+The trigger client therefore sets **no read deadline** on a delivery
+(`timeout_seconds=None`; only the connect phase stays bounded). A flat HTTP
+read timeout there is a wall-clock turn-duration policy in disguise: it fires on
+a genuinely-working agent, and because the request has already crossed the
+boundary the outcome can only be reported as `ChannelDeliveryUnknown` —
+indeterminate by construction. That is exactly what produced a run history full
+of `status: unknown` entries clustered at the old 600s cap.
+
+A daemon still has to tell a **working** agent from a **wedged** one. The
+runtime already owns the one honest answer and must not grow a second: the
+**turn lease** (`molecule_runtime/turn_lease.py`), touched on every tool call,
+expiring only after an idle TTL with no touch (`A2A_COMPLETION_IDLE_TIMEOUT_SECONDS`,
+900s), under an un-bypassable absolute cap measured from turn start
+(`MOLECULE_MAX_TURN_SECONDS`, default 4x the idle cap = 3600s).
+
+The trigger binding exposes that object, and nothing else, at
+`GET /turn-liveness` (`channel_events.turn_liveness_snapshot`). It is gated by
+the **same** ephemeral capability as a send — a daemon that cannot fire a turn
+cannot inspect one — and it is a pure read: it never touches, arms or ends a
+turn. The **channel** lane does not serve it; a channel bridges an external
+party and gets no window into the agent's turn.
+
+```json
+{"lease": true, "idle_seconds": 3.1, "ttl_seconds": 900.0,
+ "turn_age_seconds": 3000.0, "absolute_cap_seconds": 3600.0,
+ "idle_expired": false, "absolute_cap_exceeded": false, "alive": true}
+```
+
+`{"lease": false, "reason": ...}` means the mailbox kernel is off and there is
+**no signal** — a real state a caller must handle by falling back to its own
+ceiling. It does not mean the turn is dead; reporting it that way would
+reintroduce the wall-clock kill. A host predating this contract answers 404,
+which `probe_trigger_liveness` also reports as "no signal" rather than an error.
+
+Client: `probe_trigger_liveness` (SDK `molecule_plugin.channel`, vendored into
+`molecule_runtime/channel_sdk.py`). Unlike a delivery it is always time-bounded
+(5s) — an unbounded probe against a wedged host would be the very failure the
+probe exists to detect. The reference scheduler consumes it in
+`SchedulerDaemon.check_watchdog`: an `alive` turn is never cancelled however
+long it runs; `idle_expired`, `absolute_cap_exceeded`, and "no signal past the
+fallback ceiling" each cancel and re-queue the fire, and each records its own
+`cause` in the run history.

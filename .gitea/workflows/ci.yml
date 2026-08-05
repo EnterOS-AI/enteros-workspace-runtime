@@ -68,7 +68,7 @@ jobs:
           sdk_source="$(mktemp)"
           trap 'rm -f "$sdk_source"' EXIT
           curl -fsS -A curl/8.4.0 \
-            https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-sdk/raw/molecule_plugin/channel.py?ref=9372b57ac9dcebd92a40b2844ed0cba23e029ee2 \
+            https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-sdk/raw/molecule_plugin/channel.py?ref=fe1e7dbac8243d7c8f523b5eab7ed9dccc6b15b6 \
             -o "$sdk_source"
           bash scripts/check-channel-sdk-vendor.sh "$sdk_source"
 
