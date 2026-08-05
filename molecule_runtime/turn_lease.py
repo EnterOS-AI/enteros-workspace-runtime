@@ -26,8 +26,8 @@ B. Claude Code — its adapter exposes ``transcript_lines()``; a poller was
    ``~/.claude``). **NEVER BUILT.** No poller exists, and ``ClaudeSDKExecutor``
    touches the lease by no other route either, so claude-code has NO feed. That
    is precisely why :func:`arm_turn_if_fed` refuses to arm it — see runtime#408
-   and the follow-up tracking the one-line ping at its ``_report_tool_use``
-   site, which is all that is needed to bring it up to codex/hermes parity.
+   and runtime#410, which tracks the one-line ping at its ``_report_tool_use``
+   site, all that is needed to bring it up to codex/hermes parity.
 C. codex / hermes — subprocess runtimes bump ``MOLECULE_TOOL_ACTIVITY_FILE``
    (see ``executor_helpers``) on every tool call and
    :func:`feed_from_activity_file` touches the lease when its mtime advances.

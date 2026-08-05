@@ -346,7 +346,7 @@ write the tool-activity file. So claude-code keeps the pre-existing "no signal"
 behaviour, and a wedged claude-code turn is still only bounded by the daemon's
 own ceiling rather than the 900s TTL. Closing that needs a one-line
 `record_tool_activity()` at its `_report_tool_use` site — the same pattern codex
-and hermes already use — in the template repo.
+and hermes already use — in the template repo. Tracked as runtime#410.
 
 The check is empirical rather than a list of runtime names precisely so that
 this heals itself: the moment claude-code starts writing the activity file, its
