@@ -285,3 +285,21 @@ probe exists to detect. The reference scheduler consumes it in
 long it runs; `idle_expired`, `absolute_cap_exceeded`, and "no signal past the
 fallback ceiling" each cancel and re-queue the fire, and each records its own
 `cause` in the run history.
+
+### Known asymmetry: who enforces the absolute cap, and when
+
+The executor consults `absolute_cap_exceeded()` **only** at an idle-cap
+boundary — inside `turn_is_alive_despite_idle`, which runs when `astream_events`
+has produced no event for the idle cap. A turn that keeps emitting events can
+therefore exceed the absolute cap inside the runtime without being ended.
+
+A daemon polling `/turn-liveness` evaluates the same predicate **continuously**,
+so it can decide to stop waiting on a turn the executor is still running. That is
+the intended asymmetry — the daemon is bounding *its own* wait, not the turn —
+but it means a cancelled delivery does not imply a cancelled turn. The fire is
+re-queued; a re-fire that lands while the original turn is still in flight is
+dropped host-side, because a `self-scheduler` `source_type` is a routine
+self-ping class that drops rather than queues behind an in-flight turn.
+
+Tightening this properly means the executor checking the absolute cap on the
+event path too, not just at the idle boundary. That is a separate change.
