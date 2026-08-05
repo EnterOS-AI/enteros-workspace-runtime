@@ -382,3 +382,45 @@ async def test_kernel_off_subprocess_turn_is_unchanged(monkeypatch, tmp_path):
         "reason": "no turn lease is installed (mailbox kernel off)",
     }
     assert len(q.events) == 1  # the reply still flows
+
+
+# --------------------------------------------------------------------------- #
+# 7. runtime#409 — ONE scope per turn, even when the scope is entered TWICE.
+#
+#    openclaw is the only flavour that inherits SubprocessA2AExecutor, so for
+#    it (and any future subprocess runtime) BOTH main.py's TurnLeaseExecutor
+#    wrapper and this base enter turn_liveness_scope for the same turn. Without
+#    a re-entrancy guard that arms the lease twice and runs two watcher tasks
+#    polling the same file for the whole turn — a regression on the one flavour
+#    that was already correct.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_wrapped_subprocess_turn_runs_exactly_one_watcher(
+    clock_and_lease, monkeypatch
+):
+    from molecule_runtime.turn_lease_executor import wrap_executor
+
+    clock, _lease, _activity = clock_and_lease
+
+    watchers: list[str] = []
+    real_watch = turn_lease.watch_activity_file
+
+    async def counting_watch(path, **kw):
+        watchers.append(str(path))
+        return await real_watch(path, **kw)
+
+    monkeypatch.setattr(turn_lease, "watch_activity_file", counting_watch)
+
+    ex = wrap_executor(_ProbingExecutor(clock, work=lambda c: c.advance(3.0),
+                                        workspace_id="ws-409"))
+    await ex.execute(_FakeContext(), _RecordingQueue())
+
+    assert len(watchers) == 1, (
+        f"one turn started {len(watchers)} activity watchers — the wrapper and "
+        "the SubprocessA2AExecutor base both entered turn_liveness_scope and "
+        "the nested entry was not suppressed (runtime#409)"
+    )
+    # The nested scope must also not have re-armed: the turn is still dated to
+    # the outermost entry, and no scope leaked.
+    assert ex._inner.snapshot["turn_age_seconds"] == pytest.approx(3.0)
+    assert turn_lease.active_liveness_scopes() == 0

@@ -56,15 +56,60 @@ the lease is a PROCESS-GLOBAL singleton installed by the kernel wiring
 When the kernel is off the global is ``None`` and every :func:`touch_current` /
 :func:`feed_from_activity_file` call is a cheap no-op — so the touches added to
 ``a2a_executor`` change NOTHING in the proven default flow.
+
+.. _turn-lease-concurrency-limit:
+
+CONCURRENCY LIMIT — the lease describes ONE turn, and cannot say which
+----------------------------------------------------------------------
+Read this before adding a caller. The paragraph above is about INSTALLATION —
+one lease object per process, created by the kernel wiring. This one is about
+OCCUPANCY, which is a different and weaker guarantee:
+
+* The lease is SINGLE-VALUED. It carries one ``_turn_start`` and one
+  ``_last_touch``, and it carries no turn identity. Nothing in a snapshot says
+  WHICH turn it describes.
+* Touches are UNATTRIBUTED. Every feeder (native tool hooks, the activity-file
+  watcher, openclaw's subprocess output) touches the same lease, so if two
+  turns are in flight the activity of either keeps the lease of "the" turn
+  fresh. A wedged turn overlapping a working one therefore reads alive.
+* :func:`turn_liveness_scope` arms only on the OUTERMOST active scope
+  (runtime#409), so an overlapping turn does NOT re-date the lease. That is the
+  conservative choice, deliberately: ``reset()`` only ever moves the clocks
+  FORWARD, so re-arming on a later turn erases the older turn's idle clock and
+  its absolute-cap origin — which is precisely how a periodically-pinged
+  workspace ends up with a wedged turn that is never reaped. Declining to
+  re-arm cannot create that hole.
+* What that costs, stated plainly: while two turns overlap, the lease stays
+  dated to the OLDER one. A consumer reading it gets a conservative (older,
+  more likely to be judged stalled) age for the newer turn. It does NOT get a
+  falsely-fresh one. So the failure mode under overlap is an early verdict on
+  the younger turn, never an unreapable one — the opposite direction from the
+  bug, and the safe direction of the two.
+* NOT guaranteed, and do not infer it: that a snapshot corresponds to the turn
+  the reader dispatched. The scheduler's ``lease_is_attributable`` gate
+  (``turn_age_seconds < elapsed``) is a NECESSARY condition, not a sufficient
+  one — it rejects a never-armed lease, but it cannot distinguish two
+  concurrent turns.
+
+The real fix is a ``turn_id`` in the snapshot so a consumer can check the lease
+describes ITS turn and treat a mismatch as "no signal". That is issue #408
+point 3 / sdk#208: the snapshot field list is declared in the SDK
+(``molecule_plugin/channel.py``) and mirrored into ``channel_sdk.py``, so
+adding a field is an SDK-first chain that also bumps the scheduler plugin. It
+is deliberately not done here. Until it lands, ONE in-flight turn per runtime
+process is the assumption this module is honest under.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import threading
 import time
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 #: Per-turn lease TTL override (seconds). Falls back to the idle-cap.
 LEASE_TTL_ENV = "MOLECULE_TURN_LEASE_TTL_SECONDS"
@@ -451,6 +496,130 @@ def turn_is_alive_despite_idle(path: str | os.PathLike[str]) -> bool:
     return not lease.expired()
 
 
+# --------------------------------------------------------------------------
+# Scope occupancy registry — the re-entrancy guard for turn_liveness_scope.
+#
+# A DELIVERY IS NOT A TURN (runtime#409). On the native executor ``execute()``
+# delegates to ``_core_execute()``, which is RE-ENTERED for every delivery that
+# arrives while a turn is in flight — ``MOLECULE_A2A_NONBLOCKING`` is
+# default-ON fleet-wide, so this is the live path. A routine self-ping is
+# fast-acked and dropped; a user message is deferred at the same point. NEITHER
+# becomes a turn: both return before ``_core_execute`` ever reaches its own
+# ``reset_current()``, which is why the pre-#408 arm site was safe.
+#
+# A scope that armed unconditionally on entry re-dates the lease from such a
+# delivery, and ``reset()`` moves BOTH the idle clock and the absolute-cap
+# origin. On a workspace taking periodic self-pings (cron tick, delegation
+# harvester) both the TTL and the cap then reset indefinitely, so a wedged turn
+# is NEVER reaped — and because the lease *is* armed, the scheduler's
+# ``lease_is_attributable`` gate passes and the daemon TRUSTS the "alive"
+# snapshot instead of falling back to its own ceiling. That is strictly worse
+# than the unarmed state #408 set out to fix.
+#
+# The scope is also legitimately NESTED: for openclaw (and any future
+# ``SubprocessA2AExecutor`` subclass) both the ``main.py`` wrapper and the base
+# enter it, so without a guard one turn arms twice and runs two watcher tasks.
+#
+# The guard: a registry of the scopes currently active in this process, keyed
+# on the asyncio Task that entered. An entry made while the registry is EMPTY
+# is the outermost scope and does the work; every other entry is a
+# pass-through that arms nothing and starts no watcher.
+#
+# Why keyed on the task and not a bare depth counter
+# --------------------------------------------------
+# A bare integer counter would be sound for MUTUAL EXCLUSION. asyncio does not
+# preempt between statements, so ``n += 1; outermost = (n == 1)`` cannot
+# interleave with another coroutine on the same loop; the lock below covers
+# only the (not currently exercised, but free to allow for) case of a second
+# event loop on another thread.
+#
+# It is NOT sound for RECOVERY, and that is why it is not what is used here. A
+# counter cannot distinguish a scope that is still running from one whose
+# decrement was lost, and a lost decrement is a real possibility: this is an
+# ``@asynccontextmanager``, and an async generator abandoned without
+# ``__aexit__`` — a task cancelled at a bad moment, an ``aclose`` that never
+# runs — is finalized by the GC, whose call to ``athrow`` can be dropped
+# entirely when there is no running loop. One leaked increment leaves the
+# counter permanently above zero, and the guard then silently declines to arm
+# EVERY subsequent turn for the life of the container: a liveness mechanism
+# failing to a permanent no-signal state, which is the exact defect this module
+# exists to remove, reintroduced by its own guard. Keying on
+# ``asyncio.current_task()`` makes that self-healing — an owner whose task is
+# ``done()`` is provably no longer inside a scope, so it is pruned on the next
+# entry and the registry drains itself.
+#
+# Keying on the task is also the right EQUIVALENCE CLASS. Nesting (wrapper ->
+# base) happens within ONE task and is re-entrancy; an overlapping delivery is
+# a DIFFERENT task and is concurrency. Both must decline to re-arm, but they
+# are different situations — only the task key can tell them apart, and only
+# the second one is the concurrency limit documented at the top of this module.
+# --------------------------------------------------------------------------
+#: owner token -> nesting depth for that owner. Guarded by _SCOPES_LOCK.
+_ACTIVE_SCOPES: dict[object, int] = {}
+_SCOPES_LOCK = threading.Lock()
+
+
+def _prune_finished_scope_owners_locked() -> None:
+    """Drop registry entries whose owning task has finished. Caller holds the lock.
+
+    A finished task is provably not inside a scope, so its entry can only be a
+    leak (see the note above on abandoned async generators). Pruning here — on
+    entry, before the outermost decision — is what keeps a single lost
+    ``__aexit__`` from disabling arming for the life of the process.
+    """
+    dead = [
+        owner
+        for owner in _ACTIVE_SCOPES
+        if isinstance(owner, asyncio.Task) and owner.done()
+    ]
+    for owner in dead:
+        del _ACTIVE_SCOPES[owner]
+
+
+def _enter_liveness_scope() -> tuple[object, bool, bool]:
+    """Register an active liveness scope.
+
+    Returns ``(token, is_outermost, is_nested)``. ``is_nested`` distinguishes
+    re-entrancy (same task) from concurrency (another task) — same verdict,
+    different diagnosis; it is logged, not acted on.
+    """
+    try:
+        owner: object | None = asyncio.current_task()
+    except RuntimeError:  # pragma: no cover - no running loop
+        owner = None
+    # No task identity available: mint a unique token so this scope can neither
+    # be mistaken for another's nor suppress a later one by key collision. Such
+    # a token is not prunable, but it is only reachable off the asyncio path.
+    token: object = owner if owner is not None else object()
+    with _SCOPES_LOCK:
+        _prune_finished_scope_owners_locked()
+        outermost = not _ACTIVE_SCOPES
+        nested = token in _ACTIVE_SCOPES
+        _ACTIVE_SCOPES[token] = _ACTIVE_SCOPES.get(token, 0) + 1
+    return token, outermost, nested
+
+
+def _exit_liveness_scope(token: object) -> None:
+    """Deregister a scope registered by :func:`_enter_liveness_scope`."""
+    with _SCOPES_LOCK:
+        remaining = _ACTIVE_SCOPES.get(token, 0) - 1
+        if remaining > 0:
+            _ACTIVE_SCOPES[token] = remaining
+        else:
+            _ACTIVE_SCOPES.pop(token, None)
+
+
+def active_liveness_scopes() -> int:
+    """Number of liveness scopes currently active in this process.
+
+    Diagnostics / tests only. ``> 1`` means either a nested scope (wrapper plus
+    a ``SubprocessA2AExecutor`` base) or overlapping deliveries — see the
+    concurrency limit at the top of this module.
+    """
+    with _SCOPES_LOCK:
+        return sum(_ACTIVE_SCOPES.values())
+
+
 @contextlib.asynccontextmanager
 async def turn_liveness_scope():
     """Everything one turn needs from the lease, for ANY executor. Async CM.
@@ -472,14 +641,50 @@ async def turn_liveness_scope():
     3. Start the background activity-file watcher so touches land continuously
        rather than only when someone happens to read the snapshot.
 
+    NON-RE-ENTRANT — a delivery is not a turn (runtime#409)
+    -------------------------------------------------------
+    All three steps run ONLY on the outermost active scope in this process. A
+    scope entered while another is already open — whether nested inside it
+    (``main.py``'s wrapper around a ``SubprocessA2AExecutor``, which enters the
+    scope itself) or overlapping it (a delivery arriving mid-turn on the native
+    executor, which is fast-acked and dropped WITHOUT becoming a turn) — is a
+    pass-through: it arms nothing, spawns no second watcher, and yields
+    ``False``.
+
+    This is load-bearing, not tidiness. ``reset()`` moves the absolute-cap
+    origin as well as the idle clock, so arming from a dropped self-ping resets
+    both; on a workspace taking periodic self-pings that repeats forever and a
+    wedged turn is never reaped, while the armed lease makes the daemon *trust*
+    the "alive" reading. See the registry comment above for the full mechanism
+    and for why the guard is keyed on the asyncio task rather than a counter.
+
+    It does NOT make the lease multi-turn safe: see
+    :ref:`the concurrency limit <turn-lease-concurrency-limit>` at the top of
+    this module. While two turns overlap the lease stays dated to the older —
+    conservative, and the only direction that cannot manufacture an unreapable
+    turn.
+
     Kernel OFF (no lease installed) is a pure pass-through: no file is
     materialized, no env var is exported, no task is spawned — byte-identical
-    to the pre-kernel flow.
+    to the pre-kernel flow. It is also checked BEFORE the scope registry, so
+    the kernel-off path does not so much as take the lock.
 
     Never raises. A liveness scope must not be able to fail a turn.
     """
     if current() is None:
         yield False
+        return
+    token, outermost, nested = _enter_liveness_scope()
+    if not outermost:
+        try:
+            logger.debug(
+                "turn-lease: %s liveness scope entered while one is already "
+                "active — not re-arming (runtime#409)",
+                "nested" if nested else "overlapping",
+            )
+            yield False
+        finally:
+            _exit_liveness_scope(token)
         return
     armed = False
     stop_event: asyncio.Event | None = None
@@ -509,6 +714,9 @@ async def turn_liveness_scope():
     try:
         yield armed
     finally:
+        # Deregister FIRST: the registry must drain even if awaiting the
+        # watcher below hangs or raises, or this process stops arming turns.
+        _exit_liveness_scope(token)
         if stop_event is not None:
             stop_event.set()
         if watcher is not None:

@@ -50,10 +50,24 @@ class TurnLeaseExecutor(_AgentExecutor):  # type: ignore[misc]
     """Wraps an adapter's executor so its turns participate in the turn lease.
 
     Observes only — delegates ``execute`` / ``cancel`` (and every other
-    attribute) to the inner executor, so an executor that already arms the lease
-    itself (openclaw, via the shared base) is unaffected: arming twice at turn
-    start is idempotent, and neither arm can move ``_turn_start`` mid-turn,
-    which is what would bypass the absolute cap.
+    attribute) to the inner executor.
+
+    Arming is NOT unconditional here, and the difference matters (runtime#409).
+    ``execute`` is entered once per DELIVERY, and a delivery is not a turn: on
+    the native executor, a delivery arriving while a turn is in flight is
+    fast-acked and dropped (or deferred) without ever becoming one. Arming from
+    such a delivery would re-date the lease — ``reset()`` moves the
+    absolute-cap origin as well as the idle clock — so a workspace taking
+    periodic self-pings would reset both forever and its wedged turn would
+    never be reaped. :func:`turn_lease.turn_liveness_scope` therefore arms only
+    on the OUTERMOST active scope in the process; this wrapper's scope is a
+    no-op whenever another is already open. That is also what keeps an executor
+    which enters the scope itself (openclaw, via ``SubprocessA2AExecutor``)
+    from running a second watcher task per turn.
+
+    The earlier claim that "neither arm can move ``_turn_start`` mid-turn" was
+    simply wrong — that is exactly what the second arm did, and it is what
+    #409 fixes.
     """
 
     def __init__(self, inner: Any) -> None:

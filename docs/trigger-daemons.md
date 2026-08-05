@@ -351,3 +351,39 @@ and hermes already use — in the template repo. Tracked as runtime#410.
 The check is empirical rather than a list of runtime names precisely so that
 this heals itself: the moment claude-code starts writing the activity file, its
 next turn is armed with no change here.
+
+### A delivery is not a turn (runtime#409)
+
+The wrap above runs per **delivery**, and most deliveries do not become turns.
+`MOLECULE_A2A_NONBLOCKING` is default-on fleet-wide, so a delivery arriving
+while a turn is in flight re-enters the executor and is fast-acked: a routine
+self-ping (a cron tick, the delegation harvester) is dropped, a user message is
+deferred, and neither reaches the arm site the native executor has always used.
+
+Arming from one of those would be worse than not arming at all. `reset()` moves
+the **absolute-cap origin** as well as the idle clock, so a single dropped
+self-ping restarts both the 900s TTL and the 3600s cap. On a workspace that is
+pinged periodically — which is every workspace with a trigger daemon — that
+repeats forever: a wedged turn is never reaped, and because the lease *is*
+armed, `lease_is_attributable` passes and the daemon **trusts** the resulting
+"alive" reading instead of falling back to its own ceiling. It is a hole in
+exactly the capability runtime#408 restored.
+
+So `turn_liveness_scope()` arms only on the **outermost** scope active in the
+process. A scope entered while another is open — nested (the `main.py` wrapper
+around openclaw's `SubprocessA2AExecutor`, which enters the scope itself) or
+overlapping (a delivery mid-turn) — arms nothing and starts no second watcher.
+
+**Read this before trusting a snapshot under concurrency.** The lease is
+single-valued and carries no turn identity, and its feeds are unattributed, so
+it can describe only one turn at a time. While two turns overlap it stays dated
+to the **older** one — deliberately, because `reset()` only moves clocks
+forward, so re-dating on the younger turn is precisely the unreapable-turn hole
+above. The cost is a conservative (older, more likely to read stalled) age for
+the younger turn; it is never a falsely-fresh one. `lease_is_attributable` is a
+necessary condition, not a sufficient one: it rejects a never-armed lease, but
+it cannot tell two concurrent turns apart. The real fix is a `turn_id` in the
+snapshot so a consumer can detect a mismatch and treat it as "no signal" —
+issue #408 point 3 / sdk#208, an SDK-first chain because the field list is
+declared in `molecule_plugin/channel.py`. Until it lands, one in-flight turn
+per runtime process is the assumption the lease is honest under.
