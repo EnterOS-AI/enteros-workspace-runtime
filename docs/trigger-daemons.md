@@ -303,3 +303,51 @@ self-ping class that drops rather than queues behind an in-flight turn.
 
 Tightening this properly means the executor checking the absolute cap on the
 event path too, not just at the idle boundary. That is a separate change.
+
+### Which runtimes the snapshot is actually about (runtime#408)
+
+The snapshot is only as honest as the lease behind it, and a lease is only
+about a turn once something **arms** it at that turn's start. For a long time
+only the native executor did. Every adapter-supplied executor now participates
+through one wrap applied at `main.py`'s executor funnel
+(`turn_lease_executor.TurnLeaseExecutor`), which per turn:
+
+1. materializes and **exports** `MOLECULE_TOOL_ACTIVITY_FILE` before the child
+   is spawned — codex and hermes both gate their per-tool-call liveness ping on
+   that variable, and it used to be exported only by the native executor, which
+   never runs on those flavours. Their feed was written for the lease and was
+   dead on arrival;
+2. arms the lease, but **only if this runtime has been observed to feed it**
+   (`turn_lease.arm_turn_if_fed`);
+3. runs the activity-file watcher for the turn's duration.
+
+Arming is deliberately conditional. Arming is what persuades a consumer to
+believe the lease — `lease_is_attributable` passes as soon as
+`turn_age_seconds < elapsed` — so a lease that is armed but never fed is not a
+better signal than an unarmed one, it is a worse one: it reports the turn as
+idle from the instant it starts, and a legitimately long turn gets cancelled at
+the TTL. Where no feed exists the lease is therefore left unarmed and continues
+to read container uptime, which is exactly what makes a daemon reject it as "no
+signal" and fall back to its own ceiling.
+
+Current feed status per flavour:
+
+| flavour | feed | armed |
+|---|---|---|
+| native (langgraph) | tool start/end hooks | yes (always, in `a2a_executor`) |
+| openclaw | subprocess output bytes | yes |
+| codex | tool-activity file per tool item | yes, once a first tool call is seen |
+| hermes | tool-activity file per tool dispatch | yes, once a first tool call is seen |
+| claude-code | **none** | **no** — see below |
+
+`ClaudeSDKExecutor` touches the lease by no route at all: the transcript-tail
+poller sketched as feeder B in `turn_lease.py` was never built, and it does not
+write the tool-activity file. So claude-code keeps the pre-existing "no signal"
+behaviour, and a wedged claude-code turn is still only bounded by the daemon's
+own ceiling rather than the 900s TTL. Closing that needs a one-line
+`record_tool_activity()` at its `_report_tool_use` site — the same pattern codex
+and hermes already use — in the template repo.
+
+The check is empirical rather than a list of runtime names precisely so that
+this heals itself: the moment claude-code starts writing the activity file, its
+next turn is armed with no change here.

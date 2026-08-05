@@ -43,6 +43,7 @@ from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor
 
+from molecule_runtime import turn_lease
 from molecule_runtime.executor_helpers import extract_attached_files
 from molecule_runtime.platform_auth import get_workspace_id as _get_workspace_id
 from molecule_runtime.shared_runtime import (
@@ -127,13 +128,26 @@ class SubprocessA2AExecutor(AgentExecutor):
 
         await set_current_task(self._heartbeat, brief_task(user_message))
         reply: str | None = None
-        try:
-            reply = await self.run_agent(task_text, session_id, context)
-        except Exception as e:  # noqa: BLE001 - surface any runtime error as a reply
-            logger.exception("%s run_agent failed", self.runtime_label)
-            reply = f"{self.runtime_label} error: {e}"
-        finally:
-            await set_current_task(self._heartbeat, "")
+        # THE TURN-LEASE CONTRACT (runtime#408). A subprocess runtime spends its
+        # whole turn blocked inside run_agent and never enters the native
+        # executor's astream loop, so nothing here used to arm or feed the
+        # process-global lease: `turn_liveness_snapshot()` reported CONTAINER
+        # UPTIME as the age of every turn, on every subprocess flavour, forever.
+        # Entering the scope exports MOLECULE_TOOL_ACTIVITY_FILE (without which a
+        # subprocess runtime's own tool-activity ping is a no-op) BEFORE
+        # run_agent spawns the child, arms the lease for this turn if this
+        # runtime has a demonstrated feed, and runs the activity watcher for the
+        # turn's duration. It lives HERE, in the shared base, for the same
+        # reason derive_session_id does: a per-adapter reimplementation is what
+        # let the contract rot in the first place.
+        async with turn_lease.turn_liveness_scope():
+            try:
+                reply = await self.run_agent(task_text, session_id, context)
+            except Exception as e:  # noqa: BLE001 - surface any runtime error as a reply
+                logger.exception("%s run_agent failed", self.runtime_label)
+                reply = f"{self.runtime_label} error: {e}"
+            finally:
+                await set_current_task(self._heartbeat, "")
 
         if not reply:
             reply = f"{self.runtime_label} returned no output"
