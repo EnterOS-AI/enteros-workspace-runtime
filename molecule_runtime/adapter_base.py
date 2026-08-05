@@ -729,6 +729,48 @@ class BaseAdapter(ABC):
             servers, launch_env=self.mcp_launch_env(config)
         )
 
+    async def enumerate_model_facing_tools(
+        self, config: "AdapterConfig"
+    ) -> "list[str] | None":
+        """Return the tool names the MODEL can actually call, or None.
+
+        THE PORT THAT CLOSES THE #3082 BLIND SPOT.
+        ``enumerate_loaded_mcp_tools`` answers "did the MCP server come up and
+        advertise tools" — it spawns the server and asks it directly. That
+        proves the SERVER is healthy. It says NOTHING about whether those tools
+        reached the model, and a concierge whose runtime deferred, filtered, or
+        renamed them is indistinguishable from a healthy one on that signal
+        alone. It reported 54 management tools loaded while the model could call
+        zero of them.
+
+        This port answers the other half: AFTER the runtime has assembled the
+        tool list it hands the model (deferral, toolset gating, schema
+        sanitisation, name rewriting — whatever this runtime does), what names
+        remain callable? Compared against the loaded set, a non-empty difference
+        is the exact false-green above.
+
+        TRI-STATE (never guess):
+          * ``None``  — this runtime cannot answer. That is the BASE DEFAULT:
+            a runtime that has not implemented the port reports nothing, the
+            heartbeat omits the field, and core's behaviour is unchanged. An
+            unimplemented port must never manufacture a passing verdict.
+          * ``[]``    — the runtime genuinely offers the model no tools.
+          * ``[ids]`` — the post-assembly, model-callable tool names.
+
+        IMPLEMENTORS: return the names as YOUR runtime spells them. Do not try
+        to match the probe's spelling — the comparison folds both sides through
+        ``loaded_mcp_tools_probe.canonical_tool_id`` precisely so you don't have
+        to. A hermes adapter answers this by calling its own
+        ``model_tools.get_tool_definitions(..., skip_tool_search_assembly=False)``
+        and returning ``[t["function"]["name"] for t in defs]`` — that is the
+        list hermes builds ``valid_tool_names`` from, i.e. the ground truth for
+        "can the model call this".
+
+        MUST NOT RAISE and MUST NOT BLOCK: this runs on the boot path and on
+        heartbeats. Bound any work you do here and map every failure to None.
+        """
+        return None
+
     def materialize_persona(self, config: "AdapterConfig") -> "Any":
         """Materialize the workspace's CANONICAL PERSONA into the default native
         identity file (the persona-materialization PORT).

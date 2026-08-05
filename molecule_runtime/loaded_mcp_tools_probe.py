@@ -83,6 +83,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import TYPE_CHECKING
 
 from molecule_runtime.privileged_mcp_env import tenant_safe_child_env
@@ -219,15 +220,52 @@ async def _maybe_alarm_launch_failure(proc, server: str) -> None:
 
 
 def _normalize_tool_id(server: str, tool_name: str) -> str:
-    """Return the canonical ``mcp__<server>__<tool>`` dispatcher id.
+    """Return the ``mcp__<server>__<tool>`` dispatcher id AS THE SERVER IS DECLARED.
 
     A name already in ``mcp__*`` form (some servers self-namespace) is returned
-    unchanged; a bare tool name is prefixed with this server's segment so the
-    core gate's ``mcp__molecule-platform__create_workspace`` match works.
+    unchanged; a bare tool name is prefixed with this server's segment.
+
+    NOTE — this spelling is NOT what every runtime registers. The declared server
+    name is used verbatim, so a hyphenated server yields
+    ``mcp__molecule-platform__create_workspace``. hermes sanitises the same server
+    to ``mcp__molecule_platform__create_workspace`` (see
+    :func:`canonical_tool_id`). This function is deliberately left alone so the
+    ``loaded_mcp_tools`` wire value does not change under consumers that already
+    match on it; EVERY comparison must go through :func:`canonical_tool_id` first.
     """
     if tool_name.startswith("mcp__"):
         return tool_name
     return f"mcp__{server}__{tool_name}"
+
+
+# The transform hermes applies to every MCP name component before registering it
+# (tools/mcp_tool.py::sanitize_mcp_name_component). Reproduced here VERBATIM
+# because it is the only spelling the model can actually be offered.
+_TOOL_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def canonical_tool_id(tool_id: str) -> str:
+    """Fold a tool id to the one spelling every runtime agrees on.
+
+    WHY THIS EXISTS (the bug it closes). The probe composes ids from the server
+    name as DECLARED — ``mcp__molecule-platform__create_workspace``, with a
+    hyphen. No hermes workspace ever registers that string: hermes sanitises each
+    name component with ``re.sub(r"[^A-Za-z0-9_]", "_", …)`` and registers
+    ``mcp__molecule_platform__create_workspace``. Measured on a live concierge
+    (2026-08-05)::
+
+        server='molecule-platform'
+          probe  _normalize_tool_id      -> mcp__molecule-platform__create_workspace
+          hermes mcp_prefixed_tool_name  -> mcp__molecule_platform__create_workspace
+          MATCH: False
+
+    So a raw string comparison between ``loaded_mcp_tools`` and the model-facing
+    set is a CONSTANT FALSE on hermes — it would "detect" a divergence on every
+    beat including a perfectly healthy one, which is exactly as useless as the
+    constant TRUE it replaces. Fold both sides through this function first and
+    the comparison measures what it claims to measure.
+    """
+    return _TOOL_ID_UNSAFE.sub("_", str(tool_id or ""))
 
 
 def _build_server_command(spec: dict) -> list[str] | None:
@@ -696,7 +734,94 @@ async def capture_loaded_mcp_tools_at_init(
 
     if observed is not None:
         set_loaded_mcp_tools(observed)
+
+    await capture_model_facing_tools(adapter, config)
     return observed
+
+
+# ── model-facing tool set (the signal loaded_mcp_tools was HIDING) ──────────
+#
+# THE INCIDENT. loaded_mcp_tools reported 54 management tools loaded while the
+# model could call ZERO of them. The probe spawns the MCP server ITSELF over
+# stdio and does its OWN tools/list — it never asks the runtime what it actually
+# put in front of the model. hermes' tool_search had deferred the whole MCP
+# surface behind three bridge tools, so `valid_tool_names` contained none of the
+# 54. The one signal that looked like it covered this is the one that hid it: a
+# probe that talks to the server directly can only ever confirm the SERVER is
+# healthy, never that the MODEL was offered anything.
+#
+# Measured on a live concierge (2026-08-05), same box, same servers, the ONLY
+# difference being tools.tool_search.enabled:
+#
+#   probe reports                      : 60 ids (54 management)  [both configs]
+#   hermes pre-assembly tool count     : 120 (92 mcp__*)
+#
+#   tool_search=off  model-facing: 120 (92 mcp__*)
+#                    loaded ⊄ model-facing: 0/60   -> subset=True   CONVERGES
+#   tool_search=on   model-facing:  28 ( 0 mcp__*)
+#                    tool_search activated=True deferred=95 tier=1
+#                    loaded ⊄ model-facing: 60/60  -> subset=False  DIVERGES
+#
+# That single comparison would have caught the incident on day one, so the
+# runtime now reports the post-assembly model-facing set alongside the probe's
+# view, and computes the subset verdict ITSELF.
+#
+# WHY THE RUNTIME COMPUTES IT (and not core). The two sides disagree on
+# SPELLING — the probe emits mcp__molecule-platform__x, hermes registers
+# mcp__molecule_platform__x. Only the runtime sees both, so only the runtime can
+# fold them (canonical_tool_id) before comparing. Shipping the raw sets and
+# letting core diff them would re-create the incident in a new place: a constant
+# mismatch that core would have to learn to ignore, which is how a gate becomes
+# noise and then becomes disabled.
+
+
+async def capture_model_facing_tools(
+    adapter: "BaseAdapter",
+    config: "AdapterConfig",
+) -> list[str] | None:
+    """Ask the ADAPTER what the model can actually call, and publish it.
+
+    Tri-state, identical in spirit to the loaded_mcp_tools producer:
+      * ``None``  — this runtime cannot answer (base default, or the adapter
+        failed). The producer is left unset, the heartbeat OMITS the field and
+        core's existing grace/degrade behaviour is unchanged. We NEVER guess.
+      * ``[]``    — the runtime genuinely offers the model no tools.
+      * ``[ids]`` — the post-assembly, model-callable tool names.
+
+    Never raises: an adapter that throws leaves the producer unset.
+    """
+    from molecule_runtime.platform_agent_identity import set_model_facing_tools
+
+    try:
+        facing = await adapter.enumerate_model_facing_tools(config)
+    except Exception:  # noqa: BLE001 — must never block boot or a heartbeat
+        logger.warning(
+            "model_facing_tools: adapter enumeration errored — leaving producer "
+            "unset (no verdict is better than a wrong one)",
+            exc_info=True,
+        )
+        return None
+
+    if facing is not None:
+        set_model_facing_tools(facing)
+    return facing
+
+
+def loaded_not_model_facing(loaded, facing) -> list[str] | None:
+    """Which loaded MCP tool ids are NOT reachable by the model.
+
+    Returns ``None`` when the question is unanswerable (either side unobserved)
+    — absence of evidence must not read as evidence of health. Otherwise returns
+    the sorted set-difference, compared through :func:`canonical_tool_id` so the
+    hyphen/underscore spelling split cannot fake a divergence.
+
+    A NON-EMPTY result is the degraded signal: the server advertised tools that
+    the model was never offered.
+    """
+    if loaded is None or facing is None:
+        return None
+    facing_canon = {canonical_tool_id(t) for t in facing}
+    return sorted(t for t in loaded if canonical_tool_id(t) not in facing_canon)
 
 
 async def capture_loaded_mcp_tools_with_retry(

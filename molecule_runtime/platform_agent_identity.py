@@ -465,6 +465,36 @@ def loaded_mcp_tools():
         return None if _loaded_mcp_tools is None else list(_loaded_mcp_tools)
 
 
+# ── model_facing_tools producer (the half loaded_mcp_tools was hiding) ──────
+# loaded_mcp_tools is produced by asking the MCP SERVER what it advertises. That
+# can only ever prove the server is healthy. It reported 54 management tools
+# loaded on a concierge whose model could call NONE of them, because the runtime
+# had deferred the entire MCP surface behind tool_search bridge tools. This
+# producer carries the other half: what the model was ACTUALLY offered, after
+# the runtime finished assembling its tool list. Same tri-state discipline —
+# None means "not observed", never "fine".
+_model_facing_tools_lock = threading.Lock()
+_model_facing_tools = None  # type: list[str] | None
+
+
+def set_model_facing_tools(tools) -> None:
+    """Record the post-assembly tool names the model can actually call.
+
+    Pass the names as the runtime spells them (no normalisation here — the
+    comparison folds both sides via ``canonical_tool_id``). Pass ``[]`` for a
+    runtime that genuinely offers no tools, or ``None`` to clear.
+    """
+    global _model_facing_tools
+    with _model_facing_tools_lock:
+        _model_facing_tools = None if tools is None else [str(t) for t in tools]
+
+
+def model_facing_tools():
+    """The last-observed model-facing tool names, or None if never observed."""
+    with _model_facing_tools_lock:
+        return None if _model_facing_tools is None else list(_model_facing_tools)
+
+
 # ── EV2 mcp_tools_ready readiness signal (SDK workspace-comms EV2) ───────────
 # The POSITIVE half of the tools-loaded heartbeat signal — runtime#273 landed the
 # NEGATIVE half (mcp_launch_failure). The MCPReadinessProber sets this True on the
@@ -575,6 +605,26 @@ def identity_gate_payload() -> dict:
     tools = loaded_mcp_tools()
     if tools is not None:
         payload["loaded_mcp_tools"] = tools
+
+    # The anti-false-green pair. `loaded_mcp_tools` alone said 54 tools were
+    # loaded on a concierge that could call none of them; `model_facing_tools`
+    # is what the model was actually offered, and `loaded_not_model_facing` is
+    # the runtime's own verdict on the difference (computed here because only
+    # the runtime sees BOTH spellings — see loaded_mcp_tools_probe.
+    # canonical_tool_id). All three are OMITTED when unobserved: absence must
+    # keep reading as "unknown", never as "healthy".
+    facing = model_facing_tools()
+    if facing is not None:
+        payload["model_facing_tools"] = facing
+    try:
+        from molecule_runtime.loaded_mcp_tools_probe import loaded_not_model_facing
+        orphaned = loaded_not_model_facing(tools, facing)
+    except Exception:  # noqa: BLE001 — the gate payload must never crash a heartbeat
+        orphaned = None
+    if orphaned is not None:
+        # NON-EMPTY = degraded: the MCP server advertised tools the model was
+        # never offered. Core gates on this; it needs no spelling knowledge.
+        payload["loaded_not_model_facing"] = orphaned
     # EV2: the POSITIVE readiness event. Included ONLY once the MCPReadinessProber
     # has observed a tools/list result (mcp_tools_ready is not None), so a beat
     # before the first probe success OMITS both fields — absence reads as "unknown"
