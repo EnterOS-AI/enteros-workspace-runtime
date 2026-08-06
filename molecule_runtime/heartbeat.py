@@ -604,6 +604,19 @@ class HeartbeatLoop:
         # capability routing). Identical to the original async path.
         body.update(_runtime_state_payload())
         body.update(_runtime_metadata_payload())
+        # Role-identity diagnostic. Emits `role_identity_diag` ONLY when this
+        # workspace had to fall back to the branded platform default because its
+        # persona file never arrived — absent field = healthy, so the wire shape
+        # is unchanged for every normal workspace. Same runtime-only-diagnostic
+        # posture as `platform_mcp_diag` above. Without this the fact exists only
+        # in container stdout, and the CP cannot tell "FAILED to get its identity"
+        # from "never needed a role prompt file".
+        try:
+            from molecule_runtime import identity_health
+
+            body.update(identity_health.heartbeat_payload())
+        except Exception as _ident_exc:  # noqa: BLE001 — never break a heartbeat
+            logger.debug("role_identity_diag: skipped (%s)", _ident_exc)
         try:
             resp = client.post(
                 f"{self.platform_url}/registry/heartbeat",
