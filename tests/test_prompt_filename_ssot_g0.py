@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import inspect
 
+from molecule_runtime.branding import product_display_name
 from molecule_runtime.prompt import build_system_prompt
 
 # The ONE canonical prompt filename every layer converges on. If this constant
@@ -83,9 +84,12 @@ def test_negative_prompt_files_points_at_unshipped_file(tmp_path):
     # Declared file is missing → its identity never loads.
     assert "ROLE-IDENTITY-THAT-SHOULD-LOAD" not in out
     # And because prompt_files was non-empty, the canonical fallback is NOT used
-    # either — divergence => identity LOST (not wrong). The base platform frame
-    # still anchors the prompt so the agent boots (G2), just identity-less here.
-    assert "Molecule AI platform" in out
+    # either — divergence => the PROVISIONED identity is LOST, never silently
+    # substituted with a different template file. What fills the role slot is the
+    # platform's own branded default (never a third-party product — see
+    # tests/test_prompt_identity_branding.py), and the base platform frame still
+    # anchors the prompt so the agent boots (G2).
+    assert product_display_name() in out
 
 
 def test_positive_aligned_prompt_files_loads_identity(tmp_path):
