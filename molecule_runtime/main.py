@@ -1152,6 +1152,22 @@ async def main(prepare_only: bool = False):  # pragma: no cover
         except Exception:
             pass
 
+        # SSOT turn-lease wrap (runtime#408) — the SAME funnel, for the same
+        # reason: liveness is a platform invariant, not each adapter's private
+        # business. Only ONE of the four subprocess flavours inherits the shared
+        # SubprocessA2AExecutor base, so without this the other three
+        # (claude-code / codex / hermes) never arm the lease and
+        # GET /turn-liveness reports container uptime as the age of every turn.
+        # Applied OUTERMOST and unconditionally: unlike the tracing wrap above,
+        # this must not be contingent on an observability backend being
+        # configured. No-op when the mailbox kernel is off. Fail-open.
+        try:
+            from molecule_runtime import turn_lease_executor as _turn_lease_executor
+
+            executor = _turn_lease_executor.wrap_executor(executor)
+        except Exception:
+            pass
+
         # 6.0 loaded_mcp_tools producer (core#3082) — INIT-TIME enumeration.
         # Right after the executor is built (MCP servers are wired into the
         # runtime's native config by setup()), enumerate the connected MCP

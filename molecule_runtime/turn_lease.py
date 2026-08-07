@@ -20,14 +20,33 @@ Feeders ("resets on ANY tool call")
 -----------------------------------
 A. Native runtime — ``a2a_executor`` calls :func:`touch_current` from
    ``on_tool_start`` / ``on_tool_end`` (next to ``AgencyTracker.on_tool_call``).
-B. Claude Code — its adapter exposes ``transcript_lines()``; a poller touches
-   the lease when the tail advances (new jsonl lines under ``~/.claude``).
-C. codex / openclaw / hermes — subprocess runtimes export
-   ``MOLECULE_TOOL_ACTIVITY_FILE`` (see ``executor_helpers``); each tool call
-   bumps that file and :func:`feed_from_activity_file` touches the lease when
-   its mtime advances. Same pattern as ``DELEGATION_RESULTS_FILE``.
-D. Fallback — subprocess-output liveness: any bytes on the child's stdout/err
-   is a tool-activity proxy and touches the lease.
+   LIVE.
+B. Claude Code — its adapter exposes ``transcript_lines()``; a poller was
+   designed to touch the lease when the tail advances (new jsonl lines under
+   ``~/.claude``). **NEVER BUILT.** No poller exists, and ``ClaudeSDKExecutor``
+   touches the lease by no other route either, so claude-code has NO feed. That
+   is precisely why :func:`arm_turn_if_fed` refuses to arm it — see runtime#408
+   and runtime#410, which tracks the one-line ping at its ``_report_tool_use``
+   site, all that is needed to bring it up to codex/hermes parity.
+C. codex / hermes — subprocess runtimes bump ``MOLECULE_TOOL_ACTIVITY_FILE``
+   (see ``executor_helpers``) on every tool call and
+   :func:`feed_from_activity_file` touches the lease when its mtime advances.
+   Same pattern as ``DELEGATION_RESULTS_FILE``. LIVE, but ONLY since
+   runtime#408: both writers no-op when that env var is unset, and it was
+   exported exclusively by ``a2a_executor`` — which never runs on a subprocess
+   flavour. The feed was therefore dead on exactly the runtimes it was written
+   for. :func:`turn_liveness_scope` now exports it on every executor.
+D. openclaw — subprocess-output liveness: any bytes on the child's stdout/err
+   is a tool-activity proxy and touches the lease (its adapter's
+   ``_communicate_touching_lease``). LIVE.
+
+Arming, and why it is conditional
+---------------------------------
+A lease is only meaningful once :meth:`TurnLease.reset` has dated it to the
+turn in flight. A lease that is armed but never fed is not a better signal than
+an unarmed one — it is a worse one, because arming is what persuades a consumer
+to believe it. :func:`arm_turn_if_fed` therefore arms only where a feed above
+has actually been observed.
 
 Process-scoped
 --------------
@@ -37,14 +56,60 @@ the lease is a PROCESS-GLOBAL singleton installed by the kernel wiring
 When the kernel is off the global is ``None`` and every :func:`touch_current` /
 :func:`feed_from_activity_file` call is a cheap no-op — so the touches added to
 ``a2a_executor`` change NOTHING in the proven default flow.
+
+.. _turn-lease-concurrency-limit:
+
+CONCURRENCY LIMIT — the lease describes ONE turn, and cannot say which
+----------------------------------------------------------------------
+Read this before adding a caller. The paragraph above is about INSTALLATION —
+one lease object per process, created by the kernel wiring. This one is about
+OCCUPANCY, which is a different and weaker guarantee:
+
+* The lease is SINGLE-VALUED. It carries one ``_turn_start`` and one
+  ``_last_touch``, and it carries no turn identity. Nothing in a snapshot says
+  WHICH turn it describes.
+* Touches are UNATTRIBUTED. Every feeder (native tool hooks, the activity-file
+  watcher, openclaw's subprocess output) touches the same lease, so if two
+  turns are in flight the activity of either keeps the lease of "the" turn
+  fresh. A wedged turn overlapping a working one therefore reads alive.
+* :func:`turn_liveness_scope` arms only on the OUTERMOST active scope
+  (runtime#409), so an overlapping turn does NOT re-date the lease. That is the
+  conservative choice, deliberately: ``reset()`` only ever moves the clocks
+  FORWARD, so re-arming on a later turn erases the older turn's idle clock and
+  its absolute-cap origin — which is precisely how a periodically-pinged
+  workspace ends up with a wedged turn that is never reaped. Declining to
+  re-arm cannot create that hole.
+* What that costs, stated plainly: while two turns overlap, the lease stays
+  dated to the OLDER one. A consumer reading it gets a conservative (older,
+  more likely to be judged stalled) age for the newer turn. It does NOT get a
+  falsely-fresh one. So the failure mode under overlap is an early verdict on
+  the younger turn, never an unreapable one — the opposite direction from the
+  bug, and the safe direction of the two.
+* NOT guaranteed, and do not infer it: that a snapshot corresponds to the turn
+  the reader dispatched. The scheduler's ``lease_is_attributable`` gate
+  (``turn_age_seconds < elapsed``) is a NECESSARY condition, not a sufficient
+  one — it rejects a never-armed lease, but it cannot distinguish two
+  concurrent turns.
+
+The real fix is a ``turn_id`` in the snapshot so a consumer can check the lease
+describes ITS turn and treat a mismatch as "no signal". That is issue #408
+point 3 / sdk#208: the snapshot field list is declared in the SDK
+(``molecule_plugin/channel.py``) and mirrored into ``channel_sdk.py``, so
+adding a field is an SDK-first chain that also bumps the scheduler plugin. It
+is deliberately not done here. Until it lands, ONE in-flight turn per runtime
+process is the assumption this module is honest under.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import os
 import threading
 import time
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 #: Per-turn lease TTL override (seconds). Falls back to the idle-cap.
 LEASE_TTL_ENV = "MOLECULE_TURN_LEASE_TTL_SECONDS"
@@ -170,6 +235,11 @@ class TurnLease:
         self._turn_start = self._last_touch
         # mtime high-watermark for the activity-file feeder (source C).
         self._activity_file_mtime = 0.0
+        # Count of REAL activity touches (sources A/C/D) this process has ever
+        # recorded. Deliberately NOT reset by reset(): it is a property of the
+        # RUNTIME FLAVOUR ("does anything here feed the lease?"), not of a turn.
+        # See :meth:`observed_activity` / :func:`arm_turn_if_fed`.
+        self._activity_touches = 0
 
     @property
     def ttl_seconds(self) -> float:
@@ -189,6 +259,24 @@ class TurnLease:
         """
         with self._lock:
             self._last_touch = self._clock()
+            self._activity_touches += 1
+
+    @property
+    def observed_activity(self) -> bool:
+        """True once ANY real activity touch (source A/C/D) has been recorded.
+
+        This is the "has this runtime flavour got a working liveness feed?"
+        question, and it is answered EMPIRICALLY rather than by a static
+        declaration a flavour could get wrong. It never resets, because it
+        describes the flavour, not the turn.
+
+        :func:`arm_turn_if_fed` uses it to decide whether arming the lease for a
+        turn would produce an HONEST signal or merely a confident-looking one —
+        see that function for why arming a flavour with no feed is worse than
+        not arming it at all.
+        """
+        with self._lock:
+            return self._activity_touches > 0
 
     def reset(self) -> None:
         """Arm the lease at turn start: reset BOTH the idle clock and the
@@ -221,6 +309,31 @@ class TurnLease:
         """
         return self.turn_age() > self._absolute_cap
 
+    def baseline_activity_file(self, path: str | os.PathLike[str]) -> None:
+        """Adopt ``path``'s CURRENT mtime as the watermark, WITHOUT touching.
+
+        Called once at turn setup, right after the activity file is
+        materialized. Without it the very first
+        :meth:`feed_from_activity_file` compares a real mtime against a 0.0
+        watermark and "advances" — so the mere EXISTENCE of the file would
+        register as tool activity. That would be the same vacuous signal this
+        whole change exists to remove: a liveness feed that reports work
+        because a file is there, not because anything happened. Worse, it would
+        silently satisfy :meth:`observed_activity` for every flavour, including
+        the ones that never write the file at all, and so defeat the check in
+        :func:`arm_turn_if_fed`.
+
+        Missing / unstat-able file is a no-op: there is nothing to baseline
+        against, and the 0.0 watermark is then correct.
+        """
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            return
+        with self._lock:
+            if mtime > self._activity_file_mtime:
+                self._activity_file_mtime = mtime
+
     def feed_from_activity_file(self, path: str | os.PathLike[str]) -> bool:
         """Touch iff ``path``'s mtime advanced since the last check.
 
@@ -238,6 +351,7 @@ class TurnLease:
             if advanced:
                 self._activity_file_mtime = mtime
                 self._last_touch = self._clock()
+                self._activity_touches += 1
         return advanced
 
 
@@ -279,6 +393,56 @@ def reset_current() -> None:
     lease = current()
     if lease is not None:
         lease.reset()
+
+
+def observed_activity_current() -> bool:
+    """Has the global lease ever recorded a real activity touch? False if none."""
+    lease = current()
+    return lease is not None and lease.observed_activity
+
+
+def arm_turn_if_fed() -> bool:
+    """Arm the global lease for a turn starting NOW — but ONLY if this runtime
+    has been observed to feed it. Returns True iff the lease was armed.
+
+    Why this is conditional (runtime#408)
+    -------------------------------------
+    Arming is what makes the lease *believed*. A trigger daemon gates on
+    attributability — ``turn_age_seconds < elapsed`` — so an unarmed lease
+    (``turn_age`` == container uptime) is discarded as "no signal" and the
+    daemon falls back to its own absolute ceiling. The moment a runtime arms
+    per turn, that gate starts passing and every field of the snapshot is taken
+    at face value.
+
+    So arming without a working activity feed is strictly WORSE than not arming:
+
+      * unarmed + no feed  -> "no signal", daemon waits to its ceiling. A hung
+        turn is reaped late; a working turn is never killed. Safe, blunt.
+      * armed + no feed    -> the lease is trusted AND reports the turn as idle
+        from the moment it starts, because nothing ever touches it. A
+        legitimately long turn (a claude-code session doing twenty minutes of
+        tool work) is cancelled at the TTL. That is a NEW false kill, invented
+        by the fix — the same lie as before, pointed the other way.
+
+    Hence: arm only when the lease has demonstrably been fed at least once in
+    this process. The condition is EMPIRICAL, not a list of flavour names that
+    would silently rot as runtimes are added, and it is self-healing — a flavour
+    that gains a tool-activity ping starts being armed with no runtime change.
+
+    The cost is bounded and one-directional: on a fresh container the FIRST turn
+    that ever feeds the lease is itself unarmed (it is what proves the feed
+    exists), so it keeps today's safe "no signal" behaviour. Every subsequent
+    turn is armed and honest.
+    """
+    lease = current()
+    if lease is None:
+        return False
+    if not lease.observed_activity:
+        # No feed has ever been seen here — leave the lease UNARMED so it stays
+        # visibly unattributable rather than confidently wrong.
+        return False
+    lease.reset()
+    return True
 
 
 def feed_from_activity_file(path: str | os.PathLike[str]) -> bool:
@@ -330,6 +494,236 @@ def turn_is_alive_despite_idle(path: str | os.PathLike[str]) -> bool:
     if lease.absolute_cap_exceeded():
         return False
     return not lease.expired()
+
+
+# --------------------------------------------------------------------------
+# Scope occupancy registry — the re-entrancy guard for turn_liveness_scope.
+#
+# A DELIVERY IS NOT A TURN (runtime#409). On the native executor ``execute()``
+# delegates to ``_core_execute()``, which is RE-ENTERED for every delivery that
+# arrives while a turn is in flight — ``MOLECULE_A2A_NONBLOCKING`` is
+# default-ON fleet-wide, so this is the live path. A routine self-ping is
+# fast-acked and dropped; a user message is deferred at the same point. NEITHER
+# becomes a turn: both return before ``_core_execute`` ever reaches its own
+# ``reset_current()``, which is why the pre-#408 arm site was safe.
+#
+# A scope that armed unconditionally on entry re-dates the lease from such a
+# delivery, and ``reset()`` moves BOTH the idle clock and the absolute-cap
+# origin. On a workspace taking periodic self-pings (cron tick, delegation
+# harvester) both the TTL and the cap then reset indefinitely, so a wedged turn
+# is NEVER reaped — and because the lease *is* armed, the scheduler's
+# ``lease_is_attributable`` gate passes and the daemon TRUSTS the "alive"
+# snapshot instead of falling back to its own ceiling. That is strictly worse
+# than the unarmed state #408 set out to fix.
+#
+# The scope is also legitimately NESTED: for openclaw (and any future
+# ``SubprocessA2AExecutor`` subclass) both the ``main.py`` wrapper and the base
+# enter it, so without a guard one turn arms twice and runs two watcher tasks.
+#
+# The guard: a registry of the scopes currently active in this process, keyed
+# on the asyncio Task that entered. An entry made while the registry is EMPTY
+# is the outermost scope and does the work; every other entry is a
+# pass-through that arms nothing and starts no watcher.
+#
+# Why keyed on the task and not a bare depth counter
+# --------------------------------------------------
+# A bare integer counter would be sound for MUTUAL EXCLUSION. asyncio does not
+# preempt between statements, so ``n += 1; outermost = (n == 1)`` cannot
+# interleave with another coroutine on the same loop; the lock below covers
+# only the (not currently exercised, but free to allow for) case of a second
+# event loop on another thread.
+#
+# It is NOT sound for RECOVERY, and that is why it is not what is used here. A
+# counter cannot distinguish a scope that is still running from one whose
+# decrement was lost, and a lost decrement is a real possibility: this is an
+# ``@asynccontextmanager``, and an async generator abandoned without
+# ``__aexit__`` — a task cancelled at a bad moment, an ``aclose`` that never
+# runs — is finalized by the GC, whose call to ``athrow`` can be dropped
+# entirely when there is no running loop. One leaked increment leaves the
+# counter permanently above zero, and the guard then silently declines to arm
+# EVERY subsequent turn for the life of the container: a liveness mechanism
+# failing to a permanent no-signal state, which is the exact defect this module
+# exists to remove, reintroduced by its own guard. Keying on
+# ``asyncio.current_task()`` makes that self-healing — an owner whose task is
+# ``done()`` is provably no longer inside a scope, so it is pruned on the next
+# entry and the registry drains itself.
+#
+# Keying on the task is also the right EQUIVALENCE CLASS. Nesting (wrapper ->
+# base) happens within ONE task and is re-entrancy; an overlapping delivery is
+# a DIFFERENT task and is concurrency. Both must decline to re-arm, but they
+# are different situations — only the task key can tell them apart, and only
+# the second one is the concurrency limit documented at the top of this module.
+# --------------------------------------------------------------------------
+#: owner token -> nesting depth for that owner. Guarded by _SCOPES_LOCK.
+_ACTIVE_SCOPES: dict[object, int] = {}
+_SCOPES_LOCK = threading.Lock()
+
+
+def _prune_finished_scope_owners_locked() -> None:
+    """Drop registry entries whose owning task has finished. Caller holds the lock.
+
+    A finished task is provably not inside a scope, so its entry can only be a
+    leak (see the note above on abandoned async generators). Pruning here — on
+    entry, before the outermost decision — is what keeps a single lost
+    ``__aexit__`` from disabling arming for the life of the process.
+    """
+    dead = [
+        owner
+        for owner in _ACTIVE_SCOPES
+        if isinstance(owner, asyncio.Task) and owner.done()
+    ]
+    for owner in dead:
+        del _ACTIVE_SCOPES[owner]
+
+
+def _enter_liveness_scope() -> tuple[object, bool, bool]:
+    """Register an active liveness scope.
+
+    Returns ``(token, is_outermost, is_nested)``. ``is_nested`` distinguishes
+    re-entrancy (same task) from concurrency (another task) — same verdict,
+    different diagnosis; it is logged, not acted on.
+    """
+    try:
+        owner: object | None = asyncio.current_task()
+    except RuntimeError:  # pragma: no cover - no running loop
+        owner = None
+    # No task identity available: mint a unique token so this scope can neither
+    # be mistaken for another's nor suppress a later one by key collision. Such
+    # a token is not prunable, but it is only reachable off the asyncio path.
+    token: object = owner if owner is not None else object()
+    with _SCOPES_LOCK:
+        _prune_finished_scope_owners_locked()
+        outermost = not _ACTIVE_SCOPES
+        nested = token in _ACTIVE_SCOPES
+        _ACTIVE_SCOPES[token] = _ACTIVE_SCOPES.get(token, 0) + 1
+    return token, outermost, nested
+
+
+def _exit_liveness_scope(token: object) -> None:
+    """Deregister a scope registered by :func:`_enter_liveness_scope`."""
+    with _SCOPES_LOCK:
+        remaining = _ACTIVE_SCOPES.get(token, 0) - 1
+        if remaining > 0:
+            _ACTIVE_SCOPES[token] = remaining
+        else:
+            _ACTIVE_SCOPES.pop(token, None)
+
+
+def active_liveness_scopes() -> int:
+    """Number of liveness scopes currently active in this process.
+
+    Diagnostics / tests only. ``> 1`` means either a nested scope (wrapper plus
+    a ``SubprocessA2AExecutor`` base) or overlapping deliveries — see the
+    concurrency limit at the top of this module.
+    """
+    with _SCOPES_LOCK:
+        return sum(_ACTIVE_SCOPES.values())
+
+
+@contextlib.asynccontextmanager
+async def turn_liveness_scope():
+    """Everything one turn needs from the lease, for ANY executor. Async CM.
+
+    Three things happen on entry, in this order, and the ORDER MATTERS:
+
+    1. ``ensure_tool_activity_file()`` — materialize the private per-turn
+       activity file and EXPORT ``MOLECULE_TOOL_ACTIVITY_FILE``. Until this
+       runs, a subprocess runtime's tool-activity ping (codex / hermes both
+       gate theirs on that env var) is a silent no-op, so the feed the lease
+       depends on does not exist. Export BEFORE arming, and before the child is
+       spawned, or the first tool calls of the turn are lost.
+    2. ``arm_turn_if_fed()`` — arm the lease for THIS turn, if this runtime has
+       a demonstrated feed. Strictly after the delivery has been accepted (we
+       are inside ``execute``), which is what keeps ``turn_age < elapsed`` for
+       the daemon that dispatched it: a runtime that armed BEFORE the delivery
+       was accepted would report ``turn_age >= elapsed`` and silently fail the
+       daemon's attributability gate open.
+    3. Start the background activity-file watcher so touches land continuously
+       rather than only when someone happens to read the snapshot.
+
+    NON-RE-ENTRANT — a delivery is not a turn (runtime#409)
+    -------------------------------------------------------
+    All three steps run ONLY on the outermost active scope in this process. A
+    scope entered while another is already open — whether nested inside it
+    (``main.py``'s wrapper around a ``SubprocessA2AExecutor``, which enters the
+    scope itself) or overlapping it (a delivery arriving mid-turn on the native
+    executor, which is fast-acked and dropped WITHOUT becoming a turn) — is a
+    pass-through: it arms nothing, spawns no second watcher, and yields
+    ``False``.
+
+    This is load-bearing, not tidiness. ``reset()`` moves the absolute-cap
+    origin as well as the idle clock, so arming from a dropped self-ping resets
+    both; on a workspace taking periodic self-pings that repeats forever and a
+    wedged turn is never reaped, while the armed lease makes the daemon *trust*
+    the "alive" reading. See the registry comment above for the full mechanism
+    and for why the guard is keyed on the asyncio task rather than a counter.
+
+    It does NOT make the lease multi-turn safe: see
+    :ref:`the concurrency limit <turn-lease-concurrency-limit>` at the top of
+    this module. While two turns overlap the lease stays dated to the older —
+    conservative, and the only direction that cannot manufacture an unreapable
+    turn.
+
+    Kernel OFF (no lease installed) is a pure pass-through: no file is
+    materialized, no env var is exported, no task is spawned — byte-identical
+    to the pre-kernel flow. It is also checked BEFORE the scope registry, so
+    the kernel-off path does not so much as take the lock.
+
+    Never raises. A liveness scope must not be able to fail a turn.
+    """
+    if current() is None:
+        yield False
+        return
+    token, outermost, nested = _enter_liveness_scope()
+    if not outermost:
+        try:
+            logger.debug(
+                "turn-lease: %s liveness scope entered while one is already "
+                "active — not re-arming (runtime#409)",
+                "nested" if nested else "overlapping",
+            )
+            yield False
+        finally:
+            _exit_liveness_scope(token)
+        return
+    armed = False
+    stop_event: asyncio.Event | None = None
+    watcher: asyncio.Task | None = None
+    try:
+        from molecule_runtime.executor_helpers import ensure_tool_activity_file
+
+        path = ensure_tool_activity_file()
+        # Adopt the file's current mtime BEFORE arming, so that creating it
+        # cannot itself read as a tool call. See baseline_activity_file().
+        lease = current()
+        if lease is not None:
+            lease.baseline_activity_file(path)
+        armed = arm_turn_if_fed()
+        try:
+            stop_event = asyncio.Event()
+            watcher = asyncio.create_task(
+                watch_activity_file(path, stop_event=stop_event)
+            )
+        except RuntimeError:
+            # No running loop — the snapshot's own read-time feed still covers
+            # source C, just less promptly.
+            stop_event = None
+            watcher = None
+    except Exception:  # noqa: BLE001 — liveness setup must never break a turn
+        pass
+    try:
+        yield armed
+    finally:
+        # Deregister FIRST: the registry must drain even if awaiting the
+        # watcher below hangs or raises, or this process stops arming turns.
+        _exit_liveness_scope(token)
+        if stop_event is not None:
+            stop_event.set()
+        if watcher is not None:
+            try:
+                await watcher
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def watch_activity_file(

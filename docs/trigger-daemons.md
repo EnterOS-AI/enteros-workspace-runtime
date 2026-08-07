@@ -303,3 +303,87 @@ self-ping class that drops rather than queues behind an in-flight turn.
 
 Tightening this properly means the executor checking the absolute cap on the
 event path too, not just at the idle boundary. That is a separate change.
+
+### Which runtimes the snapshot is actually about (runtime#408)
+
+The snapshot is only as honest as the lease behind it, and a lease is only
+about a turn once something **arms** it at that turn's start. For a long time
+only the native executor did. Every adapter-supplied executor now participates
+through one wrap applied at `main.py`'s executor funnel
+(`turn_lease_executor.TurnLeaseExecutor`), which per turn:
+
+1. materializes and **exports** `MOLECULE_TOOL_ACTIVITY_FILE` before the child
+   is spawned — codex and hermes both gate their per-tool-call liveness ping on
+   that variable, and it used to be exported only by the native executor, which
+   never runs on those flavours. Their feed was written for the lease and was
+   dead on arrival;
+2. arms the lease, but **only if this runtime has been observed to feed it**
+   (`turn_lease.arm_turn_if_fed`);
+3. runs the activity-file watcher for the turn's duration.
+
+Arming is deliberately conditional. Arming is what persuades a consumer to
+believe the lease — `lease_is_attributable` passes as soon as
+`turn_age_seconds < elapsed` — so a lease that is armed but never fed is not a
+better signal than an unarmed one, it is a worse one: it reports the turn as
+idle from the instant it starts, and a legitimately long turn gets cancelled at
+the TTL. Where no feed exists the lease is therefore left unarmed and continues
+to read container uptime, which is exactly what makes a daemon reject it as "no
+signal" and fall back to its own ceiling.
+
+Current feed status per flavour:
+
+| flavour | feed | armed |
+|---|---|---|
+| native (langgraph) | tool start/end hooks | yes (always, in `a2a_executor`) |
+| openclaw | subprocess output bytes | yes |
+| codex | tool-activity file per tool item | yes, once a first tool call is seen |
+| hermes | tool-activity file per tool dispatch | yes, once a first tool call is seen |
+| claude-code | **none** | **no** — see below |
+
+`ClaudeSDKExecutor` touches the lease by no route at all: the transcript-tail
+poller sketched as feeder B in `turn_lease.py` was never built, and it does not
+write the tool-activity file. So claude-code keeps the pre-existing "no signal"
+behaviour, and a wedged claude-code turn is still only bounded by the daemon's
+own ceiling rather than the 900s TTL. Closing that needs a one-line
+`record_tool_activity()` at its `_report_tool_use` site — the same pattern codex
+and hermes already use — in the template repo. Tracked as runtime#410.
+
+The check is empirical rather than a list of runtime names precisely so that
+this heals itself: the moment claude-code starts writing the activity file, its
+next turn is armed with no change here.
+
+### A delivery is not a turn (runtime#409)
+
+The wrap above runs per **delivery**, and most deliveries do not become turns.
+`MOLECULE_A2A_NONBLOCKING` is default-on fleet-wide, so a delivery arriving
+while a turn is in flight re-enters the executor and is fast-acked: a routine
+self-ping (a cron tick, the delegation harvester) is dropped, a user message is
+deferred, and neither reaches the arm site the native executor has always used.
+
+Arming from one of those would be worse than not arming at all. `reset()` moves
+the **absolute-cap origin** as well as the idle clock, so a single dropped
+self-ping restarts both the 900s TTL and the 3600s cap. On a workspace that is
+pinged periodically — which is every workspace with a trigger daemon — that
+repeats forever: a wedged turn is never reaped, and because the lease *is*
+armed, `lease_is_attributable` passes and the daemon **trusts** the resulting
+"alive" reading instead of falling back to its own ceiling. It is a hole in
+exactly the capability runtime#408 restored.
+
+So `turn_liveness_scope()` arms only on the **outermost** scope active in the
+process. A scope entered while another is open — nested (the `main.py` wrapper
+around openclaw's `SubprocessA2AExecutor`, which enters the scope itself) or
+overlapping (a delivery mid-turn) — arms nothing and starts no second watcher.
+
+**Read this before trusting a snapshot under concurrency.** The lease is
+single-valued and carries no turn identity, and its feeds are unattributed, so
+it can describe only one turn at a time. While two turns overlap it stays dated
+to the **older** one — deliberately, because `reset()` only moves clocks
+forward, so re-dating on the younger turn is precisely the unreapable-turn hole
+above. The cost is a conservative (older, more likely to read stalled) age for
+the younger turn; it is never a falsely-fresh one. `lease_is_attributable` is a
+necessary condition, not a sufficient one: it rejects a never-armed lease, but
+it cannot tell two concurrent turns apart. The real fix is a `turn_id` in the
+snapshot so a consumer can detect a mismatch and treat it as "no signal" —
+issue #408 point 3 / sdk#208, an SDK-first chain because the field list is
+declared in `molecule_plugin/channel.py`. Until it lands, one in-flight turn
+per runtime process is the assumption the lease is honest under.
