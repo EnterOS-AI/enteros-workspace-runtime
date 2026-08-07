@@ -14,6 +14,7 @@ half of that guardrail.
 """
 from __future__ import annotations
 
+from molecule_runtime.branding import product_display_name
 from molecule_runtime.prompt import build_system_prompt
 
 
@@ -57,17 +58,26 @@ def test_falls_back_to_system_prompt_md_when_no_prompt_files(tmp_path):
         assert "LEGACY-SINGLE-FILE" in out, f"fallback failed for prompt_files={pf!r}"
 
 
+# Sentence unique to BASE_PLATFORM_PROMPT, carrying no product name — the name
+# itself comes from the vendored branding SSOT and is asserted separately, so a
+# rename can never make this guard stale (or, worse, quietly wrong).
+BASE_FRAME_MARKER = "You are an AI agent running as a *workspace* inside an organization on"
+
+
 def test_base_platform_identity_always_present(tmp_path):
-    # EVERY workspace carries the shared "Molecule AI platform" frame, even with
-    # no template and no prompt files — the role layers on top of it, never
-    # replaces it. This is the always-on base prompt, single-sourced in the base
-    # builder so all agents present a consistent platform identity.
+    # EVERY workspace carries the shared platform frame, even with no template
+    # and no prompt files — the role layers on top of it, never replaces it. This
+    # is the always-on base prompt, single-sourced in the base builder so all
+    # agents present a consistent platform identity, and it names the product
+    # from the branding SSOT (molecule_runtime/branding.py) rather than a literal.
     out = build_system_prompt(str(tmp_path), "ws-1", [], [], prompt_files=None, a2a_mcp=False)
-    assert "Molecule AI platform" in out
+    assert BASE_FRAME_MARKER in out
+    assert product_display_name() in out
     # Still present when a role prompt IS supplied, and layered before it.
     _write(tmp_path, "prompts/concierge.md", "ROLE-IDENTITY-MARK")
     out2 = build_system_prompt(
         str(tmp_path), "ws-1", [], [], prompt_files=["prompts/concierge.md"], a2a_mcp=False
     )
-    assert "Molecule AI platform" in out2 and "ROLE-IDENTITY-MARK" in out2
-    assert out2.index("Molecule AI platform") < out2.index("ROLE-IDENTITY-MARK")
+    assert BASE_FRAME_MARKER in out2 and "ROLE-IDENTITY-MARK" in out2
+    assert product_display_name() in out2
+    assert out2.index(BASE_FRAME_MARKER) < out2.index("ROLE-IDENTITY-MARK")

@@ -586,3 +586,38 @@ Re-vendoring (from the sdk#119 branch while it is HELD; drop `-b …` once merge
     curl -fsS -A "curl/8.4.0" \
       "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/feat/mcp-audience-contract/contracts/mcp/mcp-plugin-delivery.contract.json" \
       -o "contracts/mcp-plugin-delivery.contract.json"
+
+---
+
+## `branding.contract.json`
+
+Byte-for-byte copy of the branding identity SSOT:
+
+    molecule-ai-sdk/contracts/branding/branding.contract.json
+
+Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
+Source path:          contracts/branding/branding.contract.json
+Source commit:        `74b8860f14a18e0a20bb42acfcbd5d990c675965` ("feat(branding): TS + Python mirrors of the branding identity SSOT (contract-gated, internal#1089)" — the file's introducing commit)
+Vendored at sdk HEAD: `74b8860f14a18e0a20bb42acfcbd5d990c675965` (on `main`)
+Content sha256:       `4dea5ab988c24fe6c940004a101cf9221347aad1842afa2aab6a5df0408624b3`
+
+Why vendored: `molecule_runtime/branding.py` reads `tier1.product_display_name`
+out of this file to build the base platform frame and the branded default role
+block that EVERY workspace system prompt carries (`molecule_runtime/prompt.py`).
+That runs at agent boot inside a locked-down workspace container, so it must
+resolve OFFLINE — no clone, no token, no network fetch. Reading the SSOT instead
+of hardcoding the string is the whole point: the product was renamed once
+already *because* the display name was hardcoded in dozens of places, and
+`tests/test_prompt_identity_branding.py` ratchets the prompt sources against
+every display name the platform has ever had so a literal cannot creep back.
+
+Only `tier1` is consumed. Per the contract's own `$comment`, `tier1` is the
+flip-safe internal brand-token set ("ALREADY FLIPPED"); `tier2` (customer DNS,
+persisted org rows, pinned image pull paths) is mid-staged-migration and must
+NOT be surfaced as branding.
+
+Re-vendoring:
+
+    curl -fsS -A "curl/8.4.0" \
+      https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/branding/branding.contract.json \
+      -o molecule_runtime/contracts/branding.contract.json

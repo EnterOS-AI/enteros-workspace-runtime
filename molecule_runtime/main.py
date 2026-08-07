@@ -836,7 +836,23 @@ async def main(prepare_only: bool = False):  # pragma: no cover
             message="preflight failed — see boot log for missing config/env",
         )
         raise SystemExit(1)
-    emit_boot_step("ID", "Load identity", "ok", step=2, total=_BOOT_TOTAL)
+    # Preflight passed, but it may still have found a MISSING PROMPT FILE — the
+    # enteros-ws-test2 case, where the workspace boots fine and then serves a
+    # default identity instead of its provisioned role. That finding already
+    # existed; it just never left container stdout. Promote it (do NOT re-derive
+    # it) into the `message` of the boot step the canvas/CP already consumes.
+    # Status stays "ok" on purpose — boot did not stop — so this annotates the
+    # step rather than painting a halt.
+    _identity_warnings = [
+        w.detail for w in preflight.warnings if w.title == "Prompt file"
+    ]
+    emit_boot_step(
+        "ID", "Load identity", "ok", step=2, total=_BOOT_TOTAL,
+        message=(
+            "DEGRADED — " + "; ".join(_identity_warnings)
+            + " (workspace will serve the platform default role, not its provisioned one)"
+        ) if _identity_warnings else None,
+    )
     if awareness_config:
         awareness_namespace = resolve_awareness_namespace(
             workspace_id,

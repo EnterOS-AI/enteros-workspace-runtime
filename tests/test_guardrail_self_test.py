@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 from molecule_runtime import prompt
+from molecule_runtime.branding import product_display_name
 from molecule_runtime.prompt import build_system_prompt
 
 
@@ -85,10 +86,21 @@ def test_selftest_g1_channel_vs_file_reread(tmp_path):
 
 # ── G2: base platform frame ALWAYS present + first ─────────────────────────────
 
+# Sentence unique to BASE_PLATFORM_PROMPT. Deliberately product-NAME-free: the
+# product display name now comes from the vendored branding SSOT
+# (molecule_runtime/branding.py), so asserting a literal name here would just be
+# the stale-literal defect wearing a test's clothes. It also must NOT be read
+# back off the module, or the monkeypatch-to-"" regression leg below would go
+# vacuous ("" is in every string).
+BASE_FRAME_MARKER = "You are an AI agent running as a *workspace* inside an organization on"
+
+
 def test_selftest_g2_base_frame_always_present(tmp_path, monkeypatch):
-    # (1) PASSES: base frame present with no template at all.
+    # (1) PASSES: base frame present with no template at all, and it names the
+    # product from the branding SSOT.
     out = build_system_prompt(str(tmp_path), "ws", [], [], prompt_files=None, a2a_mcp=False)
-    assert "Molecule AI platform" in out
+    assert BASE_FRAME_MARKER in out
+    assert product_display_name() in out
 
     # (2) REGRESSION: empty out the BASE_PLATFORM_PROMPT (someone "simplifies" the
     # base frame away). The base-frame invariant now FAILS (RED).
@@ -97,7 +109,7 @@ def test_selftest_g2_base_frame_always_present(tmp_path, monkeypatch):
         str(tmp_path), "ws", [], [], prompt_files=None, a2a_mcp=False
     )
     with pytest.raises(AssertionError):
-        assert "Molecule AI platform" in regressed
+        assert BASE_FRAME_MARKER in regressed
 
 
 # ── G5 / G6 (ADR-004): SUPERSEDED — the engine-side per-runtime guardrails are

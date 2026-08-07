@@ -1,0 +1,19 @@
+{
+  "$comment": "Branding identity SSOT — the machine-readable mirror source for gen/go/branding/branding.go (Go stays the authoritative, hand-written home of the doctrine; this instance is what the TS/Python generators consume, and gen/go/branding/branding_contract_parity_test.go pins Go == this file so the three languages can never drift silently). tier1 = flip-safe internal brand tokens (Enter OS rebrand B1, internal#1089 — ALREADY FLIPPED). tier2 = staged-migration contracts that MUST NOT be flipped here (customer DNS, persisted org rows, pinned image pull paths); each has its migration documented on the Go constant. The sibling branding.schema.json const-pins every value, so a flip is a deliberate two-sided edit (instance + schema in one commit) — mirroring the Go TestB1FlipExactPins doctrine.",
+  "version": 1,
+  "tier1": {
+    "resource_prefix": "enteros",
+    "brand_name": "enteros",
+    "product_display_name": "Enter OS",
+    "product_server_display_name": "Enter OS Server",
+    "legacy_resource_prefixes": ["mol"]
+  },
+  "tier2": {
+    "app_domain": "moleculesai.app",
+    "app_domain_enteros": "enteros.ai",
+    "provider_wire_id": "molecules-server",
+    "image_repo": "registry.moleculesai.app/molecule-ai",
+    "image_repo_host": "registry.moleculesai.app",
+    "image_repo_owner": "molecule-ai"
+  }
+}
