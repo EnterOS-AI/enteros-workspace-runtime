@@ -1583,6 +1583,20 @@ async def main(prepare_only: bool = False):  # pragma: no cover
     from molecule_runtime.internal_schedules import add_schedule_routes as _add_schedule_routes
     _add_schedule_routes(starlette_app)
 
+    # /internal/a2a-auth-status — the pre-flip readiness probe for inbound
+    # A2A authentication. Same forward-auth as the routes above, so it adds
+    # no unauthenticated surface, and a 200 from it proves the tenant's copy
+    # of platform_inbound_secret matches this workspace's — which is exactly
+    # the condition enforcement will require. See a2a_inbound_gate.
+    from molecule_runtime.a2a_inbound_gate import (
+        a2a_auth_status_handler as _a2a_auth_status_handler,
+    )
+    starlette_app.add_route(
+        "/internal/a2a-auth-status",
+        _a2a_auth_status_handler,
+        methods=["GET"],
+    )
+
     built_app = make_trace_middleware(starlette_app)
 
     # uvicorn expects the level name in lowercase ("debug" / "info" /
