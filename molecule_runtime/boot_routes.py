@@ -19,6 +19,7 @@ from typing import Any
 
 from starlette.routing import Route
 
+from molecule_runtime.a2a_inbound_gate import guard_routes
 from molecule_runtime.not_configured_handler import make_not_configured_handler
 
 # Heavy a2a-sdk imports are lazy: deferred to inside build_routes so
@@ -48,6 +49,18 @@ def build_routes(
     The two branches are mutually exclusive — caller passes one or the
     other, never both. Test coverage at ``tests/test_boot_routes.py``
     pins the contract.
+
+    BOTH ``/`` branches are wrapped by ``a2a_inbound_gate.guard_routes``.
+    The guard is inert unless ``MOLECULE_A2A_REQUIRE_AUTH`` is set truthy,
+    so the default-configuration behaviour of this function is unchanged;
+    see that module for the rollout sequence. The not-configured branch is
+    guarded too — an unconfigured workspace is still a workspace, and
+    leaving its ``/`` open would make "adapter failed to boot" an
+    auth-bypass path once enforcement is on.
+
+    ``/.well-known/agent-card.json`` is deliberately NOT guarded — it is
+    public A2A discovery metadata and must stay reachable for operator
+    introspection (PR #2756).
     """
     from a2a.server.routes import create_agent_card_routes
 
@@ -70,15 +83,19 @@ def build_routes(
         # Outbound payloads must also use v0.3 shape — see main.py's
         # original comment block for the full a2a-sdk 1.x migration note.
         routes.extend(
-            create_jsonrpc_routes(
-                request_handler=handler,
-                rpc_url="/",
-                enable_v0_3_compat=True,
+            guard_routes(
+                create_jsonrpc_routes(
+                    request_handler=handler,
+                    rpc_url="/",
+                    enable_v0_3_compat=True,
+                )
             )
         )
     else:
-        routes.append(
-            Route("/", make_not_configured_handler(adapter_error), methods=["POST"])
+        routes.extend(
+            guard_routes(
+                [Route("/", make_not_configured_handler(adapter_error), methods=["POST"])]
+            )
         )
 
     return routes
