@@ -26,10 +26,19 @@ PAT for the ``gitea://`` plugin git-clone — see ``workspace-server``
 ``conciergePlatformMCPEnv`` + ``setup-gitea-netrc``) is exactly such a token:
 writing it as the npm ``_authToken`` 401-poisoned the registry and fail-closed
 the hermes concierge. So the npm ``_authToken`` is attached ONLY from a var
-explicitly DESIGNATED as a package token — ``MOLECULE_NPM_TOKEN`` →
-``MOLECULE_TEMPLATE_REPO_TOKEN`` → ``GITEA_TOKEN`` (see
+explicitly DESIGNATED as a package token — ``MOLECULE_NPM_TOKEN`` alone (see
 ``_PACKAGE_TOKEN_ENV_PRECEDENCE`` / :func:`_npm_package_token`) — never inferred
 from a git-transport credential.
+
+**2026-08-15: the guard had a hole and this is the patch.** The precedence list
+also carried ``MOLECULE_TEMPLATE_REPO_TOKEN`` and ``GITEA_TOKEN``, described as
+"intended read:package". Measured on prod, the former is a ``read:repository``
+token: repo API 200, packages API **401**, whoami **403**, anonymous **200**.
+So the module re-admitted, under a friendlier name, exactly the class of
+credential its own git-transport exclusion exists to keep out — and every
+not-pre-baked MCP plugin fail-closed at launch as a result
+(``molecule-ai-plugin-image-gen#2``). Designation must be judged on the token's
+CAPABILITY, never on how the variable is spelled.
 
 npm token vs git token — one forge, two protocols (SSOT boundary)
 =================================================================
@@ -209,11 +218,40 @@ _CANONICAL_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN"
 # NOTE: this is SEPARATE from _CANONICAL_TOKEN_ENV_PRECEDENCE / gitea_read_token
 # below, which git (plugin_sources) uses and which DELIBERATELY keeps the
 # git-http path — git legitimately needs the read:repository transport cred.
-_PACKAGE_TOKEN_ENV_PRECEDENCE = (
-    "MOLECULE_NPM_TOKEN",
-    "MOLECULE_TEMPLATE_REPO_TOKEN",
-    "GITEA_TOKEN",
-)
+_PACKAGE_TOKEN_ENV_PRECEDENCE = ("MOLECULE_NPM_TOKEN",)
+# ONE var, and it is the only one whose NAME designates a package token.
+#
+# This tuple used to also carry MOLECULE_TEMPLATE_REPO_TOKEN ("canonical;
+# intended read:package") and GITEA_TOKEN ("its alias"). Measured on prod
+# 2026-08-15, MOLECULE_TEMPLATE_REPO_TOKEN is NOT a package token:
+#
+#   GET /api/v1/repos/molecule-ai/<repo>        -> 200   (read:repository — its real scope)
+#   GET /api/packages/molecule-ai/npm/<pkg>     -> 401
+#   GET /api/v1/user            (whoami)        -> 403   (cannot even identify itself)
+#   the same GET with NO Authorization header   -> 200   (anonymous floor)
+#
+# So writing it as the npm _authToken did the precise thing this module's
+# header warns about — "a mis-scoped token is strictly WORSE than no token" —
+# turning a working anonymous fetch into a hard 401. Live effect: every
+# not-pre-baked MCP plugin fail-closed on launch. `npx @molecule-ai/
+# mcp-image-gen` E401'd on a package the same box fetches fine anonymously,
+# the MCP never started, and the agent was told only that its tools were
+# "unavailable this turn" (molecule-ai-plugin-image-gen#2).
+#
+# The management MCP survived solely because it is pre-baked into the image and
+# resolves offline — it never presents the credential. That is insulation, not
+# correctness: any cache miss puts it on the same path.
+#
+# The guard was already here in spirit. It excluded the git-transport
+# GIT_HTTP_* pair for exactly this reason, then re-admitted the same class of
+# credential under a friendlier name. The lesson is that the check has to be on
+# the token's CAPABILITY, not on how the variable is spelled — so this tuple now
+# holds only the var that exists for no other purpose.
+#
+# If a genuinely private @molecule-ai package ever needs auth, set
+# MOLECULE_NPM_TOKEN to a token minted with read:package. Do NOT re-add a
+# general-purpose forge token here; anonymous is the documented floor and it
+# beats a 401 every time.
 
 # Sentinel value core's concierge stores in GIT_HTTP_PASSWORD when the real PAT
 # lives in GIT_HTTP_USERNAME (the verified live concierge shape: workspace-server
@@ -277,17 +315,19 @@ _gitea_read_token = gitea_read_token
 def _npm_package_token(env: Mapping[str, str] | None = None) -> str:
     """Return a DESIGNATED npm package token, or "" for anonymous access.
 
-    Resolution (package-token precedence):
-      1. MOLECULE_NPM_TOKEN (purpose-specific, highest precedence)
-      2. MOLECULE_TEMPLATE_REPO_TOKEN (canonical; intended read:package)
-      3. GITEA_TOKEN (its alias)
+    Resolution: MOLECULE_NPM_TOKEN only — the one variable that exists for no
+    purpose other than package access.
 
-    Git-transport credentials (GIT_HTTP_USERNAME/GIT_HTTP_PASSWORD, incl. the
-    x-oauth-basic concierge shape) are DELIBERATELY NOT consulted: they are
-    repo-scoped and 401 the package registry, which is worse than the anonymous
-    floor. See _PACKAGE_TOKEN_ENV_PRECEDENCE for the full rationale. Returns ""
-    when no designated package token is set — the caller then writes the scope
-    line only (anonymous), which the registry serves.
+    Nothing else is consulted, and that is the whole point. Git-transport
+    credentials (GIT_HTTP_USERNAME/GIT_HTTP_PASSWORD, incl. the x-oauth-basic
+    concierge shape) were always excluded because they are repo-scoped and 401
+    the package registry. MOLECULE_TEMPLATE_REPO_TOKEN and GITEA_TOKEN were
+    removed 2026-08-15 for the same measured reason — see
+    _PACKAGE_TOKEN_ENV_PRECEDENCE for the HTTP codes.
+
+    Returns "" when no designated package token is set. The caller then writes
+    the scope line only, which the registry serves anonymously — and anonymous
+    is strictly better than a token the registry rejects.
     """
     if env is None:
         env = os.environ

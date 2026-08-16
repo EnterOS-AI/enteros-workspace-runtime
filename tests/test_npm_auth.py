@@ -63,7 +63,7 @@ def _npmrc(tmp_path: Path) -> Path:
 # install_npm_gitea_auth — scope line, token, HOME-split, clobber.
 # ---------------------------------------------------------------------------
 def test_writes_registry_and_authtoken(monkeypatch, tmp_path):
-    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-AAA")
+    monkeypatch.setenv("MOLECULE_NPM_TOKEN", "tok-AAA")
     install_npm_gitea_auth()
     content = _npmrc(tmp_path).read_text()
     assert "@molecule-ai:registry=https://git.moleculesai.app/api/packages/molecule-ai/npm/" in content
@@ -91,40 +91,58 @@ def test_npmrc_is_chmod_0600(monkeypatch, tmp_path):
     # The token is at rest in ~/.npmrc — it must be 0600 (created restricted,
     # no world-readable window). Guards the chmod/hardening regression.
     import stat
-    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-AAA")
+    monkeypatch.setenv("MOLECULE_NPM_TOKEN", "tok-AAA")
     install_npm_gitea_auth()
     mode = stat.S_IMODE(_npmrc(tmp_path).stat().st_mode)
     assert mode == 0o600, f"expected 0600, got {oct(mode)}"
 
 
-def test_token_precedence_prefers_canonical(monkeypatch, tmp_path):
-    # MOLECULE_TEMPLATE_REPO_TOKEN wins over GITEA_TOKEN; the git-http transport
-    # pair is ignored entirely for npm (never a package token — 401-poison guard).
+def test_repo_scoped_tokens_are_NOT_written_as_npm_token(monkeypatch, tmp_path):
+    """MOLECULE_TEMPLATE_REPO_TOKEN / GITEA_TOKEN must NEVER become the npm token.
+
+    Both are general forge credentials, not package tokens. Measured on prod
+    2026-08-15, MOLECULE_TEMPLATE_REPO_TOKEN returns 200 on the repo API, **401
+    on the packages API**, and 403 on whoami — while the SAME request with no
+    Authorization header returns 200. Writing it therefore converts a working
+    anonymous fetch into a hard 401 and fail-closes every not-pre-baked MCP
+    plugin at launch (molecule-ai-plugin-image-gen#2).
+
+    Anonymous is the floor and it beats a rejected token. A regression that
+    re-admits either var to the precedence list must go RED here.
+    """
     monkeypatch.setenv("GIT_HTTP_USERNAME", "tok-GHU")
     monkeypatch.setenv("GIT_HTTP_PASSWORD", "tok-GHP")
     monkeypatch.setenv("GITEA_TOKEN", "tok-GITEA")
     monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-CANON")
     install_npm_gitea_auth()
     content = _npmrc(tmp_path).read_text()
-    assert "_authToken=tok-CANON" in content
-    assert "tok-GHU" not in content and "tok-GHP" not in content
+    # the scope line is still unconditional …
+    assert "@molecule-ai:registry=https://git.moleculesai.app/api/packages/molecule-ai/npm/" in content
+    # … and NOTHING is written as a credential
+    assert "_authToken" not in content
+    for leaked in ("tok-CANON", "tok-GITEA", "tok-GHU", "tok-GHP"):
+        assert leaked not in content, f"{leaked} must never reach .npmrc"
 
 
-def test_gitea_token_used_git_http_ignored(monkeypatch, tmp_path):
-    # GITEA_TOKEN (a DESIGNATED package token) is written; the git-http transport
-    # pair is ignored entirely for npm (it is not a package token).
-    monkeypatch.setenv("GIT_HTTP_USERNAME", "tok-GHU")
-    monkeypatch.setenv("GIT_HTTP_PASSWORD", "x-oauth-basic")
+def test_designated_npm_token_still_wins_over_forge_tokens(monkeypatch, tmp_path):
+    """A real package token IS written, even alongside forge credentials.
+
+    The fix narrows WHICH var may supply the token; it does not disable auth.
+    A genuinely private @molecule-ai package is still reachable by setting
+    MOLECULE_NPM_TOKEN to a read:package token.
+    """
     monkeypatch.setenv("GITEA_TOKEN", "tok-GITEA")
+    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-CANON")
+    monkeypatch.setenv("MOLECULE_NPM_TOKEN", "tok-PKG")
     install_npm_gitea_auth()
     content = _npmrc(tmp_path).read_text()
-    assert "_authToken=tok-GITEA" in content
-    assert "tok-GHU" not in content
+    assert "_authToken=tok-PKG" in content
+    assert "tok-CANON" not in content and "tok-GITEA" not in content
 
 
 def test_molecule_npm_token_highest_precedence(monkeypatch, tmp_path):
-    # MOLECULE_NPM_TOKEN is the purpose-specific package-token override and wins
-    # over the canonical repo-token vars.
+    # MOLECULE_NPM_TOKEN is the ONLY var that may supply the npm token; the
+    # forge vars below are not candidates at all any more.
     monkeypatch.setenv("GITEA_TOKEN", "tok-GITEA")
     monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-REPO")
     monkeypatch.setenv("MOLECULE_NPM_TOKEN", "tok-NPM")
