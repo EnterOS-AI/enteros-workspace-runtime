@@ -191,10 +191,19 @@ def resolve_npm_registry(env: Mapping[str, str] | None = None) -> str:
 # Token resolution — TWO resolvers for ONE forge, because git and npm need
 # DIFFERENT scopes from the same host (see module docstring).
 # ---------------------------------------------------------------------------
-# Canonical gitea token env vars, in precedence order.
+# Canonical gitea token env vars, in precedence order. GIT ONLY.
+#
 # MOLECULE_TEMPLATE_REPO_TOKEN is the read token the box holds for fetching
-# template/plugin repos (and, once widened with read:package, packages too);
-# GITEA_TOKEN is its alias. These take precedence over the gitea HTTPS-auth pair.
+# template/plugin repos; GITEA_TOKEN is its alias. These take precedence over
+# the gitea HTTPS-auth pair.
+#
+# This comment used to add "(and, once widened with read:package, packages
+# too)". That is false in practice and the aspiration is what caused the bug
+# below: measured on prod 2026-08-15 the live token returns 200 on the repo API
+# and **401 on the packages API**, so it was never widened, and treating it as
+# though it might be is precisely the spelling-over-capability error the npm
+# resolver now refuses to make. If a package token is ever wanted, it gets its
+# own var — see _PACKAGE_TOKEN_ENV_PRECEDENCE.
 _CANONICAL_TOKEN_ENV_PRECEDENCE = ("MOLECULE_TEMPLATE_REPO_TOKEN", "GITEA_TOKEN")
 
 # npm PACKAGE-token env vars, in precedence order. ONLY vars whose token is
