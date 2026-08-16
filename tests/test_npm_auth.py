@@ -196,7 +196,7 @@ def test_scope_written_to_agent_home_too(monkeypatch, tmp_path):
     run_home.mkdir()
     monkeypatch.setenv("HOME", str(run_home))
     monkeypatch.setattr(npm_auth, "_AGENT_HOME", agent_home)
-    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-BOTH")
+    monkeypatch.setenv("MOLECULE_NPM_TOKEN", "tok-BOTH")
     install_npm_gitea_auth()
     for home in (run_home, agent_home):
         content = (home / ".npmrc").read_text()
@@ -226,7 +226,7 @@ def test_idempotent_and_additive(monkeypatch, tmp_path):
         "//git.moleculesai.app/api/packages/molecule-ai/npm/:_authToken=STALE\n"
         "@molecule-ai:registry=https://git.moleculesai.app/api/packages/molecule-ai/npm/\n"
     )
-    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-NEW")
+    monkeypatch.setenv("MOLECULE_NPM_TOKEN", "tok-NEW")
     install_npm_gitea_auth()
     lines = npmrc.read_text().splitlines()
     # unrelated line preserved
@@ -240,7 +240,7 @@ def test_idempotent_and_additive(monkeypatch, tmp_path):
 
 
 def test_custom_registry_key_derivation(monkeypatch, tmp_path):
-    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-X")
+    monkeypatch.setenv("MOLECULE_NPM_TOKEN", "tok-X")
     monkeypatch.setenv("MOLECULE_GITEA_NPM_REGISTRY", "https://gitea.example.com/api/packages/acme/npm")
     install_npm_gitea_auth()
     content = _npmrc(tmp_path).read_text()
@@ -256,7 +256,7 @@ def test_auth_key_derivation_unit():
 
 
 def test_token_value_never_logged(monkeypatch, tmp_path, caplog):
-    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "supersecret-TOKEN-zzz")
+    monkeypatch.setenv("MOLECULE_NPM_TOKEN", "supersecret-TOKEN-zzz")
     with caplog.at_level(logging.INFO):
         install_npm_gitea_auth()
     assert "supersecret-TOKEN-zzz" not in caplog.text
@@ -330,7 +330,7 @@ def test_install_honors_base_url_override(monkeypatch, tmp_path):
     # End-to-end through install_npm_gitea_auth: the derived registry (and its
     # matching _authToken key) reflect MOLECULE_GITEA_BASE_URL — the set-but-unread
     # bug is fixed at the .npmrc-write layer, not just the deriver.
-    monkeypatch.setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok-BASE")
+    monkeypatch.setenv("MOLECULE_NPM_TOKEN", "tok-BASE")
     monkeypatch.setenv("MOLECULE_GITEA_BASE_URL", "https://gitea.mirror.corp")
     install_npm_gitea_auth()
     content = _npmrc(tmp_path).read_text()
