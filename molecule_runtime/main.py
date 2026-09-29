@@ -48,6 +48,15 @@ if not logging.getLogger().handlers:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
+# At INFO, httpx logs every request with its full URL; for the config-relay
+# fetch that URL is presigned and its query (X-Amz-Credential, X-Amz-Signature)
+# grants read access to the workspace's config + secrets bundle. Quiet
+# httpx/httpcore to WARNING and redact presigned query strings on every root
+# handler (see log_redaction.py). Outside the guard above so it also covers a
+# process whose logging was configured before this import. Idempotent.
+from molecule_runtime.log_redaction import install_log_redaction
+
+install_log_redaction()
 
 from typing import TYPE_CHECKING
 

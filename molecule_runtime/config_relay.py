@@ -54,6 +54,8 @@ from typing import Callable, Mapping
 
 import httpx
 
+from molecule_runtime.log_redaction import describe_presigned_url, redact_presigned_urls
+
 # --- box-facing env contract (SSOT: CP internal/configrelay/relay.go consts) ---
 RELAY_URI_ENV = "MOLECULE_CONFIG_RELAY_URI"
 RELAY_SHA256_ENV = "MOLECULE_CONFIG_RELAY_SHA256"
@@ -113,7 +115,10 @@ class RelayResult:
 
 def _log(msg: str) -> None:
     # Boot-visible, line-buffered like the other main.py boot steps. NEVER logs
-    # the presigned URI (carries a signature) or the ack token (CWE-532).
+    # the presigned URI's query (it carries X-Amz-Credential/X-Amz-Signature) or
+    # the ack token (CWE-532): name the fetch target with
+    # describe_presigned_url(), and pass third-party error text through
+    # redact_presigned_urls() before it lands here.
     print(f"config-relay: {msg}", flush=True)
 
 
@@ -208,12 +213,14 @@ def fetch_bundle(
                 elif 400 <= status < 500:
                     # Cold presign (403/404 just after PUT) and genuine 4xx both
                     # land here: retry to the ceiling, then fail closed. Status
-                    # code only — the presigned URI is never logged.
+                    # code only — the presigned query is never logged.
                     last_detail = f"HTTP {status}"
                 else:
                     last_detail = f"HTTP {status}"
             except httpx.HTTPError as exc:
-                last_detail = f"transport error: {type(exc).__name__}: {exc}"
+                # httpx error text can embed the request URL (HTTPStatusError
+                # does: "... for url '<url>'"), so redact its presigned query.
+                last_detail = f"transport error: {type(exc).__name__}: {redact_presigned_urls(str(exc))}"
 
             if attempt < max_attempts - 1:
                 _log(f"fetch attempt {attempt + 1}/{max_attempts} failed ({last_detail}); retrying")
@@ -222,7 +229,8 @@ def fetch_bundle(
         if owns_client:
             client.close()
     raise RelayConfigError(
-        f"presigned bundle fetch failed after {max_attempts} attempts ({last_detail})"
+        f"presigned bundle fetch failed after {max_attempts} attempts ({last_detail}) "
+        f"from {describe_presigned_url(uri)}"
     )
 
 
@@ -395,7 +403,10 @@ def run_config_relay_prelude(
     except OSError:
         pass  # unreadable marker → fall through and re-materialize (fail-safe)
 
-    _log(f"active — fetching config bundle over presigned HTTPS into {config_path} (ws={workspace_id or '?'})")
+    _log(
+        f"active — fetching config bundle over presigned HTTPS into {config_path} "
+        f"(ws={workspace_id or '?'}) from {describe_presigned_url(uri)}"
+    )
     try:
         body = fetch_bundle(uri, expected_sha256, client=client, sleep=sleep)
         written = unpack_bundle(body, config_path)

@@ -141,6 +141,70 @@ def test_fetch_bundle_transport_error_retried_then_fails_closed():
 
 
 # --------------------------------------------------------------------------- #
+# fetch_bundle — failure text names the target, never the presigned query.
+# The query of a SigV4 presigned URL (X-Amz-Credential, X-Amz-Signature) is the
+# read capability for the bundle. Synthetic values.
+# --------------------------------------------------------------------------- #
+_SIG = "f00d" * 16
+_KEY_ID = "SYNTHETICKEYIDFORTESTS0000000000"
+_PRESIGNED = (
+    "https://r2.example/relay/ws-9/n.json"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    f"&X-Amz-Credential={_KEY_ID}%2F20260929%2Fauto%2Fs3%2Faws4_request"
+    "&X-Amz-Date=20260929T180747Z&X-Amz-Expires=600&X-Amz-SignedHeaders=host"
+    f"&x-id=GetObject&X-Amz-Signature={_SIG}"
+)
+_TARGET = "https://r2.example/relay/ws-9/n.json (X-Amz-Date=20260929T180747Z, X-Amz-Expires=600)"
+
+
+def test_fetch_bundle_failure_names_target_without_presigned_query(capsys):
+    with pytest.raises(RelayConfigError) as excinfo:
+        fetch_bundle(
+            _PRESIGNED, "deadbeef", client=_client(lambda req: httpx.Response(403)),
+            sleep=_NO_SLEEP, max_attempts=2,
+        )
+    message = str(excinfo.value)
+    assert message == f"presigned bundle fetch failed after 2 attempts (HTTP 403) from {_TARGET}"
+    printed = capsys.readouterr().out
+    for text in (message, printed):
+        assert _SIG not in text and _KEY_ID not in text
+
+
+def test_fetch_bundle_transport_error_text_is_redacted(capsys):
+    def handler(req: httpx.Request):
+        # Error text that embeds the request URL, as httpx.HTTPStatusError does.
+        raise httpx.ConnectError(f"connect failed for url '{req.url}'", request=req)
+
+    with pytest.raises(RelayConfigError) as excinfo:
+        fetch_bundle(_PRESIGNED, "deadbeef", client=_client(handler), sleep=_NO_SLEEP, max_attempts=2)
+    message = str(excinfo.value)
+    printed = capsys.readouterr().out
+    for text in (message, printed):
+        assert _SIG not in text and _KEY_ID not in text
+        assert "transport error: ConnectError: connect failed for url 'https://r2.example/relay/ws-9/n.json?<redacted>'" in text
+
+
+def test_prelude_boot_line_names_target_without_presigned_query(tmp_path, capsys):
+    env = {
+        "MOLECULE_CONFIG_RELAY_URI": _PRESIGNED,
+        "MOLECULE_CONFIG_RELAY_SHA256": "0" * 64,
+        "MOLECULE_CONFIG_RELAY_ACK_TOKEN": "t",
+        "MOLECULE_CP_URL": "https://cp",
+        "WORKSPACE_ID": "ws-9",
+    }
+    with pytest.raises(SystemExit) as excinfo:
+        run_config_relay_prelude(
+            workspace_id="ws-9", config_path=tmp_path, env=env,
+            client=_client(lambda req: httpx.Response(403)), sleep=_NO_SLEEP,
+        )
+    printed = capsys.readouterr().out
+    assert f"from {_TARGET}" in printed.splitlines()[0]
+    assert f"from {_TARGET}" in str(excinfo.value)
+    for text in (printed, str(excinfo.value)):
+        assert _SIG not in text and _KEY_ID not in text
+
+
+# --------------------------------------------------------------------------- #
 # validate_bundle_path + unpack_bundle — traversal guard + real unpack + perms.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("bad", ["/etc/passwd", "../escape", "a/../../b", "foo\\bar", "sp ace", ""])
