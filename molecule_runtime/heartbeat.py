@@ -74,6 +74,14 @@ if TYPE_CHECKING:
 # rows; the harvester also skips on the legacy substring as a fallback.
 ACTIVITY_MESSAGE_TYPE_BACKPRESSURE = "backpressure"
 
+# The platform's A2A proxy logs every message delivered TO this workspace as an
+# a2a_receive row on this workspace's own feed, with source_id = the sender
+# (molecule-core a2a_proxy_helpers.go). A row with one of these methods is
+# therefore a peer's request that the executor already ran as a turn — never a
+# delegation result. The delegate tool's own result rows carry source_id ==
+# this workspace (report_activity), so they never look like a peer row.
+_INBOUND_A2A_REQUEST_METHODS = frozenset({"message/send", "message/stream"})
+
 
 def _runtime_state_payload() -> dict:
     """Build the {runtime_state, sample_error} portion of the heartbeat
@@ -223,6 +231,26 @@ SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to preve
 # requires deliberate review.
 NOTIFY_STATUSES = frozenset({"failed", "error", "timeout", "cancelled"})
 _DELEGATION_PREFIX = "Delegation completed:"
+
+
+def _any_not_from(results: list[dict], parent_id: str) -> bool:
+    """True if any result came from a peer other than the parent.
+
+    A result whose target is the parent is the parent's reply to this
+    workspace. Telling the agent to "report it back to the parent" sends the
+    parent its own reply, the parent answers, and that answer is the next
+    result: a loop with a full turn on each side per round (runtime#420).
+    """
+    return any(r.get("target_id", "") != parent_id for r in results) if parent_id else True
+
+
+def _from_parent_instruction(parent_name: str) -> str:
+    return (
+        f"\n\nThese came from your parent '{parent_name}' in reply to you. Act on "
+        f"anything new they ask for, but do not send them back to '{parent_name}'."
+    )
+
+
 # Shared path — adapter executors (in their template repos) read this
 # same file via executor_helpers.read_delegation_results so heartbeat-
 # delivered async delegation results land in the next agent turn.
@@ -451,6 +479,7 @@ class HeartbeatLoop:
         self._seen_delegation_ids: set[str] = set()
         self._last_self_message_time = 0.0
         self._parent_name: str | None = None  # Cached after first lookup
+        self._parent_id: str = ""  # Set together with _parent_name
         # Seen activity IDs for a2a_receive polling (delegations via POST /a2a proxy path).
         # Loaded lazily from cursor file on first poll to avoid blocking startup.
         self._seen_activity_ids: set[str] = set()
@@ -885,6 +914,34 @@ class HeartbeatLoop:
         if changed:
             self._save_harvest_tombstones()
 
+    async def _resolve_parent(self, client: httpx.AsyncClient) -> tuple[str, str]:
+        """(parent_id, parent_name), cached after the first successful lookup.
+
+        ("", "") when the workspace has no parent; a failed lookup is retried
+        on the next cycle.
+        """
+        if self._parent_name is None:
+            try:
+                parent_resp = await client.get(
+                    f"{self.platform_url}/workspaces/{self.workspace_id}",
+                    headers=auth_headers(),
+                )
+                if parent_resp.status_code == 200:
+                    parent_id = parent_resp.json().get("parent_id", "") or ""
+                    if parent_id:
+                        parent_info = await client.get(
+                            f"{self.platform_url}/workspaces/{parent_id}",
+                            headers=auth_headers(),
+                        )
+                        if parent_info.status_code == 200:
+                            self._parent_name = parent_info.json().get("name", "")
+                            self._parent_id = parent_id
+                    else:
+                        self._parent_name = ""  # No parent — cache empty
+            except Exception:
+                pass  # Will retry next cycle
+        return self._parent_id, self._parent_name or ""
+
     async def _check_delegations(self, client: httpx.AsyncClient):
         """Check for completed delegations and store results for the agent."""
         try:
@@ -1000,35 +1057,17 @@ class HeartbeatLoop:
                         line += f"\n  Error: {r['error'][:100]}"
                     summary_lines.append(line)
 
-                # Look up parent workspace (cached after first call)
-                if self._parent_name is None:
-                    try:
-                        parent_resp = await client.get(
-                            f"{self.platform_url}/workspaces/{self.workspace_id}",
-                            headers=auth_headers(),
-                        )
-                        if parent_resp.status_code == 200:
-                            parent_id = parent_resp.json().get("parent_id", "")
-                            if parent_id:
-                                parent_info = await client.get(
-                                    f"{self.platform_url}/workspaces/{parent_id}",
-                                    headers=auth_headers(),
-                                )
-                                if parent_info.status_code == 200:
-                                    self._parent_name = parent_info.json().get("name", "")
-                        if self._parent_name is None:
-                            self._parent_name = ""  # No parent — cache empty
-                    except Exception:
-                        pass  # Will retry next cycle
-                parent_name = self._parent_name or ""
+                parent_id, parent_name = await self._resolve_parent(client)
 
                 report_instruction = ""
-                if parent_name:
+                if parent_name and _any_not_from(new_results, parent_id):
                     report_instruction = (
                         f"\n\nIMPORTANT: Report these results back to your parent '{parent_name}' "
                         f"by delegating a summary to them. Use delegate_task or delegate_task_async "
                         f"with a concise status report. Also use send_message_to_user to notify the user."
                     )
+                elif parent_name:
+                    report_instruction = _from_parent_instruction(parent_name)
                 else:
                     report_instruction = (
                         "\n\nReport results using send_message_to_user to notify the user."
@@ -1144,6 +1183,12 @@ class HeartbeatLoop:
         This method closes that gap: polls GET /workspaces/:id/activity?type=a2a_receive,
         filters for rows from peer workspaces (source_id != "" and != self.workspace_id),
         tracks seen IDs with a cursor file, and sends a self-message to wake the agent.
+
+        A peer row whose method is an A2A request (message/send, message/stream)
+        is that peer's message TO this workspace, already run as a turn by the
+        executor; it is marked seen and never surfaced. Re-injecting those
+        delivered every peer message twice and, with the report-to-parent line,
+        bounced each parent request back to the parent (runtime#420).
         """
         try:
             # Load cursor lazily on first call so startup is not blocked by disk I/O.
@@ -1192,6 +1237,10 @@ class HeartbeatLoop:
                 # (peer agent messages only; skip canvas-user messages and self-notify).
                 source_id = row.get("source_id") or ""
                 if not source_id or source_id == self.workspace_id:
+                    continue
+
+                if (row.get("method") or "") in _INBOUND_A2A_REQUEST_METHODS:
+                    self._seen_activity_ids.add(activity_id)
                     continue
 
                 # Skip non-result rows. A peer send that merely got QUEUED
@@ -1283,35 +1332,17 @@ class HeartbeatLoop:
                     line += f"\n  Error: {r['error'][:100]}"
                 summary_lines.append(line)
 
-            # Look up parent name (reuse cached value from _check_delegations if set).
-            if self._parent_name is None:
-                try:
-                    parent_resp = await client.get(
-                        f"{self.platform_url}/workspaces/{self.workspace_id}",
-                        headers=auth_headers(),
-                    )
-                    if parent_resp.status_code == 200:
-                        parent_id = parent_resp.json().get("parent_id", "")
-                        if parent_id:
-                            parent_info = await client.get(
-                                f"{self.platform_url}/workspaces/{parent_id}",
-                                headers=auth_headers(),
-                            )
-                            if parent_info.status_code == 200:
-                                self._parent_name = parent_info.json().get("name", "")
-                    if self._parent_name is None:
-                        self._parent_name = ""
-                except Exception:
-                    self._parent_name = ""
-            parent_name = self._parent_name or ""
+            parent_id, parent_name = await self._resolve_parent(client)
 
             report_instruction = ""
-            if parent_name:
+            if parent_name and _any_not_from(new_results, parent_id):
                 report_instruction = (
                     f"\n\nIMPORTANT: Delegate a summary of these results to your parent "
                     f"'{parent_name}' using delegate_task. Also use send_message_to_user "
                     f"to notify the user."
                 )
+            elif parent_name:
+                report_instruction = _from_parent_instruction(parent_name)
             else:
                 report_instruction = (
                     "\n\nReport results using send_message_to_user to notify the user."
