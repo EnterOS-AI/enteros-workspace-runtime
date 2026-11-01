@@ -16,6 +16,7 @@ from molecule_runtime.executor_helpers import (
 from molecule_runtime.skill_loader.loader import LoadedSkill
 from molecule_runtime.shared_runtime import build_peer_section
 from molecule_runtime.platform_auth import platform_headers
+from molecule_runtime.workspace_mode import continuous
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +351,19 @@ When in doubt: delegate, or ask the user who should own it. You are the front
 door and the dispatcher — never the worker."""
 
 
+# MOLECULE_CONTINUOUS=false (workspace_mode): the idle digest is not armed, and
+# it is what re-surfaces the task queue and the standing goal, so the agent
+# must not count on it.
+ON_DEMAND_PROMPT = """\
+## On-demand workspace
+
+This workspace does not wake itself. It runs only for messages it receives and
+schedules that fire. Nothing brings queued work back on its own: a task you add
+with task_add or a goal you set with goal_set is seen again only when a later
+run reads it with task_list or goal_get. Finish what you can in this run, and
+tell the user about anything that has to wait for a later one."""
+
+
 def build_system_prompt(
     config_path: str,
     workspace_id: str,
@@ -416,6 +430,9 @@ def build_system_prompt(
     # platform_guardrail=False and keep doing real work — never gag them.
     if platform_guardrail:
         _seg("orchestrator_guardrail", ORCHESTRATOR_ONLY_GUARDRAIL)
+
+    if not continuous():
+        _seg("on_demand_mode", ON_DEMAND_PROMPT)
 
     # Platform instructions (global → team → workspace scope) go next so
     # they take highest precedence among the operational instructions.

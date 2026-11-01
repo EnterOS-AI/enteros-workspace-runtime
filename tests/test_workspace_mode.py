@@ -55,7 +55,27 @@ def test_main_gates_both_idle_loops_on_the_switch():
 
 
 def test_shares_the_kernel_flag_falsy_set():
-    """One definition of "explicitly falsy" for runtime env flags."""
+    """MOLECULE_CONTINUOUS reads "explicitly falsy" exactly as MOLECULE_MAILBOX_KERNEL does."""
     from molecule_runtime import mailbox_dir
 
     assert workspace_mode._FALSY is mailbox_dir._FALSY
+
+
+def test_on_demand_prompt_only_when_the_switch_is_off(tmp_path, monkeypatch):
+    """Off, the idle digest that re-surfaces task_add/goal_set work is not armed;
+    the prompt says so instead of leaving the tools' "idle brings it back" promise."""
+    from molecule_runtime.prompt import ON_DEMAND_PROMPT, build_system_prompt
+
+    def _prompt():
+        return build_system_prompt(
+            config_path=str(tmp_path), workspace_id="w", loaded_skills=[], peers=[]
+        )
+
+    monkeypatch.setenv(CONTINUOUS_ENV, "false")
+    off = _prompt()
+    monkeypatch.delenv(CONTINUOUS_ENV)
+    on = _prompt()
+
+    assert ON_DEMAND_PROMPT in off
+    assert ON_DEMAND_PROMPT not in on
+    assert "task_add" in ON_DEMAND_PROMPT and "goal_set" in ON_DEMAND_PROMPT

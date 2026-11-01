@@ -5,7 +5,9 @@ re-wakes the agent ``idle_fire_after_seconds`` after every turn while its digest
 has changed. Set explicitly falsy, the runtime arms no idle self-wake at all —
 neither the idle digest nor the legacy static idle loop. The workspace still
 runs every message it receives (user chat, a peer's delegation) and every
-schedule its trigger daemon fires; it only stops waking itself.
+schedule its trigger daemon fires; it only stops waking itself. Without the
+digest nothing re-surfaces the task queue (task_add) or the standing goal
+(goal_set), so the system prompt tells the agent (prompt.ON_DEMAND_PROMPT).
 """
 from __future__ import annotations
 
