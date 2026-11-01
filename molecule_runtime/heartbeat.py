@@ -69,20 +69,6 @@ if TYPE_CHECKING:
         HeartbeatRuntimeMetadata,
     )
 
-# Typed marker for activity-log rows that represent backpressure echoes rather
-# than genuine peer results. The platform sets this on "queued: target busy"
-# rows; the harvester also skips on the legacy substring as a fallback.
-ACTIVITY_MESSAGE_TYPE_BACKPRESSURE = "backpressure"
-
-# The platform's A2A proxy logs every message delivered TO this workspace as an
-# a2a_receive row on this workspace's own feed, with source_id = the sender
-# (molecule-core a2a_proxy_helpers.go). A row with one of these methods is
-# therefore a peer's request that the executor already ran as a turn — never a
-# delegation result. The delegate tool's own result rows carry source_id ==
-# this workspace (report_activity), so they never look like a peer row.
-_INBOUND_A2A_REQUEST_METHODS = frozenset({"message/send", "message/stream"})
-
-
 def _runtime_state_payload() -> dict:
     """Build the {runtime_state, sample_error} portion of the heartbeat
     body when SOME adapter executor has marked itself wedged. Returns
@@ -230,25 +216,41 @@ SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to preve
 # task #384). Keep this list tiny + explicit so adding a new status
 # requires deliberate review.
 NOTIFY_STATUSES = frozenset({"failed", "error", "timeout", "cancelled"})
-_DELEGATION_PREFIX = "Delegation completed:"
 
 
-def _any_not_from(results: list[dict], parent_id: str) -> bool:
-    """True if any result came from a peer other than the parent.
+def _is_parent_reply(result: dict, parent_id: str) -> bool:
+    """A completed delegation to the parent: the parent's reply to this workspace.
 
-    A result whose target is the parent is the parent's reply to this
-    workspace. Telling the agent to "report it back to the parent" sends the
-    parent its own reply, the parent answers, and that answer is the next
-    result: a loop with a full turn on each side per round (runtime#420).
+    Telling the agent to report it back to the parent sends the parent its own
+    reply; the parent answers, and that answer is the next result — a loop with
+    a full turn on each side per round (runtime#420). A failed delegation to the
+    parent is no reply: it still needs a retry or a report.
     """
-    return any(r.get("target_id", "") != parent_id for r in results) if parent_id else True
-
-
-def _from_parent_instruction(parent_name: str) -> str:
     return (
-        f"\n\nThese came from your parent '{parent_name}' in reply to you. Act on "
-        f"anything new they ask for, but do not send them back to '{parent_name}'."
+        bool(parent_id)
+        and result.get("status") == "completed"
+        and result.get("target_id", "") == parent_id
     )
+
+
+def _report_instruction(results: list[dict], parent_id: str, parent_name: str) -> str:
+    if not parent_name:
+        return "\n\nReport results using send_message_to_user to notify the user."
+    replies = sum(1 for r in results if _is_parent_reply(r, parent_id))
+    if replies == len(results):
+        return (
+            f"\n\nThese are replies from your parent '{parent_name}'. Act on anything "
+            f"new they ask for, but do not send them back to '{parent_name}'. Use "
+            f"send_message_to_user if the user should hear about them."
+        )
+    instruction = (
+        f"\n\nIMPORTANT: Report these results back to your parent '{parent_name}' "
+        f"by delegating a summary to them. Use delegate_task or delegate_task_async "
+        f"with a concise status report. Also use send_message_to_user to notify the user."
+    )
+    if replies:
+        instruction += f" Leave out the ones marked as replies from '{parent_name}'."
+    return instruction
 
 
 # Shared path — adapter executors (in their template repos) read this
@@ -286,31 +288,6 @@ def _delegation_results_file() -> str:
     if DELEGATION_RESULTS_FILE != _LEGACY_DELEGATION_RESULTS_FILE:
         return DELEGATION_RESULTS_FILE
     return mailbox_dir.delegation_results_file()
-# Cursor file for tracking activity_log IDs processed from the a2a_receive path
-# (delegations fired via tool_delegate_task → POST /workspaces/:id/a2a proxy, not
-# POST /workspaces/:id/delegate). Persisted to disk so heartbeat restarts
-# don't re-process the same rows.
-_ACTIVITY_DELEGATION_CURSOR_FILE = os.environ.get(
-    "DELEGATION_ACTIVITY_CURSOR_FILE",
-    "/tmp/delegation_activity_cursor",
-)
-
-
-def _activity_delegation_cursor_file() -> str:
-    """Resolve the a2a_receive delegation cursor path (MUST-FIX 5).
-
-    Kernel ON: durable mailbox dir (``/workspace/.molecule``) so a restart
-    resumes where it left off instead of re-scanning ``/tmp`` (wiped on a fresh
-    container) — unless ``DELEGATION_ACTIVITY_CURSOR_FILE`` overrides it.
-    Kernel OFF: the module-level ``_ACTIVITY_DELEGATION_CURSOR_FILE`` (env at
-    import, monkeypatchable) — byte-identical to the pre-migration behavior.
-    """
-    if mailbox_dir.kernel_enabled():
-        explicit = os.environ.get("DELEGATION_ACTIVITY_CURSOR_FILE", "").strip()
-        if explicit:
-            return explicit
-        return str(mailbox_dir.resolve() / ".delegation_activity_cursor")
-    return _ACTIVITY_DELEGATION_CURSOR_FILE
 
 
 # Durable (kernel-on) harvest tombstone file: one "delegation_id<TAB>status"
@@ -414,6 +391,21 @@ def _in_flight_delegation_ids() -> set[str]:
         return set()
 
 
+def _awaited_delegation_target(delegation_id: str) -> str:
+    """The callee of a delegation this process started (builtin
+    delegate_task_async), or "" when unknown. GET /delegations' activity_logs
+    fallback lists the completed delegate_result row, which carries no
+    target_id (molecule-core delegation.go UpdateStatus), ahead of the
+    delegation's delegate row."""
+    try:
+        from molecule_runtime.builtin_tools.delegation import _delegations
+
+        task = _delegations.get(delegation_id)
+    except Exception:
+        return ""
+    return getattr(task, "workspace_id", "") or ""
+
+
 def _active_await_delegation_ids() -> set[str]:
     """The concierge's set of OPEN in-flight delegation awaits — the union of
     explicitly-registered awaits and the in-container in-flight registry. The
@@ -480,10 +472,6 @@ class HeartbeatLoop:
         self._last_self_message_time = 0.0
         self._parent_name: str | None = None  # Cached after first lookup
         self._parent_id: str = ""  # Set together with _parent_name
-        # Seen activity IDs for a2a_receive polling (delegations via POST /a2a proxy path).
-        # Loaded lazily from cursor file on first poll to avoid blocking startup.
-        self._seen_activity_ids: set[str] = set()
-        self._activity_cursor_loaded = False
         # MUST-FIX 4: durable (kernel-on) harvest tombstones keyed by
         # (delegation_id, status). Loaded lazily; only materialized when the
         # mailbox kernel is on (else _is_harvested/_commit_harvested are no-ops).
@@ -797,9 +785,9 @@ class HeartbeatLoop:
     async def _loop(self):
         # #2723: the alive-signal /registry/heartbeat POST moved to the
         # dedicated OS thread (_heartbeat_thread_loop) so it survives a
-        # blocked event loop. This async loop now owns ONLY delegation /
-        # activity polling — work that itself fires async A2A self-message
-        # POSTs and is, by nature, event-loop-bound.
+        # blocked event loop. This async loop now owns ONLY delegation
+        # polling — work that itself fires async A2A self-message POSTs and
+        # is, by nature, event-loop-bound.
         while True:
             client = None
             try:
@@ -811,14 +799,13 @@ class HeartbeatLoop:
                     except Exception as e:
                         logger.debug("Delegation check failed: %s", e)
 
-                    # 2. Check activity_logs for delegation results that arrived via
-                    # the POST /a2a proxy path (tool_delegate_task → send_a2a_message).
-                    # These are NOT written to the delegations table, so
-                    # _check_delegations misses them. See issue #354.
-                    try:
-                        await self._check_activity_delegations(client)
-                    except Exception as e:
-                        logger.debug("Activity delegation check failed: %s", e)
+                    # No a2a_receive poll. Every peer-sourced a2a_receive row on
+                    # this feed is a message delivered TO this workspace: the
+                    # proxy logs it on the receiver's feed with source_id = the
+                    # caller (molecule-core a2a_proxy_helpers.go), and a reply to
+                    # a delegation arrives the same way, as a message the executor
+                    # runs. Re-injecting those rows as "delegation results" sent
+                    # each request back to the parent (runtime#420).
 
                     await asyncio.sleep(self._interval_seconds)
 
@@ -1016,7 +1003,7 @@ class HeartbeatLoop:
                         continue
                     new_results.append({
                         "delegation_id": did,
-                        "target_id": d.get("target_id", ""),
+                        "target_id": d.get("target_id", "") or _awaited_delegation_target(did),
                         "source_id": source_id,
                         "status": status,
                         "summary": d.get("summary", ""),
@@ -1050,28 +1037,20 @@ class HeartbeatLoop:
                 # Instead reference only the delegation ID and status; the agent
                 # reads full content from DELEGATION_RESULTS_FILE which was
                 # written above from trusted platform data.
+                parent_id, parent_name = await self._resolve_parent(client)
+
                 summary_lines = []
                 for r in new_results:
-                    line = f"- [{r['status']}] Delegation {r['delegation_id'][:8]}: {r['summary'][:80]}"
+                    reply = (
+                        f" (reply from your parent '{parent_name}')"
+                        if parent_name and _is_parent_reply(r, parent_id) else ""
+                    )
+                    line = f"- [{r['status']}] Delegation {r['delegation_id'][:8]}{reply}: {r['summary'][:80]}"
                     if r.get("error"):
                         line += f"\n  Error: {r['error'][:100]}"
                     summary_lines.append(line)
 
-                parent_id, parent_name = await self._resolve_parent(client)
-
-                report_instruction = ""
-                if parent_name and _any_not_from(new_results, parent_id):
-                    report_instruction = (
-                        f"\n\nIMPORTANT: Report these results back to your parent '{parent_name}' "
-                        f"by delegating a summary to them. Use delegate_task or delegate_task_async "
-                        f"with a concise status report. Also use send_message_to_user to notify the user."
-                    )
-                elif parent_name:
-                    report_instruction = _from_parent_instruction(parent_name)
-                else:
-                    report_instruction = (
-                        "\n\nReport results using send_message_to_user to notify the user."
-                    )
+                report_instruction = _report_instruction(new_results, parent_id, parent_name)
 
                 trigger_msg = (
                     "Delegation results are ready. Review them and take appropriate action:\n"
@@ -1171,250 +1150,3 @@ class HeartbeatLoop:
 
         except Exception as e:
             logger.debug("Delegation check error: %s", e)
-
-    async def _check_activity_delegations(self, client: httpx.AsyncClient):
-        """Poll activity_logs for delegation results that arrived via the POST /a2a proxy path.
-
-        tool_delegate_task → send_a2a_message → POST /workspaces/:id/a2a (proxy)
-        logs to activity_logs but NOT the delegations table. _check_delegations
-        only checks the delegations table, so these results are invisible to the
-        heartbeat — the agent never wakes up to consume them (issue #354).
-
-        This method closes that gap: polls GET /workspaces/:id/activity?type=a2a_receive,
-        filters for rows from peer workspaces (source_id != "" and != self.workspace_id),
-        tracks seen IDs with a cursor file, and sends a self-message to wake the agent.
-
-        A peer row whose method is an A2A request (message/send, message/stream)
-        is that peer's message TO this workspace, already run as a turn by the
-        executor; it is marked seen and never surfaced. Re-injecting those
-        delivered every peer message twice and, with the report-to-parent line,
-        bounced each parent request back to the parent (runtime#420).
-        """
-        try:
-            # Load cursor lazily on first call so startup is not blocked by disk I/O.
-            if not self._activity_cursor_loaded:
-                self._activity_cursor_loaded = True
-                try:
-                    _cursor_file = _activity_delegation_cursor_file()
-                    if os.path.exists(_cursor_file):
-                        cursor = open(_cursor_file).read().strip()
-                        if cursor:
-                            self._seen_activity_ids = set(cursor.split(","))
-                except Exception:
-                    pass  # Corrupt cursor — start fresh
-
-            params: dict[str, str] = {"type": "a2a_receive"}
-            resp = await client.get(
-                f"{self.platform_url}/workspaces/{self.workspace_id}/activity",
-                params=params,
-                headers=auth_headers(),
-            )
-            if resp.status_code != 200:
-                return
-
-            rows = resp.json()
-            if not isinstance(rows, list):
-                return
-
-            # Activity API returns newest-first; process in reverse order so
-            # we advance the cursor monotonically (oldest → newest).
-            rows = list(reversed(rows))
-
-            new_results: list[dict] = []
-            last_id: str | None = None
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                activity_id = str(row.get("id", ""))
-                if not activity_id:
-                    continue
-                last_id = activity_id
-
-                if activity_id in self._seen_activity_ids:
-                    continue
-
-                # Filter: must have a non-empty source_id that is NOT this workspace
-                # (peer agent messages only; skip canvas-user messages and self-notify).
-                source_id = row.get("source_id") or ""
-                if not source_id or source_id == self.workspace_id:
-                    continue
-
-                if (row.get("method") or "") in _INBOUND_A2A_REQUEST_METHODS:
-                    self._seen_activity_ids.add(activity_id)
-                    continue
-
-                # Skip non-result rows. A peer send that merely got QUEUED
-                # because we were busy ("queued: target busy"), or a receive
-                # that FAILED (status present and != "ok" — e.g. the 300s
-                # "timeout awaiting response headers"), is not a peer response
-                # with content. Harvesting it as a "completed" result wakes
-                # the agent to "process" transient backpressure, generating
-                # more sends and more backpressure: a self-amplifying replay
-                # storm (observed: one notification wrapping 12x identical
-                # "queued: target busy" echoes). Mark seen so the cursor still
-                # advances; never surface it as a result.
-                row_status = row.get("status") or ""
-                row_message_type = row.get("message_type") or ""
-                is_backpressure = (
-                    row_message_type == ACTIVITY_MESSAGE_TYPE_BACKPRESSURE
-                    or "queued: target busy" in (row.get("summary") or "")
-                )
-                if (row_status and row_status != "ok") or is_backpressure:
-                    self._seen_activity_ids.add(activity_id)
-                    continue
-
-                self._seen_activity_ids.add(activity_id)
-                summary = row.get("summary") or ""
-                # Extract response text from request_body if available.
-                # Shape mirrors inbox._extract_text: walk parts for "text" field.
-                response_text = summary
-                request_body = row.get("request_body")
-                if isinstance(request_body, dict):
-                    params_obj = request_body.get("params")
-                    if isinstance(params_obj, dict):
-                        msg = params_obj.get("message")
-                        if isinstance(msg, dict):
-                            parts = msg.get("parts") or []
-                            texts = []
-                            for p in (parts if isinstance(parts, list) else []):
-                                if isinstance(p, dict) and p.get("kind") == "text" or p.get("type") == "text":
-                                    t = p.get("text", "")
-                                    if t:
-                                        texts.append(t)
-                            if texts:
-                                response_text = " ".join(texts)
-
-                new_results.append({
-                    "delegation_id": activity_id,  # Use activity ID as pseudo-delegation ID
-                    "target_id": source_id,
-                    "source_id": self.workspace_id,
-                    "status": "completed",
-                    "summary": summary,
-                    "response_preview": response_text[:4096],
-                    "error": "",
-                    "timestamp": time.time(),
-                })
-
-            if not new_results:
-                return
-
-            # Persist cursor so restarts don't re-process these rows.
-            if last_id:
-                try:
-                    with open(_activity_delegation_cursor_file(), "w") as f:
-                        # Keep cursor as comma-joined IDs; truncate if over 100KB.
-                        cursor_str = ",".join(sorted(self._seen_activity_ids))
-                        if len(cursor_str) > 102_400:
-                            # Evict oldest half when cursor file grows too large.
-                            sorted_ids = sorted(self._seen_activity_ids)
-                            self._seen_activity_ids = set(sorted_ids[len(sorted_ids) // 2:])
-                            cursor_str = ",".join(sorted(self._seen_activity_ids))
-                        f.write(cursor_str)
-                except Exception:
-                    pass  # Non-fatal; next cycle will retry
-
-            # Append to results file and trigger self-message (mirrors _check_delegations).
-            # RC #203: durable-queue resolution (kernel-ON) via _delegation_results_file().
-            with open(_delegation_results_file(), "a") as f:
-                for r in new_results:
-                    f.write(json.dumps(r) + "\n")
-            logger.info(
-                "Heartbeat: %d new a2a_receive delegation results from activity_logs — "
-                "triggering self-message",
-                len(new_results),
-            )
-
-            # Build and send self-message to wake the agent.
-            summary_lines = []
-            for r in new_results:
-                line = f"- [completed] Peer response from {r['target_id'][:8]}: {r['summary'][:80] or '(no summary)'}"
-                if r.get("error"):
-                    line += f"\n  Error: {r['error'][:100]}"
-                summary_lines.append(line)
-
-            parent_id, parent_name = await self._resolve_parent(client)
-
-            report_instruction = ""
-            if parent_name and _any_not_from(new_results, parent_id):
-                report_instruction = (
-                    f"\n\nIMPORTANT: Delegate a summary of these results to your parent "
-                    f"'{parent_name}' using delegate_task. Also use send_message_to_user "
-                    f"to notify the user."
-                )
-            elif parent_name:
-                report_instruction = _from_parent_instruction(parent_name)
-            else:
-                report_instruction = (
-                    "\n\nReport results using send_message_to_user to notify the user."
-                )
-
-            trigger_msg = (
-                "Delegation results are ready (from a2a_receive via activity_logs). "
-                "Review them and take appropriate action:\n"
-                + "\n".join(summary_lines)
-                + report_instruction
-            )
-
-            now = time.time()
-            if now - self._last_self_message_time < SELF_MESSAGE_COOLDOWN:
-                logger.debug(
-                    "Heartbeat: self-message cooldown active; "
-                    "a2a_receive results will be retried next cycle"
-                )
-            elif not _kernel_allows_autonomous_injection(kernel.KIND_DELEGATION_RESULT):
-                # MUST-FIX 2 (kernel-ON): same pre-injection breaker gate as the
-                # /delegations harvester above. Kernel OFF -> allow -> byte-identical.
-                logger.info(
-                    "Heartbeat: autonomous-loop breaker OPEN — dropping "
-                    "a2a_receive delegation-result self-wake (kernel)"
-                )
-            else:
-                self._last_self_message_time = now
-                try:
-                    await client.post(
-                        f"{self.platform_url}/workspaces/{self.workspace_id}/a2a",
-                        json={
-                            "method": "message/send",
-                            # #2251: single model-based builder — params
-                            # generated FROM the receiver's a2a-sdk v0.3
-                            # SendMessageRequest schema.
-                            "params": build_message_send_params(
-                                trigger_msg,
-                                metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_HARVESTER},
-                            ),
-                        },
-                        headers=self_source_headers(self.workspace_id),
-                        timeout=120.0,
-                    )
-                    logger.info("Heartbeat: a2a_receive self-message sent")
-                except Exception as e:
-                    logger.warning("Heartbeat: failed to send a2a_receive self-message: %s", e)
-
-            # Also notify the user via canvas — failure-class only. The
-            # a2a_receive path currently hardcodes status="completed"
-            # (peer responses are by definition successful deliveries),
-            # so this loop is normally a no-op now — that is the fix
-            # for task #384 canvas pollution. If a future change emits
-            # failure rows here, the gate + double-prefix dedupe below
-            # keep them clean.
-            for r in new_results:
-                if r.get("status") not in NOTIFY_STATUSES:
-                    continue
-                try:
-                    summary = (r.get("summary") or "").lstrip()
-                    # Strip any pre-existing "Delegation completed:" prefix
-                    # on the upstream summary so we don't double up.
-                    if summary.startswith(_DELEGATION_PREFIX):
-                        summary = summary[len(_DELEGATION_PREFIX):].lstrip()
-                    reason = r.get("error") or summary or "(no detail)"
-                    msg = f"Delegation {r['status']}: {reason[:200]}"
-                    await client.post(
-                        f"{self.platform_url}/workspaces/{self.workspace_id}/notify",
-                        json={"message": msg, "type": "delegation_result"},
-                        headers=auth_headers(),
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            logger.debug("Activity delegation check error: %s", e)

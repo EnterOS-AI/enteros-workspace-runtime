@@ -96,7 +96,6 @@ def _isolate(tmp_path, monkeypatch):
     """Keep the harvester off the host /tmp and the platform auth/disk cache,
     and start every case with an EMPTY await registry (the fresh-boot state)."""
     monkeypatch.setattr(hb_mod, "DELEGATION_RESULTS_FILE", str(tmp_path / "results.jsonl"))
-    monkeypatch.setattr(hb_mod, "_ACTIVITY_DELEGATION_CURSOR_FILE", str(tmp_path / "cursor"))
     monkeypatch.setattr(hb_mod, "auth_headers", lambda *a, **kw: {})
     monkeypatch.setattr(hb_mod, "self_source_headers", lambda *a, **kw: {})
     # Neutralise the in-container in-flight registry so _active_await_delegation_ids
