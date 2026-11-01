@@ -208,6 +208,9 @@ MAX_CONSECUTIVE_FAILURES = 10
 HEARTBEAT_BACKOFF_MAX_SECONDS = 300
 MAX_SEEN_DELEGATION_IDS = 200
 SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to prevent loops
+# A canvas re-parent changes parent_id without restarting the workspace, so the
+# parent behind the report-back and parent-reply checks is re-read this often.
+_PARENT_CACHE_SECONDS = 600
 # Statuses that warrant a user-visible canvas chat push. The agent self-
 # message path (above each /notify loop) always fires so the agent can
 # synthesize its own NL summary via send_message_to_user. The /notify
@@ -470,8 +473,9 @@ class HeartbeatLoop:
         self._mcp_prober = None
         self._seen_delegation_ids: set[str] = set()
         self._last_self_message_time = 0.0
-        self._parent_name: str | None = None  # Cached after first lookup
-        self._parent_id: str = ""  # Set together with _parent_name
+        self._parent_id: str = ""
+        self._parent_name: str = ""
+        self._parent_checked_at: float | None = None  # monotonic; None = never resolved
         # MUST-FIX 4: durable (kernel-on) harvest tombstones keyed by
         # (delegation_id, status). Loaded lazily; only materialized when the
         # mailbox kernel is on (else _is_harvested/_commit_harvested are no-ops).
@@ -902,32 +906,36 @@ class HeartbeatLoop:
             self._save_harvest_tombstones()
 
     async def _resolve_parent(self, client: httpx.AsyncClient) -> tuple[str, str]:
-        """(parent_id, parent_name), cached after the first successful lookup.
+        """(parent_id, parent_name), re-read at most every _PARENT_CACHE_SECONDS.
 
-        ("", "") when the workspace has no parent; a failed lookup is retried
-        on the next cycle.
+        ("", "") when the workspace has no parent. A failed lookup keeps the last
+        answer and is retried on the next cycle.
         """
-        if self._parent_name is None:
-            try:
+        now = time.monotonic()
+        if self._parent_checked_at is not None and now - self._parent_checked_at < _PARENT_CACHE_SECONDS:
+            return self._parent_id, self._parent_name
+        try:
+            self_resp = await client.get(
+                f"{self.platform_url}/workspaces/{self.workspace_id}",
+                headers=auth_headers(),
+            )
+            if self_resp.status_code != 200:
+                return self._parent_id, self._parent_name
+            parent_id = self_resp.json().get("parent_id", "") or ""
+            parent_name = ""
+            if parent_id:
                 parent_resp = await client.get(
-                    f"{self.platform_url}/workspaces/{self.workspace_id}",
+                    f"{self.platform_url}/workspaces/{parent_id}",
                     headers=auth_headers(),
                 )
-                if parent_resp.status_code == 200:
-                    parent_id = parent_resp.json().get("parent_id", "") or ""
-                    if parent_id:
-                        parent_info = await client.get(
-                            f"{self.platform_url}/workspaces/{parent_id}",
-                            headers=auth_headers(),
-                        )
-                        if parent_info.status_code == 200:
-                            self._parent_name = parent_info.json().get("name", "")
-                            self._parent_id = parent_id
-                    else:
-                        self._parent_name = ""  # No parent — cache empty
-            except Exception:
-                pass  # Will retry next cycle
-        return self._parent_id, self._parent_name or ""
+                if parent_resp.status_code != 200:
+                    return self._parent_id, self._parent_name
+                parent_name = parent_resp.json().get("name", "") or ""
+            self._parent_id, self._parent_name = parent_id, parent_name
+            self._parent_checked_at = now
+        except Exception:
+            pass  # keep the last answer; retried on the next cycle
+        return self._parent_id, self._parent_name
 
     async def _check_delegations(self, client: httpx.AsyncClient):
         """Check for completed delegations and store results for the agent."""

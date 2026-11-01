@@ -226,13 +226,30 @@ async def test_mixed_batch_reports_only_the_other_results():
 
 @pytest.mark.asyncio
 async def test_parent_lookup_is_cached_with_its_id():
-    """_resolve_parent caches both fields from one lookup; no second GET."""
+    """_resolve_parent caches both fields from one lookup; no second GET inside the TTL."""
     hb = HeartbeatLoop("http://test-platform", _WS)
     client = _make_client(get_payloads=_parent_lookup(), post_recorder=[])
 
     assert await hb._resolve_parent(client) == (_PARENT, _PARENT_NAME)
     assert await hb._resolve_parent(client) == (_PARENT, _PARENT_NAME)
     assert client.get.await_count == 2  # self + parent, once
+
+
+@pytest.mark.asyncio
+async def test_parent_lookup_is_reread_after_a_reparent(monkeypatch):
+    """A canvas re-parent changes parent_id without a restart; the cache expires."""
+    monkeypatch.setattr(hb_mod, "_PARENT_CACHE_SECONDS", 0)
+    hb = HeartbeatLoop("http://test-platform", _WS)
+    client = _make_client(
+        get_payloads=[
+            *_parent_lookup(),
+            _make_resp({"parent_id": "new-parent"}), _make_resp({"name": "New Parent"}),
+        ],
+        post_recorder=[],
+    )
+
+    assert await hb._resolve_parent(client) == (_PARENT, _PARENT_NAME)
+    assert await hb._resolve_parent(client) == ("new-parent", "New Parent")
 
 
 @pytest.mark.asyncio
