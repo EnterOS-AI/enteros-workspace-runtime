@@ -144,6 +144,8 @@ async def test_user_awaited_result_delivered_exactly_once():
 
     # Re-poll the SAME completed row — already delivered (seen-set), and the
     # await was discarded on delivery: no second self-message, no duplicate row.
+    # Past the self-message cooldown, which alone would also skip this poll.
+    hb._last_self_message_time = 0.0
     await hb._check_delegations(client)
     assert len(_a2a_self_messages(posts)) == 1, "must not re-deliver an already-delivered result"
     lines2 = Path(hb_mod.DELEGATION_RESULTS_FILE).read_text().strip().splitlines()

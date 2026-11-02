@@ -208,6 +208,11 @@ MAX_CONSECUTIVE_FAILURES = 10
 HEARTBEAT_BACKOFF_MAX_SECONDS = 300
 MAX_SEEN_DELEGATION_IDS = 200
 SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to prevent loops
+# A delegation-result self-wake that did not reach the agent (non-2xx, or no
+# connection) is retried on later polls this many times in all. Past that the
+# result is left to the results file, which native executors read on the next
+# turn; hermes reads results only from the wake (runtime#424).
+_MAX_WAKE_ATTEMPTS = 3
 # A canvas re-parent changes parent_id without restarting the workspace, so the
 # parent behind the report-back and parent-reply checks is re-read this often.
 _PARENT_CACHE_SECONDS = 600
@@ -284,9 +289,8 @@ def _delegation_results_file() -> str:
     attribute — wins verbatim. Otherwise defer to
     :func:`mailbox_dir.delegation_results_file`, which returns the DURABLE mailbox
     queue when the kernel is on and the legacy ``/tmp`` default when it is off
-    (byte-identical). Resolving live keeps the writer, the executor reader
-    (``executor_helpers.read_delegation_results``) and the idle-loop guard
-    (``main._check_delegation_results_pending``) all pointed at the SAME queue.
+    (byte-identical). Resolving live keeps the writer and the executor reader
+    (``executor_helpers.read_delegation_results``) pointed at the SAME queue.
     """
     if DELEGATION_RESULTS_FILE != _LEGACY_DELEGATION_RESULTS_FILE:
         return DELEGATION_RESULTS_FILE
@@ -473,6 +477,13 @@ class HeartbeatLoop:
         self._mcp_prober = None
         self._seen_delegation_ids: set[str] = set()
         self._last_self_message_time = 0.0
+        # runtime#424: results whose self-wake did not reach the agent, by
+        # delegation_id -> attempts so far; re-harvested on the next poll.
+        self._wake_retries: dict[str, int] = {}
+        # (delegation_id, status) already appended to the results file while
+        # their wake is unresolved, so a retry does not append them twice.
+        self._results_written: set[tuple[str, str]] = set()
+        self._wake_in_flight = False
         self._parent_id: str = ""
         self._parent_name: str = ""
         self._parent_checked_at: float | None = None  # monotonic; None = never resolved
@@ -489,6 +500,16 @@ class HeartbeatLoop:
         # CAPTURE-ONLY for now: default 0 = "no generation seen yet"; wiring it
         # into actual reconcile behavior is a later step.
         self._last_seen_generation = 0
+
+    def delegation_results_waiting(self) -> bool:
+        """True while harvested delegation results have not reached the agent:
+        their self-wake is being sent, or one that did not get through waits
+        for its retry. The idle loops skip while this holds, so an idle tick
+        never runs ahead of the results (#381). It reads this state rather than
+        DELEGATION_RESULTS_FILE because hermes never consumes that file, and a
+        check on the file kept its idle digest skipping forever (runtime#424).
+        """
+        return self._wake_in_flight or bool(self._wake_retries)
 
     @property
     def error_rate(self) -> float:
@@ -887,11 +908,9 @@ class HeartbeatLoop:
         """Durably record harvest tombstones AFTER delivery is confirmed.
 
         RC #203: called only once the harvested results were durably written to
-        ``DELEGATION_RESULTS_FILE`` AND the self-wake was sent (or deliberately
-        deferred by cooldown/breaker — both leave the result durably queued for
-        the next turn's context injection). A result whose delivery RAISED is
-        never passed here, so its tombstone stays uncommitted and it re-harvests
-        on the next pass / restart — never silently dropped. No-op when the
+        ``DELEGATION_RESULTS_FILE`` AND the self-wake was delivered (or dropped
+        by the autonomous-loop breaker). A result whose wake did not get through
+        is never passed here, so its tombstone stays uncommitted. No-op when the
         mailbox kernel is off (byte-identical).
         """
         if not mailbox_dir.kernel_enabled() or not keys:
@@ -940,6 +959,13 @@ class HeartbeatLoop:
     async def _check_delegations(self, client: httpx.AsyncClient):
         """Check for completed delegations and store results for the agent."""
         try:
+            # Inside the self-message cooldown, harvest nothing: the next poll
+            # after it picks the results up. Harvesting here marked a result
+            # seen, wrote it and committed its tombstone with no wake, and on
+            # hermes, which reads results only from the wake, it was lost
+            # (runtime#424).
+            if time.time() - self._last_self_message_time < SELF_MESSAGE_COOLDOWN:
+                return
             resp = await client.get(
                 f"{self.platform_url}/workspaces/{self.workspace_id}/delegations",
                 headers=auth_headers(),
@@ -995,10 +1021,8 @@ class HeartbeatLoop:
                         continue
 
                     self._seen_delegation_ids.add(did)
-                    # Await satisfied — drop it from the registered-await set so
-                    # the registry stays bounded (within-process re-poll is
-                    # already deduped by _seen_delegation_ids).
-                    discard_awaited_delegation(did)
+                    # The await is discarded once the wake is settled (below),
+                    # so a wake that is retried still finds it next poll.
                     # MUST-FIX 4: durable (delegation_id, status) dedup. No-op
                     # when the mailbox kernel is off (byte-identical); when on it
                     # prevents a restart or a duplicate delegate_result row from
@@ -1008,6 +1032,7 @@ class HeartbeatLoop:
                     # result-file write or self-wake POST re-harvests instead of
                     # being permanently suppressed.
                     if self._is_harvested(did, status):
+                        discard_awaited_delegation(did)
                         continue
                     new_results.append({
                         "delegation_id": did,
@@ -1021,6 +1046,14 @@ class HeartbeatLoop:
                     })
                     pending_tombstones.append((did, status))
 
+            # A retry whose row this poll did not harvest again (it left the
+            # listing, or its await is gone) has nothing left to deliver; keeping
+            # it would hold delegation_results_waiting() true for good.
+            harvested_now = {r["delegation_id"] for r in new_results}
+            for did in [d for d in self._wake_retries if d not in harvested_now]:
+                del self._wake_retries[did]
+                self._results_written = {k for k in self._results_written if k[0] != did}
+
             # Evict old seen IDs if over limit
             if len(self._seen_delegation_ids) > MAX_SEEN_DELEGATION_IDS:
                 # Keep most recent half
@@ -1028,16 +1061,21 @@ class HeartbeatLoop:
 
             if new_results:
                 # Append to results file for context injection on next message.
-                # RC #203: if this durable write raises, control jumps to the
-                # outer except and the pending tombstones are NEVER committed, so
-                # the results are re-harvested on the next pass / after restart.
-                with open(_delegation_results_file(), "a") as f:
+                # RC #203: if this durable write raises, nothing reached the
+                # agent and no tombstone is committed: un-mark the results so the
+                # next poll harvests them again, then let the outer except log it.
+                try:
+                    with open(_delegation_results_file(), "a") as f:
+                        for r in new_results:
+                            key = (r["delegation_id"], r["status"])
+                            if key not in self._results_written:
+                                f.write(json.dumps(r) + "\n")
+                                self._results_written.add(key)
+                except OSError:
                     for r in new_results:
-                        f.write(json.dumps(r) + "\n")
+                        self._seen_delegation_ids.discard(r["delegation_id"])
+                    raise
                 logger.info("Heartbeat: %d new delegation results — triggering self-message", len(new_results))
-                # Result is now durably queued. Assume the wake path is
-                # confirmed/scheduled unless the self-wake POST below raises.
-                delivery_confirmed = True
 
                 # Build a summary message for the agent.
                 # Fix B (Cycle 5): do NOT embed raw response_preview text in
@@ -1066,13 +1104,16 @@ class HeartbeatLoop:
                     + report_instruction
                 )
 
-                # Send A2A self-message to wake the agent.
-                # Minimum 60s between self-messages to avoid spam, but always send
-                # when there are genuinely NEW results to process.
-                now = time.time()
-                if now - self._last_self_message_time < SELF_MESSAGE_COOLDOWN:
-                    logger.debug("Heartbeat: self-message cooldown (60s), will retry next cycle")
-                elif not _kernel_allows_autonomous_injection(kernel.KIND_DELEGATION_RESULT):
+                # Send A2A self-message to wake the agent. The cooldown was
+                # checked before harvesting, at the top of this method.
+                #   delivered — 2xx (hermes answers 202 when it queues the wake)
+                #   dropped   — the kernel's autonomous-loop breaker is OPEN
+                #   retry     — the agent surely did not get it: non-2xx, or no
+                #               connection was made
+                #   unknown   — any other failure, e.g. a read timeout while the
+                #               agent may already be working on it; not retried,
+                #               as a duplicate wake is the worse outcome
+                if not _kernel_allows_autonomous_injection(kernel.KIND_DELEGATION_RESULT):
                     # MUST-FIX 2 (kernel-ON): route this delegation-result
                     # self-wake through the kernel's pre-injection circuit-breaker
                     # check. When the autonomous-loop breaker is OPEN we DROP the
@@ -1083,8 +1124,10 @@ class HeartbeatLoop:
                         "Heartbeat: autonomous-loop breaker OPEN — dropping "
                         "delegation-result self-wake (kernel)"
                     )
+                    outcome = "dropped"
                 else:
-                    self._last_self_message_time = now
+                    self._last_self_message_time = time.time()
+                    self._wake_in_flight = True
                     try:
                         # self_source_headers() adds X-Workspace-ID so the
                         # platform tags this row source=agent, not canvas
@@ -1104,45 +1147,60 @@ class HeartbeatLoop:
                             headers=self_source_headers(self.workspace_id),
                             timeout=120.0,
                         )
-                        # RC #203 (Finding 2): httpx does NOT raise on a 4xx/5xx —
-                        # only on transport errors. A non-2xx self-wake means the
-                        # agent was NOT woken, so it MUST be treated as a failed
-                        # delivery (same family as the tombstone bugs already fixed
-                        # on this branch): leave the tombstone UNcommitted so the
-                        # result re-harvests next pass / after restart instead of
-                        # being silently suppressed forever. Confirm on 2xx ONLY.
+                        # RC #203 (Finding 2): httpx does NOT raise on a 4xx/5xx,
+                        # only on transport errors, so a non-2xx wake is checked
+                        # here: the agent was not woken.
                         if 200 <= wake_resp.status_code < 300:
                             logger.info("Heartbeat: self-message sent to process delegation results")
+                            outcome = "delivered"
                         else:
                             logger.warning(
-                                "Heartbeat: self-wake POST returned HTTP %s — leaving "
-                                "delegation tombstone uncommitted for re-harvest",
+                                "Heartbeat: self-wake POST returned HTTP %s — will retry",
                                 wake_resp.status_code,
                             )
-                            delivery_confirmed = False
+                            outcome = "retry"
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                        logger.warning("Heartbeat: self-wake POST could not connect (%s) — will retry", e)
+                        outcome = "retry"
                     except Exception as e:
                         logger.warning("Heartbeat: failed to send self-message: %s", e)
-                        # RC #203: the wake POST failed — do NOT commit the
-                        # tombstones, so the result is re-harvested next pass /
-                        # after restart rather than silently suppressed.
-                        delivery_confirmed = False
+                        outcome = "unknown"
+                    finally:
+                        self._wake_in_flight = False
 
-                # RC #203: commit the durable harvest tombstones ONLY now — after
-                # the result was durably written AND the self-wake was sent or
-                # deliberately deferred (cooldown/breaker still leave the result
-                # queued for the next turn's injection). A failed result-file
-                # write (outer except, never reaches here) or a failed wake POST
-                # leaves the tombstone uncommitted so the result is re-harvested,
-                # never silently dropped. No-op when the kernel is off.
-                if delivery_confirmed:
+                # RC #203: commit the durable harvest tombstones only for a wake
+                # that was delivered or deliberately dropped. A failed result-file
+                # write (outer except, never reaches here) or a wake that did not
+                # get through leaves them uncommitted. No-op when the kernel is off.
+                if outcome in ("delivered", "dropped"):
                     self._commit_harvested(pending_tombstones)
+
+                settled = []
+                for r in new_results:
+                    did = r["delegation_id"]
+                    if outcome == "retry":
+                        attempts = self._wake_retries.get(did, 0) + 1
+                        if attempts < _MAX_WAKE_ATTEMPTS:
+                            self._wake_retries[did] = attempts
+                            # Not seen, so the next poll after the cooldown
+                            # harvests it again; its result line is not rewritten.
+                            self._seen_delegation_ids.discard(did)
+                            continue
+                        logger.warning(
+                            "Heartbeat: giving up on the self-wake for delegation %s after %d attempts",
+                            did[:8], attempts,
+                        )
+                    self._wake_retries.pop(did, None)
+                    self._results_written.discard((did, r["status"]))
+                    discard_awaited_delegation(did)
+                    settled.append(r)
 
                 # Also push notification to user via canvas, but ONLY for
                 # failure-class statuses. Success rows are agent-only — the
                 # self-message above wakes the agent who synthesizes its
                 # own NL via send_message_to_user. See task #384 / CTO
                 # decision 2026-05-20 (canvas pollution from raw envelopes).
-                for r in new_results:
+                for r in settled:
                     if r.get("status") not in NOTIFY_STATUSES:
                         continue
                     try:
