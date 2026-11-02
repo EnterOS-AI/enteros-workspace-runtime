@@ -96,7 +96,6 @@ def _isolate(tmp_path, monkeypatch):
     """Keep the harvester off the host /tmp and the platform auth/disk cache,
     and start every case with an EMPTY await registry (the fresh-boot state)."""
     monkeypatch.setattr(hb_mod, "DELEGATION_RESULTS_FILE", str(tmp_path / "results.jsonl"))
-    monkeypatch.setattr(hb_mod, "_ACTIVITY_DELEGATION_CURSOR_FILE", str(tmp_path / "cursor"))
     monkeypatch.setattr(hb_mod, "auth_headers", lambda *a, **kw: {})
     monkeypatch.setattr(hb_mod, "self_source_headers", lambda *a, **kw: {})
     # Neutralise the in-container in-flight registry so _active_await_delegation_ids
@@ -145,6 +144,8 @@ async def test_user_awaited_result_delivered_exactly_once():
 
     # Re-poll the SAME completed row — already delivered (seen-set), and the
     # await was discarded on delivery: no second self-message, no duplicate row.
+    # Past the self-message cooldown, which alone would also skip this poll.
+    hb._last_self_message_time = 0.0
     await hb._check_delegations(client)
     assert len(_a2a_self_messages(posts)) == 1, "must not re-deliver an already-delivered result"
     lines2 = Path(hb_mod.DELEGATION_RESULTS_FILE).read_text().strip().splitlines()

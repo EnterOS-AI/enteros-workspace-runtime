@@ -225,29 +225,6 @@ def resolve_workspace_url(
     return f"http://{machine}:{port}"
 
 
-def _check_delegation_results_pending() -> bool:
-    """Check if there are unconsumed delegation results waiting.
-
-    Reads ``DELEGATION_RESULTS_FILE``.  Returns ``True`` if the file
-    exists and contains non-whitespace content (after stripping) — meaning
-    the idle loop should skip this tick.  Returns ``False`` if the file is
-    absent, empty, or contains only whitespace.
-
-    The extracted form lets unit tests call this directly rather than mirroring
-    the logic (anti-pattern flagged as #401).
-    """
-    # RC #203: resolve the SAME queue the heartbeat writer and the executor
-    # reader use — kernel-ON the durable mailbox queue, kernel-OFF legacy /tmp.
-    from molecule_runtime.heartbeat import _delegation_results_file
-
-    try:
-        with open(_delegation_results_file()) as rf:
-            rf.seek(0)
-            return bool(rf.read().strip())
-    except FileNotFoundError:
-        return False
-
-
 async def register_with_platform(
     client,
     *,
@@ -1870,8 +1847,10 @@ async def main(prepare_only: bool = False):  # pragma: no cover
                 providers=_idle_providers,
                 policy=_idle_policy,
                 poster=_digest_poster,
-                # #381: skip the digest while unconsumed delegation results wait
-                skip_check=_check_delegation_results_pending,
+                # #381: skip while delegation results are still on their way
+                # to the agent (heartbeat state, not the results file:
+                # runtime#424)
+                skip_check=heartbeat.delegation_results_waiting,
                 # atomic-fire recheck: only fire when no turn is in flight
                 pre_fire_check=lambda: heartbeat.active_tasks == 0,
             )
@@ -1980,16 +1959,14 @@ async def main(prepare_only: bool = False):  # pragma: no cover
                 # race: the agent would compose a stale tick BEFORE processing the
                 # results notification, producing repeated identical asks (peer sends
                 # correction, we respond with stale state, peer asks again).
-                # By skipping the idle prompt when results are pending, we let the
-                # heartbeat's own self-message wake the agent after results are
-                # written. The agent then sees the results in _prepare_prompt()
-                # and processes them before composing.
-                # Guard logic extracted to _check_delegation_results_pending() for
-                # direct unit-testing (#401 follow-up).
-                if _check_delegation_results_pending():
+                # By skipping the idle prompt while the heartbeat's self-message
+                # for those results is being sent or retried, we let it reach the
+                # agent first. The signal is the heartbeat's own state, not the
+                # results file: hermes never consumes that file (runtime#424).
+                if heartbeat.delegation_results_waiting():
                     print(
-                        "Idle loop: skipping — unconsumed delegation results pending "
-                        "(heartbeat will notify agent)",
+                        "Idle loop: skipping — delegation results are being "
+                        "delivered (heartbeat)",
                         flush=True,
                     )
                     continue
