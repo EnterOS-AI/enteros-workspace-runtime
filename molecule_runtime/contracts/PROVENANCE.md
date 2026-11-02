@@ -16,7 +16,7 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
-## Re-vendor 2026-11-02 — sdk main `509f54aa` (registry change: sdk `6f89b8f8`)
+## Re-vendor 2026-11-02 — sdk main `509f54aa` (sdk#219)
 
 - `native-plugins.registry.json` re-fetched — `molecule-scheduler` source pin
   `#v0.2.3` → **`#v0.2.4`**. Sole change; every other entry byte-identical.
@@ -24,7 +24,7 @@ it at the new sdk main and bump its SHAs below.
 FUNCTIONAL. `v0.2.4` carries the cron re-arm fix (sdk 0.6.2, plugin #14): a
 schedule whose cron or timezone is edited in the grid is re-armed under the new
 definition instead of firing on its old cadence until it next fires (observed on
-a production tenant). The sdk pinned it on 2026-10-12, after runtime-v0.4.92 was
+a production tenant). The sdk pinned it on 2026-10-13, after runtime-v0.4.92 was
 cut, so the release gate's schema-sync check failed on this drift for the next
 release.
 
@@ -529,9 +529,9 @@ reads the same registry to know which plugins are NATIVE.
 
 Source repo:          https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
 Source path:          contracts/plugin/native-plugins.registry.json
-Source commit:        `e88388bcf2af54f5e7aa4ed7cdb1e9af2cda9be0` (sdk#209 — pin molecule-scheduler #v0.2.2 → #v0.2.3)
-Vendored at sdk HEAD: `e88388bcf2af54f5e7aa4ed7cdb1e9af2cda9be0` (branch `main`, MERGED)
-Content sha256:       `6bbefbff772ddb95cff60757298441ff06a5ec3fb157df915ee75c93d691916e`
+Source commit:        `6f89b8f8a6dce61e8ba8506c43a116f502a03655` (sdk#219 — pin molecule-scheduler #v0.2.3 → #v0.2.4)
+Vendored at sdk HEAD: `509f54aafb77ea56934ed502f48dd455297feb59` (branch `main`, MERGED)
+Content sha256:       `64b797f5127a6bd87a902bfe2329844a8c9f5acc5a2ad23c202c75fc185d6a62`
 
 Both SHAs above are on sdk `main`, so `check-schemas-in-sync.sh` (which fetches
 `raw/branch/main`) is green against this copy. The previous revision of this
