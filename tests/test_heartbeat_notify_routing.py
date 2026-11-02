@@ -19,20 +19,16 @@ CTO decision (per ``feedback_surface_actionable_failure_reason_to_user``
 2. KEEP FAILURE chat pushes. If a delegation failed the agent might
    swallow it, so the canvas must still surface an actionable reason.
 
-Tests below pin the new behaviour against both heartbeat poll paths:
-
-* ``_check_delegations`` — the canonical ``/workspaces/:id/delegations``
-  table walker.
-* ``_check_activity_delegations`` — the ``activity_logs`` poller
-  (task #354 fix; the path that #384 was attributable to).
-
-Plus a regression for the double-prefix bug.
+Tests below pin the behaviour on ``_check_delegations``, the heartbeat's walk
+of ``/workspaces/:id/delegations``. The ``activity_logs`` a2a_receive poller
+that #384 was attributable to (and its double-prefix regression) is gone: every
+row it read was a message delivered to the workspace (runtime#420).
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -81,14 +77,11 @@ def _make_client(get_payloads, post_recorder):
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """Redirect the results file + cursor file so the test never
+    """Redirect the results file so the test never
     touches /tmp on the host. Also stub auth_headers so we don't hit
     the platform_auth disk cache."""
     monkeypatch.setattr(
         hb_mod, "DELEGATION_RESULTS_FILE", str(tmp_path / "results.jsonl")
-    )
-    monkeypatch.setattr(
-        hb_mod, "_ACTIVITY_DELEGATION_CURSOR_FILE", str(tmp_path / "cursor")
     )
     monkeypatch.setattr(hb_mod, "auth_headers", lambda *a, **kw: {})
     monkeypatch.setattr(hb_mod, "self_source_headers", lambda *a, **kw: {})
@@ -176,165 +169,6 @@ async def test_heartbeat_keeps_failure_delegation_chat_push():
     # Status word + actionable reason both surfaced.
     assert "failed" in msg
     assert "connection refused" in msg
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_no_double_prefix():
-    """When the activity_logs ``summary`` column is already prefixed
-    ``Delegation completed:`` upstream, the heartbeat must not stack
-    another ``Delegation completed:`` on top. Regression for the
-    chloe-dong canvas observation (task #384)."""
-    hb = HeartbeatLoop("http://test-platform", _WS)
-    posts: list[tuple[str, dict]] = []
-    # Force the failure-status branch by patching NOTIFY_STATUSES so the
-    # /notify push fires for this synthetic ``completed`` row — this lets
-    # us assert on the dedupe logic. We are NOT relaxing the success-
-    # suppression contract; the other two tests pin that.
-    with patch.object(hb_mod, "NOTIFY_STATUSES", frozenset({"completed"})):
-        client = _make_client(
-            get_payloads=[
-                # 1st GET: /workspaces/:id/activity?type=a2a_receive — one peer row.
-                _make_resp([
-                    {
-                        "id": "act-row-1",
-                        "source_id": "peer-double-prefix",
-                        "summary": "Delegation completed: peer ack ok",
-                        "request_body": {"params": {"message": {"parts": []}}},
-                    },
-                ]),
-                # 2nd GET: parent lookup — pretend no parent (empty dict).
-                _make_resp({"parent_id": ""}),
-            ],
-            post_recorder=posts,
-        )
-        await hb._check_activity_delegations(client)
-
-    notify_posts = [p for p in posts if "/notify" in p[0]]
-    assert len(notify_posts) == 1
-    msg = notify_posts[0][1]["message"]
-    # Exactly ONE occurrence of "Delegation completed:" in the prefix
-    # slot — no ``Delegation completed: Delegation completed:`` stacking.
-    assert msg.count("Delegation completed:") == 1, (
-        f"upstream prefix must be stripped before re-rendering; got {msg!r}"
-    )
-    # And the status word is present once via our new format, immediately
-    # followed by the de-prefixed peer payload.
-    assert msg.startswith("Delegation completed: peer ack ok"), msg
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_skips_queued_busy_and_error_rows():
-    """Bug B (harvester replay storm): ``_check_activity_delegations`` must NOT
-    harvest transient non-result a2a_receive rows — a peer send that got
-    "queued: target busy", or a receive that FAILED (status != "ok", e.g. the
-    300s "timeout awaiting response headers") — as "completed" delegation
-    results. Harvesting them wakes the agent to "process" its own send-
-    backpressure, a self-amplifying replay loop. Only the genuine status=ok
-    peer row may trigger the single A2A self-message; all three rows are still
-    marked seen so the cursor advances and they are never re-evaluated."""
-    hb = HeartbeatLoop("http://test-platform", _WS)
-    posts: list[tuple[str, dict]] = []
-    client = _make_client(
-        get_payloads=[
-            # activity?type=a2a_receive — three peer rows; only the real one
-            # is a genuine result with content.
-            _make_resp([
-                {
-                    "id": "act-ok-1",
-                    "source_id": "peer-real",
-                    "status": "ok",
-                    "summary": "message/send -> Me",
-                    "request_body": {"params": {"message": {"parts": [
-                        {"kind": "text", "text": "Here is the real peer response."}
-                    ]}}},
-                },
-                {
-                    "id": "act-busy-1",
-                    "source_id": "peer-busy",
-                    "status": "ok",
-                    "summary": "message/send -> Me (queued: target busy)",
-                    "request_body": {"params": {"message": {"parts": []}}},
-                },
-                {
-                    "id": "act-err-1",
-                    "source_id": "peer-err",
-                    "status": "error",
-                    "summary": "A2A request failed: timeout awaiting response headers",
-                    "request_body": {"params": {"message": {"parts": []}}},
-                },
-            ]),
-            # parent lookup — no parent.
-            _make_resp({"parent_id": ""}),
-        ],
-        post_recorder=posts,
-    )
-
-    await hb._check_activity_delegations(client)
-
-    a2a_posts = [p for p in posts if p[0].endswith(f"/workspaces/{_WS}/a2a")]
-    assert len(a2a_posts) == 1, (
-        f"expected exactly one self-message for the single real result; got {a2a_posts!r}"
-    )
-    body_str = str(a2a_posts[0][1])
-    assert "queued: target busy" not in body_str, (
-        "busy-backpressure echo must not be harvested into the wake message"
-    )
-    assert "timeout awaiting response headers" not in body_str, (
-        "failed receive must not be harvested into the wake message"
-    )
-    assert "Here is the real peer response" in body_str or "message/send -> Me" in body_str
-    # All three rows marked seen so the cursor advances; non-results never re-fire.
-    assert {"act-ok-1", "act-busy-1", "act-err-1"} <= hb._seen_activity_ids
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_skips_queued_busy_by_typed_marker():
-    """Issue #138: activity rows carrying message_type=backpressure must be
-    skipped even if the summary wording no longer contains the legacy
-    'queued: target busy' substring."""
-    from molecule_runtime.heartbeat import ACTIVITY_MESSAGE_TYPE_BACKPRESSURE
-
-    hb = HeartbeatLoop("http://test-platform", _WS)
-    posts: list[tuple[str, dict]] = []
-    client = _make_client(
-        get_payloads=[
-            _make_resp([
-                {
-                    "id": "act-ok-2",
-                    "source_id": "peer-real",
-                    "status": "ok",
-                    "summary": "message/send -> Me",
-                    "request_body": {"params": {"message": {"parts": [
-                        {"kind": "text", "text": "Here is the real peer response."}
-                    ]}}},
-                },
-                {
-                    "id": "act-busy-typed",
-                    "source_id": "peer-busy",
-                    "status": "ok",
-                    # Legacy substring deliberately absent.
-                    "summary": "Target workspace busy; request queued",
-                    "message_type": ACTIVITY_MESSAGE_TYPE_BACKPRESSURE,
-                    "request_body": {"params": {"message": {"parts": []}}},
-                },
-            ]),
-            _make_resp({"parent_id": ""}),
-        ],
-        post_recorder=posts,
-    )
-
-    await hb._check_activity_delegations(client)
-
-    a2a_posts = [p for p in posts if p[0].endswith(f"/workspaces/{_WS}/a2a")]
-    assert len(a2a_posts) == 1, (
-        f"expected exactly one self-message for the real result; got {a2a_posts!r}"
-    )
-    body_str = str(a2a_posts[0][1])
-    assert "Target workspace busy" not in body_str, (
-        "typed backpressure row must not be harvested into the wake message"
-    )
-    assert "Here is the real peer response" in body_str or "message/send -> Me" in body_str
-    assert {"act-ok-2", "act-busy-typed"} <= hb._seen_activity_ids
 
 
 @pytest.mark.asyncio

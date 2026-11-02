@@ -69,12 +69,6 @@ if TYPE_CHECKING:
         HeartbeatRuntimeMetadata,
     )
 
-# Typed marker for activity-log rows that represent backpressure echoes rather
-# than genuine peer results. The platform sets this on "queued: target busy"
-# rows; the harvester also skips on the legacy substring as a fallback.
-ACTIVITY_MESSAGE_TYPE_BACKPRESSURE = "backpressure"
-
-
 def _runtime_state_payload() -> dict:
     """Build the {runtime_state, sample_error} portion of the heartbeat
     body when SOME adapter executor has marked itself wedged. Returns
@@ -214,6 +208,14 @@ MAX_CONSECUTIVE_FAILURES = 10
 HEARTBEAT_BACKOFF_MAX_SECONDS = 300
 MAX_SEEN_DELEGATION_IDS = 200
 SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to prevent loops
+# A delegation-result self-wake that did not reach the agent (non-2xx, or no
+# connection) is retried on later polls this many times in all. Past that the
+# result is left to the results file, which native executors read on the next
+# turn; hermes reads results only from the wake (runtime#424).
+_MAX_WAKE_ATTEMPTS = 3
+# A canvas re-parent changes parent_id without restarting the workspace, so the
+# parent behind the report-back and parent-reply checks is re-read this often.
+_PARENT_CACHE_SECONDS = 600
 # Statuses that warrant a user-visible canvas chat push. The agent self-
 # message path (above each /notify loop) always fires so the agent can
 # synthesize its own NL summary via send_message_to_user. The /notify
@@ -222,7 +224,43 @@ SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to preve
 # task #384). Keep this list tiny + explicit so adding a new status
 # requires deliberate review.
 NOTIFY_STATUSES = frozenset({"failed", "error", "timeout", "cancelled"})
-_DELEGATION_PREFIX = "Delegation completed:"
+
+
+def _is_parent_reply(result: dict, parent_id: str) -> bool:
+    """A completed delegation to the parent: the parent's reply to this workspace.
+
+    Telling the agent to report it back to the parent sends the parent its own
+    reply; the parent answers, and that answer is the next result — a loop with
+    a full turn on each side per round (runtime#420). A failed delegation to the
+    parent is no reply: it still needs a retry or a report.
+    """
+    return (
+        bool(parent_id)
+        and result.get("status") == "completed"
+        and result.get("target_id", "") == parent_id
+    )
+
+
+def _report_instruction(results: list[dict], parent_id: str, parent_name: str) -> str:
+    if not parent_name:
+        return "\n\nReport results using send_message_to_user to notify the user."
+    replies = sum(1 for r in results if _is_parent_reply(r, parent_id))
+    if replies == len(results):
+        return (
+            f"\n\nThese are replies from your parent '{parent_name}'. Act on anything "
+            f"new they ask for, but do not send them back to '{parent_name}'. Use "
+            f"send_message_to_user if the user should hear about them."
+        )
+    instruction = (
+        f"\n\nIMPORTANT: Report these results back to your parent '{parent_name}' "
+        f"by delegating a summary to them. Use delegate_task or delegate_task_async "
+        f"with a concise status report. Also use send_message_to_user to notify the user."
+    )
+    if replies:
+        instruction += f" Leave out the ones marked as replies from '{parent_name}'."
+    return instruction
+
+
 # Shared path — adapter executors (in their template repos) read this
 # same file via executor_helpers.read_delegation_results so heartbeat-
 # delivered async delegation results land in the next agent turn.
@@ -251,38 +289,12 @@ def _delegation_results_file() -> str:
     attribute — wins verbatim. Otherwise defer to
     :func:`mailbox_dir.delegation_results_file`, which returns the DURABLE mailbox
     queue when the kernel is on and the legacy ``/tmp`` default when it is off
-    (byte-identical). Resolving live keeps the writer, the executor reader
-    (``executor_helpers.read_delegation_results``) and the idle-loop guard
-    (``main._check_delegation_results_pending``) all pointed at the SAME queue.
+    (byte-identical). Resolving live keeps the writer and the executor reader
+    (``executor_helpers.read_delegation_results``) pointed at the SAME queue.
     """
     if DELEGATION_RESULTS_FILE != _LEGACY_DELEGATION_RESULTS_FILE:
         return DELEGATION_RESULTS_FILE
     return mailbox_dir.delegation_results_file()
-# Cursor file for tracking activity_log IDs processed from the a2a_receive path
-# (delegations fired via tool_delegate_task → POST /workspaces/:id/a2a proxy, not
-# POST /workspaces/:id/delegate). Persisted to disk so heartbeat restarts
-# don't re-process the same rows.
-_ACTIVITY_DELEGATION_CURSOR_FILE = os.environ.get(
-    "DELEGATION_ACTIVITY_CURSOR_FILE",
-    "/tmp/delegation_activity_cursor",
-)
-
-
-def _activity_delegation_cursor_file() -> str:
-    """Resolve the a2a_receive delegation cursor path (MUST-FIX 5).
-
-    Kernel ON: durable mailbox dir (``/workspace/.molecule``) so a restart
-    resumes where it left off instead of re-scanning ``/tmp`` (wiped on a fresh
-    container) — unless ``DELEGATION_ACTIVITY_CURSOR_FILE`` overrides it.
-    Kernel OFF: the module-level ``_ACTIVITY_DELEGATION_CURSOR_FILE`` (env at
-    import, monkeypatchable) — byte-identical to the pre-migration behavior.
-    """
-    if mailbox_dir.kernel_enabled():
-        explicit = os.environ.get("DELEGATION_ACTIVITY_CURSOR_FILE", "").strip()
-        if explicit:
-            return explicit
-        return str(mailbox_dir.resolve() / ".delegation_activity_cursor")
-    return _ACTIVITY_DELEGATION_CURSOR_FILE
 
 
 # Durable (kernel-on) harvest tombstone file: one "delegation_id<TAB>status"
@@ -386,6 +398,21 @@ def _in_flight_delegation_ids() -> set[str]:
         return set()
 
 
+def _awaited_delegation_target(delegation_id: str) -> str:
+    """The callee of a delegation this process started (builtin
+    delegate_task_async), or "" when unknown. GET /delegations' activity_logs
+    fallback lists the completed delegate_result row, which carries no
+    target_id (molecule-core delegation.go UpdateStatus), ahead of the
+    delegation's delegate row."""
+    try:
+        from molecule_runtime.builtin_tools.delegation import _delegations
+
+        task = _delegations.get(delegation_id)
+    except Exception:
+        return ""
+    return getattr(task, "workspace_id", "") or ""
+
+
 def _active_await_delegation_ids() -> set[str]:
     """The concierge's set of OPEN in-flight delegation awaits — the union of
     explicitly-registered awaits and the in-container in-flight registry. The
@@ -450,11 +477,16 @@ class HeartbeatLoop:
         self._mcp_prober = None
         self._seen_delegation_ids: set[str] = set()
         self._last_self_message_time = 0.0
-        self._parent_name: str | None = None  # Cached after first lookup
-        # Seen activity IDs for a2a_receive polling (delegations via POST /a2a proxy path).
-        # Loaded lazily from cursor file on first poll to avoid blocking startup.
-        self._seen_activity_ids: set[str] = set()
-        self._activity_cursor_loaded = False
+        # runtime#424: results whose self-wake did not reach the agent, by
+        # delegation_id -> attempts so far; re-harvested on the next poll.
+        self._wake_retries: dict[str, int] = {}
+        # (delegation_id, status) already appended to the results file while
+        # their wake is unresolved, so a retry does not append them twice.
+        self._results_written: set[tuple[str, str]] = set()
+        self._wake_in_flight = False
+        self._parent_id: str = ""
+        self._parent_name: str = ""
+        self._parent_checked_at: float | None = None  # monotonic; None = never resolved
         # MUST-FIX 4: durable (kernel-on) harvest tombstones keyed by
         # (delegation_id, status). Loaded lazily; only materialized when the
         # mailbox kernel is on (else _is_harvested/_commit_harvested are no-ops).
@@ -468,6 +500,16 @@ class HeartbeatLoop:
         # CAPTURE-ONLY for now: default 0 = "no generation seen yet"; wiring it
         # into actual reconcile behavior is a later step.
         self._last_seen_generation = 0
+
+    def delegation_results_waiting(self) -> bool:
+        """True while harvested delegation results have not reached the agent:
+        their self-wake is being sent, or one that did not get through waits
+        for its retry. The idle loops skip while this holds, so an idle tick
+        never runs ahead of the results (#381). It reads this state rather than
+        DELEGATION_RESULTS_FILE because hermes never consumes that file, and a
+        check on the file kept its idle digest skipping forever (runtime#424).
+        """
+        return self._wake_in_flight or bool(self._wake_retries)
 
     @property
     def error_rate(self) -> float:
@@ -768,9 +810,9 @@ class HeartbeatLoop:
     async def _loop(self):
         # #2723: the alive-signal /registry/heartbeat POST moved to the
         # dedicated OS thread (_heartbeat_thread_loop) so it survives a
-        # blocked event loop. This async loop now owns ONLY delegation /
-        # activity polling — work that itself fires async A2A self-message
-        # POSTs and is, by nature, event-loop-bound.
+        # blocked event loop. This async loop now owns ONLY delegation
+        # polling — work that itself fires async A2A self-message POSTs and
+        # is, by nature, event-loop-bound.
         while True:
             client = None
             try:
@@ -782,14 +824,13 @@ class HeartbeatLoop:
                     except Exception as e:
                         logger.debug("Delegation check failed: %s", e)
 
-                    # 2. Check activity_logs for delegation results that arrived via
-                    # the POST /a2a proxy path (tool_delegate_task → send_a2a_message).
-                    # These are NOT written to the delegations table, so
-                    # _check_delegations misses them. See issue #354.
-                    try:
-                        await self._check_activity_delegations(client)
-                    except Exception as e:
-                        logger.debug("Activity delegation check failed: %s", e)
+                    # No a2a_receive poll. Every peer-sourced a2a_receive row on
+                    # this feed is a message delivered TO this workspace: the
+                    # proxy logs it on the receiver's feed with source_id = the
+                    # caller (molecule-core a2a_proxy_helpers.go), and a reply to
+                    # a delegation arrives the same way, as a message the executor
+                    # runs. Re-injecting those rows as "delegation results" sent
+                    # each request back to the parent (runtime#420).
 
                     await asyncio.sleep(self._interval_seconds)
 
@@ -867,11 +908,9 @@ class HeartbeatLoop:
         """Durably record harvest tombstones AFTER delivery is confirmed.
 
         RC #203: called only once the harvested results were durably written to
-        ``DELEGATION_RESULTS_FILE`` AND the self-wake was sent (or deliberately
-        deferred by cooldown/breaker — both leave the result durably queued for
-        the next turn's context injection). A result whose delivery RAISED is
-        never passed here, so its tombstone stays uncommitted and it re-harvests
-        on the next pass / restart — never silently dropped. No-op when the
+        ``DELEGATION_RESULTS_FILE`` AND the self-wake was delivered (or dropped
+        by the autonomous-loop breaker). A result whose wake did not get through
+        is never passed here, so its tombstone stays uncommitted. No-op when the
         mailbox kernel is off (byte-identical).
         """
         if not mailbox_dir.kernel_enabled() or not keys:
@@ -885,9 +924,48 @@ class HeartbeatLoop:
         if changed:
             self._save_harvest_tombstones()
 
+    async def _resolve_parent(self, client: httpx.AsyncClient) -> tuple[str, str]:
+        """(parent_id, parent_name), re-read at most every _PARENT_CACHE_SECONDS.
+
+        ("", "") when the workspace has no parent. A failed lookup keeps the last
+        answer and is retried on the next cycle.
+        """
+        now = time.monotonic()
+        if self._parent_checked_at is not None and now - self._parent_checked_at < _PARENT_CACHE_SECONDS:
+            return self._parent_id, self._parent_name
+        try:
+            self_resp = await client.get(
+                f"{self.platform_url}/workspaces/{self.workspace_id}",
+                headers=auth_headers(),
+            )
+            if self_resp.status_code != 200:
+                return self._parent_id, self._parent_name
+            parent_id = self_resp.json().get("parent_id", "") or ""
+            parent_name = ""
+            if parent_id:
+                parent_resp = await client.get(
+                    f"{self.platform_url}/workspaces/{parent_id}",
+                    headers=auth_headers(),
+                )
+                if parent_resp.status_code != 200:
+                    return self._parent_id, self._parent_name
+                parent_name = parent_resp.json().get("name", "") or ""
+            self._parent_id, self._parent_name = parent_id, parent_name
+            self._parent_checked_at = now
+        except Exception:
+            pass  # keep the last answer; retried on the next cycle
+        return self._parent_id, self._parent_name
+
     async def _check_delegations(self, client: httpx.AsyncClient):
         """Check for completed delegations and store results for the agent."""
         try:
+            # Inside the self-message cooldown, harvest nothing: the next poll
+            # after it picks the results up. Harvesting here marked a result
+            # seen, wrote it and committed its tombstone with no wake, and on
+            # hermes, which reads results only from the wake, it was lost
+            # (runtime#424).
+            if time.time() - self._last_self_message_time < SELF_MESSAGE_COOLDOWN:
+                return
             resp = await client.get(
                 f"{self.platform_url}/workspaces/{self.workspace_id}/delegations",
                 headers=auth_headers(),
@@ -943,10 +1021,8 @@ class HeartbeatLoop:
                         continue
 
                     self._seen_delegation_ids.add(did)
-                    # Await satisfied — drop it from the registered-await set so
-                    # the registry stays bounded (within-process re-poll is
-                    # already deduped by _seen_delegation_ids).
-                    discard_awaited_delegation(did)
+                    # The await is discarded once the wake is settled (below),
+                    # so a wake that is retried still finds it next poll.
                     # MUST-FIX 4: durable (delegation_id, status) dedup. No-op
                     # when the mailbox kernel is off (byte-identical); when on it
                     # prevents a restart or a duplicate delegate_result row from
@@ -956,10 +1032,11 @@ class HeartbeatLoop:
                     # result-file write or self-wake POST re-harvests instead of
                     # being permanently suppressed.
                     if self._is_harvested(did, status):
+                        discard_awaited_delegation(did)
                         continue
                     new_results.append({
                         "delegation_id": did,
-                        "target_id": d.get("target_id", ""),
+                        "target_id": d.get("target_id", "") or _awaited_delegation_target(did),
                         "source_id": source_id,
                         "status": status,
                         "summary": d.get("summary", ""),
@@ -969,6 +1046,14 @@ class HeartbeatLoop:
                     })
                     pending_tombstones.append((did, status))
 
+            # A retry whose row this poll did not harvest again (it left the
+            # listing, or its await is gone) has nothing left to deliver; keeping
+            # it would hold delegation_results_waiting() true for good.
+            harvested_now = {r["delegation_id"] for r in new_results}
+            for did in [d for d in self._wake_retries if d not in harvested_now]:
+                del self._wake_retries[did]
+                self._results_written = {k for k in self._results_written if k[0] != did}
+
             # Evict old seen IDs if over limit
             if len(self._seen_delegation_ids) > MAX_SEEN_DELEGATION_IDS:
                 # Keep most recent half
@@ -976,16 +1061,21 @@ class HeartbeatLoop:
 
             if new_results:
                 # Append to results file for context injection on next message.
-                # RC #203: if this durable write raises, control jumps to the
-                # outer except and the pending tombstones are NEVER committed, so
-                # the results are re-harvested on the next pass / after restart.
-                with open(_delegation_results_file(), "a") as f:
+                # RC #203: if this durable write raises, nothing reached the
+                # agent and no tombstone is committed: un-mark the results so the
+                # next poll harvests them again, then let the outer except log it.
+                try:
+                    with open(_delegation_results_file(), "a") as f:
+                        for r in new_results:
+                            key = (r["delegation_id"], r["status"])
+                            if key not in self._results_written:
+                                f.write(json.dumps(r) + "\n")
+                                self._results_written.add(key)
+                except OSError:
                     for r in new_results:
-                        f.write(json.dumps(r) + "\n")
+                        self._seen_delegation_ids.discard(r["delegation_id"])
+                    raise
                 logger.info("Heartbeat: %d new delegation results — triggering self-message", len(new_results))
-                # Result is now durably queued. Assume the wake path is
-                # confirmed/scheduled unless the self-wake POST below raises.
-                delivery_confirmed = True
 
                 # Build a summary message for the agent.
                 # Fix B (Cycle 5): do NOT embed raw response_preview text in
@@ -993,46 +1083,20 @@ class HeartbeatLoop:
                 # Instead reference only the delegation ID and status; the agent
                 # reads full content from DELEGATION_RESULTS_FILE which was
                 # written above from trusted platform data.
+                parent_id, parent_name = await self._resolve_parent(client)
+
                 summary_lines = []
                 for r in new_results:
-                    line = f"- [{r['status']}] Delegation {r['delegation_id'][:8]}: {r['summary'][:80]}"
+                    reply = (
+                        f" (reply from your parent '{parent_name}')"
+                        if parent_name and _is_parent_reply(r, parent_id) else ""
+                    )
+                    line = f"- [{r['status']}] Delegation {r['delegation_id'][:8]}{reply}: {r['summary'][:80]}"
                     if r.get("error"):
                         line += f"\n  Error: {r['error'][:100]}"
                     summary_lines.append(line)
 
-                # Look up parent workspace (cached after first call)
-                if self._parent_name is None:
-                    try:
-                        parent_resp = await client.get(
-                            f"{self.platform_url}/workspaces/{self.workspace_id}",
-                            headers=auth_headers(),
-                        )
-                        if parent_resp.status_code == 200:
-                            parent_id = parent_resp.json().get("parent_id", "")
-                            if parent_id:
-                                parent_info = await client.get(
-                                    f"{self.platform_url}/workspaces/{parent_id}",
-                                    headers=auth_headers(),
-                                )
-                                if parent_info.status_code == 200:
-                                    self._parent_name = parent_info.json().get("name", "")
-                        if self._parent_name is None:
-                            self._parent_name = ""  # No parent — cache empty
-                    except Exception:
-                        pass  # Will retry next cycle
-                parent_name = self._parent_name or ""
-
-                report_instruction = ""
-                if parent_name:
-                    report_instruction = (
-                        f"\n\nIMPORTANT: Report these results back to your parent '{parent_name}' "
-                        f"by delegating a summary to them. Use delegate_task or delegate_task_async "
-                        f"with a concise status report. Also use send_message_to_user to notify the user."
-                    )
-                else:
-                    report_instruction = (
-                        "\n\nReport results using send_message_to_user to notify the user."
-                    )
+                report_instruction = _report_instruction(new_results, parent_id, parent_name)
 
                 trigger_msg = (
                     "Delegation results are ready. Review them and take appropriate action:\n"
@@ -1040,13 +1104,16 @@ class HeartbeatLoop:
                     + report_instruction
                 )
 
-                # Send A2A self-message to wake the agent.
-                # Minimum 60s between self-messages to avoid spam, but always send
-                # when there are genuinely NEW results to process.
-                now = time.time()
-                if now - self._last_self_message_time < SELF_MESSAGE_COOLDOWN:
-                    logger.debug("Heartbeat: self-message cooldown (60s), will retry next cycle")
-                elif not _kernel_allows_autonomous_injection(kernel.KIND_DELEGATION_RESULT):
+                # Send A2A self-message to wake the agent. The cooldown was
+                # checked before harvesting, at the top of this method.
+                #   delivered — 2xx (hermes answers 202 when it queues the wake)
+                #   dropped   — the kernel's autonomous-loop breaker is OPEN
+                #   retry     — the agent surely did not get it: non-2xx, or no
+                #               connection was made
+                #   unknown   — any other failure, e.g. a read timeout while the
+                #               agent may already be working on it; not retried,
+                #               as a duplicate wake is the worse outcome
+                if not _kernel_allows_autonomous_injection(kernel.KIND_DELEGATION_RESULT):
                     # MUST-FIX 2 (kernel-ON): route this delegation-result
                     # self-wake through the kernel's pre-injection circuit-breaker
                     # check. When the autonomous-loop breaker is OPEN we DROP the
@@ -1057,8 +1124,10 @@ class HeartbeatLoop:
                         "Heartbeat: autonomous-loop breaker OPEN — dropping "
                         "delegation-result self-wake (kernel)"
                     )
+                    outcome = "dropped"
                 else:
-                    self._last_self_message_time = now
+                    self._last_self_message_time = time.time()
+                    self._wake_in_flight = True
                     try:
                         # self_source_headers() adds X-Workspace-ID so the
                         # platform tags this row source=agent, not canvas
@@ -1078,45 +1147,60 @@ class HeartbeatLoop:
                             headers=self_source_headers(self.workspace_id),
                             timeout=120.0,
                         )
-                        # RC #203 (Finding 2): httpx does NOT raise on a 4xx/5xx —
-                        # only on transport errors. A non-2xx self-wake means the
-                        # agent was NOT woken, so it MUST be treated as a failed
-                        # delivery (same family as the tombstone bugs already fixed
-                        # on this branch): leave the tombstone UNcommitted so the
-                        # result re-harvests next pass / after restart instead of
-                        # being silently suppressed forever. Confirm on 2xx ONLY.
+                        # RC #203 (Finding 2): httpx does NOT raise on a 4xx/5xx,
+                        # only on transport errors, so a non-2xx wake is checked
+                        # here: the agent was not woken.
                         if 200 <= wake_resp.status_code < 300:
                             logger.info("Heartbeat: self-message sent to process delegation results")
+                            outcome = "delivered"
                         else:
                             logger.warning(
-                                "Heartbeat: self-wake POST returned HTTP %s — leaving "
-                                "delegation tombstone uncommitted for re-harvest",
+                                "Heartbeat: self-wake POST returned HTTP %s — will retry",
                                 wake_resp.status_code,
                             )
-                            delivery_confirmed = False
+                            outcome = "retry"
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                        logger.warning("Heartbeat: self-wake POST could not connect (%s) — will retry", e)
+                        outcome = "retry"
                     except Exception as e:
                         logger.warning("Heartbeat: failed to send self-message: %s", e)
-                        # RC #203: the wake POST failed — do NOT commit the
-                        # tombstones, so the result is re-harvested next pass /
-                        # after restart rather than silently suppressed.
-                        delivery_confirmed = False
+                        outcome = "unknown"
+                    finally:
+                        self._wake_in_flight = False
 
-                # RC #203: commit the durable harvest tombstones ONLY now — after
-                # the result was durably written AND the self-wake was sent or
-                # deliberately deferred (cooldown/breaker still leave the result
-                # queued for the next turn's injection). A failed result-file
-                # write (outer except, never reaches here) or a failed wake POST
-                # leaves the tombstone uncommitted so the result is re-harvested,
-                # never silently dropped. No-op when the kernel is off.
-                if delivery_confirmed:
+                # RC #203: commit the durable harvest tombstones only for a wake
+                # that was delivered or deliberately dropped. A failed result-file
+                # write (outer except, never reaches here) or a wake that did not
+                # get through leaves them uncommitted. No-op when the kernel is off.
+                if outcome in ("delivered", "dropped"):
                     self._commit_harvested(pending_tombstones)
+
+                settled = []
+                for r in new_results:
+                    did = r["delegation_id"]
+                    if outcome == "retry":
+                        attempts = self._wake_retries.get(did, 0) + 1
+                        if attempts < _MAX_WAKE_ATTEMPTS:
+                            self._wake_retries[did] = attempts
+                            # Not seen, so the next poll after the cooldown
+                            # harvests it again; its result line is not rewritten.
+                            self._seen_delegation_ids.discard(did)
+                            continue
+                        logger.warning(
+                            "Heartbeat: giving up on the self-wake for delegation %s after %d attempts",
+                            did[:8], attempts,
+                        )
+                    self._wake_retries.pop(did, None)
+                    self._results_written.discard((did, r["status"]))
+                    discard_awaited_delegation(did)
+                    settled.append(r)
 
                 # Also push notification to user via canvas, but ONLY for
                 # failure-class statuses. Success rows are agent-only — the
                 # self-message above wakes the agent who synthesizes its
                 # own NL via send_message_to_user. See task #384 / CTO
                 # decision 2026-05-20 (canvas pollution from raw envelopes).
-                for r in new_results:
+                for r in settled:
                     if r.get("status") not in NOTIFY_STATUSES:
                         continue
                     try:
@@ -1132,258 +1216,3 @@ class HeartbeatLoop:
 
         except Exception as e:
             logger.debug("Delegation check error: %s", e)
-
-    async def _check_activity_delegations(self, client: httpx.AsyncClient):
-        """Poll activity_logs for delegation results that arrived via the POST /a2a proxy path.
-
-        tool_delegate_task → send_a2a_message → POST /workspaces/:id/a2a (proxy)
-        logs to activity_logs but NOT the delegations table. _check_delegations
-        only checks the delegations table, so these results are invisible to the
-        heartbeat — the agent never wakes up to consume them (issue #354).
-
-        This method closes that gap: polls GET /workspaces/:id/activity?type=a2a_receive,
-        filters for rows from peer workspaces (source_id != "" and != self.workspace_id),
-        tracks seen IDs with a cursor file, and sends a self-message to wake the agent.
-        """
-        try:
-            # Load cursor lazily on first call so startup is not blocked by disk I/O.
-            if not self._activity_cursor_loaded:
-                self._activity_cursor_loaded = True
-                try:
-                    _cursor_file = _activity_delegation_cursor_file()
-                    if os.path.exists(_cursor_file):
-                        cursor = open(_cursor_file).read().strip()
-                        if cursor:
-                            self._seen_activity_ids = set(cursor.split(","))
-                except Exception:
-                    pass  # Corrupt cursor — start fresh
-
-            params: dict[str, str] = {"type": "a2a_receive"}
-            resp = await client.get(
-                f"{self.platform_url}/workspaces/{self.workspace_id}/activity",
-                params=params,
-                headers=auth_headers(),
-            )
-            if resp.status_code != 200:
-                return
-
-            rows = resp.json()
-            if not isinstance(rows, list):
-                return
-
-            # Activity API returns newest-first; process in reverse order so
-            # we advance the cursor monotonically (oldest → newest).
-            rows = list(reversed(rows))
-
-            new_results: list[dict] = []
-            last_id: str | None = None
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                activity_id = str(row.get("id", ""))
-                if not activity_id:
-                    continue
-                last_id = activity_id
-
-                if activity_id in self._seen_activity_ids:
-                    continue
-
-                # Filter: must have a non-empty source_id that is NOT this workspace
-                # (peer agent messages only; skip canvas-user messages and self-notify).
-                source_id = row.get("source_id") or ""
-                if not source_id or source_id == self.workspace_id:
-                    continue
-
-                # Skip non-result rows. A peer send that merely got QUEUED
-                # because we were busy ("queued: target busy"), or a receive
-                # that FAILED (status present and != "ok" — e.g. the 300s
-                # "timeout awaiting response headers"), is not a peer response
-                # with content. Harvesting it as a "completed" result wakes
-                # the agent to "process" transient backpressure, generating
-                # more sends and more backpressure: a self-amplifying replay
-                # storm (observed: one notification wrapping 12x identical
-                # "queued: target busy" echoes). Mark seen so the cursor still
-                # advances; never surface it as a result.
-                row_status = row.get("status") or ""
-                row_message_type = row.get("message_type") or ""
-                is_backpressure = (
-                    row_message_type == ACTIVITY_MESSAGE_TYPE_BACKPRESSURE
-                    or "queued: target busy" in (row.get("summary") or "")
-                )
-                if (row_status and row_status != "ok") or is_backpressure:
-                    self._seen_activity_ids.add(activity_id)
-                    continue
-
-                self._seen_activity_ids.add(activity_id)
-                summary = row.get("summary") or ""
-                # Extract response text from request_body if available.
-                # Shape mirrors inbox._extract_text: walk parts for "text" field.
-                response_text = summary
-                request_body = row.get("request_body")
-                if isinstance(request_body, dict):
-                    params_obj = request_body.get("params")
-                    if isinstance(params_obj, dict):
-                        msg = params_obj.get("message")
-                        if isinstance(msg, dict):
-                            parts = msg.get("parts") or []
-                            texts = []
-                            for p in (parts if isinstance(parts, list) else []):
-                                if isinstance(p, dict) and p.get("kind") == "text" or p.get("type") == "text":
-                                    t = p.get("text", "")
-                                    if t:
-                                        texts.append(t)
-                            if texts:
-                                response_text = " ".join(texts)
-
-                new_results.append({
-                    "delegation_id": activity_id,  # Use activity ID as pseudo-delegation ID
-                    "target_id": source_id,
-                    "source_id": self.workspace_id,
-                    "status": "completed",
-                    "summary": summary,
-                    "response_preview": response_text[:4096],
-                    "error": "",
-                    "timestamp": time.time(),
-                })
-
-            if not new_results:
-                return
-
-            # Persist cursor so restarts don't re-process these rows.
-            if last_id:
-                try:
-                    with open(_activity_delegation_cursor_file(), "w") as f:
-                        # Keep cursor as comma-joined IDs; truncate if over 100KB.
-                        cursor_str = ",".join(sorted(self._seen_activity_ids))
-                        if len(cursor_str) > 102_400:
-                            # Evict oldest half when cursor file grows too large.
-                            sorted_ids = sorted(self._seen_activity_ids)
-                            self._seen_activity_ids = set(sorted_ids[len(sorted_ids) // 2:])
-                            cursor_str = ",".join(sorted(self._seen_activity_ids))
-                        f.write(cursor_str)
-                except Exception:
-                    pass  # Non-fatal; next cycle will retry
-
-            # Append to results file and trigger self-message (mirrors _check_delegations).
-            # RC #203: durable-queue resolution (kernel-ON) via _delegation_results_file().
-            with open(_delegation_results_file(), "a") as f:
-                for r in new_results:
-                    f.write(json.dumps(r) + "\n")
-            logger.info(
-                "Heartbeat: %d new a2a_receive delegation results from activity_logs — "
-                "triggering self-message",
-                len(new_results),
-            )
-
-            # Build and send self-message to wake the agent.
-            summary_lines = []
-            for r in new_results:
-                line = f"- [completed] Peer response from {r['target_id'][:8]}: {r['summary'][:80] or '(no summary)'}"
-                if r.get("error"):
-                    line += f"\n  Error: {r['error'][:100]}"
-                summary_lines.append(line)
-
-            # Look up parent name (reuse cached value from _check_delegations if set).
-            if self._parent_name is None:
-                try:
-                    parent_resp = await client.get(
-                        f"{self.platform_url}/workspaces/{self.workspace_id}",
-                        headers=auth_headers(),
-                    )
-                    if parent_resp.status_code == 200:
-                        parent_id = parent_resp.json().get("parent_id", "")
-                        if parent_id:
-                            parent_info = await client.get(
-                                f"{self.platform_url}/workspaces/{parent_id}",
-                                headers=auth_headers(),
-                            )
-                            if parent_info.status_code == 200:
-                                self._parent_name = parent_info.json().get("name", "")
-                    if self._parent_name is None:
-                        self._parent_name = ""
-                except Exception:
-                    self._parent_name = ""
-            parent_name = self._parent_name or ""
-
-            report_instruction = ""
-            if parent_name:
-                report_instruction = (
-                    f"\n\nIMPORTANT: Delegate a summary of these results to your parent "
-                    f"'{parent_name}' using delegate_task. Also use send_message_to_user "
-                    f"to notify the user."
-                )
-            else:
-                report_instruction = (
-                    "\n\nReport results using send_message_to_user to notify the user."
-                )
-
-            trigger_msg = (
-                "Delegation results are ready (from a2a_receive via activity_logs). "
-                "Review them and take appropriate action:\n"
-                + "\n".join(summary_lines)
-                + report_instruction
-            )
-
-            now = time.time()
-            if now - self._last_self_message_time < SELF_MESSAGE_COOLDOWN:
-                logger.debug(
-                    "Heartbeat: self-message cooldown active; "
-                    "a2a_receive results will be retried next cycle"
-                )
-            elif not _kernel_allows_autonomous_injection(kernel.KIND_DELEGATION_RESULT):
-                # MUST-FIX 2 (kernel-ON): same pre-injection breaker gate as the
-                # /delegations harvester above. Kernel OFF -> allow -> byte-identical.
-                logger.info(
-                    "Heartbeat: autonomous-loop breaker OPEN — dropping "
-                    "a2a_receive delegation-result self-wake (kernel)"
-                )
-            else:
-                self._last_self_message_time = now
-                try:
-                    await client.post(
-                        f"{self.platform_url}/workspaces/{self.workspace_id}/a2a",
-                        json={
-                            "method": "message/send",
-                            # #2251: single model-based builder — params
-                            # generated FROM the receiver's a2a-sdk v0.3
-                            # SendMessageRequest schema.
-                            "params": build_message_send_params(
-                                trigger_msg,
-                                metadata={A2A_MESSAGE_SOURCE_TYPE: A2A_SOURCE_SELF_HARVESTER},
-                            ),
-                        },
-                        headers=self_source_headers(self.workspace_id),
-                        timeout=120.0,
-                    )
-                    logger.info("Heartbeat: a2a_receive self-message sent")
-                except Exception as e:
-                    logger.warning("Heartbeat: failed to send a2a_receive self-message: %s", e)
-
-            # Also notify the user via canvas — failure-class only. The
-            # a2a_receive path currently hardcodes status="completed"
-            # (peer responses are by definition successful deliveries),
-            # so this loop is normally a no-op now — that is the fix
-            # for task #384 canvas pollution. If a future change emits
-            # failure rows here, the gate + double-prefix dedupe below
-            # keep them clean.
-            for r in new_results:
-                if r.get("status") not in NOTIFY_STATUSES:
-                    continue
-                try:
-                    summary = (r.get("summary") or "").lstrip()
-                    # Strip any pre-existing "Delegation completed:" prefix
-                    # on the upstream summary so we don't double up.
-                    if summary.startswith(_DELEGATION_PREFIX):
-                        summary = summary[len(_DELEGATION_PREFIX):].lstrip()
-                    reason = r.get("error") or summary or "(no detail)"
-                    msg = f"Delegation {r['status']}: {reason[:200]}"
-                    await client.post(
-                        f"{self.platform_url}/workspaces/{self.workspace_id}/notify",
-                        json={"message": msg, "type": "delegation_result"},
-                        headers=auth_headers(),
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            logger.debug("Activity delegation check error: %s", e)
