@@ -1784,8 +1784,21 @@ async def main(prepare_only: bool = False):  # pragma: no cover
     # boot-integration path was validated live on the local stack 2026-07-13
     # (idle-digest canary) and is asserted by the ephemeral-CP gate's
     # idle-digest sub-step.
+    #
+    # MOLECULE_CONTINUOUS=false (workspace_mode): neither idle loop is armed.
+    # The workspace still runs every message and schedule fire it receives.
+    from molecule_runtime.workspace_mode import continuous as _continuous
+
+    _wakes_itself = _continuous()
+    if adapter_ready and not _wakes_itself:
+        print(
+            "Idle wake: off (MOLECULE_CONTINUOUS=false) — runs only for "
+            "messages and schedules",
+            flush=True,
+        )
+
     _idle_digest_enabled = False
-    if adapter_ready:
+    if adapter_ready and _wakes_itself:
         try:
             from molecule_runtime import mailbox_dir as _mbox
 
@@ -1905,7 +1918,7 @@ async def main(prepare_only: bool = False):  # pragma: no cover
 
     # Skipped on misconfigured boots — the self-fire would route to the
     # -32603 handler in a tight loop and consume cycles for no useful work.
-    if adapter_ready and config.idle_prompt and not _idle_digest_enabled:
+    if adapter_ready and _wakes_itself and config.idle_prompt and not _idle_digest_enabled:
         # Idle-fire HTTP timeout. Kept tight relative to the fire cadence so a
         # hung platform doesn't accumulate dangling requests — a fire that
         # takes longer than the idle interval itself is almost certainly stuck.
