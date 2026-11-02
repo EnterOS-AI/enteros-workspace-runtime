@@ -16,6 +16,18 @@ it at the new sdk main and bump its SHAs below.
 
 ---
 
+## Re-vendor 2026-11-02 — sdk main `509f54aa` (registry change: sdk `6f89b8f8`)
+
+- `native-plugins.registry.json` re-fetched — `molecule-scheduler` source pin
+  `#v0.2.3` → **`#v0.2.4`**. Sole change; every other entry byte-identical.
+
+FUNCTIONAL. `v0.2.4` carries the cron re-arm fix (sdk 0.6.2, plugin #14): a
+schedule whose cron or timezone is edited in the grid is re-armed under the new
+definition instead of firing on its old cadence until it next fires (observed on
+a production tenant). The sdk pinned it on 2026-10-12, after runtime-v0.4.92 was
+cut, so the release gate's schema-sync check failed on this drift for the next
+release.
+
 ## Re-vendor 2026-08-05 — sdk main `e88388bc` (sdk#209)
 
 - `native-plugins.registry.json` re-fetched — `molecule-scheduler` source pin
