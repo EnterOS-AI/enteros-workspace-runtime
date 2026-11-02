@@ -24,7 +24,6 @@ _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parent.parent))
 
 from molecule_runtime import heartbeat as hb_mod  # noqa: E402
-from molecule_runtime.builtin_tools import delegation as delegation_mod  # noqa: E402
 from molecule_runtime.heartbeat import HeartbeatLoop  # noqa: E402
 
 
@@ -165,6 +164,10 @@ async def test_parent_reply_is_not_reported_back_to_parent():
 async def test_parent_reply_without_target_id_is_recognised(monkeypatch):
     """GET /delegations' activity_logs fallback lists the completed delegate_result
     row without target_id; the callee comes from the local delegate_task_async record."""
+    # Imported here, not at module top: delegation reads WORKSPACE_ID / PLATFORM_URL
+    # at import, and a collection-time import fixes them before other tests set them.
+    from molecule_runtime.builtin_tools import delegation as delegation_mod
+
     hb = HeartbeatLoop("http://test-platform", _WS)
     monkeypatch.setitem(
         delegation_mod._delegations,
