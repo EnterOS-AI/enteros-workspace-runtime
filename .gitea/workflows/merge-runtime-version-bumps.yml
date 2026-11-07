@@ -154,6 +154,15 @@ jobs:
           # Verified 2026-07-28: all 66 open bump PRs across the four
           # maintained templates are authored by molecule-runtime-release-bot.
           BUMP_OPENER_LOGIN: molecule-runtime-release-bot
+          # Same gap on the MERGE side (runtime#339, 2026-11-05): every scheduled
+          # run since mid-August ends with "cannot resolve the merge identity
+          # (GET /user with CONSUMER_BUMP_MERGE_TOKEN failed and BUMP_MERGE_LOGIN
+          # is unset)". The secret is the devops-engineer token: that account
+          # approved and merged every sweeper-merged bump (e.g. template-hermes
+          # #350, template-claude-code #390) and still has write on all four
+          # templates. Same fallback rules as the opener: whoami wins when it
+          # works, and the script validates this login names a real account.
+          BUMP_MERGE_LOGIN: devops-engineer
         run: |
           if [ -z "${CONSUMER_BUMP_MERGE_TOKEN:-}" ]; then
             echo "::warning::CONSUMER_BUMP_MERGE_TOKEN secret absent; skipping consumer runtime-version bump merge sweeper (runtime#131 + runtime#83). Provision a non-author identity with write on the consumer template repos to enable."
