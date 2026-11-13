@@ -12,9 +12,11 @@ RequestContext/EventQueue shapes a production turn gets.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -141,13 +143,30 @@ class Sleeping:
         await asyncio.sleep(60)
 
 
-class IgnoringCancel:
+class Stubborn:
+    """Swallows every cancellation until released (or for 10 s at most), so only
+    run_once's cancel grace can bound how long run_once waits for it."""
+
+    def __init__(self):
+        self.release = asyncio.Event()
+        self.cancels = 0
+        self.task = None
+
     async def execute(self, context, queue):
+        self.task = asyncio.current_task()
         await queue.enqueue_event(new_text_message("partial"))
-        try:
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            await asyncio.sleep(1.0)  # swallows the first cancel, then gives up
+        give_up = time.monotonic() + 10
+        while not self.release.is_set() and time.monotonic() < give_up:
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                self.cancels += 1
+
+    async def let_go(self):
+        """Release the turn and wait for it, so the test's loop can close."""
+        self.release.set()
+        if self.task is not None:
+            await asyncio.wait({self.task}, timeout=5)
 
 
 def msg(text):
@@ -394,12 +413,20 @@ async def test_run_once_deadline_cancels_and_reports_timed_out():
 
 
 @pytest.mark.asyncio
-async def test_run_once_executor_ignoring_cancel_is_bounded():
+async def test_run_once_cancel_grace_bounds_a_turn_that_keeps_ignoring_cancel():
+    ex, rec = Stubborn(), _Recorder()
     started = time.monotonic()
-    rc = await run_once(
-        _spec_with_seconds_left(0.2), IgnoringCancel(), heartbeat=_hb(), report=_Recorder(), cancel_grace_seconds=0.1
-    )
-    assert rc == 124 and time.monotonic() - started < 2
+    try:
+        rc = await run_once(
+            _spec_with_seconds_left(0.2), ex, heartbeat=_hb(), report=rec, cancel_grace_seconds=0.1
+        )
+        elapsed = time.monotonic() - started
+        # Without the grace, run_once would wait the executor's full 10 s.
+        assert rc == 124 and elapsed < 1.0
+        assert ex.cancels >= 1 and not ex.task.done()  # still swallowing: only the grace ended the wait
+        assert (rec.bodies[-1]["status"], rec.bodies[-1]["output"]) == ("timed_out", "partial")
+    finally:
+        await ex.let_go()
 
 
 @pytest.mark.asyncio
@@ -437,10 +464,16 @@ async def test_run_once_unsettled_turn_times_out():
 
 
 @pytest.mark.asyncio
-async def test_run_once_core_409_does_not_run():
-    rec, ex = _Recorder(statuses=[409]), Replying("x")
+@pytest.mark.parametrize("code", [401, 403, 409])
+async def test_run_once_core_refusing_started_does_not_run(code, capsys):
+    # 409: not a Light agent (or the run already finished); 401/403: the run
+    # token is revoked or not this run's. Core would record nothing, and every
+    # call the task made with that token would be refused too.
+    rec, ex = _Recorder(statuses=[code]), Replying("x")
     assert await run_once(_spec(), ex, heartbeat=_hb(), report=rec) == 1
-    assert ex.called is False and len(rec.bodies) == 1
+    assert ex.called is False
+    assert [b["phase"] for b in rec.bodies] == ["started"]  # no `finished`
+    assert f"core refused run {RUN_ID} ({code}:" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -485,9 +518,87 @@ async def test_run_once_flushes_traces_after_finished(monkeypatch):
     assert order == ["report:started", "report:finished", "flush"]
 
 
+class UnknownState:
+    """An executor bug: a task status whose state the a2a enum does not name."""
+
+    async def execute(self, context, queue):
+        await queue.enqueue_event(
+            TaskStatusUpdateEvent(task_id="t1", context_id="c1", status=TaskStatus(state=99))
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,want",
+    [
+        # MOLECULE_RUN_PROMPT holding a byte that is not UTF-8 (the env decodes
+        # it as a lone surrogate): the turn's protobuf message refuses it.
+        ("non-utf8-prompt", "UnicodeEncodeError"),
+        # classify_turn cannot name the state.
+        ("unknown-task-state", "ValueError"),
+    ],
+)
+async def test_run_once_exception_inside_is_the_runs_failure(case, want):
+    if case == "non-utf8-prompt":
+        spec, ex = _spec(prompt="report \udcff"), Replying("x")
+    else:
+        spec, ex = _spec(), UnknownState()
+    rec = _Recorder()
+
+    assert await run_once(spec, ex, heartbeat=_hb(), report=rec) == 1
+
+    assert [(b["phase"], b["status"], b["exit_code"]) for b in rec.bodies] == [
+        ("started", "running", None),
+        ("finished", "failed", 1),
+    ]
+    error = rec.bodies[-1]["error"]
+    assert want in error and "adapter setup failed" not in error
+
+
+@pytest.mark.asyncio
+async def test_run_once_exception_after_finished_never_reports_again(monkeypatch):
+    def broken_flush(timeout_seconds=10.0):
+        raise RuntimeError("flush bug")
+
+    monkeypatch.setattr(ro, "flush_traces", broken_flush)
+    rec = _Recorder()
+
+    assert await run_once(_spec(), Replying("done"), heartbeat=_hb(), report=rec) == 0
+
+    assert [(b["phase"], b["status"]) for b in rec.bodies] == [("started", "running"), ("finished", "succeeded")]
+
+
 @pytest.mark.asyncio
 async def test_report_boot_failure_reports_one_failed_finish():
     rec = _Recorder()
     assert await report_boot_failure(_spec(), "RuntimeError: gateway down", report=rec) == 1
     assert [(b["phase"], b["status"], b["exit_code"]) for b in rec.bodies] == [("finished", "failed", 1)]
     assert rec.bodies[0]["error"].startswith("adapter setup failed:")
+
+
+# --- the exit bound (main.py arms it after the run's last report) -------------------------
+
+
+def test_arm_exit_bound_ends_a_process_that_outlives_the_grace():
+    ended: list[int] = []
+    timer = ro.arm_exit_bound(124, grace_seconds=0.05, hard_exit=ended.append)
+    timer.join(2)
+    assert ended == [124]
+    # A daemon timer: a process that exits normally first is never held by it.
+    assert timer.daemon and timer.name == "run-once-exit-bound"
+
+
+def test_post_deadline_accounting_matches_the_readme():
+    """README "Light runs": after the turn deadline, ending the run takes up to
+    58 s (cancel grace, the finished report with its retries, the Langfuse and
+    OTel flushes), and the exit bound ends the process at most 5 s after that.
+    The reserve min(120, D // 4) covers the 58 s only from D = 232 s."""
+    grace = inspect.signature(run_once).parameters["cancel_grace_seconds"].default
+    backoff = inspect.signature(report_run).parameters["backoff_seconds"].default
+    report_worst = ro.REPORT_TIMEOUT_SECONDS * (len(backoff) + 1) + sum(backoff)
+    total = grace + report_worst + 2 * ro.TRACE_FLUSH_SECONDS
+    assert (grace, report_worst, total, ro.EXIT_GRACE_SECONDS) == (5.0, 33.0, 58.0, 5.0)
+    assert min(d for d in range(1, 4000) if deadline_reserve(d) >= total) == 232
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    for claim in ("58 s", "232 s", "33 s"):
+        assert claim in readme, claim

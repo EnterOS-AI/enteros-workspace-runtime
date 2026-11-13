@@ -1291,9 +1291,24 @@ async def main(prepare_only: bool = False):  # pragma: no cover
         # traces, exit 0 / 1 / 124. Never reaches registration, the heartbeat
         # or uvicorn below. See molecule_runtime/run_once.py.
         if run_spec is not None:
-            raise SystemExit(
-                await _run_once.run_once(run_spec, executor, heartbeat=heartbeat)
-            )
+            try:
+                run_exit = await _run_once.run_once(run_spec, executor, heartbeat=heartbeat)
+            except Exception as run_err:  # noqa: BLE001 - never the setup arm below
+                # run_once reports its own failures and does not raise for
+                # one. Whatever still escapes it must not reach the adapter-
+                # setup arm below, which would report a second `finished`
+                # labelled "adapter setup failed". Exit 1, report nothing more.
+                print(
+                    f"[run-once] run {run_spec.run_id} raised "
+                    f"{type(run_err).__name__}: {run_err}; exiting 1",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                run_exit = _run_once.EXIT_FAILED
+            # The normal exit can hang on a turn that ignores cancellation;
+            # the bound ends the process a few seconds after the report.
+            _run_once.arm_exit_bound(run_exit)
+            raise SystemExit(run_exit)
 
         # 6b. Restore from pre-stop snapshot if one exists (molecule-core#1391).
         # The snapshot is scrubbed before being written, so secrets are
@@ -1364,9 +1379,9 @@ async def main(prepare_only: bool = False):  # pragma: no cover
         if run_spec is not None:
             # A Light run cannot degrade to "reachable-but-misconfigured": that
             # path registers and serves. Record the failed run and exit 1.
-            raise SystemExit(
-                await _run_once.report_boot_failure(run_spec, adapter_error)
-            )
+            run_exit = await _run_once.report_boot_failure(run_spec, adapter_error)
+            _run_once.arm_exit_bound(run_exit)
+            raise SystemExit(run_exit)
 
     # 7. Wrap in A2A.
     #

@@ -300,9 +300,34 @@ with the final reply text, flushes traces and exits:
 | Exit | Meaning |
 | --- | --- |
 | 0 | succeeded |
-| 1 | failed: the executor raised or reported a failed task, the runtime is wedged, setup failed, or core answered 409 (not a Light agent) |
-| 124 | timed out: the turn was still going at the deadline minus a reserve of `min(120 s, deadline / 4)`, kept back to report before Kubernetes ends the pod |
+| 1 | failed: the executor raised or reported a failed task, the runtime is wedged, setup failed, or once mode itself raised (the `error` names the exception). Also when core answers the `started` report with 409 (not a Light agent, or the run already finished), 401 (the run token is invalid or revoked) or 403: then the task does not run and there is no `finished` report |
+| 124 | timed out: the turn was still going at the run deadline minus a reserve (below) |
 | 2 | refused to boot: unknown `MOLECULE_RUN_MODE`, or a blank prompt, schedule, run id, workspace id or platform URL, or a bad deadline |
+
+**The deadline.** With D = `MOLECULE_RUN_DEADLINE_SECONDS` (the Job's
+`activeDeadlineSeconds`), the run stops waiting for the turn at boot + D − R,
+where boot is the moment `molecule-runtime` starts and R = `min(120 s, D // 4)`.
+Ending the run then takes up to 58 s:
+
+| After the turn deadline | At most |
+| --- | --- |
+| the cancelled turn's grace to stop | 5 s |
+| the `finished` report: three 10 s attempts, 1 s and 2 s apart | 33 s |
+| the Langfuse trace flush | 10 s |
+| the OpenTelemetry flush | 10 s |
+| **total, until the summary line** | **58 s** |
+
+The process then exits. If something still holds it (a turn that keeps
+swallowing the cancel, a worker thread still blocked in the turn), an exit
+bound ends it 5 s later with the same exit code.
+
+R covers the 58 s only when D ≥ 232 s (R = D // 4 ≥ 58). R must also absorb
+what Kubernetes counts before boot: pod start, the image pull, the copy step
+and the start script (about 10-15 s warm for hermes; one cold image pull was
+measured at 51 s). At the default D = 3600 s, R = 120 s leaves about 57 s for
+that (120 − 58 − 5). When it runs out, a short deadline or a slow cold pull,
+Kubernetes ends the pod at the Job deadline, perhaps before the `finished`
+report, and core records the run from the Job.
 
 A run never registers, never serves A2A, never heartbeats and never polls the
 agent's inbox, and neither does the MCP server or a CLI started in the same
@@ -333,8 +358,10 @@ molecule-runtime-light-copy --src /mnt/agent --dst /mnt/run --token-env MOLECULE
 - Writes the run token from the named env var to `<dst>/configs/.auth_token`
   (mode 0600).
 - Prints one JSON line, `{"files":N,"bytes":N,"excluded":N,"seconds":F}`, and
-  exits 0. Any error (an unreadable file, a bad exclude file, no token) exits 1
-  without that line, so a run never starts on a partial copy.
+  exits 0. Any error (an unreadable file; an exclude file that is missing, not
+  UTF-8 or holds an absolute pattern; a token that is missing or not UTF-8)
+  prints one line, `light-copy: FAILED <path>: <reason>`, and exits 1 without
+  the JSON line, so a run never starts on a partial copy.
 
 ## Installation
 

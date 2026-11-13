@@ -30,9 +30,11 @@ The run's token (the env var named by ``--token-env``) is written to
 
 On success one JSON line goes to stdout -- ``{"files":N,"bytes":N,"excluded":N,
 "seconds":F}`` -- and the exit code is 0. Any error (an unreadable file or
-directory, a bad exclude file, no token) prints one line naming the path to
-stderr and exits 1 without the JSON line: a run must never start on a partial
-copy. Bad arguments exit 2 (argparse).
+directory, an exclude file that is missing, not UTF-8 or holds an absolute
+pattern, a token that is missing or not UTF-8) prints one line naming the path
+to stderr, ``light-copy: FAILED <path>: <reason>``, and exits 1 without the JSON
+line: a run must never start on a partial copy. The inputs are checked before
+anything is copied. Bad arguments exit 2 (argparse).
 """
 from __future__ import annotations
 
@@ -102,6 +104,12 @@ def load_patterns(exclude_file: str | None) -> list[str]:
     except OSError as exc:
         raise CopyError(
             exclude_file, f"cannot read the exclude file named by {EXCLUDE_FILE_ENV}: {_reason(exc)}"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise CopyError(
+            exclude_file,
+            f"the exclude file named by {EXCLUDE_FILE_ENV} is not UTF-8 text "
+            f"(byte {exc.object[exc.start]:#04x} at offset {exc.start})",
         ) from exc
     for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -281,6 +289,10 @@ def main(argv: list[str] | None = None) -> int:
         token = os.environ.get(args.token_env, "").strip()
         if not token:
             raise CopyError(TOKEN_RELPATH, f"env {args.token_env} is empty or unset; a run needs its token")
+        try:
+            token.encode("utf-8")  # a byte that is not UTF-8 arrives as a lone surrogate
+        except UnicodeEncodeError:
+            raise CopyError(TOKEN_RELPATH, f"env {args.token_env} is not UTF-8 text") from None
         patterns = load_patterns(os.environ.get(EXCLUDE_FILE_ENV, "").strip() or None)
         stats = copy_tree(src, dst, patterns)
         write_token(dst, token)
