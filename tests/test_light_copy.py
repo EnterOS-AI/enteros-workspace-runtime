@@ -131,7 +131,7 @@ def test_unreadable_file_fails_loudly(dirs, run, monkeypatch):
     # Patched rather than chmod 000: CI may run as root, which reads anything.
     monkeypatch.setattr(light_copy, "_open_source", deny)
 
-    rc, summary, out, err = run(src, dst)
+    rc, _summary, out, err = run(src, dst)
 
     assert rc == 1
     assert "configs/.hermes/state.db" in err

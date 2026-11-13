@@ -24,6 +24,7 @@ scheduler stays off while its schedules run as Light runs.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 
 from molecule_runtime.mailbox_dir import _FALSY
 
@@ -47,12 +48,12 @@ def continuous() -> bool:
     return os.environ.get(CONTINUOUS_ENV, "").strip().lower() not in _FALSY
 
 
-def resolve_run_mode() -> str:
+def resolve_run_mode(env: Mapping[str, str] | None = None) -> str:
     """``"serve"`` when ``MOLECULE_RUN_MODE`` is unset or blank, ``"once"`` for
     ``once`` (trimmed, any case). Raises :class:`UnknownRunMode` for anything else:
     a run pod with a value this runtime does not know must refuse to boot rather
-    than guess."""
-    raw = os.environ.get(RUN_MODE_ENV, "")
+    than guess. ``env`` defaults to ``os.environ``."""
+    raw = (os.environ if env is None else env).get(RUN_MODE_ENV, "")
     value = raw.strip().lower()
     if not value:
         return RUN_MODE_SERVE

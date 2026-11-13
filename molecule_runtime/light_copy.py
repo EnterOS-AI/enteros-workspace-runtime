@@ -43,9 +43,9 @@ import os
 import stat
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 BUILTIN_EXCLUDES: tuple[str, ...] = (
     "configs/.auth_token",
