@@ -97,6 +97,9 @@ molecule-runtime-prepare = "molecule_runtime.main:prepare_sync"
 # this wheel and run `molecule-mcp` locally. It uses the same registry-backed
 # platform tool contract that container-bound runtimes expose via auto-spawned MCP.
 molecule-mcp = "molecule_runtime.mcp_cli:main"
+# The Light run copy step (contract C2): a run pod's init container copies the
+# parked agent's volume into the pod's private emptyDir with this.
+molecule-runtime-light-copy = "molecule_runtime.light_copy:main"
 
 [tool.ruff]
 lint.ignore = ["E402"]

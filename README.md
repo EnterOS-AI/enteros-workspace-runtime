@@ -270,6 +270,35 @@ tenant is selected by `platform_url`, and the workspace token is scoped by the
 tenant that issued it. Workspace IDs do not need to match across orgs; use the
 ID and token returned by each tenant.
 
+## Light runs
+
+A Light agent is a parked agent whose schedules run as isolated, short-lived
+copies of it, one Kubernetes Job per fire. The control plane starts each run
+pod; this package provides the two pieces that run inside it.
+
+### The copy step: `molecule-runtime-light-copy`
+
+The run pod's init container copies the agent's volume (mounted read-only) into
+the pod's private emptyDir:
+
+```bash
+molecule-runtime-light-copy --src /mnt/agent --dst /mnt/run --token-env MOLECULE_WORKSPACE_TOKEN
+```
+
+- Copies files, directories and symlinks (links are copied as links, never
+  followed, even when they point outside the volume) and keeps permission
+  bits. Skips sockets, FIFOs and devices. Never changes `--dst` itself.
+- Leaves out `configs/.auth_token`, `configs/.platform_inbound_secret` and
+  `lost+found/`, plus the engine's list in the file named by
+  `MOLECULE_LIGHT_COPY_EXCLUDE_FILE`: one glob pattern per line, relative to
+  the volume root (`configs/...`, `rtstate/...`), `#` comments, a trailing `/`
+  for a directory and everything under it.
+- Writes the run token from the named env var to `<dst>/configs/.auth_token`
+  (mode 0600).
+- Prints one JSON line, `{"files":N,"bytes":N,"excluded":N,"seconds":F}`, and
+  exits 0. Any error (an unreadable file, a bad exclude file, no token) exits 1
+  without that line, so a run never starts on a partial copy.
+
 ## Installation
 
 The runtime distribution is served by Molecule's Gitea registry. Public PyPI is
