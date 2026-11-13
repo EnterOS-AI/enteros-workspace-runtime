@@ -368,6 +368,13 @@ async def set_current_task(heartbeat: "HeartbeatLoop | None", task: str) -> None
             heartbeat.active_tasks = max(0, getattr(heartbeat, "active_tasks", 0) - 1)
             if heartbeat.active_tasks == 0:
                 heartbeat.current_task = ""
+    # A Light run pod keeps the counters (once mode reads active_tasks to see
+    # the turn settle) but never heartbeats: that would write the PARKED
+    # agent's row and could wake it (contract C1/C5).
+    from molecule_runtime.workspace_mode import in_run_pod
+
+    if in_run_pod():
+        return
     workspace_id = os.environ.get("WORKSPACE_ID", "")
     platform_url = os.environ.get("PLATFORM_URL", "")
     if not (workspace_id and platform_url):

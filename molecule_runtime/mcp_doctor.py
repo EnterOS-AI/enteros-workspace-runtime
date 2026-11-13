@@ -330,6 +330,16 @@ def check_token_auth() -> Verdict:
     a redundant 401.
     """
     label = "Token auth"
+    from molecule_runtime.workspace_mode import in_run_pod
+
+    if in_run_pod():
+        # A Light run pod never heartbeats: it would write the parked agent's row.
+        _warn(
+            label,
+            "skipped (Light run pod: MOLECULE_RUN_MODE is set, and a run never heartbeats)",
+            "run doctor outside the run pod",
+        )
+        return "warn"
     base = os.environ.get("PLATFORM_URL", "").strip().rstrip("/")
     workspace_id = os.environ.get("WORKSPACE_ID", "").strip()
     token, source_label = _resolve_token()

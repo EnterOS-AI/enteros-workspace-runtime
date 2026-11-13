@@ -176,6 +176,12 @@ def emit_boot_step(
         # separate process without it) still emits normally.
         if os.environ.get("MOLECULE_RUNTIME_PREPARE_ONLY") == "1":
             return
+        # A Light run pod (MOLECULE_RUN_MODE set) is not booting the agent the
+        # canvas shows; its boot steps would repaint a parked agent's screen.
+        from molecule_runtime.workspace_mode import in_run_pod
+
+        if in_run_pod():
+            return
         if not _is_concierge():
             # Ordinary tenant boot — don't spam the endpoint.
             return

@@ -526,6 +526,16 @@ class HeartbeatLoop:
         self.request_count += 1
 
     def start(self) -> None:
+        # A Light run pod (MOLECULE_RUN_MODE set) arms nothing: no alive
+        # heartbeat (it would write the parked agent's row and could wake it),
+        # no delegation polling (it would consume results meant for the agent),
+        # no MCP readiness prober. Once mode never calls start(); this guard
+        # keeps a future caller from changing that.
+        from molecule_runtime.workspace_mode import in_run_pod
+
+        if in_run_pod():
+            logger.info("heartbeat: Light run pod (MOLECULE_RUN_MODE set) - not starting")
+            return
         # #2723: alive-signal heartbeat on a dedicated daemon OS thread so it
         # survives a blocked asyncio event loop. The async _loop continues to
         # own delegation/activity polling.
