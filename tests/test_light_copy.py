@@ -233,6 +233,30 @@ def test_bad_exclude_file_fails_before_copying(dirs, run, tmp_path, case):
     assert list(dst.iterdir()) == []
 
 
+@pytest.mark.parametrize("case", ["exclude_file", "token"])
+def test_input_that_is_not_utf8_fails_in_one_line(dirs, run, tmp_path, case):
+    """Bytes that are not UTF-8 in the exclude file or in the token env end the
+    step with the one-line FAILED message, before anything is copied: never a
+    traceback, never a partial copy or a half-written token file."""
+    src, dst = dirs
+    (src / "configs").mkdir()
+    (src / "configs/config.yaml").write_bytes(b"x: 1\n")
+    if case == "exclude_file":
+        exclude = tmp_path / "exclude.txt"
+        exclude.write_bytes(b"# leave-out list\nconfigs/caf\xe9/\n")  # Latin-1, not UTF-8
+        rc, _summary, out, err = run(src, dst, exclude_path=exclude)
+        named = str(exclude)
+    else:
+        # A token env holding a non-UTF-8 byte decodes as a lone surrogate.
+        rc, _summary, out, err = run(src, dst, token="run-\udcfftoken")
+        named = "configs/.auth_token"
+
+    assert rc == 1 and out == ""
+    assert err.startswith(f"light-copy: FAILED {named}: ") and "UTF-8" in err
+    assert err.count("\n") == 1 and "Traceback" not in err
+    assert list(dst.iterdir()) == []
+
+
 def test_token_written_0600_replacing_agent_token(dirs, run):
     src, dst = dirs
     (src / "configs").mkdir()

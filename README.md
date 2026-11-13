@@ -333,8 +333,10 @@ molecule-runtime-light-copy --src /mnt/agent --dst /mnt/run --token-env MOLECULE
 - Writes the run token from the named env var to `<dst>/configs/.auth_token`
   (mode 0600).
 - Prints one JSON line, `{"files":N,"bytes":N,"excluded":N,"seconds":F}`, and
-  exits 0. Any error (an unreadable file, a bad exclude file, no token) exits 1
-  without that line, so a run never starts on a partial copy.
+  exits 0. Any error (an unreadable file; an exclude file that is missing, not
+  UTF-8 or holds an absolute pattern; a token that is missing or not UTF-8)
+  prints one line, `light-copy: FAILED <path>: <reason>`, and exits 1 without
+  the JSON line, so a run never starts on a partial copy.
 
 ## Installation
 
