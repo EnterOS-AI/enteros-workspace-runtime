@@ -567,3 +567,68 @@ def test_org_id_is_not_read_from_the_workspace_id(monkeypatch):
     platform_auth.clear_cache()
     assert platform_auth.get_org_id() is None
     assert os.environ.get("MOLECULE_ORG_ID") is None
+
+
+# --- C3b: the run id rides every core request from a Light run pod ------------
+
+RUN_ID_HEADER = "X-Molecule-Run-Id"
+
+
+def _call_builder(builder_name):
+    builder = SANCTIONED_BUILDERS[builder_name]
+    try:
+        return builder("ws-tenant-guard")  # type: ignore[operator]
+    except TypeError:
+        return builder()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("builder_name", sorted(SANCTIONED_BUILDERS))
+def test_every_sanctioned_builder_carries_the_run_id_in_a_run_pod(builder_name, monkeypatch):
+    """Contract C3b: core stores the run id on the activity rows a run's
+    requests write, so every builder on the allowlist must attach it."""
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    monkeypatch.setenv("MOLECULE_RUN_ID", "light-ws-abc-123")
+    platform_auth.clear_cache()
+    assert _call_builder(builder_name).get(RUN_ID_HEADER) == "light-ws-abc-123"
+
+
+@pytest.mark.parametrize("builder_name", sorted(SANCTIONED_BUILDERS))
+def test_no_run_id_header_when_serving(builder_name, monkeypatch):
+    monkeypatch.delenv("MOLECULE_RUN_MODE", raising=False)
+    monkeypatch.setenv("MOLECULE_RUN_ID", "light-ws-abc-123")
+    platform_auth.clear_cache()
+    assert RUN_ID_HEADER not in _call_builder(builder_name)
+
+
+@pytest.mark.parametrize("builder_name", sorted(SANCTIONED_BUILDERS))
+@pytest.mark.parametrize("run_id", [None, "", "  "])
+def test_no_run_id_header_when_run_id_blank(builder_name, run_id, monkeypatch):
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    if run_id is None:
+        monkeypatch.delenv("MOLECULE_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("MOLECULE_RUN_ID", run_id)
+    platform_auth.clear_cache()
+    assert RUN_ID_HEADER not in _call_builder(builder_name)
+
+
+@pytest.mark.parametrize("run_id", ["has space", "a\r\nX-Evil: 1", "x" * 129])
+def test_unsafe_run_id_is_omitted_not_sent(run_id, monkeypatch):
+    """Same fail-closed rule as the org id (CWE-20 / header injection)."""
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    monkeypatch.setenv("MOLECULE_RUN_ID", run_id)
+    assert platform_auth.run_id_headers() == {}
+    assert RUN_ID_HEADER not in platform_auth.platform_headers()
+
+
+def test_run_id_rides_the_per_workspace_url_branch_too(monkeypatch):
+    """platform_headers() skips tenant_headers() for a workspace with its own
+    platform_url; the run id must not depend on which branch builds the dict."""
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    monkeypatch.setenv("MOLECULE_RUN_ID", "light-ws-abc-123")
+    platform_auth.clear_cache()
+    platform_auth.register_workspace_platform_url("ws-own-url", "https://own.moleculesai.app")
+    try:
+        assert platform_auth.platform_headers("ws-own-url")[RUN_ID_HEADER] == "light-ws-abc-123"
+    finally:
+        platform_auth.clear_cache()

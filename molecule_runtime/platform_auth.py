@@ -27,6 +27,7 @@ import threading
 from pathlib import Path
 
 import molecule_runtime.configs_dir as configs_dir
+from molecule_runtime.workspace_mode import in_run_pod
 
 logger = logging.getLogger(__name__)
 
@@ -452,11 +453,47 @@ def get_org_id() -> str | None:
     return None
 
 
+RUN_ID_HEADER = "X-Molecule-Run-Id"
+RUN_ID_ENV = "MOLECULE_RUN_ID"
+_run_id_warned = False
+
+
+def run_id_headers() -> dict[str, str]:
+    """Return ``{"X-Molecule-Run-Id": <MOLECULE_RUN_ID>}`` from a Light run pod.
+
+    Contract C3b: every request the sanctioned builders produce carries the
+    run id when ``workspace_mode.in_run_pod()`` and ``MOLECULE_RUN_ID`` is not
+    blank, and never otherwise. Core stores it on the activity rows those
+    requests write, so a run's tool calls and messages can be listed per run.
+
+    The value is a Job name (DNS-1123), but it is still checked with the same
+    fail-closed header pattern as the org id: an unsafe value is logged once
+    and omitted, never placed in a header (CWE-20 / header injection).
+    """
+    global _run_id_warned
+    if not in_run_pod():
+        return {}
+    run_id = os.environ.get(RUN_ID_ENV, "").strip()
+    if not run_id:
+        return {}
+    if not _ORG_ID_RE.match(run_id):
+        if not _run_id_warned:
+            _run_id_warned = True
+            logger.warning(
+                "%s is set but is not a valid HTTP header value - omitting the %s header",
+                RUN_ID_ENV,
+                RUN_ID_HEADER,
+            )
+        return {}
+    return {RUN_ID_HEADER: run_id}
+
+
 def tenant_headers() -> dict[str, str]:
     """Return the platform's tenant-routing headers — ``{}`` when unset.
 
     ``{"X-Molecule-Org-Id": <org id>}`` when ``MOLECULE_ORG_ID`` resolves,
-    otherwise an empty dict.
+    otherwise an empty dict. From a Light run pod the run id rides along
+    (:func:`run_id_headers`, contract C3b).
 
     OMIT rather than forge (issue #373): the org id is an authorization-
     adjacent routing claim the runtime has no standing to invent. A
@@ -467,7 +504,9 @@ def tenant_headers() -> dict[str, str]:
     passthrough, so an absent header is also the correct wire shape.
     """
     org_id = get_org_id()
-    return {_ORG_ID_HEADER: org_id} if org_id else {}
+    headers = {_ORG_ID_HEADER: org_id} if org_id else {}
+    headers.update(run_id_headers())
+    return headers
 
 
 def platform_headers(
@@ -488,6 +527,7 @@ def platform_headers(
     * ``X-Workspace-ID``   — only when ``source=True``; identifies this
       workspace as the SOURCE of the request (see
       :func:`self_source_headers`).
+    * ``X-Molecule-Run-Id`` — only from a Light run pod (:func:`run_id_headers`).
 
     Merge extra headers at the call site — ``{**platform_headers(ws),
     "Content-Type": "application/json"}`` — rather than growing kwargs
@@ -532,6 +572,9 @@ def platform_headers(
         if not workspace_id:
             raise ValueError("platform_headers(source=True) requires workspace_id")
         headers["X-Workspace-ID"] = workspace_id
+    # Contract C3b, on both branches above (the per-workspace-URL branch
+    # skips tenant_headers()).
+    headers.update(run_id_headers())
     return headers
 
 

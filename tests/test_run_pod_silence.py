@@ -315,3 +315,12 @@ def test_the_sweep_detects_a_new_site(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(__import__(__name__), "PKG_ROOT", fake_root)
     assert _registry_post_sites() == {("rogue.py", "beat")}
+
+
+# --- C3b: the activity POST a run makes carries its run id --------------------
+
+
+@pytest.mark.asyncio
+async def test_activity_post_carries_run_id_in_run_pod(run_pod, monkeypatch):
+    http = await _report_activity(monkeypatch)
+    assert http.calls[0][2].get("X-Molecule-Run-Id") == RUN_ID
