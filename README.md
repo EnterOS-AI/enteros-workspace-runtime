@@ -288,13 +288,15 @@ execs `molecule-runtime` with this environment (set by the control plane):
 | `MOLECULE_RUN_SCHEDULE` | The schedule's name, sent as `schedule_name` metadata. |
 | `MOLECULE_RUN_ID` | The Job name; sent as `X-Molecule-Run-Id` on every request to core. |
 | `MOLECULE_RUN_DEADLINE_SECONDS` | The Job's `activeDeadlineSeconds` (default 3600). |
+| `MOLECULE_RUN_HOLD_SECONDS` | Start early (below): hold the turn until the scheduled minute + this many seconds. A whole number; unset or blank = 0, no hold. |
 
 The runtime boots the adapter and executor as usual but skips what downloads,
 installs or only matters to a long-lived server: the config-relay fetch, the
 declared-plugin install, the reprovision wake note, the MCP tool enumeration
-and boot-step events. It then sends the prompt through the executor as a
-scheduled self-turn (`source_type: self-scheduler`), waits until the turn has
-settled, reports `started` and `finished` to `POST /workspaces/{id}/light/runs`
+and boot-step events. It then holds the turn if start early applies, sends the
+prompt through the executor as a scheduled self-turn
+(`source_type: self-scheduler`), waits until the turn has settled, reports
+`started` (after the hold) and `finished` to `POST /workspaces/{id}/light/runs`
 with the final reply text, flushes traces and exits:
 
 | Exit | Meaning |
@@ -302,7 +304,27 @@ with the final reply text, flushes traces and exits:
 | 0 | succeeded |
 | 1 | failed: the executor raised or reported a failed task, the runtime is wedged, setup failed, or once mode itself raised (the `error` names the exception). Also when core answers the `started` report with 409 (not a Light agent, or the run already finished), 401 (the run token is invalid or revoked) or 403: then the task does not run and there is no `finished` report |
 | 124 | timed out: the turn was still going at the run deadline minus a reserve (below) |
-| 2 | refused to boot: unknown `MOLECULE_RUN_MODE`, or a blank prompt, schedule, run id, workspace id or platform URL, or a bad deadline |
+| 2 | refused to boot: unknown `MOLECULE_RUN_MODE`, or a blank prompt, schedule, run id, workspace id or platform URL, or a bad deadline or hold |
+
+**Start early.** The control plane fires each CronJob a minute before the
+schedule's time and sets `MOLECULE_RUN_HOLD_SECONDS=60`, so the pod start, the
+copy step and the boot happen before that time and the task starts on it. The
+CronJob controller names each Job `<cronjob>-<minutes since the Unix epoch>`,
+the minute the fire was scheduled for. Once the engine is ready, the runtime
+reads that minute from `MOLECULE_RUN_ID` and holds the turn until that minute
+plus the hold, then reports `started` and runs it. The wait runs on the
+monotonic clock. There is no hold:
+
+- for a run-now Job (`<cronjob>-m<unix seconds>`) or any run id whose last
+  `-`-separated field is not all digits;
+- when that minute is more than a day from the pod's clock;
+- when the target has already passed (a slow start, such as a cold image pull).
+
+The turn deadline below still counts from boot, so the hold uses part of it:
+the control plane adds the hold to the Job's deadline (`activeDeadlineSeconds`,
+and so `MOLECULE_RUN_DEADLINE_SECONDS`), and the hold never runs past the turn
+deadline. A hold that cannot be computed is skipped with one log line; it
+never fails the run.
 
 **The deadline.** With D = `MOLECULE_RUN_DEADLINE_SECONDS` (the Job's
 `activeDeadlineSeconds`), the run stops waiting for the turn at boot + D − R,

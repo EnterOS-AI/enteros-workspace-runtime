@@ -134,6 +134,7 @@ class Call:
     path: str
     body: dict | None
     at: float = 0.0  # time.monotonic() when the request arrived
+    wall: float = 0.0  # time.time() when the request arrived
 
 
 class _Recorder(BaseHTTPRequestHandler):
@@ -144,7 +145,9 @@ class _Recorder(BaseHTTPRequestHandler):
             body = json.loads(raw) if raw else None
         except ValueError:
             body = None
-        self.server.calls.append(Call(self.command, self.path.split("?")[0], body, time.monotonic()))
+        self.server.calls.append(
+            Call(self.command, self.path.split("?")[0], body, time.monotonic(), time.time())
+        )
         payload = b'{"ok": true}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -330,7 +333,48 @@ def test_once_mode_reports_once_when_the_exit_bound_cannot_be_armed(tmp_path, st
         assert "adapter.setup() failed" not in out
 
 
-@pytest.mark.parametrize("env", [{"MOLECULE_RUN_MODE": "twice"}, {"MOLECULE_RUN_PROMPT": "  "}])
+def test_once_mode_holds_the_turn_until_the_scheduled_minute_plus_hold(tmp_path):
+    """Start early, end to end: a Job named by the CronJob controller for the
+    current minute, with a hold that puts the target about 10 s after this
+    child starts. The `started` report (and so the turn) waits for the target."""
+    now = time.time()
+    minute = int(now) // 60
+    hold = int(now - minute * 60) + 10
+    target = minute * 60 + hold
+
+    rc, calls, out = _boot(
+        tmp_path,
+        "reply",
+        MOLECULE_RUN_ID=f"light-1a2b3c4d-9f8e7d6c-{minute}",
+        MOLECULE_RUN_HOLD_SECONDS=str(hold),
+    )
+
+    assert rc == 0, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == ["started", "finished"], out[-3000:]
+    assert calls[0].wall >= target - 0.05, f"started {target - calls[0].wall:.2f}s before the target"
+    assert "holding the turn" in out, out[-3000:]
+    assert calls[-1].body["status"] == "succeeded"
+
+
+def test_once_mode_never_holds_a_run_now_job(tmp_path):
+    started = time.time()
+    rc, calls, out = _boot(
+        tmp_path,
+        "reply",
+        MOLECULE_RUN_ID=f"light-1a2b3c4d-9f8e7d6c-m{int(started)}",
+        MOLECULE_RUN_HOLD_SECONDS="60",
+    )
+
+    assert rc == 0, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == ["started", "finished"], out[-3000:]
+    assert "holding the turn" not in out and "no hold: the run id names no scheduled minute" in out
+    assert calls[-1].wall - started < 45, "a run-now Job waited for a hold"
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"MOLECULE_RUN_MODE": "twice"}, {"MOLECULE_RUN_PROMPT": "  "}, {"MOLECULE_RUN_HOLD_SECONDS": "soon"}],
+)
 def test_once_mode_refusal_exits_2_without_any_call(tmp_path, env):
     rc, calls, out = _boot(tmp_path, "reply", **env)
 

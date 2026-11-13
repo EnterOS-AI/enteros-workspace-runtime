@@ -7,18 +7,32 @@ the image's normal start script and then ``molecule-runtime`` with
 a workspace does (minus the steps that download, install or only matter to a
 long-lived server) and hands the executor to :func:`run_once`, which:
 
-1. reports ``started`` to core's run ledger (``POST /workspaces/{id}/light/runs``);
+1. holds the turn until the schedule's own minute when
+   ``MOLECULE_RUN_HOLD_SECONDS`` is set (start early, below);
+2. reports ``started`` to core's run ledger (``POST /workspaces/{id}/light/runs``);
    a 401, 403 or 409 answer means core will not record the run, so the task
    does not run (exit 1, no ``finished``);
-2. sends ``MOLECULE_RUN_PROMPT`` through ``executor.execute()`` as a scheduled
+3. sends ``MOLECULE_RUN_PROMPT`` through ``executor.execute()`` as a scheduled
    self-turn (envelope metadata ``source_type=self-scheduler`` and
    ``schedule_name=MOLECULE_RUN_SCHEDULE``, the shape of a trigger-daemon fire);
-3. waits until the turn has settled: ``execute()`` returned and the executor's
+4. waits until the turn has settled: ``execute()`` returned and the executor's
    busy count (``heartbeat.active_tasks``) is back to zero;
-4. reports ``finished`` with the final reply text, flushes traces, and returns
+5. reports ``finished`` with the final reply text, flushes traces, and returns
    the exit code: 0 succeeded, 1 failed, 124 timed out (2 = refused to boot,
    raised from :func:`boot_gate`). ``main()`` then arms :func:`arm_exit_bound`
    and exits.
+
+Start early: the control plane fires each CronJob a minute before the
+schedule's time and sets ``MOLECULE_RUN_HOLD_SECONDS`` (60), so the pod start,
+the copy step and the boot happen before that time. The CronJob controller
+names each Job ``<cronjob>-<minutes since the Unix epoch>``, the minute it was
+scheduled for; :func:`plan_hold` reads that minute from ``MOLECULE_RUN_ID`` and
+the turn waits, after boot and before the ``started`` report, until that minute
+plus the hold. Nothing is held for a run-now Job (``<cronjob>-m<unix seconds>``),
+for any other name, for a minute more than a day from this pod's clock, or when
+the target has already passed (a slow start). The turn deadline below still
+counts from boot, so the hold uses part of it: the control plane adds the hold
+to the Job's deadline. The hold never runs past the turn deadline.
 
 Deadline: the run stops waiting at ``boot start + D - R``, where D is
 ``MOLECULE_RUN_DEADLINE_SECONDS`` (the Job's ``activeDeadlineSeconds``) and
@@ -49,7 +63,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 from a2a.server.agent_execution import RequestContext
@@ -100,6 +114,14 @@ PROMPT_ENV = "MOLECULE_RUN_PROMPT"
 SCHEDULE_ENV = "MOLECULE_RUN_SCHEDULE"
 RUN_ID_ENV = "MOLECULE_RUN_ID"
 DEADLINE_ENV = "MOLECULE_RUN_DEADLINE_SECONDS"
+HOLD_ENV = "MOLECULE_RUN_HOLD_SECONDS"
+
+# Start early: a scheduled minute further than this from the pod's clock is not
+# a fire's (a hand-made Job name that ends in digits, a clock far off): no hold.
+MAX_SCHEDULE_DISTANCE_SECONDS = 86400
+# A minute since the epoch has 8 digits until the year 2160; a longer field is
+# no minute (and stays cheap to parse).
+_MAX_MINUTE_DIGITS = 12
 
 # a2a_executor.A2A_SOURCE_SELF_SCHEDULER: the marker a trigger-daemon fire carries.
 SOURCE_TYPE = "self-scheduler"
@@ -131,6 +153,7 @@ class RunSpec:
     platform_url: str
     started_at: float  # wall clock when main() began
     started_monotonic: float  # monotonic clock when main() began
+    hold_seconds: int = 0  # start early: hold the turn until the scheduled minute + this
 
 
 @dataclass(frozen=True)
@@ -183,6 +206,15 @@ def boot_gate(
             deadline = 0
         if deadline <= 0:
             raise RunRefused(f"{DEADLINE_ENV}={raw_deadline[:20]!r} is not a positive whole number of seconds")
+    raw_hold = env.get(HOLD_ENV, "").strip()
+    hold = 0
+    if raw_hold:
+        try:
+            if not (raw_hold.isascii() and raw_hold.isdigit()):
+                raise ValueError(raw_hold)
+            hold = int(raw_hold)
+        except ValueError:  # also more digits than int() converts
+            raise RunRefused(f"{HOLD_ENV}={raw_hold[:20]!r} is not a whole number of seconds (0 or more)") from None
     return RunSpec(
         run_id=run_id,
         schedule=schedule,
@@ -192,6 +224,7 @@ def boot_gate(
         platform_url=platform_url,
         started_at=started_at,
         started_monotonic=started_monotonic,
+        hold_seconds=hold,
     )
 
 
@@ -205,6 +238,42 @@ def turn_deadline(spec: RunSpec) -> float:
     return spec.started_monotonic + spec.deadline_seconds - deadline_reserve(spec.deadline_seconds)
 
 
+def scheduled_minute(run_id: str) -> int | None:
+    """The minute (since the Unix epoch) a CronJob fire was scheduled for.
+
+    The CronJob controller names each Job ``<cronjob>-<minutes since the
+    epoch>``, so that minute is the run id's last ``-``-separated field when it
+    is all ASCII digits. None for any other name: run-now Jobs are named
+    ``<cronjob>-m<unix seconds>``, and a hand-made Job may be named anything."""
+    cronjob, _dash, field = run_id.rpartition("-")
+    if not cronjob or not (field.isascii() and field.isdigit()) or len(field) > _MAX_MINUTE_DIGITS:
+        return None
+    return int(field)
+
+
+class Hold(NamedTuple):
+    seconds: float  # how long to hold the turn; 0.0 = start it now
+    why: str  # for the run's log line
+
+
+def plan_hold(spec: RunSpec, now: float) -> Hold:
+    """How long to hold the turn at wall-clock ``now`` so it starts at the
+    scheduled minute + ``spec.hold_seconds`` (start early, module docstring)."""
+    if spec.hold_seconds <= 0:
+        return Hold(0.0, f"{HOLD_ENV} is 0")
+    minute = scheduled_minute(spec.run_id)
+    if minute is None:
+        return Hold(0.0, "the run id names no scheduled minute (a run-now or hand-made Job)")
+    scheduled = minute * 60
+    if abs(scheduled - now) > MAX_SCHEDULE_DISTANCE_SECONDS:
+        return Hold(0.0, "the scheduled minute is more than a day from this clock")
+    target = scheduled + spec.hold_seconds
+    left = target - now
+    if left <= 0:
+        return Hold(0.0, f"the scheduled minute + {spec.hold_seconds}s has passed")
+    return Hold(float(left), f"{_rfc3339(target)}, the scheduled minute + {spec.hold_seconds}s")
+
+
 def print_line(line: str, *, stderr: bool = False) -> None:
     """Print one ``[run-once]`` line; never raises (a closed stream, a strict
     encoding), so a log line can never become the run's failure."""
@@ -212,6 +281,39 @@ def print_line(line: str, *, stderr: bool = False) -> None:
         print(line, file=sys.stderr if stderr else sys.stdout, flush=True)
     except Exception:  # noqa: BLE001
         pass
+
+
+async def _hold(
+    spec: RunSpec,
+    *,
+    wall_clock: Callable[[], float],
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], Awaitable[Any]],
+) -> None:
+    """Start early: wait until the scheduled minute + the hold, never past the
+    turn deadline. The wall clock is read once; the wait itself runs on the
+    monotonic clock, so a clock step during it changes nothing. Fail-open: a
+    hold that cannot be planned is skipped, never the run's failure."""
+    if spec.hold_seconds <= 0:
+        return
+    try:
+        hold = plan_hold(spec, wall_clock())
+        if hold.seconds <= 0:
+            print_line(f"[run-once] run {spec.run_id}: no hold: {hold.why}")
+            return
+        start = monotonic()
+        end = min(start + hold.seconds, turn_deadline(spec))
+        if end < start + hold.seconds:
+            print_line(
+                f"[run-once] run {spec.run_id}: holding the turn {max(end - start, 0.0):.1f}s, "
+                f"until the turn deadline, before {hold.why}"
+            )
+        else:
+            print_line(f"[run-once] run {spec.run_id}: holding the turn {hold.seconds:.1f}s, until {hold.why}")
+        while (left := end - monotonic()) > 0:
+            await sleep(left)
+    except Exception as exc:  # noqa: BLE001 - the hold is a nicety; the run goes on without it
+        print_line(f"[run-once] run {spec.run_id}: no hold: {type(exc).__name__}: {exc}")
 
 
 def build_run_context(spec: RunSpec) -> RequestContext:
@@ -454,12 +556,17 @@ async def run_once(
     monotonic: Callable[[], float] = time.monotonic,
     settle_poll_seconds: float = 0.2,
     cancel_grace_seconds: float = 5.0,
+    wall_clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> int:
     """Run the scheduled prompt once (see the module docstring); return the exit code.
 
     Never raises an ``Exception``: one raised while the run is under way (by
     once mode itself, or by an input the engine's types refuse) is the run's
-    failure, reported as its one ``finished`` with ``error`` naming it."""
+    failure, reported as its one ``finished`` with ``error`` naming it.
+    ``wall_clock``, ``monotonic`` and ``sleep`` are the start-early hold's
+    clocks (``monotonic`` also places the turn deadline)."""
+    await _hold(spec, wall_clock=wall_clock, monotonic=monotonic, sleep=sleep)
     status = await _report(report, spec, ledger_body(spec, phase="started"))
     refusal = _STARTED_REFUSALS.get(status)
     if refusal is not None:

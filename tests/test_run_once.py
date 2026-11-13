@@ -37,9 +37,11 @@ from molecule_runtime.run_once import (
     deadline_reserve,
     head_utf8,
     ledger_body,
+    plan_hold,
     report_boot_failure,
     report_run,
     run_once,
+    scheduled_minute,
     tail_utf8,
     turn_deadline,
 )
@@ -50,6 +52,13 @@ RUN_ID = "light-ws-abc-123"
 T_START = datetime(2026, 11, 13, 4, 39, 52, tzinfo=timezone.utc).timestamp()
 T_0441 = datetime(2026, 11, 13, 4, 41, 0, tzinfo=timezone.utc).timestamp()
 T0 = {"started_at": T_START, "started_monotonic": 0.0}
+
+# Start early: a schedule due at 09:00Z fires its CronJob at 08:59Z, and the
+# CronJob controller names that Job `<cronjob>-<minutes since the epoch>`.
+SCHED_EPOCH = datetime(2026, 11, 13, 8, 59, 0, tzinfo=timezone.utc).timestamp()
+SCHED_MIN = int(SCHED_EPOCH) // 60
+CRON_JOB = f"light-1a2b3c4d-9f8e7d6c-{SCHED_MIN}"
+RUN_NOW_JOB = f"light-1a2b3c4d-9f8e7d6c-m{int(SCHED_EPOCH) + 5}"
 
 
 def run_env(**over):
@@ -239,6 +248,69 @@ def test_boot_gate_refuses_bad_deadline(raw):
 def test_boot_gate_keeps_prompt_byte_exact():
     prompt = "  line 1\n\tline 2 ✓ 中文\n" + "x" * 65536 + "\n"
     assert boot_gate(run_env(MOLECULE_RUN_PROMPT=prompt), prepare_only=False, **T0).prompt == prompt
+
+
+@pytest.mark.parametrize("raw,want", [(None, 0), ("", 0), ("  ", 0), ("0", 0), ("60", 60), (" 60 ", 60)])
+def test_boot_gate_hold(raw, want):
+    spec = boot_gate(run_env(MOLECULE_RUN_HOLD_SECONDS=raw), prepare_only=False, **T0)
+    assert spec.hold_seconds == want
+
+
+@pytest.mark.parametrize("raw", ["-1", "1.5", "60s", "abc", "+60", "1e3", "٦٠", "6 0"])
+def test_boot_gate_refuses_a_bad_hold(raw):
+    with pytest.raises(RunRefused, match="MOLECULE_RUN_HOLD_SECONDS"):
+        boot_gate(run_env(MOLECULE_RUN_HOLD_SECONDS=raw), prepare_only=False, **T0)
+
+
+# --- start early: the scheduled minute and the hold --------------------------------
+
+
+@pytest.mark.parametrize(
+    "run_id,want",
+    [
+        (CRON_JOB, SCHED_MIN),  # the CronJob controller's Job name
+        (f"light-12345678-87654321-{SCHED_MIN}", SCHED_MIN),  # all-digit fields inside the CronJob's name
+        (f"nightly-2-{SCHED_MIN}", SCHED_MIN),
+        ("light-1a2b3c4d-12345678", 12345678),  # a hand-made Job: parses; plan_hold sees it is far from now
+        (RUN_NOW_JOB, None),  # run now: `<cronjob>-m<unix seconds>`
+        ("light-1a2b3c4d-9f8e7d6c", None),  # the CronJob's own name: hex, not a minute
+        (str(SCHED_MIN), None),  # no CronJob name before the minute
+        (f"-{SCHED_MIN}", None),
+        ("light-", None),
+        ("", None),
+        (f"light-{SCHED_MIN}x", None),
+        (f"light-+{SCHED_MIN}", None),
+        (f"light- {SCHED_MIN}", None),
+        (f"light-{SCHED_MIN}\n", None),
+        ("light-٢٩٣٨", None),  # digits, but not ASCII ones
+        ("light-²", None),
+        ("light-" + "9" * 400, None),  # no minute has that many digits
+    ],
+)
+def test_scheduled_minute(run_id, want):
+    assert scheduled_minute(run_id) == want
+
+
+@pytest.mark.parametrize(
+    "run_id,hold,after,want",
+    [
+        (CRON_JOB, 60, 12.5, 47.5),  # booted 12.5 s after the fire: the turn starts at 09:00:00
+        (CRON_JOB, 60, 0, 60.0),
+        (CRON_JOB, 60, -30, 90.0),  # this node's clock is 30 s behind the controller's
+        (CRON_JOB, 60, 60, 0.0),  # already at the target
+        (CRON_JOB, 60, 75, 0.0),  # late (a cold image pull): no hold
+        (CRON_JOB, 0, 12.5, 0.0),  # no hold configured
+        (RUN_NOW_JOB, 60, 12.5, 0.0),  # a run-now Job is never held
+        ("light-ws-abc-123", 60, 12.5, 0.0),  # minute 123: more than a day ago
+        ("light-1a2b3c4d-12345678", 60, 12.5, 0.0),  # 1993: more than a day ago
+        (CRON_JOB, 60, -86401, 0.0),  # scheduled more than a day ahead of this clock
+        (CRON_JOB, 60, -86400, 86460.0),  # exactly a day ahead: still held (the deadline bounds it)
+        (CRON_JOB, 200000, 86401, 0.0),  # scheduled more than a day ago, target still ahead
+        (CRON_JOB, 200000, 86400, 113600.0),  # exactly a day ago: still held
+    ],
+)
+def test_plan_hold(run_id, hold, after, want):
+    assert plan_hold(_spec(run_id=run_id, hold_seconds=hold), SCHED_EPOCH + after).seconds == want
 
 
 # --- deadline, context, text helpers --------------------------------------------
@@ -557,6 +629,137 @@ async def test_run_once_flushes_traces_after_finished(monkeypatch):
     monkeypatch.setattr(ro, "flush_traces", lambda timeout_seconds=10.0: order.append("flush") or True)
     await run_once(_spec(), Replying("x"), heartbeat=_hb(), report=_Recorder(order=order))
     assert order == ["report:started", "report:finished", "flush"]
+
+
+# --- start early: the hold in run_once ------------------------------------------------
+
+
+class _Clock:
+    """Wall and monotonic clocks that move only when the run sleeps: the seams
+    the hold reads (``wall_clock``, ``monotonic``) and waits with (``sleep``)."""
+
+    def __init__(self, wall: float, mono: float = 1000.0, order: list | None = None):
+        self.wall, self.mono, self.order = wall, mono, order
+        self.slept: list[float] = []
+
+    def time(self) -> float:
+        return self.wall
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        if self.order is not None:
+            self.order.append(f"hold:{seconds:g}")
+        self.wall += seconds
+        self.mono += seconds
+
+
+class _NotesTheClock:
+    """Replies, noting the clocks when the turn starts."""
+
+    def __init__(self, clock: _Clock, order: list | None = None):
+        self.clock, self.order = clock, order
+        self.started_wall = self.started_mono = None
+
+    async def execute(self, context, queue):
+        self.started_wall, self.started_mono = self.clock.wall, self.clock.mono
+        if self.order is not None:
+            self.order.append("execute")
+        await queue.enqueue_event(new_text_message("done"))
+
+
+def _held(clock: _Clock, *, run_id=CRON_JOB, hold=60, deadline=3600, booted_ago=10.0, **over) -> RunSpec:
+    return _spec(
+        run_id=run_id,
+        hold_seconds=hold,
+        deadline_seconds=deadline,
+        started_monotonic=clock.mono - booted_ago,
+        **over,
+    )
+
+
+def _clock_seams(clock: _Clock) -> dict:
+    return {"wall_clock": clock.time, "monotonic": clock.monotonic, "sleep": clock.sleep}
+
+
+@pytest.mark.asyncio
+async def test_run_once_holds_the_turn_until_the_scheduled_minute_plus_hold(capsys):
+    order: list[str] = []
+    clock = _Clock(wall=SCHED_EPOCH + 12.5, order=order)  # booted 12.5 s after the 08:59 fire
+    ex, rec = _NotesTheClock(clock, order), _Recorder(order=order)
+
+    rc = await run_once(_held(clock), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock))
+
+    assert rc == 0
+    assert clock.slept == [47.5]
+    assert ex.started_wall == SCHED_EPOCH + 60  # 09:00:00Z, the schedule's own minute
+    assert ex.started_mono == 1000.0 + 47.5
+    # After boot, before the `started` report.
+    assert order == ["hold:47.5", "report:started", "execute", "report:finished"]
+    assert f"run {CRON_JOB}: holding the turn 47.5s, until 2026-11-13T09:00:00Z" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after", [60, 61.5, 600])
+async def test_run_once_does_not_hold_when_the_target_has_passed(after, capsys):
+    clock = _Clock(wall=SCHED_EPOCH + after)
+    ex, rec = _NotesTheClock(clock), _Recorder()
+
+    assert await run_once(_held(clock), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock)) == 0
+
+    assert clock.slept == [] and ex.started_mono == 1000.0
+    assert [b["phase"] for b in rec.bodies] == ["started", "finished"]
+    assert "no hold: the scheduled minute + 60s has passed" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_id", [RUN_NOW_JOB, "light-ws-abc-123"])
+async def test_run_once_never_holds_a_run_without_a_scheduled_minute_near_now(run_id):
+    clock = _Clock(wall=SCHED_EPOCH + 5)
+    ex = _NotesTheClock(clock)
+
+    assert await run_once(_held(clock, run_id=run_id), ex, heartbeat=_hb(), report=_Recorder(), **_clock_seams(clock)) == 0
+
+    assert clock.slept == [] and ex.started_mono == 1000.0
+
+
+@pytest.mark.asyncio
+async def test_run_once_without_a_hold_never_reads_the_clocks():
+    def no_clock():
+        raise AssertionError("read a clock for a run with no hold")
+
+    rec = _Recorder()
+    rc = await run_once(_spec(run_id=CRON_JOB), Replying("x"), heartbeat=_hb(), report=rec, wall_clock=no_clock)
+    assert rc == 0 and [b["phase"] for b in rec.bodies] == ["started", "finished"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_hold_stops_at_the_turn_deadline():
+    # D = 120 s: R = 30 s, so the turn deadline is boot + 90 s. Boot was 70 s
+    # ago, so 20 s are left, while the target is 50 s away (this clock is
+    # behind): the hold ends at the turn deadline and the run times out there.
+    clock = _Clock(wall=SCHED_EPOCH + 10)
+    ex, rec = _NotesTheClock(clock), _Recorder()
+
+    rc = await run_once(_held(clock, deadline=120, booted_ago=70), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock))
+
+    assert clock.slept == [20.0]
+    assert rc == 124 and ex.started_wall is None
+    assert [(b["phase"], b["status"]) for b in rec.bodies] == [("started", "running"), ("finished", "timed_out")]
+
+
+@pytest.mark.asyncio
+async def test_run_once_a_hold_that_cannot_be_planned_does_not_stop_the_run(capsys):
+    # A hold too large for a float: planning it raises OverflowError.
+    clock = _Clock(wall=SCHED_EPOCH + 5)
+    ex, rec = _NotesTheClock(clock), _Recorder()
+
+    rc = await run_once(_held(clock, hold=10**400), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock))
+
+    assert rc == 0 and clock.slept == [] and ex.started_mono == 1000.0
+    assert "no hold: OverflowError" in capsys.readouterr().out
 
 
 # --- an executor exception whose text UTF-8 cannot encode -------------------------------
