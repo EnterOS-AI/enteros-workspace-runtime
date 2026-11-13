@@ -142,13 +142,24 @@ def _start_refresh_daemon(daemon_path: Path) -> None:
         f"sleep 30; "
         f"done"
     )
+    env = {**os.environ, "TOKEN_HELPER_SCRIPT": str(_INSTALL_DIR / _HELPER_SCRIPT)}
+    # A Light run pod's GH_TOKEN comes from the env snapshot taken when the
+    # agent was parked, usually long expired by the time the run starts. git
+    # fetches a fresh token through the helper on demand, but the gh CLI only
+    # gets one from this daemon: refresh at once instead of after 60 s.
+    from molecule_runtime.workspace_mode import in_run_pod
+
+    if in_run_pod():
+        env["TOKEN_REFRESH_INITIAL_DELAY_SEC"] = "0"
     with open(_DAEMON_LOG_FILE, "ab") as log_handle:
         proc = subprocess.Popen(
             ["bash", "-c", wrapper],
             stdout=log_handle, stderr=log_handle,
             # Detach: new session so the daemon survives the runtime exiting.
+            # (In a run pod it still ends with the pod: PID 1 exiting tears
+            # down the container's PID namespace.)
             start_new_session=True,
-            env={**os.environ, "TOKEN_HELPER_SCRIPT": str(_INSTALL_DIR / _HELPER_SCRIPT)},
+            env=env,
         )
     _DAEMON_PID_FILE.write_text(str(proc.pid))
     log.info("credential_helper: refresh daemon spawned pid=%d", proc.pid)
