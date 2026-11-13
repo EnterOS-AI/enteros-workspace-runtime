@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,9 +37,11 @@ from molecule_runtime.run_once import (
     deadline_reserve,
     head_utf8,
     ledger_body,
+    plan_hold,
     report_boot_failure,
     report_run,
     run_once,
+    scheduled_minute,
     tail_utf8,
     turn_deadline,
 )
@@ -49,6 +52,13 @@ RUN_ID = "light-ws-abc-123"
 T_START = datetime(2026, 11, 13, 4, 39, 52, tzinfo=timezone.utc).timestamp()
 T_0441 = datetime(2026, 11, 13, 4, 41, 0, tzinfo=timezone.utc).timestamp()
 T0 = {"started_at": T_START, "started_monotonic": 0.0}
+
+# Start early: a schedule due at 09:00Z fires its CronJob at 08:59Z, and the
+# CronJob controller names that Job `<cronjob>-<minutes since the epoch>`.
+SCHED_EPOCH = datetime(2026, 11, 13, 8, 59, 0, tzinfo=timezone.utc).timestamp()
+SCHED_MIN = int(SCHED_EPOCH) // 60
+CRON_JOB = f"light-1a2b3c4d-9f8e7d6c-{SCHED_MIN}"
+RUN_NOW_JOB = f"light-1a2b3c4d-9f8e7d6c-m{int(SCHED_EPOCH) + 5}"
 
 
 def run_env(**over):
@@ -240,6 +250,81 @@ def test_boot_gate_keeps_prompt_byte_exact():
     assert boot_gate(run_env(MOLECULE_RUN_PROMPT=prompt), prepare_only=False, **T0).prompt == prompt
 
 
+@pytest.mark.parametrize("raw,want", [(None, 0), ("", 0), ("  ", 0), ("0", 0), ("60", 60), (" 60 ", 60)])
+def test_boot_gate_hold(raw, want):
+    spec = boot_gate(run_env(MOLECULE_RUN_HOLD_SECONDS=raw), prepare_only=False, **T0)
+    assert spec.hold_seconds == want
+
+
+@pytest.mark.parametrize("raw", ["-1", "1.5", "60s", "abc", "+60", "1e3", "٦٠", "6 0"])
+def test_boot_gate_refuses_a_bad_hold(raw):
+    with pytest.raises(RunRefused, match="MOLECULE_RUN_HOLD_SECONDS"):
+        boot_gate(run_env(MOLECULE_RUN_HOLD_SECONDS=raw), prepare_only=False, **T0)
+
+
+# --- start early: the scheduled minute and the hold --------------------------------
+
+
+@pytest.mark.parametrize(
+    "run_id,want",
+    [
+        (CRON_JOB, SCHED_MIN),  # the CronJob controller's Job name
+        (f"light-12345678-87654321-{SCHED_MIN}", SCHED_MIN),  # all-digit fields inside the CronJob's name
+        (f"nightly-2-{SCHED_MIN}", SCHED_MIN),
+        ("light-1a2b3c4d-12345678", 12345678),  # a hand-made Job: parses; plan_hold sees it is far from now
+        (RUN_NOW_JOB, None),  # run now: `<cronjob>-m<unix seconds>`
+        ("light-1a2b3c4d-9f8e7d6c", None),  # the CronJob's own name: hex, not a minute
+        (str(SCHED_MIN), None),  # no CronJob name before the minute
+        (f"-{SCHED_MIN}", None),
+        ("light-", None),
+        ("", None),
+        (f"light-{SCHED_MIN}x", None),
+        (f"light-+{SCHED_MIN}", None),
+        (f"light- {SCHED_MIN}", None),
+        (f"light-{SCHED_MIN}\n", None),
+        ("light-٢٩٣٨", None),  # digits, but not ASCII ones
+        ("light-²", None),
+        ("light-" + "9" * 400, None),  # no minute has that many digits
+    ],
+)
+def test_scheduled_minute(run_id, want):
+    assert scheduled_minute(run_id) == want
+
+
+@pytest.mark.parametrize(
+    "run_id,hold,after,want",
+    [
+        (CRON_JOB, 60, 12.5, 47.5),  # booted 12.5 s after the fire: the turn starts at 09:00:00
+        (CRON_JOB, 60, 0, 60.0),
+        # The controller never creates a Job before its minute, so a wait longer
+        # than the hold means this pod's clock is behind: at most the hold + 30 s.
+        (CRON_JOB, 60, -29, 89.0),
+        (CRON_JOB, 60, -30, 90.0),  # this node's clock is 30 s behind the controller's
+        (CRON_JOB, 60, -31, 90.0),
+        (CRON_JOB, 60, -1800, 90.0),  # 30 min behind: not a 30 min wait
+        (CRON_JOB, 60, 60, 0.0),  # already at the target
+        (CRON_JOB, 60, 75, 0.0),  # late (a cold image pull): no hold
+        (CRON_JOB, 0, 12.5, 0.0),  # no hold configured
+        (RUN_NOW_JOB, 60, 12.5, 0.0),  # a run-now Job is never held
+        ("light-ws-abc-123", 60, 12.5, 0.0),  # minute 123: more than a day ago
+        ("light-1a2b3c4d-12345678", 60, 12.5, 0.0),  # 1993: more than a day ago
+        (CRON_JOB, 60, -86401, 0.0),  # scheduled more than a day ahead of this clock
+        (CRON_JOB, 60, -86400, 90.0),  # exactly a day ahead: held, at most the hold + 30 s
+        (CRON_JOB, 200000, 86401, 0.0),  # scheduled more than a day ago, target still ahead
+        (CRON_JOB, 200000, 86400, 113600.0),  # exactly a day ago: still held
+    ],
+)
+def test_plan_hold(run_id, hold, after, want):
+    assert plan_hold(_spec(run_id=run_id, hold_seconds=hold), SCHED_EPOCH + after).seconds == want
+
+
+def test_plan_hold_names_the_clock_difference_when_it_caps():
+    hold = plan_hold(_spec(run_id=CRON_JOB, hold_seconds=60), SCHED_EPOCH - 1800)
+    assert hold.seconds == 90.0
+    assert "this pod's clock is 1800.0s behind the controller's" in hold.why
+    assert "1800.0s behind" not in plan_hold(_spec(run_id=CRON_JOB, hold_seconds=60), SCHED_EPOCH - 30).why
+
+
 # --- deadline, context, text helpers --------------------------------------------
 
 
@@ -259,6 +344,14 @@ def test_tail_and_head_utf8_never_split_a_character():
     assert tail_utf8("中" * 30000, 65536) == "中" * 21845
     assert head_utf8("中" * 2000, 4096) == "中" * 1365
     assert tail_utf8("short", 65536) == "short" and head_utf8("short", 4096) == "short"
+
+
+def test_tail_and_head_utf8_keep_a_lone_surrogate_visible():
+    # Text decoded with surrogateescape (a file name, a tool's output) holds lone
+    # surrogates, which UTF-8 cannot encode; the report must still carry it.
+    assert head_utf8("caf\udce9.txt", 4096) == "caf\\udce9.txt"
+    assert tail_utf8("caf\udce9.txt", 65536) == "caf\\udce9.txt"
+    assert head_utf8("\udce9" * 1000, 16) == "\\udce9\\udce9\\udc"
 
 
 # --- classify_turn ----------------------------------------------------------------
@@ -449,6 +542,38 @@ async def test_run_once_waits_for_turn_to_settle():
     assert rec.active_tasks_at[-1] == 0  # the finished report waited for the release
 
 
+class SlowToStop:
+    """Needs a short await to stop once cancelled: cleanup that enqueues the
+    turn's last status. Classifying the run before that cleanup is done would
+    report a turn that has not stopped yet."""
+
+    def __init__(self):
+        self.task = None
+
+    async def execute(self, context, queue):
+        self.task = asyncio.current_task()
+        await queue.enqueue_event(new_text_message("partial"))
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.1)
+            await queue.enqueue_event(new_text_message("stopped cleanly"))
+            raise
+
+
+@pytest.mark.asyncio
+async def test_run_once_cancel_grace_waits_for_a_turn_that_stops_soon_after_the_cancel():
+    ex, rec = SlowToStop(), _Recorder()
+    try:
+        rc = await run_once(_spec_with_seconds_left(0.2), ex, heartbeat=_hb(), report=rec)
+        assert ex.task.done()  # run_once waited for the turn to stop
+        assert rc == 124
+        assert (rec.bodies[-1]["status"], rec.bodies[-1]["output"]) == ("timed_out", "stopped cleanly")
+    finally:
+        if ex.task is not None:
+            await asyncio.wait({ex.task}, timeout=5)
+
+
 @pytest.mark.asyncio
 async def test_run_once_unsettled_turn_times_out():
     hb = _hb()
@@ -516,6 +641,200 @@ async def test_run_once_flushes_traces_after_finished(monkeypatch):
     monkeypatch.setattr(ro, "flush_traces", lambda timeout_seconds=10.0: order.append("flush") or True)
     await run_once(_spec(), Replying("x"), heartbeat=_hb(), report=_Recorder(order=order))
     assert order == ["report:started", "report:finished", "flush"]
+
+
+# --- start early: the hold in run_once ------------------------------------------------
+
+
+class _Clock:
+    """Wall and monotonic clocks that move only when the run sleeps: the seams
+    the hold reads (``wall_clock``, ``monotonic``) and waits with (``sleep``)."""
+
+    def __init__(self, wall: float, mono: float = 1000.0, order: list | None = None):
+        self.wall, self.mono, self.order = wall, mono, order
+        self.slept: list[float] = []
+
+    def time(self) -> float:
+        return self.wall
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        if self.order is not None:
+            self.order.append(f"hold:{seconds:g}")
+        self.wall += seconds
+        self.mono += seconds
+
+
+class _NotesTheClock:
+    """Replies, noting the clocks when the turn starts."""
+
+    def __init__(self, clock: _Clock, order: list | None = None):
+        self.clock, self.order = clock, order
+        self.started_wall = self.started_mono = None
+
+    async def execute(self, context, queue):
+        self.started_wall, self.started_mono = self.clock.wall, self.clock.mono
+        if self.order is not None:
+            self.order.append("execute")
+        await queue.enqueue_event(new_text_message("done"))
+
+
+def _held(clock: _Clock, *, run_id=CRON_JOB, hold=60, deadline=3600, booted_ago=10.0, **over) -> RunSpec:
+    return _spec(
+        run_id=run_id,
+        hold_seconds=hold,
+        deadline_seconds=deadline,
+        started_monotonic=clock.mono - booted_ago,
+        **over,
+    )
+
+
+def _clock_seams(clock: _Clock) -> dict:
+    return {"wall_clock": clock.time, "monotonic": clock.monotonic, "sleep": clock.sleep}
+
+
+@pytest.mark.asyncio
+async def test_run_once_holds_the_turn_until_the_scheduled_minute_plus_hold(capsys):
+    order: list[str] = []
+    clock = _Clock(wall=SCHED_EPOCH + 12.5, order=order)  # booted 12.5 s after the 08:59 fire
+    ex, rec = _NotesTheClock(clock, order), _Recorder(order=order)
+
+    rc = await run_once(_held(clock), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock))
+
+    assert rc == 0
+    assert clock.slept == [47.5]
+    assert ex.started_wall == SCHED_EPOCH + 60  # 09:00:00Z, the schedule's own minute
+    assert ex.started_mono == 1000.0 + 47.5
+    # After boot, before the `started` report.
+    assert order == ["hold:47.5", "report:started", "execute", "report:finished"]
+    assert f"run {CRON_JOB}: holding the turn 47.5s, until 2026-11-13T09:00:00Z" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after", [60, 61.5, 600])
+async def test_run_once_does_not_hold_when_the_target_has_passed(after, capsys):
+    clock = _Clock(wall=SCHED_EPOCH + after)
+    ex, rec = _NotesTheClock(clock), _Recorder()
+
+    assert await run_once(_held(clock), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock)) == 0
+
+    assert clock.slept == [] and ex.started_mono == 1000.0
+    assert [b["phase"] for b in rec.bodies] == ["started", "finished"]
+    assert "no hold: the scheduled minute + 60s has passed" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_id", [RUN_NOW_JOB, "light-ws-abc-123"])
+async def test_run_once_never_holds_a_run_without_a_scheduled_minute_near_now(run_id):
+    clock = _Clock(wall=SCHED_EPOCH + 5)
+    ex = _NotesTheClock(clock)
+
+    assert await run_once(_held(clock, run_id=run_id), ex, heartbeat=_hb(), report=_Recorder(), **_clock_seams(clock)) == 0
+
+    assert clock.slept == [] and ex.started_mono == 1000.0
+
+
+@pytest.mark.asyncio
+async def test_run_once_without_a_hold_never_reads_the_clocks(capsys):
+    used: list[str] = []
+
+    def wall_clock():
+        used.append("wall_clock")
+        return SCHED_EPOCH
+
+    async def sleep(seconds):
+        used.append("sleep")
+
+    rec = _Recorder()
+    rc = await run_once(
+        _spec(run_id=CRON_JOB), Replying("x"), heartbeat=_hb(), report=rec, wall_clock=wall_clock, sleep=sleep
+    )
+    assert rc == 0 and [b["phase"] for b in rec.bodies] == ["started", "finished"]
+    assert used == [] and "hold" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_run_once_caps_the_hold_when_this_clock_is_behind(capsys):
+    # Review 21724 Optional 1. This pod's clock reads 30 min before the Job's
+    # scheduled minute, which the controller had already reached: holding until
+    # the target would start the task 30 min late, or never.
+    order: list[str] = []
+    clock = _Clock(wall=SCHED_EPOCH - 1800, order=order)
+    ex, rec = _NotesTheClock(clock, order), _Recorder(order=order)
+
+    rc = await run_once(_held(clock, deadline=3660), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock))
+
+    assert rc == 0
+    assert sum(clock.slept) == 90.0  # the hold + 30 s, not 1860 s
+    assert ex.started_mono == 1000.0 + 90.0
+    assert order == ["hold:90", "report:started", "execute", "report:finished"]
+    out = capsys.readouterr().out
+    assert len([line for line in out.splitlines() if "hold" in line]) == 1
+    assert "holding the turn 90.0s, the hold + 30s at most: this pod's clock is 1800.0s behind" in out
+
+
+@pytest.mark.asyncio
+async def test_run_once_hold_that_reaches_the_turn_deadline_never_starts_the_task(capsys):
+    # Review 21724 Nit 2. D = 120 s: R = 30 s, so the turn deadline is boot +
+    # 90 s. Boot was 70 s ago, so 20 s are left, and the target is 50 s away:
+    # the hold ends at the turn deadline before the task starts. The run sends
+    # no `started`, only one `finished` that says so, so the time after the
+    # deadline is the one report the README budgets.
+    clock = _Clock(wall=SCHED_EPOCH + 10)
+    ex, rec = _NotesTheClock(clock), _Recorder()
+
+    rc = await run_once(_held(clock, deadline=120, booted_ago=70), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock))
+
+    assert clock.slept == [20.0]
+    assert rc == 124 and ex.started_wall is None
+    assert [(b["phase"], b["status"], b["exit_code"]) for b in rec.bodies] == [("finished", "timed_out", 124)]
+    error = rec.bodies[0]["error"]
+    assert error == (
+        "timed out while waiting to start: the start-early hold reached the turn deadline "
+        "(120s, less a 30s reserve to report) before the task started"
+    )
+    assert "holding the turn 20.0s, until the turn deadline" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_run_once_a_hold_that_cannot_be_planned_does_not_stop_the_run(capsys):
+    # A hold too large for a float: planning it raises OverflowError.
+    clock = _Clock(wall=SCHED_EPOCH + 5)
+    ex, rec = _NotesTheClock(clock), _Recorder()
+
+    rc = await run_once(_held(clock, hold=10**400), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock))
+
+    assert rc == 0 and clock.slept == [] and ex.started_mono == 1000.0
+    assert "no hold: OverflowError" in capsys.readouterr().out
+
+
+# --- an executor exception whose text UTF-8 cannot encode -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_once_reports_the_executors_own_exception_when_its_text_is_not_utf8(run_pod_token):
+    class RaisesOnAFileName:
+        async def execute(self, context, queue):
+            raise RuntimeError("tool failed on caf\udce9.txt")  # a name decoded with surrogateescape
+
+    sent: list[dict] = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+
+    async def report(spec, body):  # the real report_run: httpx must be able to encode the body
+        return await report_run(spec, body, transport=transport)
+
+    assert await run_once(_spec(), RaisesOnAFileName(), heartbeat=_hb(), report=report) == 1
+
+    assert [(b["phase"], b["status"]) for b in sent] == [("started", "running"), ("finished", "failed")]
+    assert sent[-1]["error"] == "RuntimeError: tool failed on caf\\udce9.txt"
 
 
 class UnknownState:
@@ -588,17 +907,57 @@ def test_arm_exit_bound_ends_a_process_that_outlives_the_grace():
     assert timer.daemon and timer.name == "run-once-exit-bound"
 
 
+def test_print_line_never_raises(monkeypatch):
+    # A run's log lines (the hold, the exit bound, main()'s guard) are written
+    # where an exception would become a second report or stop the run.
+    class Closed:
+        def write(self, _text):
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(ro.sys, "stdout", Closed())
+    monkeypatch.setattr(ro.sys, "stderr", Closed())
+    ro.print_line("[run-once] to stdout")
+    ro.print_line("[run-once] to stderr", stderr=True)
+
+
+def test_arm_exit_bound_never_raises_when_no_thread_can_start(monkeypatch, capsys):
+    # Timer.start() raises this when the pod's pids or memory limit refuses a
+    # thread. main() arms the bound inside the adapter-setup `try`, so a raise
+    # here would be reported as a second `finished`, "adapter setup failed".
+    class NoThreadTimer(threading.Timer):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(ro, "threading", SimpleNamespace(Timer=NoThreadTimer))
+    ended: list[int] = []
+
+    assert ro.arm_exit_bound(0, grace_seconds=0.05, hard_exit=ended.append) is None
+
+    assert "could not arm the exit bound (RuntimeError: can't start new thread)" in capsys.readouterr().err
+    assert ended == []
+
+
 def test_post_deadline_accounting_matches_the_readme():
-    """README "Light runs": after the turn deadline, ending the run takes up to
-    58 s (cancel grace, the finished report with its retries, the Langfuse and
-    OTel flushes), and the exit bound ends the process at most 5 s after that.
-    The reserve min(120, D // 4) covers the 58 s only from D = 232 s."""
+    """README "Light runs": after the turn deadline, ending the run takes about
+    88 s: the cancel grace, the finished report with its retries, the Langfuse
+    and OTel flushes. httpx's 10 s timeout applies to each phase of a request,
+    so one report attempt can take about 20 s (10 s to connect, 10 s waiting
+    for the answer). The exit bound ends the process at most 5 s after that.
+    The reserve min(120, D // 4) covers the 88 s only from D = 352 s, and at the
+    3600 s default leaves about 27 s for what Kubernetes counts before boot."""
     grace = inspect.signature(run_once).parameters["cancel_grace_seconds"].default
     backoff = inspect.signature(report_run).parameters["backoff_seconds"].default
-    report_worst = ro.REPORT_TIMEOUT_SECONDS * (len(backoff) + 1) + sum(backoff)
+    attempt = 2 * ro.REPORT_TIMEOUT_SECONDS  # connect, then the answer
+    report_worst = attempt * (len(backoff) + 1) + sum(backoff)
     total = grace + report_worst + 2 * ro.TRACE_FLUSH_SECONDS
-    assert (grace, report_worst, total, ro.EXIT_GRACE_SECONDS) == (5.0, 33.0, 58.0, 5.0)
-    assert min(d for d in range(1, 4000) if deadline_reserve(d) >= total) == 232
+    assert (grace, attempt, report_worst, total, ro.EXIT_GRACE_SECONDS) == (5.0, 20.0, 63.0, 88.0, 5.0)
+    assert min(d for d in range(1, 4000) if deadline_reserve(d) >= total) == 352
+    assert deadline_reserve(3600) - total - ro.EXIT_GRACE_SECONDS == 27
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-    for claim in ("58 s", "232 s", "33 s"):
+    for claim in ("about 20 s", "about 63 s", "about 88 s", "352 s", "about 27 s"):
         assert claim in readme, claim
+    for stale in ("58 s", "33 s", "232 s", "57 s"):
+        assert stale not in readme, stale

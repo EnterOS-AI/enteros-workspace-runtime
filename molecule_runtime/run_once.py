@@ -7,30 +7,53 @@ the image's normal start script and then ``molecule-runtime`` with
 a workspace does (minus the steps that download, install or only matter to a
 long-lived server) and hands the executor to :func:`run_once`, which:
 
-1. reports ``started`` to core's run ledger (``POST /workspaces/{id}/light/runs``);
+1. holds the turn until the schedule's own minute when
+   ``MOLECULE_RUN_HOLD_SECONDS`` is set (start early, below);
+2. reports ``started`` to core's run ledger (``POST /workspaces/{id}/light/runs``);
    a 401, 403 or 409 answer means core will not record the run, so the task
    does not run (exit 1, no ``finished``);
-2. sends ``MOLECULE_RUN_PROMPT`` through ``executor.execute()`` as a scheduled
+3. sends ``MOLECULE_RUN_PROMPT`` through ``executor.execute()`` as a scheduled
    self-turn (envelope metadata ``source_type=self-scheduler`` and
    ``schedule_name=MOLECULE_RUN_SCHEDULE``, the shape of a trigger-daemon fire);
-3. waits until the turn has settled: ``execute()`` returned and the executor's
+4. waits until the turn has settled: ``execute()`` returned and the executor's
    busy count (``heartbeat.active_tasks``) is back to zero;
-4. reports ``finished`` with the final reply text, flushes traces, and returns
+5. reports ``finished`` with the final reply text, flushes traces, and returns
    the exit code: 0 succeeded, 1 failed, 124 timed out (2 = refused to boot,
    raised from :func:`boot_gate`). ``main()`` then arms :func:`arm_exit_bound`
    and exits.
 
+Start early: the control plane fires each CronJob a minute before the
+schedule's time and sets ``MOLECULE_RUN_HOLD_SECONDS`` (60), so the pod start,
+the copy step and the boot happen before that time. The CronJob controller
+names each Job ``<cronjob>-<minutes since the Unix epoch>``, the minute it was
+scheduled for; :func:`plan_hold` reads that minute from ``MOLECULE_RUN_ID`` and
+the turn waits, after boot and before the ``started`` report, until that minute
+plus the hold. The controller never creates a Job before its minute, so a wait
+longer than the hold means this pod's clock is behind the controller's: the
+turn then waits the hold + ``HOLD_SKEW_ALLOWANCE_SECONDS`` (30 s) at most, and
+the log line names the difference. Nothing is held for a run-now Job
+(``<cronjob>-m<unix seconds>``), for any other name, for a minute more than a
+day from this pod's clock, or when the target has already passed (a slow
+start). The turn deadline below still counts from boot, so the hold uses part of
+it: the control plane adds the hold to the Job's deadline. The hold never runs
+past the turn deadline; when it reaches it, the task never starts, and the run
+reports one ``finished`` (``timed_out``, "timed out while waiting to start")
+and no ``started``, so the time after the deadline is the one report budgeted
+below.
+
 Deadline: the run stops waiting at ``boot start + D - R``, where D is
 ``MOLECULE_RUN_DEADLINE_SECONDS`` (the Job's ``activeDeadlineSeconds``) and
-R = ``min(120 s, D // 4)``. Ending the run then takes up to 58 s: the turn gets
-5 s to stop after it is cancelled, the ``finished`` report up to 33 s (three
-10 s attempts, 1 s and 2 s apart), the Langfuse and OpenTelemetry flushes up to
-10 s each; the exit bound ends the process at most 5 s later. R is at least
-58 s only from D = 232 s, and it must also absorb what Kubernetes counts before
-this process starts (pod start, image pull, the copy step and the start
-script's boot: about 10-15 s warm for hermes), so at the 3600 s default about
-57 s are left for that. A pod the Job deadline ends first (a short deadline, a
-cold image pull) is recorded by core from the Job's status.
+R = ``min(120 s, D // 4)``. Ending the run then takes about 88 s at most: the
+turn gets 5 s to stop after it is cancelled; the ``finished`` report about
+63 s (three attempts, 1 s and 2 s apart, each about 20 s at most, because
+httpx's 10 s timeout applies to connecting and to waiting for the answer
+separately); the Langfuse and OpenTelemetry flushes up to 10 s each. The exit
+bound ends the process at most 5 s later. R covers the 88 s only from
+D = 352 s, and it must also absorb what Kubernetes counts before this process
+starts (pod start, image pull, the copy step and the start script's boot:
+about 10-15 s warm for hermes), so at the 3600 s default about 27 s are left
+for that. A pod the Job deadline ends first (a short deadline, a cold image
+pull) is recorded by core from the Job's status.
 
 A run never registers, never serves A2A, never heartbeats and never polls the
 agent's inbox: :func:`workspace_mode.in_run_pod` switches those paths off
@@ -47,7 +70,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 from a2a.server.agent_execution import RequestContext
@@ -98,6 +121,19 @@ PROMPT_ENV = "MOLECULE_RUN_PROMPT"
 SCHEDULE_ENV = "MOLECULE_RUN_SCHEDULE"
 RUN_ID_ENV = "MOLECULE_RUN_ID"
 DEADLINE_ENV = "MOLECULE_RUN_DEADLINE_SECONDS"
+HOLD_ENV = "MOLECULE_RUN_HOLD_SECONDS"
+
+# Start early: a scheduled minute further than this from the pod's clock is not
+# a fire's (a hand-made Job name that ends in digits, a clock far off): no hold.
+MAX_SCHEDULE_DISTANCE_SECONDS = 86400
+# The CronJob controller never creates a Job before its scheduled minute, so
+# when the clocks agree the wait is at most the hold. A longer one means this
+# pod's clock is behind the controller's: the turn then waits the hold plus
+# this much at most, and runs.
+HOLD_SKEW_ALLOWANCE_SECONDS = 30
+# A minute since the epoch has 8 digits until the year 2160; a longer field is
+# no minute (and stays cheap to parse).
+_MAX_MINUTE_DIGITS = 12
 
 # a2a_executor.A2A_SOURCE_SELF_SCHEDULER: the marker a trigger-daemon fire carries.
 SOURCE_TYPE = "self-scheduler"
@@ -129,6 +165,7 @@ class RunSpec:
     platform_url: str
     started_at: float  # wall clock when main() began
     started_monotonic: float  # monotonic clock when main() began
+    hold_seconds: int = 0  # start early: hold the turn until the scheduled minute + this
 
 
 @dataclass(frozen=True)
@@ -181,6 +218,15 @@ def boot_gate(
             deadline = 0
         if deadline <= 0:
             raise RunRefused(f"{DEADLINE_ENV}={raw_deadline[:20]!r} is not a positive whole number of seconds")
+    raw_hold = env.get(HOLD_ENV, "").strip()
+    hold = 0
+    if raw_hold:
+        try:
+            if not (raw_hold.isascii() and raw_hold.isdigit()):
+                raise ValueError(raw_hold)
+            hold = int(raw_hold)
+        except ValueError:  # also more digits than int() converts
+            raise RunRefused(f"{HOLD_ENV}={raw_hold[:20]!r} is not a whole number of seconds (0 or more)") from None
     return RunSpec(
         run_id=run_id,
         schedule=schedule,
@@ -190,6 +236,7 @@ def boot_gate(
         platform_url=platform_url,
         started_at=started_at,
         started_monotonic=started_monotonic,
+        hold_seconds=hold,
     )
 
 
@@ -201,6 +248,112 @@ def deadline_reserve(deadline_seconds: int) -> int:
 def turn_deadline(spec: RunSpec) -> float:
     """The monotonic instant once mode stops waiting for the turn."""
     return spec.started_monotonic + spec.deadline_seconds - deadline_reserve(spec.deadline_seconds)
+
+
+def scheduled_minute(run_id: str) -> int | None:
+    """The minute (since the Unix epoch) a CronJob fire was scheduled for.
+
+    The CronJob controller names each Job ``<cronjob>-<minutes since the
+    epoch>``, so that minute is the run id's last ``-``-separated field when it
+    is all ASCII digits. None for any other name: run-now Jobs are named
+    ``<cronjob>-m<unix seconds>``, and a hand-made Job may be named anything."""
+    cronjob, _dash, field = run_id.rpartition("-")
+    if not cronjob or not (field.isascii() and field.isdigit()) or len(field) > _MAX_MINUTE_DIGITS:
+        return None
+    return int(field)
+
+
+class Hold(NamedTuple):
+    seconds: float  # how long to hold the turn; 0.0 = start it now
+    why: str  # for the run's log line
+
+
+def plan_hold(spec: RunSpec, now: float) -> Hold:
+    """How long to hold the turn at wall-clock ``now`` so it starts at the
+    scheduled minute + ``spec.hold_seconds`` (start early, module docstring):
+    never longer than the hold + ``HOLD_SKEW_ALLOWANCE_SECONDS``."""
+    if spec.hold_seconds <= 0:
+        return Hold(0.0, f"{HOLD_ENV} is 0")
+    minute = scheduled_minute(spec.run_id)
+    if minute is None:
+        return Hold(0.0, "the run id names no scheduled minute (a run-now or hand-made Job)")
+    scheduled = minute * 60
+    if abs(scheduled - now) > MAX_SCHEDULE_DISTANCE_SECONDS:
+        return Hold(0.0, "the scheduled minute is more than a day from this clock")
+    target = scheduled + spec.hold_seconds
+    left = target - now
+    if left <= 0:
+        return Hold(0.0, f"the scheduled minute + {spec.hold_seconds}s has passed")
+    cap = spec.hold_seconds + HOLD_SKEW_ALLOWANCE_SECONDS
+    if left > cap:
+        # The controller had reached the scheduled minute when it created this
+        # Job, and this clock has not: it is behind by at least the difference.
+        return Hold(
+            float(cap),
+            f"the hold + {HOLD_SKEW_ALLOWANCE_SECONDS}s at most: this pod's clock is "
+            f"{scheduled - now:.1f}s behind the controller's (the Job's scheduled minute, "
+            f"{_rfc3339(scheduled)}, is still ahead of it)",
+        )
+    return Hold(float(left), f"until {_rfc3339(target)}, the scheduled minute + {spec.hold_seconds}s")
+
+
+def print_line(line: str, *, stderr: bool = False) -> None:
+    """Print one ``[run-once]`` line; never raises (a closed stream, a strict
+    encoding), so a log line can never become the run's failure."""
+    try:
+        print(line, file=sys.stderr if stderr else sys.stdout, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _hold(
+    spec: RunSpec,
+    *,
+    wall_clock: Callable[[], float],
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], Awaitable[Any]],
+) -> bool:
+    """Start early: wait until the scheduled minute + the hold (see
+    :func:`plan_hold`), never past the turn deadline. The wall clock is read
+    once; the wait itself runs on the monotonic clock, so a clock step during it
+    changes nothing. Returns True when the turn deadline cut the hold short: the
+    task can no longer start. Fail-open: a hold that cannot be planned is
+    skipped, never the run's failure."""
+    if spec.hold_seconds <= 0:
+        return False
+    try:
+        hold = plan_hold(spec, wall_clock())
+        if hold.seconds <= 0:
+            print_line(f"[run-once] run {spec.run_id}: no hold: {hold.why}")
+            return False
+        start = monotonic()
+        end = min(start + hold.seconds, turn_deadline(spec))
+        cut = end < start + hold.seconds
+        if cut:
+            print_line(
+                f"[run-once] run {spec.run_id}: holding the turn {max(end - start, 0.0):.1f}s, "
+                f"until the turn deadline (planned {hold.seconds:.1f}s, {hold.why})"
+            )
+        else:
+            print_line(f"[run-once] run {spec.run_id}: holding the turn {hold.seconds:.1f}s, {hold.why}")
+        while (left := end - monotonic()) > 0:
+            await sleep(left)
+        return cut
+    except Exception as exc:  # noqa: BLE001 - the hold is a nicety; the run goes on without it
+        print_line(f"[run-once] run {spec.run_id}: no hold: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _timed_out_before_start(spec: RunSpec) -> TurnResult:
+    """The run's result when the hold reached the turn deadline: the task never started."""
+    reserve = deadline_reserve(spec.deadline_seconds)
+    return TurnResult(
+        "timed_out",
+        "",
+        "timed out while waiting to start: the start-early hold reached the turn deadline "
+        f"({spec.deadline_seconds}s, less a {reserve}s reserve to report) before the task started",
+        EXIT_TIMED_OUT,
+    )
 
 
 def build_run_context(spec: RunSpec) -> RequestContext:
@@ -228,20 +381,30 @@ class RunEventQueue(EventQueue):
         self.events.append(event)
 
 
+def _utf8(text: str) -> bytes:
+    # backslashreplace: a lone surrogate (text decoded with surrogateescape, such
+    # as a file name inside an executor's exception) stays visible as \udcXX
+    # instead of failing the encode, and what the helpers return is text httpx
+    # can send in the report.
+    return text.encode("utf-8", "backslashreplace")
+
+
 def tail_utf8(text: str, limit: int) -> str:
-    """The last ``limit`` bytes of ``text`` as UTF-8, never splitting a character."""
-    data = text.encode("utf-8")
-    if len(data) <= limit:
-        return text
-    return data[-limit:].decode("utf-8", errors="ignore")
+    """The last ``limit`` bytes of ``text`` as UTF-8, never splitting a character
+    (a lone surrogate is kept as its ``\\udcXX`` escape)."""
+    data = _utf8(text)
+    if len(data) > limit:
+        data = data[-limit:]
+    return data.decode("utf-8", errors="ignore")
 
 
 def head_utf8(text: str, limit: int) -> str:
-    """The first ``limit`` bytes of ``text`` as UTF-8, never splitting a character."""
-    data = text.encode("utf-8")
-    if len(data) <= limit:
-        return text
-    return data[:limit].decode("utf-8", errors="ignore")
+    """The first ``limit`` bytes of ``text`` as UTF-8, never splitting a character
+    (a lone surrogate is kept as its ``\\udcXX`` escape)."""
+    data = _utf8(text)
+    if len(data) > limit:
+        data = data[:limit]
+    return data.decode("utf-8", errors="ignore")
 
 
 def _parts_text(parts: Any) -> str:
@@ -433,12 +596,21 @@ async def run_once(
     monotonic: Callable[[], float] = time.monotonic,
     settle_poll_seconds: float = 0.2,
     cancel_grace_seconds: float = 5.0,
+    wall_clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> int:
     """Run the scheduled prompt once (see the module docstring); return the exit code.
 
     Never raises an ``Exception``: one raised while the run is under way (by
     once mode itself, or by an input the engine's types refuse) is the run's
-    failure, reported as its one ``finished`` with ``error`` naming it."""
+    failure, reported as its one ``finished`` with ``error`` naming it.
+    ``wall_clock``, ``monotonic`` and ``sleep`` are the start-early hold's
+    clocks (``monotonic`` also places the turn deadline)."""
+    if await _hold(spec, wall_clock=wall_clock, monotonic=monotonic, sleep=sleep):
+        # The hold reached the turn deadline: the task never starts. One
+        # `finished` and no `started`, so the time after the deadline is the
+        # single report the module docstring budgets.
+        return await _finish(report, spec, _timed_out_before_start(spec))
     status = await _report(report, spec, ledger_body(spec, phase="started"))
     refusal = _STARTED_REFUSALS.get(status)
     if refusal is not None:
@@ -534,7 +706,7 @@ def arm_exit_bound(
     *,
     grace_seconds: float = EXIT_GRACE_SECONDS,
     hard_exit: Callable[[int], Any] = os._exit,
-) -> threading.Timer:
+) -> threading.Timer | None:
     """Make sure a run's process is gone ``grace_seconds`` from now.
 
     ``main()`` calls this in once mode only, after the run's last report, then
@@ -545,7 +717,14 @@ def arm_exit_bound(
     that way would live until the Job deadline, and with ``concurrencyPolicy:
     Forbid`` the schedule's next fire would wait for it. The daemon timer ends
     the process with ``code`` after the grace; a normal exit before then ends
-    the timer with it. stdout and stderr are flushed now, from this thread."""
+    the timer with it. stdout and stderr are flushed now, from this thread.
+
+    Never raises. ``main()`` arms the bound inside its adapter-setup ``try``,
+    where an exception would be reported as a second ``finished`` ("adapter
+    setup failed"). When the timer cannot start (``Timer.start()`` raises
+    ``RuntimeError: can't start new thread`` when the pod's pids or memory
+    limit refuses a thread), one stderr line says so, None is returned, and the
+    caller's ``SystemExit(code)`` ends the run without the bound."""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
@@ -560,8 +739,15 @@ def arm_exit_bound(
             pass
         hard_exit(code)
 
-    timer = threading.Timer(grace_seconds, _end)
-    timer.name = "run-once-exit-bound"
-    timer.daemon = True
-    timer.start()
+    try:
+        timer = threading.Timer(grace_seconds, _end)
+        timer.name = "run-once-exit-bound"
+        timer.daemon = True
+        timer.start()
+    except Exception as exc:  # noqa: BLE001 - see the docstring: never a second report
+        print_line(
+            f"[run-once] could not arm the exit bound ({type(exc).__name__}: {exc}); exiting {code} without it",
+            stderr=True,
+        )
+        return None
     return timer

@@ -1298,11 +1298,11 @@ async def main(prepare_only: bool = False):  # pragma: no cover
                 # one. Whatever still escapes it must not reach the adapter-
                 # setup arm below, which would report a second `finished`
                 # labelled "adapter setup failed". Exit 1, report nothing more.
-                print(
+                # print_line and arm_exit_bound never raise, for the same reason.
+                _run_once.print_line(
                     f"[run-once] run {run_spec.run_id} raised "
                     f"{type(run_err).__name__}: {run_err}; exiting 1",
-                    file=sys.stderr,
-                    flush=True,
+                    stderr=True,
                 )
                 run_exit = _run_once.EXIT_FAILED
             # The normal exit can hang on a turn that ignores cancellation;

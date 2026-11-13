@@ -65,6 +65,21 @@ STUB_ADAPTER = textwrap.dedent(
         _run_once.run_once = _escaping_run_once
 
 
+    if os.environ.get("STUB_ARM_FAILS"):
+        # Stands in for a pod whose pids or memory limit refuses a new thread:
+        # Timer.start(), and so arming the exit bound, raises.
+        import threading as _threading
+        import types as _types
+
+        import molecule_runtime.run_once as _run_once
+
+        class _NoThreadTimer(_threading.Timer):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        _run_once.threading = _types.SimpleNamespace(Timer=_NoThreadTimer)
+
+
     class _Executor:
         async def execute(self, context, event_queue):
             if MODE == "raise":
@@ -119,6 +134,7 @@ class Call:
     path: str
     body: dict | None
     at: float = 0.0  # time.monotonic() when the request arrived
+    wall: float = 0.0  # time.time() when the request arrived
 
 
 class _Recorder(BaseHTTPRequestHandler):
@@ -129,7 +145,9 @@ class _Recorder(BaseHTTPRequestHandler):
             body = json.loads(raw) if raw else None
         except ValueError:
             body = None
-        self.server.calls.append(Call(self.command, self.path.split("?")[0], body, time.monotonic()))
+        self.server.calls.append(
+            Call(self.command, self.path.split("?")[0], body, time.monotonic(), time.time())
+        )
         payload = b'{"ok": true}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -292,7 +310,94 @@ def test_once_mode_never_reports_twice_when_an_exception_escapes_the_run(tmp_pat
     assert "escaped after the finished report" in out
 
 
-@pytest.mark.parametrize("env", [{"MOLECULE_RUN_MODE": "twice"}, {"MOLECULE_RUN_PROMPT": "  "}])
+@pytest.mark.parametrize(
+    "stub,rc_want,phases_want,status_want",
+    [
+        ("reply", 0, ["started", "finished"], "succeeded"),
+        ("setup_fails", 1, ["finished"], "failed"),
+    ],
+)
+def test_once_mode_reports_once_when_the_exit_bound_cannot_be_armed(tmp_path, stub, rc_want, phases_want, status_want):
+    """Review 21722 Optional 1: main() arms the exit bound inside the adapter-
+    setup `try`. When no thread can start, arming it raised into the setup arm,
+    which reported a second `finished` ("adapter setup failed") and exited 1
+    under a `succeeded` row. The run's own report must stay its only one."""
+    rc, calls, out = _boot(tmp_path, stub, STUB_ARM_FAILS="1")
+
+    assert rc == rc_want, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == phases_want, out[-3000:]
+    assert calls[-1].body["status"] == status_want
+    assert "could not arm the exit bound (RuntimeError: can't start new thread)" in out
+    assert "Traceback" not in out, out[-3000:]
+    if stub == "reply":
+        assert "adapter.setup() failed" not in out
+
+
+def test_once_mode_holds_the_turn_until_the_scheduled_minute_plus_hold(tmp_path):
+    """Start early, end to end: a Job named by the CronJob controller for the
+    current minute, with a hold that puts the target about 10 s after this
+    child starts. The `started` report (and so the turn) waits for the target."""
+    now = time.time()
+    minute = int(now) // 60
+    hold = int(now - minute * 60) + 10
+    target = minute * 60 + hold
+
+    rc, calls, out = _boot(
+        tmp_path,
+        "reply",
+        MOLECULE_RUN_ID=f"light-1a2b3c4d-9f8e7d6c-{minute}",
+        MOLECULE_RUN_HOLD_SECONDS=str(hold),
+    )
+
+    assert rc == 0, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == ["started", "finished"], out[-3000:]
+    assert calls[0].wall >= target - 0.05, f"started {target - calls[0].wall:.2f}s before the target"
+    assert "holding the turn" in out, out[-3000:]
+    assert calls[-1].body["status"] == "succeeded"
+
+
+def test_once_mode_hold_that_reaches_the_turn_deadline_never_starts_the_task(tmp_path):
+    """Review 21724: this pod's clock reads 30 min before the Job's minute, and
+    the run deadline (D = 20 s, so boot + 15 s) is shorter than even the capped
+    hold. The task never starts: one `finished` (timed_out) that names the hold,
+    no `started`, exit 124; the log names the clock difference."""
+    minute = int(time.time()) // 60 + 30
+
+    rc, calls, out = _boot(
+        tmp_path,
+        "reply",
+        MOLECULE_RUN_ID=f"light-1a2b3c4d-9f8e7d6c-{minute}",
+        MOLECULE_RUN_HOLD_SECONDS="60",
+        MOLECULE_RUN_DEADLINE_SECONDS="20",
+    )
+
+    assert rc == 124, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == ["finished"], out[-3000:]
+    finished = calls[0].body
+    assert finished["status"] == "timed_out" and finished["exit_code"] == 124
+    assert finished["error"].startswith("timed out while waiting to start: the start-early hold reached"), finished
+    assert "the hold + 30s at most: this pod's clock is" in out and "until the turn deadline" in out
+
+
+def test_once_mode_never_holds_a_run_now_job(tmp_path):
+    started = time.time()
+    rc, calls, out = _boot(
+        tmp_path,
+        "reply",
+        MOLECULE_RUN_ID=f"light-1a2b3c4d-9f8e7d6c-m{int(started)}",
+        MOLECULE_RUN_HOLD_SECONDS="60",
+    )
+
+    assert rc == 0, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == ["started", "finished"], out[-3000:]
+    assert "holding the turn" not in out and "no hold: the run id names no scheduled minute" in out
+    assert calls[-1].wall - started < 45, "a run-now Job waited for a hold"
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"MOLECULE_RUN_MODE": "twice"}, {"MOLECULE_RUN_PROMPT": "  "}, {"MOLECULE_RUN_HOLD_SECONDS": "soon"}],
+)
 def test_once_mode_refusal_exits_2_without_any_call(tmp_path, env):
     rc, calls, out = _boot(tmp_path, "reply", **env)
 
