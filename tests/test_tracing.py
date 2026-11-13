@@ -583,3 +583,15 @@ def test_declared_memory_basename_served_from_mailbox_is_labeled_memory(tmp_path
     role_text = "\n".join(c["text"] for c in comps if c["label"] == "role_prompt_files")
     assert "MAILBOX_ONLY_SENTINEL" in mem_text
     assert "MAILBOX_ONLY_SENTINEL" not in role_text
+
+
+def test_flush_waits_for_inflight_trace():
+    """Once mode exits right after its last report, so it must be able to wait
+    for the off-loop trace worker (its atexit hook is shutdown(wait=False))."""
+    import time
+
+    tracing._submit_offloop(time.sleep, 0.2)
+    assert tracing.flush(2.0) is True
+    tracing._submit_offloop(time.sleep, 1.5)
+    assert tracing.flush(0.1) is False
+    assert tracing.flush(5.0) is True  # drained again, so later tests start clean

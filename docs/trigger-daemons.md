@@ -91,6 +91,21 @@ workspace schedules natively, the heartbeat advertises the `scheduler`
 capability, and the platform's central scheduler defers for this workspace
 (`NativeSchedulerCheck`) so the agent is never double-triggered.
 
+### Light agents (`MOLECULE_LIGHT=1`)
+
+A Light agent's schedules run as Light runs: the control plane fires one
+short-lived copy of the agent per schedule (see the README, "Light runs").
+With `MOLECULE_LIGHT=1` in the environment, both paths above leave every
+`kind: trigger` daemon unstarted; channel and generic daemons start as usual,
+and the reload summary reports only what actually runs. Everything that
+reads the schedules keeps working: boot seeding still fills the grid, the
+`/internal/schedules` API below still serves it, and
+`MOLECULE_RUNTIME_NATIVE_SCHEDULER=1` is still set from the installed plugins,
+so the central scheduler keeps deferring. One consequence: a poke ("run now")
+through `/internal/schedules/{name}/run` on an open Light agent waits for a
+daemon that never runs; the platform's Run now for a Light agent goes through
+the control plane instead.
+
 ## Durable state: one directory, two writers
 
 The schedule grid, poke queue, run history, and health heartbeat all live in

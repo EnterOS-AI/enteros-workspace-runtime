@@ -255,7 +255,19 @@ def main() -> None:
     # MOLECULE_MCP_DISABLE_HEARTBEAT escape hatch exists for tests +
     # the rare embedded use-case.
     workspace_platform_urls = _platform_url_by_workspace(platform_url, workspaces)
-    if not os.environ.get("MOLECULE_MCP_DISABLE_HEARTBEAT", "").strip():
+    # A Light run pod (MOLECULE_RUN_MODE set, contract C1) never registers,
+    # heartbeats or polls the inbox: each would act on the PARKED agent
+    # (write its row, wake it, consume messages meant for it). The MCP
+    # server itself still serves its tools.
+    from molecule_runtime.workspace_mode import in_run_pod
+
+    run_pod = in_run_pod()
+    if run_pod:
+        logger.info(
+            "molecule-mcp: Light run pod (MOLECULE_RUN_MODE set) - no register, "
+            "heartbeat or inbox poller"
+        )
+    if not run_pod and not os.environ.get("MOLECULE_MCP_DISABLE_HEARTBEAT", "").strip():
         for wsid, tok, _ws_platform_url in workspaces:
             ws_platform_url = workspace_platform_urls[wsid]
             _platform_register(ws_platform_url, wsid, tok)
@@ -272,7 +284,7 @@ def main() -> None:
     # Same disable pattern as heartbeat: in-container callers (with
     # push delivery via canvas WebSocket) skip this to avoid duplicate
     # delivery; tests use the env to keep imports cheap.
-    if not os.environ.get("MOLECULE_MCP_DISABLE_INBOX", "").strip():
+    if not run_pod and not os.environ.get("MOLECULE_MCP_DISABLE_INBOX", "").strip():
         _start_inbox_pollers(
             platform_url,
             [w[0] for w in workspaces],

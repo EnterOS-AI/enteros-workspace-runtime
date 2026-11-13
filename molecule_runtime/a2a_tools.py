@@ -19,6 +19,7 @@ from molecule_runtime.a2a_client import (
 )
 from molecule_runtime.builtin_tools.security import _redact_secrets
 from molecule_runtime.platform_auth import list_registered_workspaces
+from molecule_runtime.workspace_mode import in_run_pod
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +92,10 @@ async def report_activity(
                 json=payload,
                 headers=_auth_headers_for_heartbeat(),
             )
-            # Also push current_task via heartbeat for canvas card display
-            if summary:
+            # Also push current_task via heartbeat for canvas card display —
+            # never from a Light run pod, whose heartbeat would write the
+            # parked agent's row (the activity row above is still wanted).
+            if summary and not in_run_pod():
                 await client.post(
                     f"{PLATFORM_URL}/registry/heartbeat",
                     json={

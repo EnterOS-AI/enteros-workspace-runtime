@@ -270,6 +270,72 @@ tenant is selected by `platform_url`, and the workspace token is scoped by the
 tenant that issued it. Workspace IDs do not need to match across orgs; use the
 ID and token returned by each tenant.
 
+## Light runs
+
+A Light agent is a parked agent whose schedules run as isolated, short-lived
+copies of it, one Kubernetes Job per fire. The control plane starts each run
+pod; this package provides the two pieces that run inside it.
+
+### Once mode: `MOLECULE_RUN_MODE=once`
+
+The run pod's main container starts the image's normal start script, which
+execs `molecule-runtime` with this environment (set by the control plane):
+
+| Variable | Meaning |
+| --- | --- |
+| `MOLECULE_RUN_MODE` | `once`. Unset or blank = a normal workspace; any other value refuses to boot. |
+| `MOLECULE_RUN_PROMPT` | The schedule's prompt, used byte-for-byte. |
+| `MOLECULE_RUN_SCHEDULE` | The schedule's name, sent as `schedule_name` metadata. |
+| `MOLECULE_RUN_ID` | The Job name; sent as `X-Molecule-Run-Id` on every request to core. |
+| `MOLECULE_RUN_DEADLINE_SECONDS` | The Job's `activeDeadlineSeconds` (default 3600). |
+
+The runtime boots the adapter and executor as usual but skips what downloads,
+installs or only matters to a long-lived server: the config-relay fetch, the
+declared-plugin install, the reprovision wake note, the MCP tool enumeration
+and boot-step events. It then sends the prompt through the executor as a
+scheduled self-turn (`source_type: self-scheduler`), waits until the turn has
+settled, reports `started` and `finished` to `POST /workspaces/{id}/light/runs`
+with the final reply text, flushes traces and exits:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | succeeded |
+| 1 | failed: the executor raised or reported a failed task, the runtime is wedged, setup failed, or core answered 409 (not a Light agent) |
+| 124 | timed out: the turn was still going at the deadline minus a reserve of `min(120 s, deadline / 4)`, kept back to report before Kubernetes ends the pod |
+| 2 | refused to boot: unknown `MOLECULE_RUN_MODE`, or a blank prompt, schedule, run id, workspace id or platform URL, or a bad deadline |
+
+A run never registers, never serves A2A, never heartbeats and never polls the
+agent's inbox, and neither does the MCP server or a CLI started in the same
+container: `workspace_mode.in_run_pod()` reads `MOLECULE_RUN_MODE` from the
+environment at every such call site.
+
+`MOLECULE_LIGHT=1` (set on every Light agent, open or running) keeps
+`kind: trigger` plugin daemons from starting; see
+[docs/trigger-daemons.md](docs/trigger-daemons.md#light-agents-molecule_light1).
+
+### The copy step: `molecule-runtime-light-copy`
+
+The run pod's init container copies the agent's volume (mounted read-only) into
+the pod's private emptyDir:
+
+```bash
+molecule-runtime-light-copy --src /mnt/agent --dst /mnt/run --token-env MOLECULE_WORKSPACE_TOKEN
+```
+
+- Copies files, directories and symlinks (links are copied as links, never
+  followed, even when they point outside the volume) and keeps permission
+  bits. Skips sockets, FIFOs and devices. Never changes `--dst` itself.
+- Leaves out `configs/.auth_token`, `configs/.platform_inbound_secret` and
+  `lost+found/`, plus the engine's list in the file named by
+  `MOLECULE_LIGHT_COPY_EXCLUDE_FILE`: one glob pattern per line, relative to
+  the volume root (`configs/...`, `rtstate/...`), `#` comments, a trailing `/`
+  for a directory and everything under it.
+- Writes the run token from the named env var to `<dst>/configs/.auth_token`
+  (mode 0600).
+- Prints one JSON line, `{"files":N,"bytes":N,"excluded":N,"seconds":F}`, and
+  exits 0. Any error (an unreadable file, a bad exclude file, no token) exits 1
+  without that line, so a run never starts on a partial copy.
+
 ## Installation
 
 The runtime distribution is served by Molecule's Gitea registry. Public PyPI is

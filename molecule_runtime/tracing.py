@@ -102,10 +102,15 @@ def _submit_offloop(fn: Callable, *args: Any) -> None:
         pass
 
 
-def _drain(timeout: float = 2.0) -> bool:
-    """Test-only: block until in-flight trace emissions finish (or timeout).
-    Production never calls this; it lets tests assert on off-loop emission
-    without racing the background worker."""
+def flush(timeout: float = 10.0) -> bool:
+    """Block until in-flight trace emissions finish, at most ``timeout`` seconds.
+
+    Returns True when nothing is left in flight. A long-lived workspace never
+    needs this; a process about to exit does (once mode, after its last ledger
+    report): the worker's atexit hook is ``shutdown(wait=False)``, so a trace
+    still in flight would otherwise be at the mercy of interpreter teardown.
+    Each emission ends in ``lf.flush()``, so "none in flight" means delivered
+    (or failed fail-open)."""
     import time
 
     deadline = time.monotonic() + timeout
@@ -114,7 +119,13 @@ def _drain(timeout: float = 2.0) -> bool:
             if _inflight == 0:
                 return True
         time.sleep(0.005)
-    return False
+    with _submit_lock:
+        return _inflight == 0
+
+
+def _drain(timeout: float = 2.0) -> bool:
+    """Test-only: the older name, used by tests that assert on off-loop emission."""
+    return flush(timeout)
 
 # workspace_id -> last consolidated system prompt (recorded by the shared
 # build_system_prompt so a turn's generation can carry the exact prompt sent

@@ -261,3 +261,82 @@ async def test_ensure_warm_noop_when_nothing_new(tmp_path, monkeypatch):
 
     assert result["added"] == []
     assert holder.event_transport.added == []     # no re-bind on a no-op reload
+
+
+# ------------------- MOLECULE_LIGHT=1: no kind: trigger daemons -------------------
+# Contract C1: a Light agent's schedules run as Light runs, so its own scheduler
+# (the kind: trigger daemon) never starts, on cold boot or on the warm
+# /internal/daemons/reload path. Seeding and NATIVE_SCHEDULER_ENV are unchanged:
+# the schedules still live in the agent's grid and core keeps deferring to it.
+
+def _light_specs():
+    chan = DaemonSpec(name="a", plugin="chan", kind="channel", command=["python", "-c", "1"])
+    trig = DaemonSpec(name="scheduler", plugin="molecule-scheduler", kind="trigger",
+                      command=["python", "scheduler.py"])
+    return chan, trig
+
+
+@pytest.mark.asyncio
+async def test_light_cold_start_skips_trigger_keeps_channel(tmp_path, monkeypatch):
+    monkeypatch.setenv("MOLECULE_LIGHT", "1")
+    monkeypatch.delenv(plugin_daemons.NATIVE_SCHEDULER_ENV, raising=False)
+    chan, trig = _light_specs()
+    _patch_holder(monkeypatch, [[chan, trig]])
+    from molecule_runtime.daemon_runtime import DaemonRuntime
+
+    holder = DaemonRuntime(app=object(), config_path=str(tmp_path), server=None)
+    result = await holder.ensure_daemons()
+
+    assert result == {"armed": 1, "added": [chan.key], "trigger": False}
+    assert [s.key for s in holder.supervisor.specs] == [chan.key]
+    # The schedules stay native to the agent's grid, so core keeps deferring.
+    assert os.environ.get(plugin_daemons.NATIVE_SCHEDULER_ENV) == "1"
+
+
+@pytest.mark.asyncio
+async def test_light_trigger_only_arms_nothing_but_still_seeds(tmp_path, monkeypatch):
+    from molecule_runtime import schedule_seed, trigger_state
+
+    monkeypatch.setenv("MOLECULE_LIGHT", "1")
+    _, trig = _light_specs()
+    _patch_holder(monkeypatch, [[trig]])
+    monkeypatch.setattr(trigger_state, "resolve_grid_path", lambda: tmp_path / "trigger" / "schedules.yaml")
+    calls = []
+    monkeypatch.setattr(schedule_seed, "seed_schedules_from_plugins",
+                        lambda **kw: calls.append("plugins") or 0)
+    monkeypatch.setattr(schedule_seed, "seed_schedules_from_workspace_config",
+                        lambda configs_dir, store: calls.append("config") or 0)
+    from molecule_runtime.daemon_runtime import DaemonRuntime
+
+    holder = DaemonRuntime(app=object(), config_path=str(tmp_path), server=None)
+    result = await holder.ensure_daemons()
+
+    assert result == {"armed": 0, "added": [], "trigger": False}
+    assert holder.supervisor is None
+    assert calls == ["plugins", "config"]   # the schedule store keeps being seeded
+
+
+@pytest.mark.asyncio
+async def test_light_reload_route_never_adds_trigger(tmp_path, monkeypatch):
+    import httpx
+    from starlette.applications import Starlette
+
+    from molecule_runtime import platform_inbound_auth
+    from molecule_runtime.daemon_runtime import DaemonRuntime, add_daemon_routes
+
+    monkeypatch.setenv("MOLECULE_LIGHT", "1")
+    chan, trig = _light_specs()
+    _patch_holder(monkeypatch, [[chan], [chan, trig]])   # boot sees chan; reload sees chan + trigger
+    monkeypatch.setattr(platform_inbound_auth, "get_inbound_secret", lambda: "s3cret")
+    app = Starlette()
+    holder = DaemonRuntime(app=app, config_path=str(tmp_path), server=None)
+    add_daemon_routes(app, holder)
+    await holder.ensure_daemons()                        # cold boot
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://ws") as client:
+        resp = await client.post("/internal/daemons/reload", headers={"Authorization": "Bearer s3cret"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"armed": 1, "added": [], "trigger": False}
+    assert holder.event_transport.added == []
+    assert holder.supervisor.supervised == []

@@ -277,3 +277,40 @@ def test_github_creds_alone_no_longer_cause_git_config_when_gitea_provider(monke
     assert "ghs_should_NOT_take_over" not in log_text, (
         f"GH_TOKEN leaked into logs! Found in: {log_text!r}"
     )
+
+
+# --- Light run pods refresh at boot (MOLECULE_RUN_MODE set) -------------------
+# A run pod's GH_TOKEN comes from the env snapshot taken when the agent was
+# parked, so it is usually long expired when the run starts. git asks the helper
+# on demand (fresh token), but the gh CLI only gets a fresh token from the
+# refresh daemon, whose first refresh normally waits 60 s.
+
+
+def _daemon_env(fresh_helper, monkeypatch, tmp_path):
+    captured = {}
+
+    class _Proc:
+        pid = 4242
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return _Proc()
+
+    monkeypatch.setattr(fresh_helper, "_DAEMON_PID_FILE", tmp_path / "refresh-daemon.pid")
+    monkeypatch.setattr(fresh_helper, "_DAEMON_LOG_FILE", tmp_path / "refresh-daemon.log")
+    monkeypatch.setattr(fresh_helper.subprocess, "Popen", fake_popen)
+    fresh_helper._start_refresh_daemon(tmp_path / "molecule-gh-token-refresh.sh")
+    return captured
+
+
+def test_refresh_daemon_first_refresh_immediate_in_run_pod(fresh_helper, monkeypatch, tmp_path):
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    env = _daemon_env(fresh_helper, monkeypatch, tmp_path)
+    assert env["TOKEN_REFRESH_INITIAL_DELAY_SEC"] == "0"
+
+
+def test_refresh_daemon_delay_unchanged_when_serving(fresh_helper, monkeypatch, tmp_path):
+    monkeypatch.delenv("MOLECULE_RUN_MODE", raising=False)
+    monkeypatch.delenv("TOKEN_REFRESH_INITIAL_DELAY_SEC", raising=False)
+    env = _daemon_env(fresh_helper, monkeypatch, tmp_path)
+    assert "TOKEN_REFRESH_INITIAL_DELAY_SEC" not in env

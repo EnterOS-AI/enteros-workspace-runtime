@@ -79,3 +79,72 @@ def test_on_demand_prompt_only_when_the_switch_is_off(tmp_path, monkeypatch):
     assert ON_DEMAND_PROMPT in off
     assert ON_DEMAND_PROMPT not in on
     assert "task_add" in ON_DEMAND_PROMPT and "goal_set" in ON_DEMAND_PROMPT
+
+
+# --- Light runs: MOLECULE_RUN_MODE and MOLECULE_LIGHT (contract C1) -----------
+
+from molecule_runtime.workspace_mode import (  # noqa: E402
+    LIGHT_ENV,
+    RUN_MODE_ENV,
+    UnknownRunMode,
+    in_run_pod,
+    is_light,
+    resolve_run_mode,
+)
+
+
+def _set(monkeypatch, name, value):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+
+def test_env_names_are_the_contract_names():
+    assert RUN_MODE_ENV == "MOLECULE_RUN_MODE"
+    assert LIGHT_ENV == "MOLECULE_LIGHT"
+
+
+@pytest.mark.parametrize(
+    "raw,want",
+    [(None, "serve"), ("", "serve"), ("  ", "serve"), ("once", "once"), (" Once ", "once")],
+)
+def test_resolve_run_mode(monkeypatch, raw, want):
+    _set(monkeypatch, RUN_MODE_ENV, raw)
+    assert resolve_run_mode() == want
+
+
+@pytest.mark.parametrize("raw", ["twice", "serve", "1", "true"])
+def test_resolve_run_mode_rejects_unknown(monkeypatch, raw):
+    _set(monkeypatch, RUN_MODE_ENV, raw)
+    with pytest.raises(UnknownRunMode):
+        resolve_run_mode()
+
+
+@pytest.mark.parametrize(
+    "raw,want", [(None, False), ("", False), ("  ", False), ("once", True), ("twice", True)]
+)
+def test_in_run_pod(monkeypatch, raw, want):
+    """Any non-blank value: `once`, or an unknown value that refuses to boot.
+    Either way the process belongs to a run pod and must stay silent."""
+    _set(monkeypatch, RUN_MODE_ENV, raw)
+    assert in_run_pod() is want
+
+
+@pytest.mark.parametrize(
+    "raw,want",
+    [("1", True), ("true", True), ("YES", True), ("on", True),
+     ("0", False), ("false", False), ("", False), (None, False)],
+)
+def test_is_light(monkeypatch, raw, want):
+    _set(monkeypatch, LIGHT_ENV, raw)
+    assert is_light() is want
+
+
+def test_run_switches_read_live_not_cached(monkeypatch):
+    monkeypatch.setenv(RUN_MODE_ENV, "once")
+    monkeypatch.setenv(LIGHT_ENV, "1")
+    assert in_run_pod() is True and is_light() is True
+    monkeypatch.delenv(RUN_MODE_ENV)
+    monkeypatch.delenv(LIGHT_ENV)
+    assert in_run_pod() is False and is_light() is False

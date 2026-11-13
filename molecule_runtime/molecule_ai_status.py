@@ -32,26 +32,32 @@ PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080"
 
 
 def set_status(task: str):
-    """Push current_task to platform via heartbeat."""
+    """Push current_task to platform via heartbeat.
+
+    In a Light run pod (``MOLECULE_RUN_MODE`` set) only the activity row is
+    written: a heartbeat from a run would write the parked agent's row."""
+    from molecule_runtime.workspace_mode import in_run_pod
+
     try:
         try:
             from molecule_runtime.platform_auth import platform_headers as _platform_headers
             _headers = _platform_headers(WORKSPACE_ID)
         except Exception:
             _headers = {}
-        httpx.post(
-            f"{PLATFORM_URL}/registry/heartbeat",
-            json={
-                "workspace_id": WORKSPACE_ID,
-                "current_task": task,
-                "active_tasks": 1 if task else 0,
-                "error_rate": 0,
-                "sample_error": "",
-                "uptime_seconds": 0,
-            },
-            headers=_headers,
-            timeout=5.0,
-        )
+        if not in_run_pod():
+            httpx.post(
+                f"{PLATFORM_URL}/registry/heartbeat",
+                json={
+                    "workspace_id": WORKSPACE_ID,
+                    "current_task": task,
+                    "active_tasks": 1 if task else 0,
+                    "error_rate": 0,
+                    "sample_error": "",
+                    "uptime_seconds": 0,
+                },
+                headers=_headers,
+                timeout=5.0,
+            )
         if task:
             # Also log as activity for traceability
             httpx.post(

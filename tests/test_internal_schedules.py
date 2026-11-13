@@ -176,3 +176,10 @@ def test_unconfigured_state_dir_is_503(tmp_path: Path, monkeypatch: pytest.Monke
     add_schedule_routes(app, state_dir_factory=_raises)
     client = TestClient(app)
     assert client.get("/internal/schedules", headers=AUTH).status_code == 503
+
+
+def test_schedule_api_unaffected_by_light(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract C1: MOLECULE_LIGHT=1 turns the trigger daemon off, never the
+    schedule store or this API (park reads the schedules from it)."""
+    monkeypatch.setenv("MOLECULE_LIGHT", "1")
+    test_crud_lifecycle(client)

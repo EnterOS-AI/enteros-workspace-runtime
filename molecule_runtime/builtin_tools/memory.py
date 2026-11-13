@@ -470,6 +470,12 @@ async def _maybe_log_skill_promotion(content: str, scope: str, memory_result: di
                 json=payload,
                 headers=_headers,
             )
+            # A Light run pod never heartbeats (it would write the parked
+            # agent's row); the activity row above is enough.
+            from molecule_runtime.workspace_mode import in_run_pod
+
+            if in_run_pod():
+                return
             await client.post(
                 f"{platform_url}/registry/heartbeat",
                 headers=_headers,
