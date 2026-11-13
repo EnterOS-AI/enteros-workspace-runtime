@@ -726,13 +726,22 @@ async def test_run_once_never_holds_a_run_without_a_scheduled_minute_near_now(ru
 
 
 @pytest.mark.asyncio
-async def test_run_once_without_a_hold_never_reads_the_clocks():
-    def no_clock():
-        raise AssertionError("read a clock for a run with no hold")
+async def test_run_once_without_a_hold_never_reads_the_clocks(capsys):
+    used: list[str] = []
+
+    def wall_clock():
+        used.append("wall_clock")
+        return SCHED_EPOCH
+
+    async def sleep(seconds):
+        used.append("sleep")
 
     rec = _Recorder()
-    rc = await run_once(_spec(run_id=CRON_JOB), Replying("x"), heartbeat=_hb(), report=rec, wall_clock=no_clock)
+    rc = await run_once(
+        _spec(run_id=CRON_JOB), Replying("x"), heartbeat=_hb(), report=rec, wall_clock=wall_clock, sleep=sleep
+    )
     assert rc == 0 and [b["phase"] for b in rec.bodies] == ["started", "finished"]
+    assert used == [] and "hold" not in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -856,6 +865,22 @@ def test_arm_exit_bound_ends_a_process_that_outlives_the_grace():
     assert ended == [124]
     # A daemon timer: a process that exits normally first is never held by it.
     assert timer.daemon and timer.name == "run-once-exit-bound"
+
+
+def test_print_line_never_raises(monkeypatch):
+    # A run's log lines (the hold, the exit bound, main()'s guard) are written
+    # where an exception would become a second report or stop the run.
+    class Closed:
+        def write(self, _text):
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(ro.sys, "stdout", Closed())
+    monkeypatch.setattr(ro.sys, "stderr", Closed())
+    ro.print_line("[run-once] to stdout")
+    ro.print_line("[run-once] to stderr", stderr=True)
 
 
 def test_arm_exit_bound_never_raises_when_no_thread_can_start(monkeypatch, capsys):
