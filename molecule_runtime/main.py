@@ -8,6 +8,7 @@ import logging
 import os
 import socket
 import sys
+import time
 from collections.abc import Mapping
 
 import httpx
@@ -619,6 +620,8 @@ async def start_poll_delivery_when_bound(
 
 
 async def main(prepare_only: bool = False):  # pragma: no cover
+    # Light runs: a run's deadline counts from the moment this process began.
+    boot_wall, boot_mono = time.time(), time.monotonic()
     # This process is always inside a tenant workspace or concierge trust boundary.
     # Remove operator-only capabilities before any helper, SDK, CLI, or MCP child
     # can inherit them. Core/CP provisioning deny them too; this is the runtime's
@@ -627,6 +630,29 @@ async def main(prepare_only: bool = False):  # pragma: no cover
         scrub_tenant_forbidden_process_env,
     )
     scrub_tenant_forbidden_process_env()
+
+    # Light run gate (contract C1), before any boot step has a side effect.
+    # MOLECULE_RUN_MODE unset/blank: a normal workspace, run_spec None. `once`:
+    # this process is a Light run pod; it boots quietly (no plugin downloads,
+    # no config-relay fetch, nothing only a long-lived server needs), runs one
+    # prompt through the executor after the smoke branch, and exits without
+    # ever registering, serving A2A or heartbeating. An unknown value, or a
+    # once-mode env that cannot start a run, refuses to boot with exit 2.
+    # Prepare mode (molecule-runtime-prepare) gets the quiet boot, not the run.
+    from molecule_runtime import run_once as _run_once
+    from molecule_runtime.workspace_mode import in_run_pod
+
+    try:
+        run_spec = _run_once.boot_gate(
+            os.environ,
+            prepare_only=prepare_only,
+            started_at=boot_wall,
+            started_monotonic=boot_mono,
+        )
+    except _run_once.RunRefused as refused:
+        print(f"[run-once] refused to boot: {refused}", file=sys.stderr, flush=True)
+        raise SystemExit(_run_once.EXIT_REFUSED)
+    quiet_boot = in_run_pod()
 
     workspace_id = os.environ.get("WORKSPACE_ID", "")
     if not workspace_id:
@@ -647,8 +673,11 @@ async def main(prepare_only: bool = False):  # pragma: no cover
     # its MOLECULE_CONFIG_RELAY_ENABLE flag is on, so this is a no-op until the
     # operator flips that flag. MUST run BEFORE any step reads config_path
     # (credential helper, npm auth, declared-plugins, load_config).
-    from molecule_runtime.config_relay import run_config_relay_prelude
-    run_config_relay_prelude(workspace_id=workspace_id, config_path=config_path)
+    # Skipped in a Light run: the copy already holds /configs, and a stale
+    # relay key in the env snapshot would fail the boot closed.
+    if not quiet_boot:
+        from molecule_runtime.config_relay import run_config_relay_prelude
+        run_config_relay_prelude(workspace_id=workspace_id, config_path=config_path)
 
     # Docker-aware default — host.docker.internal resolves the platform service
     # from inside the Docker network mesh; falls back to localhost for local dev.
@@ -717,17 +746,21 @@ async def main(prepare_only: bool = False):  # pragma: no cover
     # except arm below runs and the name would otherwise stay unbound, turning
     # step 8a into a NameError inside the boot path.
     _plugin_install_report = None
-    emit_boot_step("PLG", "Install plugins", "running", step=1, total=_BOOT_TOTAL)
-    try:
-        _plugin_install_report = install_declared_plugins()
-        print(_plugin_install_report.summary(), flush=True)
-        emit_boot_step("PLG", "Install plugins", "ok", step=1, total=_BOOT_TOTAL)
-    except Exception as e:  # noqa: BLE001 — boot-install must never block boot
-        print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
-        emit_boot_step(
-            "PLG", "Install plugins", "failed", step=1, total=_BOOT_TOTAL,
-            message=f"{type(e).__name__}: {e}",
-        )
+    # Skipped in a Light run: it git-clones, and the copy already carries the
+    # parked agent's /configs/plugins (a re-install could make one copy's
+    # definition differ from the agent's).
+    if not quiet_boot:
+        emit_boot_step("PLG", "Install plugins", "running", step=1, total=_BOOT_TOTAL)
+        try:
+            _plugin_install_report = install_declared_plugins()
+            print(_plugin_install_report.summary(), flush=True)
+            emit_boot_step("PLG", "Install plugins", "ok", step=1, total=_BOOT_TOTAL)
+        except Exception as e:  # noqa: BLE001 — boot-install must never block boot
+            print(f"declared-plugins boot-install failed (non-fatal): {e}", flush=True)
+            emit_boot_step(
+                "PLG", "Install plugins", "failed", step=1, total=_BOOT_TOTAL,
+                message=f"{type(e).__name__}: {e}",
+            )
 
     # 0.2d Self-reprovision wake detection (design §5.2 — proactive wake).
     # Diff the plugins tree boot-install just (re)built against last boot's
@@ -740,8 +773,10 @@ async def main(prepare_only: bool = False):  # pragma: no cover
     # MUST run right here: after install_declared_plugins (the tree is
     # final) and before load_config may reassign config_path (the state
     # file lives beside the env-resolved plugins dir it describes).
+    # Not in a Light run: the wake note is a long-lived server's (after the
+    # smoke branch), and preparing it writes boot state.
     from molecule_runtime.reprovision_wake import prepare_wake_plan
-    wake_plan = prepare_wake_plan()
+    wake_plan = None if quiet_boot else prepare_wake_plan()
 
     # 0.3 Pre-commit hook installer — refuses commits that add internal-flavored
     # paths or known secret shapes to any git repo the workspace touches. Lifted
@@ -1201,38 +1236,41 @@ async def main(prepare_only: bool = False):  # pragma: no cover
         # ok once the enumeration is successfully KICKED OFF — the terminal
         # online verdict (loaded_mcp_tools populated) is the platform's, carried
         # by the heartbeat, not this presentation step.
-        emit_boot_step("TOOL", "Enumerate tools", "running", step=5, total=_BOOT_TOTAL)
-        try:
-            from molecule_runtime.loaded_mcp_tools_probe import (
-                capture_loaded_mcp_tools_with_retry,
-            )
-            global _LOADED_MCP_TOOLS_BG_TASK
-            _LOADED_MCP_TOOLS_BG_TASK = asyncio.create_task(
-                # runtime#181 / ADR-004: pass the resolved adapter so enumeration
-                # goes through the runtime-owns-discovery contract
-                # (adapter.enumerate_loaded_mcp_tools). Each adapter reads its OWN
-                # native config and feeds the resolved specs to the generic engine
-                # (enumerate_from_specs_async); the engine never resolves servers by
-                # runtime name. The BaseAdapter default handles a not-yet-migrated /
-                # third-party adapter via the generic JSON reader.
-                capture_loaded_mcp_tools_with_retry(adapter, adapter_config)
-            )
-            print(
-                "loaded_mcp_tools: spawned background init-enumeration (retry until "
-                "the management MCP is connectable; non-blocking)",
-                flush=True,
-            )
-            emit_boot_step("TOOL", "Enumerate tools", "ok", step=5, total=_BOOT_TOTAL)
-        except Exception as mcp_probe_err:  # noqa: BLE001 — never block boot
-            print(
-                f"loaded_mcp_tools: failed to spawn init enumeration (non-fatal): "
-                f"{type(mcp_probe_err).__name__}: {mcp_probe_err}",
-                flush=True,
-            )
-            emit_boot_step(
-                "TOOL", "Enumerate tools", "failed", step=5, total=_BOOT_TOTAL,
-                message=f"{type(mcp_probe_err).__name__}: {mcp_probe_err}",
-            )
+        # Skipped in a Light run: it only feeds the heartbeat's online gate,
+        # and it spawns MCP subprocesses.
+        if not quiet_boot:
+            emit_boot_step("TOOL", "Enumerate tools", "running", step=5, total=_BOOT_TOTAL)
+            try:
+                from molecule_runtime.loaded_mcp_tools_probe import (
+                    capture_loaded_mcp_tools_with_retry,
+                )
+                global _LOADED_MCP_TOOLS_BG_TASK
+                _LOADED_MCP_TOOLS_BG_TASK = asyncio.create_task(
+                    # runtime#181 / ADR-004: pass the resolved adapter so enumeration
+                    # goes through the runtime-owns-discovery contract
+                    # (adapter.enumerate_loaded_mcp_tools). Each adapter reads its OWN
+                    # native config and feeds the resolved specs to the generic engine
+                    # (enumerate_from_specs_async); the engine never resolves servers by
+                    # runtime name. The BaseAdapter default handles a not-yet-migrated /
+                    # third-party adapter via the generic JSON reader.
+                    capture_loaded_mcp_tools_with_retry(adapter, adapter_config)
+                )
+                print(
+                    "loaded_mcp_tools: spawned background init-enumeration (retry until "
+                    "the management MCP is connectable; non-blocking)",
+                    flush=True,
+                )
+                emit_boot_step("TOOL", "Enumerate tools", "ok", step=5, total=_BOOT_TOTAL)
+            except Exception as mcp_probe_err:  # noqa: BLE001 — never block boot
+                print(
+                    f"loaded_mcp_tools: failed to spawn init enumeration (non-fatal): "
+                    f"{type(mcp_probe_err).__name__}: {mcp_probe_err}",
+                    flush=True,
+                )
+                emit_boot_step(
+                    "TOOL", "Enumerate tools", "failed", step=5, total=_BOOT_TOTAL,
+                    message=f"{type(mcp_probe_err).__name__}: {mcp_probe_err}",
+                )
 
         # 6a. Boot-smoke short-circuit (issue #2275): if MOLECULE_SMOKE_MODE
         # is set, exercise the executor's full import tree by calling
@@ -1247,6 +1285,15 @@ async def main(prepare_only: bool = False):  # pragma: no cover
                 except Exception:  # noqa: BLE001
                     pass
             raise SystemExit(exit_code)
+
+        # 6a'. Light run (MOLECULE_RUN_MODE=once): run the schedule's prompt
+        # through the executor once, report it to core's run ledger, flush
+        # traces, exit 0 / 1 / 124. Never reaches registration, the heartbeat
+        # or uvicorn below. See molecule_runtime/run_once.py.
+        if run_spec is not None:
+            raise SystemExit(
+                await _run_once.run_once(run_spec, executor, heartbeat=heartbeat)
+            )
 
         # 6b. Restore from pre-stop snapshot if one exists (molecule-core#1391).
         # The snapshot is scrubbed before being written, so secrets are
@@ -1314,6 +1361,12 @@ async def main(prepare_only: bool = False):  # pragma: no cover
                 flush=True,
             )
             return 1
+        if run_spec is not None:
+            # A Light run cannot degrade to "reachable-but-misconfigured": that
+            # path registers and serves. Record the failed run and exit 1.
+            raise SystemExit(
+                await _run_once.report_boot_failure(run_spec, adapter_error)
+            )
 
     # 7. Wrap in A2A.
     #
@@ -1733,7 +1786,7 @@ async def main(prepare_only: bool = False):  # pragma: no cover
     # persist (read-only volume) skips the send entirely so an unbounded
     # announce-every-boot loop is impossible.
     reprovision_wake_task = None
-    if wake_plan.additions:
+    if wake_plan and wake_plan.additions:
         if adapter_ready:
             from molecule_runtime.reprovision_wake import (
                 mark_wake_attempt,
