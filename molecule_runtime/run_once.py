@@ -435,6 +435,8 @@ async def run_once(
             timed_out = True
             task.cancel()
             await asyncio.wait({task}, timeout=cancel_grace_seconds)
+            if task.done() and not task.cancelled():
+                task.exception()  # retrieved: the run is timed_out whatever it raised
 
     result = classify_turn(queue.events, raised=raised, timed_out=timed_out, wedge_reason=_wedge_reason())
     if timed_out:
