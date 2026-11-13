@@ -296,7 +296,12 @@ def test_scheduled_minute(run_id, want):
     [
         (CRON_JOB, 60, 12.5, 47.5),  # booted 12.5 s after the fire: the turn starts at 09:00:00
         (CRON_JOB, 60, 0, 60.0),
+        # The controller never creates a Job before its minute, so a wait longer
+        # than the hold means this pod's clock is behind: at most the hold + 30 s.
+        (CRON_JOB, 60, -29, 89.0),
         (CRON_JOB, 60, -30, 90.0),  # this node's clock is 30 s behind the controller's
+        (CRON_JOB, 60, -31, 90.0),
+        (CRON_JOB, 60, -1800, 90.0),  # 30 min behind: not a 30 min wait
         (CRON_JOB, 60, 60, 0.0),  # already at the target
         (CRON_JOB, 60, 75, 0.0),  # late (a cold image pull): no hold
         (CRON_JOB, 0, 12.5, 0.0),  # no hold configured
@@ -304,13 +309,20 @@ def test_scheduled_minute(run_id, want):
         ("light-ws-abc-123", 60, 12.5, 0.0),  # minute 123: more than a day ago
         ("light-1a2b3c4d-12345678", 60, 12.5, 0.0),  # 1993: more than a day ago
         (CRON_JOB, 60, -86401, 0.0),  # scheduled more than a day ahead of this clock
-        (CRON_JOB, 60, -86400, 86460.0),  # exactly a day ahead: still held (the deadline bounds it)
+        (CRON_JOB, 60, -86400, 90.0),  # exactly a day ahead: held, at most the hold + 30 s
         (CRON_JOB, 200000, 86401, 0.0),  # scheduled more than a day ago, target still ahead
         (CRON_JOB, 200000, 86400, 113600.0),  # exactly a day ago: still held
     ],
 )
 def test_plan_hold(run_id, hold, after, want):
     assert plan_hold(_spec(run_id=run_id, hold_seconds=hold), SCHED_EPOCH + after).seconds == want
+
+
+def test_plan_hold_names_the_clock_difference_when_it_caps():
+    hold = plan_hold(_spec(run_id=CRON_JOB, hold_seconds=60), SCHED_EPOCH - 1800)
+    assert hold.seconds == 90.0
+    assert "this pod's clock is 1800.0s behind the controller's" in hold.why
+    assert "1800.0s behind" not in plan_hold(_spec(run_id=CRON_JOB, hold_seconds=60), SCHED_EPOCH - 30).why
 
 
 # --- deadline, context, text helpers --------------------------------------------
@@ -745,10 +757,32 @@ async def test_run_once_without_a_hold_never_reads_the_clocks(capsys):
 
 
 @pytest.mark.asyncio
-async def test_run_once_hold_stops_at_the_turn_deadline():
-    # D = 120 s: R = 30 s, so the turn deadline is boot + 90 s. Boot was 70 s
-    # ago, so 20 s are left, while the target is 50 s away (this clock is
-    # behind): the hold ends at the turn deadline and the run times out there.
+async def test_run_once_caps_the_hold_when_this_clock_is_behind(capsys):
+    # Review 21724 Optional 1. This pod's clock reads 30 min before the Job's
+    # scheduled minute, which the controller had already reached: holding until
+    # the target would start the task 30 min late, or never.
+    order: list[str] = []
+    clock = _Clock(wall=SCHED_EPOCH - 1800, order=order)
+    ex, rec = _NotesTheClock(clock, order), _Recorder(order=order)
+
+    rc = await run_once(_held(clock, deadline=3660), ex, heartbeat=_hb(), report=rec, **_clock_seams(clock))
+
+    assert rc == 0
+    assert sum(clock.slept) == 90.0  # the hold + 30 s, not 1860 s
+    assert ex.started_mono == 1000.0 + 90.0
+    assert order == ["hold:90", "report:started", "execute", "report:finished"]
+    out = capsys.readouterr().out
+    assert len([line for line in out.splitlines() if "hold" in line]) == 1
+    assert "holding the turn 90.0s, the hold + 30s at most: this pod's clock is 1800.0s behind" in out
+
+
+@pytest.mark.asyncio
+async def test_run_once_hold_that_reaches_the_turn_deadline_never_starts_the_task(capsys):
+    # Review 21724 Nit 2. D = 120 s: R = 30 s, so the turn deadline is boot +
+    # 90 s. Boot was 70 s ago, so 20 s are left, and the target is 50 s away:
+    # the hold ends at the turn deadline before the task starts. The run sends
+    # no `started`, only one `finished` that says so, so the time after the
+    # deadline is the one report the README budgets.
     clock = _Clock(wall=SCHED_EPOCH + 10)
     ex, rec = _NotesTheClock(clock), _Recorder()
 
@@ -756,7 +790,13 @@ async def test_run_once_hold_stops_at_the_turn_deadline():
 
     assert clock.slept == [20.0]
     assert rc == 124 and ex.started_wall is None
-    assert [(b["phase"], b["status"]) for b in rec.bodies] == [("started", "running"), ("finished", "timed_out")]
+    assert [(b["phase"], b["status"], b["exit_code"]) for b in rec.bodies] == [("finished", "timed_out", 124)]
+    error = rec.bodies[0]["error"]
+    assert error == (
+        "timed out while waiting to start: the start-early hold reached the turn deadline "
+        "(120s, less a 30s reserve to report) before the task started"
+    )
+    assert "holding the turn 20.0s, until the turn deadline" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio

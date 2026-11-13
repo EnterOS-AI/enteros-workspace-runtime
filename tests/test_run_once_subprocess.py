@@ -356,6 +356,29 @@ def test_once_mode_holds_the_turn_until_the_scheduled_minute_plus_hold(tmp_path)
     assert calls[-1].body["status"] == "succeeded"
 
 
+def test_once_mode_hold_that_reaches_the_turn_deadline_never_starts_the_task(tmp_path):
+    """Review 21724: this pod's clock reads 30 min before the Job's minute, and
+    the run deadline (D = 20 s, so boot + 15 s) is shorter than even the capped
+    hold. The task never starts: one `finished` (timed_out) that names the hold,
+    no `started`, exit 124; the log names the clock difference."""
+    minute = int(time.time()) // 60 + 30
+
+    rc, calls, out = _boot(
+        tmp_path,
+        "reply",
+        MOLECULE_RUN_ID=f"light-1a2b3c4d-9f8e7d6c-{minute}",
+        MOLECULE_RUN_HOLD_SECONDS="60",
+        MOLECULE_RUN_DEADLINE_SECONDS="20",
+    )
+
+    assert rc == 124, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == ["finished"], out[-3000:]
+    finished = calls[0].body
+    assert finished["status"] == "timed_out" and finished["exit_code"] == 124
+    assert finished["error"].startswith("timed out while waiting to start: the start-early hold reached"), finished
+    assert "the hold + 30s at most: this pod's clock is" in out and "until the turn deadline" in out
+
+
 def test_once_mode_never_holds_a_run_now_job(tmp_path):
     started = time.time()
     rc, calls, out = _boot(

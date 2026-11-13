@@ -28,11 +28,18 @@ the copy step and the boot happen before that time. The CronJob controller
 names each Job ``<cronjob>-<minutes since the Unix epoch>``, the minute it was
 scheduled for; :func:`plan_hold` reads that minute from ``MOLECULE_RUN_ID`` and
 the turn waits, after boot and before the ``started`` report, until that minute
-plus the hold. Nothing is held for a run-now Job (``<cronjob>-m<unix seconds>``),
-for any other name, for a minute more than a day from this pod's clock, or when
-the target has already passed (a slow start). The turn deadline below still
-counts from boot, so the hold uses part of it: the control plane adds the hold
-to the Job's deadline. The hold never runs past the turn deadline.
+plus the hold. The controller never creates a Job before its minute, so a wait
+longer than the hold means this pod's clock is behind the controller's: the
+turn then waits the hold + ``HOLD_SKEW_ALLOWANCE_SECONDS`` (30 s) at most, and
+the log line names the difference. Nothing is held for a run-now Job
+(``<cronjob>-m<unix seconds>``), for any other name, for a minute more than a
+day from this pod's clock, or when the target has already passed (a slow
+start). The turn deadline below still counts from boot, so the hold uses part of
+it: the control plane adds the hold to the Job's deadline. The hold never runs
+past the turn deadline; when it reaches it, the task never starts, and the run
+reports one ``finished`` (``timed_out``, "timed out while waiting to start")
+and no ``started``, so the time after the deadline is the one report budgeted
+below.
 
 Deadline: the run stops waiting at ``boot start + D - R``, where D is
 ``MOLECULE_RUN_DEADLINE_SECONDS`` (the Job's ``activeDeadlineSeconds``) and
@@ -119,6 +126,11 @@ HOLD_ENV = "MOLECULE_RUN_HOLD_SECONDS"
 # Start early: a scheduled minute further than this from the pod's clock is not
 # a fire's (a hand-made Job name that ends in digits, a clock far off): no hold.
 MAX_SCHEDULE_DISTANCE_SECONDS = 86400
+# The CronJob controller never creates a Job before its scheduled minute, so
+# when the clocks agree the wait is at most the hold. A longer one means this
+# pod's clock is behind the controller's: the turn then waits the hold plus
+# this much at most, and runs.
+HOLD_SKEW_ALLOWANCE_SECONDS = 30
 # A minute since the epoch has 8 digits until the year 2160; a longer field is
 # no minute (and stays cheap to parse).
 _MAX_MINUTE_DIGITS = 12
@@ -258,7 +270,8 @@ class Hold(NamedTuple):
 
 def plan_hold(spec: RunSpec, now: float) -> Hold:
     """How long to hold the turn at wall-clock ``now`` so it starts at the
-    scheduled minute + ``spec.hold_seconds`` (start early, module docstring)."""
+    scheduled minute + ``spec.hold_seconds`` (start early, module docstring):
+    never longer than the hold + ``HOLD_SKEW_ALLOWANCE_SECONDS``."""
     if spec.hold_seconds <= 0:
         return Hold(0.0, f"{HOLD_ENV} is 0")
     minute = scheduled_minute(spec.run_id)
@@ -271,7 +284,17 @@ def plan_hold(spec: RunSpec, now: float) -> Hold:
     left = target - now
     if left <= 0:
         return Hold(0.0, f"the scheduled minute + {spec.hold_seconds}s has passed")
-    return Hold(float(left), f"{_rfc3339(target)}, the scheduled minute + {spec.hold_seconds}s")
+    cap = spec.hold_seconds + HOLD_SKEW_ALLOWANCE_SECONDS
+    if left > cap:
+        # The controller had reached the scheduled minute when it created this
+        # Job, and this clock has not: it is behind by at least the difference.
+        return Hold(
+            float(cap),
+            f"the hold + {HOLD_SKEW_ALLOWANCE_SECONDS}s at most: this pod's clock is "
+            f"{scheduled - now:.1f}s behind the controller's (the Job's scheduled minute, "
+            f"{_rfc3339(scheduled)}, is still ahead of it)",
+        )
+    return Hold(float(left), f"until {_rfc3339(target)}, the scheduled minute + {spec.hold_seconds}s")
 
 
 def print_line(line: str, *, stderr: bool = False) -> None:
@@ -289,31 +312,48 @@ async def _hold(
     wall_clock: Callable[[], float],
     monotonic: Callable[[], float],
     sleep: Callable[[float], Awaitable[Any]],
-) -> None:
-    """Start early: wait until the scheduled minute + the hold, never past the
-    turn deadline. The wall clock is read once; the wait itself runs on the
-    monotonic clock, so a clock step during it changes nothing. Fail-open: a
-    hold that cannot be planned is skipped, never the run's failure."""
+) -> bool:
+    """Start early: wait until the scheduled minute + the hold (see
+    :func:`plan_hold`), never past the turn deadline. The wall clock is read
+    once; the wait itself runs on the monotonic clock, so a clock step during it
+    changes nothing. Returns True when the turn deadline cut the hold short: the
+    task can no longer start. Fail-open: a hold that cannot be planned is
+    skipped, never the run's failure."""
     if spec.hold_seconds <= 0:
-        return
+        return False
     try:
         hold = plan_hold(spec, wall_clock())
         if hold.seconds <= 0:
             print_line(f"[run-once] run {spec.run_id}: no hold: {hold.why}")
-            return
+            return False
         start = monotonic()
         end = min(start + hold.seconds, turn_deadline(spec))
-        if end < start + hold.seconds:
+        cut = end < start + hold.seconds
+        if cut:
             print_line(
                 f"[run-once] run {spec.run_id}: holding the turn {max(end - start, 0.0):.1f}s, "
-                f"until the turn deadline, before {hold.why}"
+                f"until the turn deadline (planned {hold.seconds:.1f}s, {hold.why})"
             )
         else:
-            print_line(f"[run-once] run {spec.run_id}: holding the turn {hold.seconds:.1f}s, until {hold.why}")
+            print_line(f"[run-once] run {spec.run_id}: holding the turn {hold.seconds:.1f}s, {hold.why}")
         while (left := end - monotonic()) > 0:
             await sleep(left)
+        return cut
     except Exception as exc:  # noqa: BLE001 - the hold is a nicety; the run goes on without it
         print_line(f"[run-once] run {spec.run_id}: no hold: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _timed_out_before_start(spec: RunSpec) -> TurnResult:
+    """The run's result when the hold reached the turn deadline: the task never started."""
+    reserve = deadline_reserve(spec.deadline_seconds)
+    return TurnResult(
+        "timed_out",
+        "",
+        "timed out while waiting to start: the start-early hold reached the turn deadline "
+        f"({spec.deadline_seconds}s, less a {reserve}s reserve to report) before the task started",
+        EXIT_TIMED_OUT,
+    )
 
 
 def build_run_context(spec: RunSpec) -> RequestContext:
@@ -566,7 +606,11 @@ async def run_once(
     failure, reported as its one ``finished`` with ``error`` naming it.
     ``wall_clock``, ``monotonic`` and ``sleep`` are the start-early hold's
     clocks (``monotonic`` also places the turn deadline)."""
-    await _hold(spec, wall_clock=wall_clock, monotonic=monotonic, sleep=sleep)
+    if await _hold(spec, wall_clock=wall_clock, monotonic=monotonic, sleep=sleep):
+        # The hold reached the turn deadline: the task never starts. One
+        # `finished` and no `started`, so the time after the deadline is the
+        # single report the module docstring budgets.
+        return await _finish(report, spec, _timed_out_before_start(spec))
     status = await _report(report, spec, ledger_body(spec, phase="started"))
     refusal = _STARTED_REFUSALS.get(status)
     if refusal is not None:

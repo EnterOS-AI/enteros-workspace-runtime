@@ -320,11 +320,19 @@ monotonic clock. There is no hold:
 - when that minute is more than a day from the pod's clock;
 - when the target has already passed (a slow start, such as a cold image pull).
 
+The wait is never longer than the hold plus 30 s. The controller never creates
+a Job before its minute, so a longer wait means the pod's clock is behind the
+controller's: the runtime then waits the hold plus 30 s, logs the difference
+on the same line, and runs the task.
+
 The turn deadline below still counts from boot, so the hold uses part of it:
 the control plane adds the hold to the Job's deadline (`activeDeadlineSeconds`,
-and so `MOLECULE_RUN_DEADLINE_SECONDS`), and the hold never runs past the turn
-deadline. A hold that cannot be computed is skipped with one log line; it
-never fails the run.
+and so `MOLECULE_RUN_DEADLINE_SECONDS`). The hold never runs past the turn
+deadline. If it reaches it, the task never starts: the run sends no `started`,
+only one `finished` (`timed_out`, "timed out while waiting to start: the
+start-early hold reached the turn deadline ..."), so the time after the
+deadline is the single report the table below budgets. A hold that cannot be
+computed is skipped with one log line; it never fails the run.
 
 **The deadline.** With D = `MOLECULE_RUN_DEADLINE_SECONDS` (the Job's
 `activeDeadlineSeconds`), the run stops waiting for the turn at boot + D − R,
