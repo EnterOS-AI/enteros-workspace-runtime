@@ -16,6 +16,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -32,6 +33,7 @@ STUB_ADAPTER = textwrap.dedent(
     """
     import asyncio
     import os
+    import time
 
     from a2a.helpers import new_text_message
 
@@ -40,12 +42,40 @@ STUB_ADAPTER = textwrap.dedent(
     MODE = os.environ.get("STUB_MODE", "reply")
 
 
+    async def _swallow_cancel_for(seconds):
+        give_up = time.monotonic() + seconds
+        while time.monotonic() < give_up:
+            try:
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                pass
+
+
+    if MODE == "escape":
+        # Stands in for a bug that lets an exception escape run_once after it
+        # has reported `finished`: main() must not report the run again.
+        import molecule_runtime.run_once as _run_once
+
+        _real_run_once = _run_once.run_once
+
+        async def _escaping_run_once(*args, **kwargs):
+            await _real_run_once(*args, **kwargs)
+            raise RuntimeError("escaped after the finished report")
+
+        _run_once.run_once = _escaping_run_once
+
+
     class _Executor:
         async def execute(self, context, event_queue):
             if MODE == "raise":
                 raise RuntimeError("stub boom")
             if MODE == "hang":
                 await asyncio.sleep(60)
+            if MODE == "stubborn":
+                # Keeps swallowing CancelledError for 40 s, then returns.
+                await event_queue.enqueue_event(new_text_message("partial"))
+                await _swallow_cancel_for(40)
+                return
             meta = context.metadata
             text = context.message.parts[0].text
             await event_queue.enqueue_event(
@@ -72,6 +102,10 @@ STUB_ADAPTER = textwrap.dedent(
         async def setup(self, config):
             if MODE == "setup_fails":
                 raise RuntimeError("stub setup failed")
+            if MODE == "setup_fails_stubborn":
+                # Leaves a task behind that keeps swallowing CancelledError.
+                self._left_behind = asyncio.ensure_future(_swallow_cancel_for(40))
+                raise RuntimeError("stub setup failed")
 
         async def create_executor(self, config):
             return _Executor()
@@ -84,6 +118,7 @@ class Call:
     method: str
     path: str
     body: dict | None
+    at: float = 0.0  # time.monotonic() when the request arrived
 
 
 class _Recorder(BaseHTTPRequestHandler):
@@ -94,7 +129,7 @@ class _Recorder(BaseHTTPRequestHandler):
             body = json.loads(raw) if raw else None
         except ValueError:
             body = None
-        self.server.calls.append(Call(self.command, self.path.split("?")[0], body))
+        self.server.calls.append(Call(self.command, self.path.split("?")[0], body, time.monotonic()))
         payload = b'{"ok": true}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -116,6 +151,12 @@ _ENTRIES = {
 
 def _boot(tmp_path, stub, entry="serve", **env_over):
     """Boot the real runtime once; return (exit code, recorded calls, output)."""
+    rc, calls, out, _exited_at = _boot_timed(tmp_path, stub, entry, **env_over)
+    return rc, calls, out
+
+
+def _boot_timed(tmp_path, stub, entry="serve", **env_over):
+    """``_boot`` plus the time.monotonic() at which the child had exited."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Recorder)
     server.calls = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -163,7 +204,8 @@ def _boot(tmp_path, stub, entry="serve", **env_over):
             text=True,
             timeout=90,
         )
-        return proc.returncode, list(server.calls), proc.stdout + proc.stderr
+        exited_at = time.monotonic()
+        return proc.returncode, list(server.calls), proc.stdout + proc.stderr, exited_at
     finally:
         server.shutdown()
         server.server_close()
@@ -199,6 +241,55 @@ def test_once_mode_boot_exit_codes(tmp_path, stub, env, rc_want, status_want):
     assert rc == rc_want, out[-3000:]
     assert calls and calls[-1].body["status"] == status_want, out[-3000:]
     assert all(c.path == RUNS for c in calls), [c.path for c in calls]
+
+
+@pytest.mark.parametrize(
+    "stub,rc_want,phases_want,status_want",
+    [
+        ("stubborn", 124, ["started", "finished"], "timed_out"),  # the turn ignores the cancel
+        ("setup_fails_stubborn", 1, ["finished"], "failed"),  # setup left such a task behind
+    ],
+)
+def test_once_mode_exit_is_bounded_when_a_task_ignores_cancel(tmp_path, stub, rc_want, phases_want, status_want):
+    """A task that keeps swallowing CancelledError must not hold the process.
+    asyncio.run's shutdown waits for every task it cancels, so without the exit
+    bound this child lived until the stub gave up (40 s), about 30 s after its
+    timed_out report; in a run pod that lasts until the Job deadline."""
+    rc, calls, out, exited_at = _boot_timed(tmp_path, stub, MOLECULE_RUN_DEADLINE_SECONDS="8")
+
+    assert rc == rc_want, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == phases_want, out[-3000:]
+    assert calls[-1].body["status"] == status_want
+    if stub == "stubborn":
+        assert calls[-1].body["output"] == "partial"
+    lingered = exited_at - calls[-1].at
+    assert lingered < 15, f"the child exited {lingered:.1f}s after its finished report"
+
+
+def test_once_mode_reports_an_exception_inside_the_run_as_its_failure(tmp_path):
+    """A prompt byte that is not UTF-8 makes the turn's message raise inside
+    run_once, after `started`. The run's one `finished` names the exception; it
+    is never reported as an adapter setup failure."""
+    rc, calls, out = _boot(tmp_path, "reply", MOLECULE_RUN_PROMPT="report \udcff")
+
+    assert rc == 1, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == ["started", "finished"], out[-3000:]
+    finished = calls[-1].body
+    assert finished["status"] == "failed" and "UnicodeEncodeError" in finished["error"]
+    assert "adapter setup failed" not in finished["error"]
+    assert "adapter.setup() failed" not in out
+
+
+def test_once_mode_never_reports_twice_when_an_exception_escapes_the_run(tmp_path):
+    rc, calls, out = _boot(tmp_path, "escape")
+
+    assert rc == 1, out[-3000:]
+    # The run's own two reports and nothing else: no second `finished` saying
+    # "adapter setup failed".
+    assert [(c.body or {}).get("phase") for c in calls] == ["started", "finished"], out[-3000:]
+    assert calls[-1].body["status"] == "succeeded"
+    assert "adapter.setup() failed" not in out
+    assert "escaped after the finished report" in out
 
 
 @pytest.mark.parametrize("env", [{"MOLECULE_RUN_MODE": "twice"}, {"MOLECULE_RUN_PROMPT": "  "}])

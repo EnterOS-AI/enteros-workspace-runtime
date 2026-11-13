@@ -8,6 +8,8 @@ a workspace does (minus the steps that download, install or only matter to a
 long-lived server) and hands the executor to :func:`run_once`, which:
 
 1. reports ``started`` to core's run ledger (``POST /workspaces/{id}/light/runs``);
+   a 401, 403 or 409 answer means core will not record the run, so the task
+   does not run (exit 1, no ``finished``);
 2. sends ``MOLECULE_RUN_PROMPT`` through ``executor.execute()`` as a scheduled
    self-turn (envelope metadata ``source_type=self-scheduler`` and
    ``schedule_name=MOLECULE_RUN_SCHEDULE``, the shape of a trigger-daemon fire);
@@ -15,16 +17,20 @@ long-lived server) and hands the executor to :func:`run_once`, which:
    busy count (``heartbeat.active_tasks``) is back to zero;
 4. reports ``finished`` with the final reply text, flushes traces, and returns
    the exit code: 0 succeeded, 1 failed, 124 timed out (2 = refused to boot,
-   raised from :func:`boot_gate`).
+   raised from :func:`boot_gate`). ``main()`` then arms :func:`arm_exit_bound`
+   and exits.
 
 Deadline: the run stops waiting at ``boot start + D - R``, where D is
 ``MOLECULE_RUN_DEADLINE_SECONDS`` (the Job's ``activeDeadlineSeconds``) and
-R = ``min(120 s, D // 4)``. R covers what the runtime cannot see (pod start, a
-warm image pull, the copy step, the start script's boot, about 13 s for hermes)
-and what follows the turn (the finished report, at most 33 s with retries, and
-the trace flush, at most 10 s), so the run reports ``timed_out`` itself before
-Kubernetes kills the pod. A pod the Job deadline kills first (a cold image pull)
-is recorded by core from the Job's status.
+R = ``min(120 s, D // 4)``. Ending the run then takes up to 58 s: the turn gets
+5 s to stop after it is cancelled, the ``finished`` report up to 33 s (three
+10 s attempts, 1 s and 2 s apart), the Langfuse and OpenTelemetry flushes up to
+10 s each; the exit bound ends the process at most 5 s later. R is at least
+58 s only from D = 232 s, and it must also absorb what Kubernetes counts before
+this process starts (pod start, image pull, the copy step and the start
+script's boot: about 10-15 s warm for hermes), so at the 3600 s default about
+57 s are left for that. A pod the Job deadline ends first (a short deadline, a
+cold image pull) is recorded by core from the Job's status.
 
 A run never registers, never serves A2A, never heartbeats and never polls the
 agent's inbox: :func:`workspace_mode.in_run_pod` switches those paths off
@@ -34,6 +40,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
+import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -74,6 +83,16 @@ OUTPUT_LIMIT_BYTES = 64 * 1024
 ERROR_LIMIT_BYTES = 4 * 1024
 REPORT_TIMEOUT_SECONDS = 10.0
 TRACE_FLUSH_SECONDS = 10.0
+EXIT_GRACE_SECONDS = 5.0  # arm_exit_bound: the normal exit's grace
+
+# Answers to the `started` report after which the task must not run (exit 1, no
+# `finished`): core will not record the run, and every call the task made to
+# core with this token would be refused too.
+_STARTED_REFUSALS = {
+    401: "the run token is invalid or revoked",
+    403: "this token may not report the run",
+    409: "not a Light agent, or this run already finished",
+}
 
 PROMPT_ENV = "MOLECULE_RUN_PROMPT"
 SCHEDULE_ENV = "MOLECULE_RUN_SCHEDULE"
@@ -391,6 +410,20 @@ def _summary_line(spec: RunSpec, result: TurnResult, flushed: bool) -> str:
     return line if flushed else line + " traces=unflushed"
 
 
+async def _finish(report: Report, spec: RunSpec, result: TurnResult) -> int:
+    """Report the run's one ``finished``, flush traces, print the summary line."""
+    await _report(report, spec, ledger_body(spec, phase="finished", result=result, finished_at=time.time()))
+    # The run now has its one `finished`: nothing below may report it again,
+    # and nothing below may raise into the caller, which could take it for a
+    # setup failure.
+    try:
+        flushed = flush_traces(TRACE_FLUSH_SECONDS)
+        print(_summary_line(spec, result, flushed), flush=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("run %s: %s after the finished report: %s", spec.run_id, type(exc).__name__, exc)
+    return result.exit_code
+
+
 async def run_once(
     spec: RunSpec,
     executor: Any,
@@ -401,15 +434,48 @@ async def run_once(
     settle_poll_seconds: float = 0.2,
     cancel_grace_seconds: float = 5.0,
 ) -> int:
-    """Run the scheduled prompt once (see the module docstring); return the exit code."""
-    if await _report(report, spec, ledger_body(spec, phase="started")) == 409:
+    """Run the scheduled prompt once (see the module docstring); return the exit code.
+
+    Never raises an ``Exception``: one raised while the run is under way (by
+    once mode itself, or by an input the engine's types refuse) is the run's
+    failure, reported as its one ``finished`` with ``error`` naming it."""
+    status = await _report(report, spec, ledger_body(spec, phase="started"))
+    refusal = _STARTED_REFUSALS.get(status)
+    if refusal is not None:
         print(
-            f"[run-once] core refused run {spec.run_id} (409: the workspace is not a Light agent); "
-            "not running the task",
+            f"[run-once] core refused run {spec.run_id} ({status}: {refusal}); not running the task",
             flush=True,
         )
         return EXIT_FAILED
 
+    try:
+        result = await _run_turn(
+            spec,
+            executor,
+            heartbeat=heartbeat,
+            monotonic=monotonic,
+            settle_poll_seconds=settle_poll_seconds,
+            cancel_grace_seconds=cancel_grace_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported below as the run's failure
+        logger.exception("run %s: once mode raised", spec.run_id)
+        result = TurnResult(
+            "failed", "", head_utf8(f"once mode raised {type(exc).__name__}: {exc}", ERROR_LIMIT_BYTES), EXIT_FAILED
+        )
+    return await _finish(report, spec, result)
+
+
+async def _run_turn(
+    spec: RunSpec,
+    executor: Any,
+    *,
+    heartbeat: Any,
+    monotonic: Callable[[], float],
+    settle_poll_seconds: float,
+    cancel_grace_seconds: float,
+) -> TurnResult:
+    """Send the prompt through the executor, wait for the turn to settle or for
+    the deadline, and classify what happened."""
     queue = RunEventQueue()
     context = build_run_context(spec)
 
@@ -434,6 +500,9 @@ async def run_once(
         else:
             timed_out = True
             task.cancel()
+            # The turn gets this long to stop. One that keeps swallowing the
+            # cancel is left running: the run reports now, and the exit bound
+            # (arm_exit_bound, armed by main()) ends the process soon after.
             await asyncio.wait({task}, timeout=cancel_grace_seconds)
             if task.done() and not task.cancelled():
                 task.exception()  # retrieved: the run is timed_out whatever it raised
@@ -448,10 +517,7 @@ async def run_once(
                 f"({spec.deadline_seconds}s, less a {reserve}s reserve to report)"
             ),
         )
-    await _report(report, spec, ledger_body(spec, phase="finished", result=result, finished_at=time.time()))
-    flushed = flush_traces(TRACE_FLUSH_SECONDS)
-    print(_summary_line(spec, result, flushed), flush=True)
-    return result.exit_code
+    return result
 
 
 async def report_boot_failure(spec: RunSpec, error: str, *, report: Report = report_run) -> int:
@@ -460,7 +526,42 @@ async def report_boot_failure(spec: RunSpec, error: str, *, report: Report = rep
     The run never reaches the serve path's registration, which is where a normal
     workspace goes when its setup fails."""
     result = TurnResult("failed", "", head_utf8(f"adapter setup failed: {error}", ERROR_LIMIT_BYTES), EXIT_FAILED)
-    await _report(report, spec, ledger_body(spec, phase="finished", result=result, finished_at=time.time()))
-    flushed = flush_traces(TRACE_FLUSH_SECONDS)
-    print(_summary_line(spec, result, flushed), flush=True)
-    return EXIT_FAILED
+    return await _finish(report, spec, result)
+
+
+def arm_exit_bound(
+    code: int,
+    *,
+    grace_seconds: float = EXIT_GRACE_SECONDS,
+    hard_exit: Callable[[int], Any] = os._exit,
+) -> threading.Timer:
+    """Make sure a run's process is gone ``grace_seconds`` from now.
+
+    ``main()`` calls this in once mode only, after the run's last report, then
+    raises ``SystemExit(code)`` for the normal exit. That exit can hang: on a
+    turn that keeps swallowing cancellation (``asyncio.run`` waits for every
+    task it cancels), on a worker thread still blocked in the turn, or on a
+    trace export to an unreachable backend at interpreter exit. A run pod held
+    that way would live until the Job deadline, and with ``concurrencyPolicy:
+    Forbid`` the schedule's next fire would wait for it. The daemon timer ends
+    the process with ``code`` after the grace; a normal exit before then ends
+    the timer with it. stdout and stderr are flushed now, from this thread."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:  # noqa: BLE001 - a closed stream must not stop the exit
+            pass
+
+    def _end() -> None:
+        # os.write, not print: the main thread may hold the stdio locks.
+        try:
+            os.write(2, f"[run-once] still running {grace_seconds:g}s after the run ended; exiting {code}\n".encode())
+        except OSError:
+            pass
+        hard_exit(code)
+
+    timer = threading.Timer(grace_seconds, _end)
+    timer.name = "run-once-exit-bound"
+    timer.daemon = True
+    timer.start()
+    return timer
