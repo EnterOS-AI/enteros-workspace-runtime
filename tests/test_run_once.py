@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -261,6 +262,14 @@ def test_tail_and_head_utf8_never_split_a_character():
     assert tail_utf8("short", 65536) == "short" and head_utf8("short", 4096) == "short"
 
 
+def test_tail_and_head_utf8_keep_a_lone_surrogate_visible():
+    # Text decoded with surrogateescape (a file name, a tool's output) holds lone
+    # surrogates, which UTF-8 cannot encode; the report must still carry it.
+    assert head_utf8("caf\udce9.txt", 4096) == "caf\\udce9.txt"
+    assert tail_utf8("caf\udce9.txt", 65536) == "caf\\udce9.txt"
+    assert head_utf8("\udce9" * 1000, 16) == "\\udce9\\udce9\\udc"
+
+
 # --- classify_turn ----------------------------------------------------------------
 
 
@@ -449,6 +458,38 @@ async def test_run_once_waits_for_turn_to_settle():
     assert rec.active_tasks_at[-1] == 0  # the finished report waited for the release
 
 
+class SlowToStop:
+    """Needs a short await to stop once cancelled: cleanup that enqueues the
+    turn's last status. Classifying the run before that cleanup is done would
+    report a turn that has not stopped yet."""
+
+    def __init__(self):
+        self.task = None
+
+    async def execute(self, context, queue):
+        self.task = asyncio.current_task()
+        await queue.enqueue_event(new_text_message("partial"))
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.1)
+            await queue.enqueue_event(new_text_message("stopped cleanly"))
+            raise
+
+
+@pytest.mark.asyncio
+async def test_run_once_cancel_grace_waits_for_a_turn_that_stops_soon_after_the_cancel():
+    ex, rec = SlowToStop(), _Recorder()
+    try:
+        rc = await run_once(_spec_with_seconds_left(0.2), ex, heartbeat=_hb(), report=rec)
+        assert ex.task.done()  # run_once waited for the turn to stop
+        assert rc == 124
+        assert (rec.bodies[-1]["status"], rec.bodies[-1]["output"]) == ("timed_out", "stopped cleanly")
+    finally:
+        if ex.task is not None:
+            await asyncio.wait({ex.task}, timeout=5)
+
+
 @pytest.mark.asyncio
 async def test_run_once_unsettled_turn_times_out():
     hb = _hb()
@@ -516,6 +557,32 @@ async def test_run_once_flushes_traces_after_finished(monkeypatch):
     monkeypatch.setattr(ro, "flush_traces", lambda timeout_seconds=10.0: order.append("flush") or True)
     await run_once(_spec(), Replying("x"), heartbeat=_hb(), report=_Recorder(order=order))
     assert order == ["report:started", "report:finished", "flush"]
+
+
+# --- an executor exception whose text UTF-8 cannot encode -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_once_reports_the_executors_own_exception_when_its_text_is_not_utf8(run_pod_token):
+    class RaisesOnAFileName:
+        async def execute(self, context, queue):
+            raise RuntimeError("tool failed on caf\udce9.txt")  # a name decoded with surrogateescape
+
+    sent: list[dict] = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+
+    async def report(spec, body):  # the real report_run: httpx must be able to encode the body
+        return await report_run(spec, body, transport=transport)
+
+    assert await run_once(_spec(), RaisesOnAFileName(), heartbeat=_hb(), report=report) == 1
+
+    assert [(b["phase"], b["status"]) for b in sent] == [("started", "running"), ("finished", "failed")]
+    assert sent[-1]["error"] == "RuntimeError: tool failed on caf\\udce9.txt"
 
 
 class UnknownState:
@@ -588,17 +655,41 @@ def test_arm_exit_bound_ends_a_process_that_outlives_the_grace():
     assert timer.daemon and timer.name == "run-once-exit-bound"
 
 
+def test_arm_exit_bound_never_raises_when_no_thread_can_start(monkeypatch, capsys):
+    # Timer.start() raises this when the pod's pids or memory limit refuses a
+    # thread. main() arms the bound inside the adapter-setup `try`, so a raise
+    # here would be reported as a second `finished`, "adapter setup failed".
+    class NoThreadTimer(threading.Timer):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(ro, "threading", SimpleNamespace(Timer=NoThreadTimer))
+    ended: list[int] = []
+
+    assert ro.arm_exit_bound(0, grace_seconds=0.05, hard_exit=ended.append) is None
+
+    assert "could not arm the exit bound (RuntimeError: can't start new thread)" in capsys.readouterr().err
+    assert ended == []
+
+
 def test_post_deadline_accounting_matches_the_readme():
-    """README "Light runs": after the turn deadline, ending the run takes up to
-    58 s (cancel grace, the finished report with its retries, the Langfuse and
-    OTel flushes), and the exit bound ends the process at most 5 s after that.
-    The reserve min(120, D // 4) covers the 58 s only from D = 232 s."""
+    """README "Light runs": after the turn deadline, ending the run takes about
+    88 s: the cancel grace, the finished report with its retries, the Langfuse
+    and OTel flushes. httpx's 10 s timeout applies to each phase of a request,
+    so one report attempt can take about 20 s (10 s to connect, 10 s waiting
+    for the answer). The exit bound ends the process at most 5 s after that.
+    The reserve min(120, D // 4) covers the 88 s only from D = 352 s, and at the
+    3600 s default leaves about 27 s for what Kubernetes counts before boot."""
     grace = inspect.signature(run_once).parameters["cancel_grace_seconds"].default
     backoff = inspect.signature(report_run).parameters["backoff_seconds"].default
-    report_worst = ro.REPORT_TIMEOUT_SECONDS * (len(backoff) + 1) + sum(backoff)
+    attempt = 2 * ro.REPORT_TIMEOUT_SECONDS  # connect, then the answer
+    report_worst = attempt * (len(backoff) + 1) + sum(backoff)
     total = grace + report_worst + 2 * ro.TRACE_FLUSH_SECONDS
-    assert (grace, report_worst, total, ro.EXIT_GRACE_SECONDS) == (5.0, 33.0, 58.0, 5.0)
-    assert min(d for d in range(1, 4000) if deadline_reserve(d) >= total) == 232
+    assert (grace, attempt, report_worst, total, ro.EXIT_GRACE_SECONDS) == (5.0, 20.0, 63.0, 88.0, 5.0)
+    assert min(d for d in range(1, 4000) if deadline_reserve(d) >= total) == 352
+    assert deadline_reserve(3600) - total - ro.EXIT_GRACE_SECONDS == 27
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-    for claim in ("58 s", "232 s", "33 s"):
+    for claim in ("about 20 s", "about 63 s", "about 88 s", "352 s", "about 27 s"):
         assert claim in readme, claim
+    for stale in ("58 s", "33 s", "232 s", "57 s"):
+        assert stale not in readme, stale

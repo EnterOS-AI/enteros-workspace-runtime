@@ -65,6 +65,21 @@ STUB_ADAPTER = textwrap.dedent(
         _run_once.run_once = _escaping_run_once
 
 
+    if os.environ.get("STUB_ARM_FAILS"):
+        # Stands in for a pod whose pids or memory limit refuses a new thread:
+        # Timer.start(), and so arming the exit bound, raises.
+        import threading as _threading
+        import types as _types
+
+        import molecule_runtime.run_once as _run_once
+
+        class _NoThreadTimer(_threading.Timer):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        _run_once.threading = _types.SimpleNamespace(Timer=_NoThreadTimer)
+
+
     class _Executor:
         async def execute(self, context, event_queue):
             if MODE == "raise":
@@ -290,6 +305,29 @@ def test_once_mode_never_reports_twice_when_an_exception_escapes_the_run(tmp_pat
     assert calls[-1].body["status"] == "succeeded"
     assert "adapter.setup() failed" not in out
     assert "escaped after the finished report" in out
+
+
+@pytest.mark.parametrize(
+    "stub,rc_want,phases_want,status_want",
+    [
+        ("reply", 0, ["started", "finished"], "succeeded"),
+        ("setup_fails", 1, ["finished"], "failed"),
+    ],
+)
+def test_once_mode_reports_once_when_the_exit_bound_cannot_be_armed(tmp_path, stub, rc_want, phases_want, status_want):
+    """Review 21722 Optional 1: main() arms the exit bound inside the adapter-
+    setup `try`. When no thread can start, arming it raised into the setup arm,
+    which reported a second `finished` ("adapter setup failed") and exited 1
+    under a `succeeded` row. The run's own report must stay its only one."""
+    rc, calls, out = _boot(tmp_path, stub, STUB_ARM_FAILS="1")
+
+    assert rc == rc_want, out[-3000:]
+    assert [(c.body or {}).get("phase") for c in calls] == phases_want, out[-3000:]
+    assert calls[-1].body["status"] == status_want
+    assert "could not arm the exit bound (RuntimeError: can't start new thread)" in out
+    assert "Traceback" not in out, out[-3000:]
+    if stub == "reply":
+        assert "adapter.setup() failed" not in out
 
 
 @pytest.mark.parametrize("env", [{"MOLECULE_RUN_MODE": "twice"}, {"MOLECULE_RUN_PROMPT": "  "}])

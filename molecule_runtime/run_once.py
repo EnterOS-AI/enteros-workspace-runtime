@@ -22,15 +22,17 @@ long-lived server) and hands the executor to :func:`run_once`, which:
 
 Deadline: the run stops waiting at ``boot start + D - R``, where D is
 ``MOLECULE_RUN_DEADLINE_SECONDS`` (the Job's ``activeDeadlineSeconds``) and
-R = ``min(120 s, D // 4)``. Ending the run then takes up to 58 s: the turn gets
-5 s to stop after it is cancelled, the ``finished`` report up to 33 s (three
-10 s attempts, 1 s and 2 s apart), the Langfuse and OpenTelemetry flushes up to
-10 s each; the exit bound ends the process at most 5 s later. R is at least
-58 s only from D = 232 s, and it must also absorb what Kubernetes counts before
-this process starts (pod start, image pull, the copy step and the start
-script's boot: about 10-15 s warm for hermes), so at the 3600 s default about
-57 s are left for that. A pod the Job deadline ends first (a short deadline, a
-cold image pull) is recorded by core from the Job's status.
+R = ``min(120 s, D // 4)``. Ending the run then takes about 88 s at most: the
+turn gets 5 s to stop after it is cancelled; the ``finished`` report about
+63 s (three attempts, 1 s and 2 s apart, each about 20 s at most, because
+httpx's 10 s timeout applies to connecting and to waiting for the answer
+separately); the Langfuse and OpenTelemetry flushes up to 10 s each. The exit
+bound ends the process at most 5 s later. R covers the 88 s only from
+D = 352 s, and it must also absorb what Kubernetes counts before this process
+starts (pod start, image pull, the copy step and the start script's boot:
+about 10-15 s warm for hermes), so at the 3600 s default about 27 s are left
+for that. A pod the Job deadline ends first (a short deadline, a cold image
+pull) is recorded by core from the Job's status.
 
 A run never registers, never serves A2A, never heartbeats and never polls the
 agent's inbox: :func:`workspace_mode.in_run_pod` switches those paths off
@@ -203,6 +205,15 @@ def turn_deadline(spec: RunSpec) -> float:
     return spec.started_monotonic + spec.deadline_seconds - deadline_reserve(spec.deadline_seconds)
 
 
+def print_line(line: str, *, stderr: bool = False) -> None:
+    """Print one ``[run-once]`` line; never raises (a closed stream, a strict
+    encoding), so a log line can never become the run's failure."""
+    try:
+        print(line, file=sys.stderr if stderr else sys.stdout, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def build_run_context(spec: RunSpec) -> RequestContext:
     """The scheduled self-turn: one user-role text part holding the prompt, with
     the trigger-fire metadata on the request envelope (where the runtime's own
@@ -228,20 +239,30 @@ class RunEventQueue(EventQueue):
         self.events.append(event)
 
 
+def _utf8(text: str) -> bytes:
+    # backslashreplace: a lone surrogate (text decoded with surrogateescape, such
+    # as a file name inside an executor's exception) stays visible as \udcXX
+    # instead of failing the encode, and what the helpers return is text httpx
+    # can send in the report.
+    return text.encode("utf-8", "backslashreplace")
+
+
 def tail_utf8(text: str, limit: int) -> str:
-    """The last ``limit`` bytes of ``text`` as UTF-8, never splitting a character."""
-    data = text.encode("utf-8")
-    if len(data) <= limit:
-        return text
-    return data[-limit:].decode("utf-8", errors="ignore")
+    """The last ``limit`` bytes of ``text`` as UTF-8, never splitting a character
+    (a lone surrogate is kept as its ``\\udcXX`` escape)."""
+    data = _utf8(text)
+    if len(data) > limit:
+        data = data[-limit:]
+    return data.decode("utf-8", errors="ignore")
 
 
 def head_utf8(text: str, limit: int) -> str:
-    """The first ``limit`` bytes of ``text`` as UTF-8, never splitting a character."""
-    data = text.encode("utf-8")
-    if len(data) <= limit:
-        return text
-    return data[:limit].decode("utf-8", errors="ignore")
+    """The first ``limit`` bytes of ``text`` as UTF-8, never splitting a character
+    (a lone surrogate is kept as its ``\\udcXX`` escape)."""
+    data = _utf8(text)
+    if len(data) > limit:
+        data = data[:limit]
+    return data.decode("utf-8", errors="ignore")
 
 
 def _parts_text(parts: Any) -> str:
@@ -534,7 +555,7 @@ def arm_exit_bound(
     *,
     grace_seconds: float = EXIT_GRACE_SECONDS,
     hard_exit: Callable[[int], Any] = os._exit,
-) -> threading.Timer:
+) -> threading.Timer | None:
     """Make sure a run's process is gone ``grace_seconds`` from now.
 
     ``main()`` calls this in once mode only, after the run's last report, then
@@ -545,7 +566,14 @@ def arm_exit_bound(
     that way would live until the Job deadline, and with ``concurrencyPolicy:
     Forbid`` the schedule's next fire would wait for it. The daemon timer ends
     the process with ``code`` after the grace; a normal exit before then ends
-    the timer with it. stdout and stderr are flushed now, from this thread."""
+    the timer with it. stdout and stderr are flushed now, from this thread.
+
+    Never raises. ``main()`` arms the bound inside its adapter-setup ``try``,
+    where an exception would be reported as a second ``finished`` ("adapter
+    setup failed"). When the timer cannot start (``Timer.start()`` raises
+    ``RuntimeError: can't start new thread`` when the pod's pids or memory
+    limit refuses a thread), one stderr line says so, None is returned, and the
+    caller's ``SystemExit(code)`` ends the run without the bound."""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
@@ -560,8 +588,15 @@ def arm_exit_bound(
             pass
         hard_exit(code)
 
-    timer = threading.Timer(grace_seconds, _end)
-    timer.name = "run-once-exit-bound"
-    timer.daemon = True
-    timer.start()
+    try:
+        timer = threading.Timer(grace_seconds, _end)
+        timer.name = "run-once-exit-bound"
+        timer.daemon = True
+        timer.start()
+    except Exception as exc:  # noqa: BLE001 - see the docstring: never a second report
+        print_line(
+            f"[run-once] could not arm the exit bound ({type(exc).__name__}: {exc}); exiting {code} without it",
+            stderr=True,
+        )
+        return None
     return timer

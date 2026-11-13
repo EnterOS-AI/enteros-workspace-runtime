@@ -307,25 +307,25 @@ with the final reply text, flushes traces and exits:
 **The deadline.** With D = `MOLECULE_RUN_DEADLINE_SECONDS` (the Job's
 `activeDeadlineSeconds`), the run stops waiting for the turn at boot + D − R,
 where boot is the moment `molecule-runtime` starts and R = `min(120 s, D // 4)`.
-Ending the run then takes up to 58 s:
+Ending the run then takes about 88 s at most:
 
 | After the turn deadline | At most |
 | --- | --- |
 | the cancelled turn's grace to stop | 5 s |
-| the `finished` report: three 10 s attempts, 1 s and 2 s apart | 33 s |
+| the `finished` report: three attempts, 1 s and 2 s apart; httpx's 10 s timeout applies to connecting and to waiting for the answer separately, so one attempt can take about 20 s | about 63 s |
 | the Langfuse trace flush | 10 s |
 | the OpenTelemetry flush | 10 s |
-| **total, until the summary line** | **58 s** |
+| **total, until the summary line** | **about 88 s** |
 
 The process then exits. If something still holds it (a turn that keeps
 swallowing the cancel, a worker thread still blocked in the turn), an exit
 bound ends it 5 s later with the same exit code.
 
-R covers the 58 s only when D ≥ 232 s (R = D // 4 ≥ 58). R must also absorb
+R covers the 88 s only when D ≥ 352 s (R = D // 4 ≥ 88). R must also absorb
 what Kubernetes counts before boot: pod start, the image pull, the copy step
 and the start script (about 10-15 s warm for hermes; one cold image pull was
-measured at 51 s). At the default D = 3600 s, R = 120 s leaves about 57 s for
-that (120 − 58 − 5). When it runs out, a short deadline or a slow cold pull,
+measured at 51 s). At the default D = 3600 s, R = 120 s leaves about 27 s for
+that (120 − 88 − 5). When it runs out, a short deadline or a slow cold pull,
 Kubernetes ends the pod at the Job deadline, perhaps before the `finished`
 report, and core records the run from the Job.
 
