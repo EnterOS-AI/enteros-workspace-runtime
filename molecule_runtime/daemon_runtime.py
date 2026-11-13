@@ -125,6 +125,24 @@ class DaemonRuntime:
         else:
             os.environ.pop(plugin_daemons.NATIVE_SCHEDULER_ENV, None)
 
+        # A Light agent's schedules run as Light runs (contract C1): its own
+        # scheduler (the kind: trigger daemon) never starts, on cold boot or on
+        # the warm /internal/daemons/reload path. Seeding and the
+        # NATIVE_SCHEDULER_ENV capability above deliberately use the
+        # unfiltered set: the schedules still live in the agent's grid, the
+        # /internal/schedules* API keeps serving them, and core keeps deferring.
+        from molecule_runtime.workspace_mode import is_light
+
+        if is_light():
+            skipped = [s.key for s in specs if s.kind == "trigger"]
+            if skipped:
+                logger.info(
+                    "MOLECULE_LIGHT=1: not starting trigger daemon(s) %s; this "
+                    "agent's schedules run as Light runs",
+                    ", ".join(skipped),
+                )
+                specs = [s for s in specs if s.kind != "trigger"]
+
         if not specs:
             return {"armed": 0, "added": [], "trigger": False}
 
