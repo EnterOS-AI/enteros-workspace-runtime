@@ -148,3 +148,60 @@ def test_run_switches_read_live_not_cached(monkeypatch):
     monkeypatch.delenv(RUN_MODE_ENV)
     monkeypatch.delenv(LIGHT_ENV)
     assert in_run_pod() is False and is_light() is False
+
+
+def test_continuous_false_seeds_goal_from_env_without_idle_loop(tmp_path, monkeypatch):
+    """runtime#429: MOLECULE_CONTINUOUS=false still seeds MOLECULE_IDLE_GOAL."""
+    import inspect
+    from molecule_runtime import main as runtime_main
+    from molecule_runtime.idle_digest.providers.goal import GoalStateProvider
+
+    monkeypatch.setenv("MOLECULE_MAILBOX_DIR", str(tmp_path / "mbox"))
+    monkeypatch.setenv("MOLECULE_CONTINUOUS", "false")
+    monkeypatch.setenv("MOLECULE_IDLE_GOAL", "ship v1")
+    monkeypatch.setenv("MOLECULE_MAILBOX_KERNEL", "1")
+
+    assert continuous() is False
+    assert runtime_main._seed_on_demand_goal_state(idle_prompt="") is True
+
+    doc = GoalStateProvider().get()
+    assert doc is not None
+    assert doc["goal"] == "ship v1"
+    assert doc["source"] == "env-bootstrap"
+
+    # Boot wiring keeps both idle loops strictly behind _wakes_itself while
+    # calling _seed_on_demand_goal_state when _wakes_itself is False.
+    src = inspect.getsource(runtime_main.main)
+    assert "if adapter_ready and not _wakes_itself:" in src
+    assert "_seed_on_demand_goal_state(" in src
+    assert "if adapter_ready and _wakes_itself:" in src
+    assert "if adapter_ready and _wakes_itself and config.idle_prompt and not _idle_digest_enabled:" in src
+
+
+def test_continuous_false_migrates_legacy_idle_prompt_when_env_unset(tmp_path, monkeypatch):
+    """runtime#429: legacy config.idle_prompt migrates on boot even when idle wake is off."""
+    from molecule_runtime import main as runtime_main
+    from molecule_runtime.idle_digest.providers.goal import GoalStateProvider
+
+    monkeypatch.setenv("MOLECULE_MAILBOX_DIR", str(tmp_path / "mbox"))
+    monkeypatch.setenv("MOLECULE_CONTINUOUS", "false")
+    monkeypatch.delenv("MOLECULE_IDLE_GOAL", raising=False)
+    monkeypatch.setenv("MOLECULE_MAILBOX_KERNEL", "1")
+
+    assert runtime_main._seed_on_demand_goal_state(idle_prompt="check backlog hourly") is True
+    doc = GoalStateProvider().get()
+    assert doc is not None
+    assert doc["goal"] == "check backlog hourly"
+
+
+def test_continuous_false_skips_goal_seed_when_kernel_disabled(tmp_path, monkeypatch):
+    from molecule_runtime import main as runtime_main
+    from molecule_runtime.idle_digest.providers.goal import GoalStateProvider
+
+    monkeypatch.setenv("MOLECULE_MAILBOX_DIR", str(tmp_path / "mbox"))
+    monkeypatch.setenv("MOLECULE_CONTINUOUS", "false")
+    monkeypatch.setenv("MOLECULE_IDLE_GOAL", "should not seed")
+    monkeypatch.setenv("MOLECULE_MAILBOX_KERNEL", "0")
+
+    assert runtime_main._seed_on_demand_goal_state(idle_prompt="") is False
+    assert GoalStateProvider().get() is None

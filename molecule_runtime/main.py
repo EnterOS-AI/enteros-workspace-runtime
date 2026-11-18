@@ -619,6 +619,57 @@ async def start_poll_delivery_when_bound(
     )
 
 
+def _seed_goal_state_providers(providers, idle_prompt: str | None) -> None:
+    """Run goal-state legacy migration + env bootstrap across providers."""
+    for _gp in providers:
+        if getattr(_gp, "provider_id", None) == "goal-state":
+            try:
+                _gp.migrate_from_config(idle_prompt)
+            except Exception:
+                pass
+            try:
+                # Provision-time deterministic seed (MOLECULE_IDLE_GOAL /
+                # goal-state boot contract): safe to re-run every boot.
+                _gp.bootstrap_from_env()
+            except Exception:
+                pass
+            break
+
+
+def _seed_on_demand_goal_state(
+    *,
+    config_path: str = "",
+    prompt_files=(),
+    workspace_name: str = "this workspace",
+    runtime_kind: str = "claude-code",
+    platform_url: str = "",
+    workspace_id: str = "",
+    idle_prompt: str | None = None,
+) -> bool:
+    """Seed goal-state on boot when continuous idle waking is off (#429)."""
+    try:
+        from molecule_runtime import mailbox_dir as _mbox
+
+        if not _mbox.kernel_enabled():
+            return False
+        from molecule_runtime.idle_digest import (
+            build_default_providers as _build_idle_providers,
+        )
+
+        providers = _build_idle_providers(
+            config_path=config_path,
+            prompt_files=prompt_files,
+            workspace_name=workspace_name,
+            runtime_kind=runtime_kind,
+            platform_url=platform_url,
+            workspace_id=workspace_id,
+        )
+        _seed_goal_state_providers(providers, idle_prompt)
+        return True
+    except Exception:
+        return False
+
+
 async def main(prepare_only: bool = False):  # pragma: no cover
     # Light runs: a run's deadline counts from the moment this process began.
     boot_wall, boot_mono = time.time(), time.monotonic()
@@ -1864,6 +1915,17 @@ async def main(prepare_only: bool = False):  # pragma: no cover
             "messages and schedules",
             flush=True,
         )
+        # On-demand workspaces still seed goal-state (MOLECULE_IDLE_GOAL or
+        # legacy config.idle_prompt) so goal_get works without an idle loop.
+        _seed_on_demand_goal_state(
+            config_path=config.config_path,
+            prompt_files=config.prompt_files,
+            workspace_name=config.name,
+            runtime_kind=config.runtime,
+            platform_url=platform_url,
+            workspace_id=workspace_id,
+            idle_prompt=config.idle_prompt,
+        )
 
     _idle_digest_enabled = False
     if adapter_ready and _wakes_itself:
@@ -1894,22 +1956,8 @@ async def main(prepare_only: bool = False):  # pragma: no cover
                 platform_url=platform_url,
                 workspace_id=workspace_id,
             )
-            # goal-state first-boot migration of a legacy config.idle_prompt value
-            for _gp in _idle_providers:
-                if _gp.provider_id == "goal-state":
-                    try:
-                        _gp.migrate_from_config(config.idle_prompt)
-                    except Exception:
-                        pass
-                    try:
-                        # Provision-time deterministic seed (MOLECULE_IDLE_GOAL
-                        # workspace secret / CP env) — after the one-shot config
-                        # migration, same source-rank rules (never clobbers an
-                        # agent-set goal).
-                        _gp.bootstrap_from_env()
-                    except Exception:
-                        pass
-                    break
+            # goal-state first-boot migration + MOLECULE_IDLE_GOAL seed
+            _seed_goal_state_providers(_idle_providers, config.idle_prompt)
 
             _IDLE_FIRE_TIMEOUT = max(60, min(300, _idle_policy.idle_fire_after_seconds))
 
