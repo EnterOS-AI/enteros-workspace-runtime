@@ -150,6 +150,15 @@ _ALIAS_PAIRS: dict[str, str] = {
 # but ARE read by the privileged MCP — carried verbatim from their own env var.
 _LEGACY_ONLY_KEYS: tuple[str, ...] = ("PLATFORM_URL", "WORKSPACE_ID")
 
+# Org CONTEXT the management MCP reads — not credentials, carried verbatim from
+# the container env, which core sets on the concierge (conciergePlatformMCPEnv):
+#   * MOLECULE_LLM_DEFAULT_MODEL — the platform default model the tenant holds.
+#     provision_workspace / light_create_agent give it to a workspace whose model
+#     nobody named. Without it here a hermes concierge's MCP child never sees it:
+#     hermes builds a stdio child's env from a small allowlist plus the server
+#     config's own ``env``, not from the container env.
+ORG_CONTEXT_ENV_KEYS: tuple[str, ...] = ("MOLECULE_LLM_DEFAULT_MODEL",)
+
 # ── audience=self delivery (RFC plugin-mcp-audience-contract, self-schedule v1) ──
 # The self audience is the workspace acting as ITSELF; its bearer is the
 # NON-privileged workspace token, NOT the org key. The in-container SSOT for that
@@ -206,13 +215,15 @@ for _canon, _legacy in _ALIAS_PAIRS.items():
     _ALIAS_OF[_canon] = _legacy
     _ALIAS_OF[_legacy] = _canon
 
-# Every key we inject = canonical set ∪ legacy proven set. Ordered, de-duped.
+# Every key we inject = canonical set ∪ legacy proven set ∪ org context.
+# Ordered, de-duped.
 _INJECTED_KEYS: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
             *PRIVILEGED_ENV_KEYS,
             *_ALIAS_PAIRS.values(),
             *_LEGACY_ONLY_KEYS,
+            *ORG_CONTEXT_ENV_KEYS,
         )
     )
 )
@@ -351,7 +362,8 @@ def _inject_org_env(
     NOTHING — org injection stays anchored to the core-verified NAME, never a
     manifest field (review security-major-2). Each injected key absent from the
     descriptor ``env`` is resolved (canonical-or-alias) and merged; descriptor keys
-    win. Returns the spec unchanged when nothing resolves.
+    win. The org context (``ORG_CONTEXT_ENV_KEYS``, e.g. the platform default
+    model) rides the same merge. Returns the spec unchanged when nothing resolves.
     """
     from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
 

@@ -624,3 +624,50 @@ def test_self_audience_no_api_url_logs_misconfig(caplog):
         out = inject_privileged_env("schedule-self", {"audience": "self"}, {})
     assert "MOLECULE_API_URL" not in out["env"]
     assert "NO tenant API URL" in caplog.text
+
+
+# ── org context: the platform default model (new agents' default) ──────────────
+# Core sets MOLECULE_LLM_DEFAULT_MODEL on the concierge (conciergePlatformMCPEnv);
+# the management MCP's provision_workspace / light_create_agent give it to a
+# workspace whose model nobody named. A hermes concierge's MCP child only sees the
+# descriptor env (hermes allowlists the rest), so the injector must carry it.
+
+
+def test_forwards_platform_default_model_to_management_mcp():
+    env = {
+        "MOLECULE_ORG_API_KEY": "org-token",
+        "MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-4-hydrogen",
+    }
+    out = inject_privileged_env(MANAGEMENT_MCP_NAME, {"command": "npx"}, env)
+    assert out["env"]["MOLECULE_LLM_DEFAULT_MODEL"] == "google/gemini-4-hydrogen"
+
+
+def test_platform_default_model_alone_is_still_forwarded():
+    out = inject_privileged_env(
+        MANAGEMENT_MCP_NAME, {}, {"MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-4-hydrogen"}
+    )
+    assert out["env"] == {"MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-4-hydrogen"}
+
+
+def test_platform_default_model_absent_is_not_injected():
+    out = inject_privileged_env(MANAGEMENT_MCP_NAME, {}, {"MOLECULE_ORG_API_KEY": "k"})
+    assert "MOLECULE_LLM_DEFAULT_MODEL" not in out["env"]
+
+
+def test_descriptor_declared_default_model_wins():
+    spec = {"env": {"MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-3.1-flash-lite"}}
+    out = inject_privileged_env(
+        MANAGEMENT_MCP_NAME, spec, {"MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-4-hydrogen"}
+    )
+    assert out["env"]["MOLECULE_LLM_DEFAULT_MODEL"] == "google/gemini-3.1-flash-lite"
+
+
+def test_platform_default_model_never_reaches_other_mcp_surfaces():
+    env = {"MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-4-hydrogen", "WORKSPACE_ID": "ws-1"}
+    # an ordinary (non-audience) MCP is untouched
+    assert inject_privileged_env("image-gen", {"command": "npx"}, env) == {"command": "npx"}
+    # the self surface carries the workspace's own identity only
+    self_out = inject_privileged_env(
+        "molecule-schedule-self", {"command": "npx", "audience": "self"}, env
+    )
+    assert "MOLECULE_LLM_DEFAULT_MODEL" not in self_out["env"]
