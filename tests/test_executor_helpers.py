@@ -2072,3 +2072,136 @@ def test_tool_activity_file_private_under_mailbox_when_kernel_on(tmp_path, monke
             os.environ.pop("MOLECULE_TOOL_ACTIVITY_FILE", None)
         else:
             os.environ["MOLECULE_TOOL_ACTIVITY_FILE"] = _saved
+
+
+def test_get_message_metadata_coerces_protobuf_struct_and_falls_back_when_empty():
+    """runtime#430: empty protobuf Struct on message.metadata falls back to context.metadata."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from google.protobuf.struct_pb2 import Struct
+
+    env_struct = Struct()
+    env_struct.update({"source_type": "self-scheduler", "schedule_name": "nightly"})
+
+    ctx = SimpleNamespace(
+        message=SimpleNamespace(metadata=Struct()),
+        metadata=env_struct,
+    )
+    assert eh.get_message_metadata(ctx) == {
+        "source_type": "self-scheduler",
+        "schedule_name": "nightly",
+    }
+    assert eh.get_message_source_type(ctx) == "self-scheduler"
+
+    # Message-level non-empty Struct takes precedence over envelope metadata.
+    msg_struct = Struct()
+    msg_struct.update({"source_type": "self-idle"})
+    ctx_msg_wins = SimpleNamespace(
+        message=SimpleNamespace(metadata=msg_struct),
+        metadata=env_struct,
+    )
+    assert eh.get_message_source_type(ctx_msg_wins) == "self-idle"
+
+    # Mocked non-mapping metadata must fail closed to None rather than crashing.
+    bad_ctx = SimpleNamespace(message=SimpleNamespace(metadata=MagicMock()), metadata=MagicMock())
+    assert eh.get_message_metadata(bad_ctx) is None
+    assert eh.get_message_source_type(bad_ctx) is None
+
+
+def test_get_message_metadata_from_real_a2a_sdk_v03_request_context():
+    """runtime#430: end-to-end RequestContext built by a2a-sdk 1.x enable_v0_3_compat=True."""
+    import importlib
+    import sys
+
+    saved = {
+        k: v for k, v in list(sys.modules.items())
+        if k == "a2a" or k.startswith("a2a.")
+    }
+    for k in saved:
+        del sys.modules[k]
+    try:
+        try:
+            a2a_exec = importlib.import_module("a2a.server.agent_execution")
+            a2a_rh = importlib.import_module("a2a.server.request_handlers")
+            a2a_routes = importlib.import_module("a2a.server.routes")
+            a2a_tasks = importlib.import_module("a2a.server.tasks")
+            a2a_types = importlib.import_module("a2a.types")
+        except ModuleNotFoundError:
+            pytest.skip("a2a-sdk not installed in current test env")
+
+        from starlette.applications import Starlette
+        from starlette.testclient import TestClient
+
+        captured = []
+
+        class _RecordingExecutor(a2a_exec.AgentExecutor):
+            async def execute(self, context, event_queue):
+                captured.append(
+                    (
+                        eh.get_message_metadata(context),
+                        eh.get_message_source_type(context),
+                    )
+                )
+                reply = a2a_types.Message(
+                    message_id="reply-1",
+                    role=a2a_types.Role.ROLE_AGENT,
+                    parts=[a2a_types.Part(text="ok")],
+                    context_id=context.context_id,
+                    task_id=context.task_id,
+                )
+                await event_queue.enqueue_event(reply)
+
+            async def cancel(self, context, event_queue):
+                pass
+
+        card = a2a_types.AgentCard(
+            name="test",
+            description="test",
+            version="0.0.1",
+            capabilities=a2a_types.AgentCapabilities(),
+            default_input_modes=["text/plain"],
+            default_output_modes=["text/plain"],
+            skills=[],
+            supported_interfaces=[],
+        )
+        handler = a2a_rh.DefaultRequestHandler(
+            agent_executor=_RecordingExecutor(),
+            task_store=a2a_tasks.InMemoryTaskStore(),
+            agent_card=card,
+        )
+        routes = a2a_routes.create_jsonrpc_routes(
+            request_handler=handler,
+            rpc_url="/",
+            enable_v0_3_compat=True,
+        )
+        client = TestClient(Starlette(routes=routes))
+        resp = client.post(
+            "/",
+            json={
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "message/send",
+                "params": {
+                    "message": {
+                        "messageId": "msg-1",
+                        "role": "user",
+                        "parts": [{"kind": "text", "text": "tick"}],
+                    },
+                    "metadata": {
+                        "source_type": "self-scheduler",
+                        "schedule_name": "nightly",
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert captured == [
+            (
+                {"source_type": "self-scheduler", "schedule_name": "nightly"},
+                "self-scheduler",
+            )
+        ]
+    finally:
+        for k in [k for k in list(sys.modules) if k == "a2a" or k.startswith("a2a.")]:
+            del sys.modules[k]
+        sys.modules.update(saved)
