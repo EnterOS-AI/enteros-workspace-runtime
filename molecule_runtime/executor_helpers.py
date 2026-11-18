@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Mapping
 import hashlib
 import json
 import logging
@@ -755,21 +756,42 @@ def extract_message_text(message: Any) -> str:
 A2A_MESSAGE_SOURCE_TYPE_KEY = "source_type"
 
 
+def _coerce_metadata_dict(raw: Any) -> dict | None:
+    """Convert a dict, protobuf Struct/Message, or Mapping into a plain dict."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    try:
+        from google.protobuf.json_format import MessageToDict
+        from google.protobuf.message import Message as _ProtoMessage
+
+        if isinstance(raw, _ProtoMessage):
+            converted = MessageToDict(raw, preserving_proto_field_name=True)
+            return converted if isinstance(converted, dict) else None
+    except Exception:
+        pass
+    return None
+
+
 def get_message_metadata(context: Any) -> dict | None:
     """Return the inbound A2A envelope's metadata dict, or None.
 
-    Reads ``message.metadata`` first, then falls back to the envelope-level
-    ``context.metadata``. The runtime's own self-sends stamp ``source_type`` on
-    the ENVELOPE (``MessageSendParams(metadata=...)``) with no message-level
-    metadata, so the fallback branch is the one production self-wakes actually
-    take — both branches are load-bearing."""
-    metadata = None
+    Reads ``message.metadata`` first when non-empty, then falls back to the
+    envelope-level ``context.metadata``. Under ``a2a-sdk`` 1.x v0.3 compat,
+    protobuf conversion populates an empty ``google.protobuf.struct_pb2.Struct``
+    on ``message.metadata`` when only ``params.metadata`` was sent, so an
+    empty ``Struct`` / dict must still fall through to ``context.metadata``."""
     message = getattr(context, "message", None)
-    if message is not None:
-        metadata = getattr(message, "metadata", None)
-    if metadata is None:
-        metadata = getattr(context, "metadata", None)
-    return metadata if isinstance(metadata, dict) else None
+    msg_meta = _coerce_metadata_dict(getattr(message, "metadata", None)) if message is not None else None
+    if msg_meta:
+        return msg_meta
+    ctx_meta = _coerce_metadata_dict(getattr(context, "metadata", None))
+    if ctx_meta:
+        return ctx_meta
+    return msg_meta if msg_meta is not None else ctx_meta
 
 
 def get_message_source_type(context: Any) -> str | None:
