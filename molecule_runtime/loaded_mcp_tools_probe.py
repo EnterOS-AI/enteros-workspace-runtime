@@ -565,6 +565,8 @@ async def _probe_specs_async(
         )
         return None
 
+    from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
+
     any_connected = False
     collected: set[str] = set()
     for name, spec in servers.items():
@@ -574,7 +576,18 @@ async def _probe_specs_async(
         server_spec = _merge_launch_env_into_spec(server_spec, launch_env)
         ids = await _list_tools_from_mcp_server(name, server_spec)
         if ids is None:
-            continue  # broken/unreachable/stalled server — degrade-safe skip
+            # If the declared management MCP failed or timed out its handshake,
+            # never publish a partial list from healthy siblings (e.g. molecule-self):
+            # doing so causes capture_loaded_mcp_tools_with_retry to stop on attempt 1
+            # and leaves loaded_mcp_tools permanently missing provision_workspace (#438).
+            if name == MANAGEMENT_MCP_NAME and _build_server_command(server_spec) is not None:
+                logger.warning(
+                    "loaded_mcp_tools: management server %r is declared but failed/timed out "
+                    "handshake — leaving producer unset (None) so retry/grace window applies",
+                    name,
+                )
+                return None
+            continue  # non-management broken/unreachable/stalled server — degrade-safe skip
         any_connected = True
         collected.update(ids)
 
