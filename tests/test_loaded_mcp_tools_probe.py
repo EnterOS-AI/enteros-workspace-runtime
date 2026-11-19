@@ -988,3 +988,106 @@ class TestAdapterMcpLaunchEnv:
             _cfg(config_root)
         )
         assert inj_out == ["mcp__molecule-platform__create_workspace"]
+
+
+class TestPartialTimeoutManagementMCP:
+    """runtime#438: a healthy sibling MCP (e.g. molecule-self) must NOT mask a
+    declared management MCP (molecule-platform) timeout or hard launch-failure."""
+
+    @pytest.mark.asyncio
+    async def test_management_server_timeout_with_healthy_peer_returns_none_and_retries(
+        self, tmp_path, monkeypatch
+    ):
+        from molecule_runtime import platform_agent_identity as pai
+
+        monkeypatch.setattr(probe, "_MCP_READ_TIMEOUT_SECONDS", 0.5)
+        monkeypatch.setattr(probe, "_MCP_HANDSHAKE_TIMEOUT_SECONDS", 1.0)
+        monkeypatch.setattr(probe, "_MCP_ENUMERATION_TIMEOUT_SECONDS", 10.0)
+
+        healthy_self = _write_fake_server(
+            tmp_path, tools=["schedule_task"], name="self_srv.py"
+        )
+        stall_mgmt = _write_fake_server(
+            tmp_path, tools=[], hang_after_init=True, name="mgmt_stall.py"
+        )
+        ready_mgmt = _write_fake_server(
+            tmp_path, tools=["provision_workspace"], name="mgmt_ok.py"
+        )
+        config_root = _claude_settings_with(
+            tmp_path,
+            {
+                "molecule-self": {"command": sys.executable, "args": [str(healthy_self)]},
+                "molecule-platform": {"command": sys.executable, "args": [str(stall_mgmt)]},
+            },
+        )
+
+        # Negative control on attempt 1: partial enumeration (only molecule-self
+        # succeeded) must return None so retry continues and producer stays unset.
+        first = await probe.capture_loaded_mcp_tools_at_init(
+            _ProbeAdapter(), _cfg(config_root), force=True
+        )
+        assert first is None
+        assert pai.loaded_mcp_tools() is None
+        assert probe.launch_failure_reason() is None
+
+        # Retry loop: attempt 1 times out on molecule-platform, attempt 2 swaps in
+        # the recovered server and publishes both servers' tools.
+        orig_capture = probe.capture_loaded_mcp_tools_at_init
+        attempts = {"n": 0}
+
+        async def _flaky_capture(adapter, config, *, force=False):
+            attempts["n"] += 1
+            if attempts["n"] == 2:
+                _claude_settings_with(
+                    tmp_path,
+                    {
+                        "molecule-self": {"command": sys.executable, "args": [str(healthy_self)]},
+                        "molecule-platform": {"command": sys.executable, "args": [str(ready_mgmt)]},
+                    },
+                )
+            return await orig_capture(adapter, config, force=force)
+
+        monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _flaky_capture)
+        out = await probe.capture_loaded_mcp_tools_with_retry(
+            _ProbeAdapter(), _cfg(config_root), max_attempts=3, interval_seconds=0.01, force=True
+        )
+        assert attempts["n"] == 2
+        assert out == [
+            "mcp__molecule-platform__provision_workspace",
+            "mcp__molecule-self__schedule_task",
+        ]
+        assert pai.loaded_mcp_tools() == out
+
+    @pytest.mark.asyncio
+    async def test_management_server_hard_exit_with_healthy_peer_short_circuits_retry(
+        self, tmp_path, monkeypatch
+    ):
+        healthy_self = _write_fake_server(
+            tmp_path, tools=["schedule_task"], name="self_srv.py"
+        )
+        broken_mgmt = _write_fake_server(
+            tmp_path, tools=[], broken=True, name="mgmt_broken.py"
+        )
+        config_root = _claude_settings_with(
+            tmp_path,
+            {
+                "molecule-self": {"command": sys.executable, "args": [str(healthy_self)]},
+                "molecule-platform": {"command": sys.executable, "args": [str(broken_mgmt)]},
+            },
+        )
+
+        orig_capture = probe.capture_loaded_mcp_tools_at_init
+        attempts = {"n": 0}
+
+        async def _spy_capture(adapter, config, *, force=False):
+            attempts["n"] += 1
+            return await orig_capture(adapter, config, force=force)
+
+        monkeypatch.setattr(probe, "capture_loaded_mcp_tools_at_init", _spy_capture)
+        out = await probe.capture_loaded_mcp_tools_with_retry(
+            _ProbeAdapter(), _cfg(config_root), max_attempts=5, interval_seconds=0.01, force=True
+        )
+        assert out is None
+        assert attempts["n"] == 1
+        assert probe.launch_failure_reason() is not None
+        assert "molecule-platform" in probe.launch_failure_reason()
